@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (-D warnings)
+        run: cargo build --locked --all-targets
+
+      - name: Test (-D warnings)
+        run: cargo test --locked
+
+      - name: Dependency audit
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit
