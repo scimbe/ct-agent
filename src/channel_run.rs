@@ -1688,7 +1688,6 @@ fn run_service_handler_with_timeout(
     input: &str,
     timeout: std::time::Duration,
 ) -> Result<String, String> {
-    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let slug = match service {
         ct_common::channel::ServiceType::CodeGeneration => "code_generation",
@@ -1696,20 +1695,27 @@ fn run_service_handler_with_timeout(
         ct_common::channel::ServiceType::SafetyCheck => "safety_check",
         ct_common::channel::ServiceType::TextGeneration => "text_generation",
     };
-    let mut child = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(cmd)
         .env("CT_SERVICE_TYPE", slug)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // #183: put the child in its OWN process group (pgid == its pid) so the timeout kill below can
-        // signal the WHOLE subtree, not just the immediate `sh -c`. The handler scripts shell out to a
-        // real LLM CLI as a GRANDCHILD; killing only the `sh` pid leaves an orphaned (costed, running)
-        // LLM subprocess whenever the script pipes/backgrounds, defeating SERVICE_HANDLER_TIMEOUT.
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("service handler spawn failed: {e}"))?;
+        .stderr(Stdio::piped());
+    // #183: put the child in its OWN process group (pgid == its pid) on Unix so the timeout
+    // kill below can signal the WHOLE subtree, not just the immediate `sh -c`. The handler
+    // scripts shell out to a real LLM CLI as a GRANDCHILD; killing only the `sh` pid leaves an
+    // orphaned (costed, running) LLM subprocess whenever the script pipes/backgrounds,
+    // defeating SERVICE_HANDLER_TIMEOUT. `std::process::Command` has no process-group concept
+    // on Windows, so the timeout kill there (below) only ever reaches the immediate child --
+    // a narrower, documented guarantee than Unix's whole-group kill.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|e| format!("service handler spawn failed: {e}"))?;
     let pid = child.id();
 
     // Write stdin on its own thread so it can proceed concurrently with the wait/output-read
@@ -1740,8 +1746,19 @@ fn run_service_handler_with_timeout(
             // timeout as an orphan. `process_group(0)` above made pgid == pid, and a NEGATIVE pid to
             // kill(2) signals every process in that group. Done via libc, not `Command::new("kill")`:
             // minimal images ship no `kill` binary, so the old spawn silently no-op'd there.
+            #[cfg(unix)]
             unsafe {
                 libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+            // Windows: no raw kill-by-pid in std and no process-group equivalent (see the
+            // process_group comment above) -- shell out to the always-present taskkill,
+            // which only reaches the immediate child, not any grandchild the handler
+            // script spawned.
+            #[cfg(not(unix))]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .status();
             }
             return Err(format!(
                 "service handler timed out after {}s (pid {pid} killed)",
