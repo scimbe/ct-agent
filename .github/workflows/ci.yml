@@ -33,6 +33,17 @@ jobs:
           # RUSTSEC-2026-0118 (hickory-proto NSEC3 unbounded-loop advisory) has no fixed
           # upgrade available as of this writing -- ignored explicitly rather than left to
           # silently block every CI run. Revisit (drop the --ignore) once hickory-dns ships
-          # a fix. RUSTSEC-2026-0119 (the other hickory-proto advisory, CPU exhaustion) is
-          # NOT ignored -- fixed by the hickory-resolver >=0.26.1 bump in Cargo.toml.
-          cargo audit --ignore RUSTSEC-2026-0118
+          # a fix.
+          #
+          # RUSTSEC-2026-0119 (the other hickory-proto advisory, CPU exhaustion) IS fixed
+          # for ct-agent's own direct hickory-resolver dependency (bumped to 0.26.1) -- but
+          # Cargo.lock still carries a SECOND copy at the vulnerable 0.25.2, pulled in
+          # transitively as an optional dependency of libp2p (libp2p-mdns -> hickory-proto
+          # 0.25.2, local-network mDNS peer discovery, unrelated to the ACME/DNS-01 path the
+          # 0.26.1 bump addresses). `cargo tree -i hickory-proto@0.25.2` shows it as
+          # unreachable ("nothing to print") -- it is resolved into Cargo.lock but never
+          # actually compiled, since ct-agent doesn't enable libp2p's "mdns" feature.
+          # cargo-audit scans Cargo.lock's package list without feature-awareness, so it
+          # flags this regardless -- a documented class of cargo-audit false positive.
+          # Ignored here for that reason; revisit if libp2p ever makes this reachable.
+          cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
