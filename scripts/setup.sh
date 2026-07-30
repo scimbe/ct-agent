@@ -180,15 +180,38 @@ ensure_env() {
   # error, so this is defaulted rather than left optional.
   : "${CT_AGENT_MODE:=browser}"
   : "${CT_AGENT_EDGE_CERT_URL:=$CT_AGENT_CP_URL}"
+  # A fresh CT_AGENT_ID every run would break restore: ct-agent's onboard_or_restore
+  # only reuses persisted identity/tenant when CT_AGENT_ID matches the "agent" file
+  # written at onboard time (src/onboard.rs's OnboardedAgent::restore) -- otherwise
+  # it silently falls through to re-onboarding with the (already single-use-spent)
+  # join token and the background process dies on a 409, right after this script's
+  # own "already onboarded, skipping onboard" line claimed success. Found live: a
+  # second run against existing state crashed the backgrounded agent this way.
+  if [ -z "${CT_AGENT_ID:-}" ] && [ -f "$STATE_DIR/agent" ]; then
+    CT_AGENT_ID="$(cat "$STATE_DIR/agent")"
+  fi
   : "${CT_AGENT_ID:=agent-$(date +%s)-$$}"
+  # ct-agent defaults this to /shared/capability.bin -- a path from CADS-Tunnel's
+  # own docker-compose shared volume that doesn't exist on a customer's machine.
+  # Without overriding it, onboarding fails (ENOENT) right after fetching the
+  # edge cert.
+  : "${CT_AGENT_CAPABILITY_OUT:=$STATE_DIR/capability.bin}"
   : "${CT_AGENT_EDGE:=}"
   if [ -z "$CT_AGENT_EDGE" ]; then
-    local ni
+    # /network-info returns just the port ({"mesh_edge_port":4433,...}), not a
+    # host:port string -- the host is the same one CT_AGENT_CP_URL points at.
+    local ni edge_host edge_port
     ni=$(curl -fsSL "${CT_AGENT_CP_URL%/}/network-info" 2>/dev/null || true)
-    CT_AGENT_EDGE=$(printf '%s' "$ni" | sed -n 's/.*"mesh_edge_addr":"\([^"]*\)".*/\1/p')
+    edge_port=$(printf '%s' "$ni" | sed -n 's/.*"mesh_edge_port":\([0-9]*\).*/\1/p')
+    edge_host=$(printf '%s' "$CT_AGENT_CP_URL" | sed -E 's#^[a-zA-Z]+://##; s#[:/].*##')
+    [ -n "$edge_port" ] && [ -n "$edge_host" ] && CT_AGENT_EDGE="${edge_host}:${edge_port}"
     [ -n "$CT_AGENT_EDGE" ] || die "could not determine CT_AGENT_EDGE automatically — set it in .env (host:port of the mesh edge)"
   fi
-  export CT_AGENT_MODE CT_AGENT_EDGE_CERT_URL CT_AGENT_ID CT_AGENT_EDGE CT_AGENT_STATE_DIR="$STATE_DIR"
+  # ct-agent reads/writes its bound-identity state here but doesn't create the
+  # directory itself -- onboarding fails (ENOENT) on a fresh checkout otherwise.
+  mkdir -p "$STATE_DIR"
+  export CT_AGENT_MODE CT_AGENT_EDGE_CERT_URL CT_AGENT_ID CT_AGENT_EDGE CT_AGENT_CAPABILITY_OUT \
+    CT_AGENT_STATE_DIR="$STATE_DIR"
 }
 
 # --- 4. optional template -------------------------------------------------------
@@ -211,17 +234,44 @@ install_direct() {
   chmod +x ./ct-agent
   ok "ct-agent binary ready"
 
+  local fresh=1
   if [ -d "$STATE_DIR" ] && [ -n "$(ls -A "$STATE_DIR" 2>/dev/null || true)" ]; then
-    ok "existing state in $STATE_DIR — already onboarded, skipping onboard"
-  else
-    log "onboarding (this reads CT_AGENT_JOIN_TOKEN/CT_AGENT_TOKEN from the environment, never the command line)"
-    ./ct-agent onboard || die "onboarding failed"
-    ok "onboarded"
+    ok "existing state in $STATE_DIR — restoring bound identity"
+    fresh=0
   fi
 
+  # `ct-agent onboard` (and the bare invocation with CT_AGENT_JOIN_TOKEN set --
+  # they're the same code path) never returns: once onboarding succeeds it
+  # falls straight into serving, forever, in the foreground. A prior version
+  # of this script called `./ct-agent onboard` synchronously before
+  # backgrounding a separate serve process -- on a genuinely fresh install
+  # that just hung forever, since onboard never gets to the point of
+  # returning. Found live. Fix: always background it up front, then on a
+  # fresh install confirm onboarding actually completed by watching for its
+  # persisted state file rather than waiting on the process to exit.
   log "starting ct-agent in the background"
   nohup ./ct-agent >./ct-agent.log 2>&1 &
   echo $! > "$PID_FILE"
+
+  sleep 1
+  kill -0 "$(cat "$PID_FILE")" 2>/dev/null || die "ct-agent exited immediately — see ./ct-agent.log for details"
+
+  if [ "$fresh" -eq 1 ]; then
+    log "onboarding (this reads CT_AGENT_JOIN_TOKEN/CT_AGENT_TOKEN from the environment, never the command line)"
+    local deadline=$((SECONDS + 45))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      [ -f "$STATE_DIR/tenant" ] && break
+      kill -0 "$(cat "$PID_FILE")" 2>/dev/null || die "onboarding failed — see ./ct-agent.log for details"
+      sleep 1
+    done
+    if [ ! -f "$STATE_DIR/tenant" ]; then
+      kill "$(cat "$PID_FILE")" 2>/dev/null || true
+      rm -f "$PID_FILE"
+      die "onboarding did not complete within 45s — see ./ct-agent.log for details"
+    fi
+    ok "onboarded"
+  fi
+
   ok "running, pid $(cat "$PID_FILE") (logs: ./ct-agent.log)"
 }
 

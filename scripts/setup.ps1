@@ -147,14 +147,37 @@ function Import-DotEnv {
   # forever, not just error, so this is defaulted rather than left optional.
   if (-not $env:CT_AGENT_MODE)          { $env:CT_AGENT_MODE = 'browser' }
   if (-not $env:CT_AGENT_EDGE_CERT_URL) { $env:CT_AGENT_EDGE_CERT_URL = $env:CT_AGENT_CP_URL }
-  if (-not $env:CT_AGENT_ID)            { $env:CT_AGENT_ID = "agent-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())-$PID" }
+  # A fresh CT_AGENT_ID every run would break restore: ct-agent's onboard_or_restore
+  # only reuses persisted identity/tenant when CT_AGENT_ID matches the "agent" file
+  # written at onboard time -- otherwise it silently falls through to re-onboarding
+  # with the (already single-use-spent) join token and the background process dies
+  # on a 409, right after this script's own "already onboarded" line claimed
+  # success. Found live testing setup.sh's Linux twin; fixed here too for parity.
+  if (-not $env:CT_AGENT_ID) {
+    $agentFile = Join-Path $StateDir 'agent'
+    if (Test-Path $agentFile) {
+      $env:CT_AGENT_ID = (Get-Content $agentFile -Raw).Trim()
+    } else {
+      $env:CT_AGENT_ID = "agent-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())-$PID"
+    }
+  }
+  # ct-agent defaults this to /shared/capability.bin -- a path from CADS-Tunnel's
+  # own docker-compose shared volume that doesn't exist on a customer's machine.
+  # Without overriding it, onboarding fails right after fetching the edge cert.
+  if (-not $env:CT_AGENT_CAPABILITY_OUT) { $env:CT_AGENT_CAPABILITY_OUT = Join-Path $StateDir 'capability.bin' }
   if (-not $env:CT_AGENT_EDGE) {
     try {
+      # /network-info returns just the port ({"mesh_edge_port":4433,...}), not a
+      # host:port string -- the host is the same one CT_AGENT_CP_URL points at.
       $ni = Invoke-RestMethod -Uri "$($env:CT_AGENT_CP_URL.TrimEnd('/'))/network-info"
-      $env:CT_AGENT_EDGE = $ni.mesh_edge_addr
+      $edgeHost = ([uri]$env:CT_AGENT_CP_URL).Host
+      if ($ni.mesh_edge_port -and $edgeHost) { $env:CT_AGENT_EDGE = "${edgeHost}:$($ni.mesh_edge_port)" }
     } catch { }
     if (-not $env:CT_AGENT_EDGE) { Die "could not determine CT_AGENT_EDGE automatically -- set it in .env (host:port of the mesh edge)" }
   }
+  # ct-agent reads/writes its bound-identity state here but doesn't create the
+  # directory itself -- onboarding fails on a fresh checkout otherwise.
+  New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
   $env:CT_AGENT_STATE_DIR = $StateDir
 }
 
@@ -182,19 +205,40 @@ function Install-Direct {
   Invoke-WebRequest -Uri $url -OutFile .\ct-agent.exe -UseBasicParsing
   Ok "ct-agent binary ready"
 
-  if ((Test-Path $StateDir) -and (Get-ChildItem $StateDir -ErrorAction SilentlyContinue)) {
-    Ok "existing state in $StateDir -- already onboarded, skipping onboard"
-  } else {
-    Log "onboarding (reads CT_AGENT_JOIN_TOKEN/CT_AGENT_TOKEN from the environment, never the command line)"
-    & .\ct-agent.exe onboard
-    if ($LASTEXITCODE -ne 0) { Die "onboarding failed" }
-    Ok "onboarded"
-  }
+  $fresh = -not ((Test-Path $StateDir) -and (Get-ChildItem $StateDir -ErrorAction SilentlyContinue))
+  if (-not $fresh) { Ok "existing state in $StateDir -- restoring bound identity" }
 
+  # `ct-agent.exe onboard` (and the bare invocation with CT_AGENT_JOIN_TOKEN set --
+  # they're the same code path) never returns: once onboarding succeeds it falls
+  # straight into serving, forever. Running it synchronously before starting a
+  # separate background process would just hang on a genuinely fresh install
+  # (found live testing setup.sh's Linux twin). Fix: always background it up
+  # front, then on a fresh install confirm onboarding completed by watching for
+  # its persisted state file rather than waiting on the process to exit.
   Log "starting ct-agent in the background"
   $proc = Start-Process -FilePath .\ct-agent.exe -PassThru -WindowStyle Hidden `
     -RedirectStandardOutput .\ct-agent.log -RedirectStandardError .\ct-agent.err.log
   Set-Content -Path $PidFile -Value $proc.Id
+
+  Start-Sleep -Seconds 1
+  if ($proc.HasExited) { Die "ct-agent exited immediately -- see .\ct-agent.log for details" }
+
+  if ($fresh) {
+    Log "onboarding (reads CT_AGENT_JOIN_TOKEN/CT_AGENT_TOKEN from the environment, never the command line)"
+    $tenantFile = Join-Path $StateDir 'tenant'
+    $deadline = (Get-Date).AddSeconds(45)
+    while ((Get-Date) -lt $deadline -and -not (Test-Path $tenantFile)) {
+      if ($proc.HasExited) { Die "onboarding failed -- see .\ct-agent.log for details" }
+      Start-Sleep -Seconds 1
+    }
+    if (-not (Test-Path $tenantFile)) {
+      Stop-Process -Id $proc.Id -ErrorAction SilentlyContinue
+      Remove-Item $PidFile -ErrorAction SilentlyContinue
+      Die "onboarding did not complete within 45s -- see .\ct-agent.log for details"
+    }
+    Ok "onboarded"
+  }
+
   Ok "running, pid $($proc.Id) (logs: .\ct-agent.log)"
 }
 
