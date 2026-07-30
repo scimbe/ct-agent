@@ -12,7 +12,29 @@ can be downloaded and installed without cloning the whole tunnel/edge/control-pl
 workspace. See that repo's docs (`docs/adr`, `docs/agent-onboarding.md`) for the full
 system design.
 
-## Install
+## Quick start (recommended)
+
+A guided setup script that checks your environment, walks you through a `.env`
+file, optionally grabs a starter site template, installs + onboards the agent
+(directly on this host, or as a Docker container), and reports your tunnel's
+certificate tier (Rot/Gelb/Grün) with the exact commands to stop/reset it or go
+from Gelb to Grün:
+
+```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh | bash
+```
+
+```powershell
+# Windows
+irm https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.ps1 | iex
+```
+
+Add `--docker`/`-Docker` to run as a container instead of directly on the host (the
+direct-host path is meant for an isolated VM/container/dedicated host — the script
+warns about this before proceeding). See `scripts/setup.sh --help` for all flags.
+
+## Manual install
 
 Prebuilt binaries are attached to every [release](https://github.com/scimbe/ct-agent/releases)
 for Linux (x86_64, i686, aarch64), Windows (x86_64, i686), and macOS (x86_64, aarch64).
