@@ -27,7 +27,26 @@ ok()   { printf "${C_G}  ✓${C_0} %s\n" "$*"; }
 warn() { printf "${C_Y}  !${C_0} %s\n" "$*" >&2; }
 die()  { printf "${C_R}error:${C_0} %s\n" "$*" >&2; exit 1; }
 
-usage() { sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() {
+  cat <<'USAGE'
+ct-agent guided setup (Linux/macOS) — a richer, optional alternative to the
+portal's thin curl-pipe-sh one-liner (CADS-Tunnel's /install.sh). Checks your
+environment, walks you through a .env file, optionally grabs a starter
+template, installs + onboards the agent (directly on this host, or as a
+Docker container), then reports your tunnel's certificate tier (Rot/Gelb/
+Grün) and the commands you need to stop/reset it or go from Gelb to Grün.
+
+  ./scripts/setup.sh                  # direct-host install (asks to confirm)
+  ./scripts/setup.sh --docker         # run as a Docker container instead
+  ./scripts/setup.sh --yes            # skip the sandbox-warning confirmation
+  ./scripts/setup.sh --template       # also fetch the starter site template
+  ./scripts/setup.sh --green          # push straight through to Grün (own cert)
+  ./scripts/setup.sh --help
+
+Env overrides: CT_RELEASE_BASE (default: this repo's GitHub releases), NO_COLOR.
+USAGE
+  exit "${1:-0}"
+}
 
 RELEASE_BASE="${CT_RELEASE_BASE:-https://github.com/scimbe/ct-agent/releases/latest/download}"
 MODE="direct"
