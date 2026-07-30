@@ -30,4 +30,9 @@ jobs:
       - name: Dependency audit
         run: |
           cargo install cargo-audit --locked || true
-          cargo audit
+          # RUSTSEC-2026-0118 (hickory-proto NSEC3 unbounded-loop advisory) has no fixed
+          # upgrade available as of this writing -- ignored explicitly rather than left to
+          # silently block every CI run. Revisit (drop the --ignore) once hickory-dns ships
+          # a fix. RUSTSEC-2026-0119 (the other hickory-proto advisory, CPU exhaustion) is
+          # NOT ignored -- fixed by the hickory-resolver >=0.26.1 bump in Cargo.toml.
+          cargo audit --ignore RUSTSEC-2026-0118

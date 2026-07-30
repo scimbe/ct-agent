@@ -48,7 +48,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # ask -- Let's Encrypt validates against the authoritative servers themselves from
 # several perspectives, and a zone's two authoritative servers have been measured
 # drifting ~60s apart, which no resolver-side check can see.
-hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "system-config"] }
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio", "system-config"] }
 libp2p = { version = "0.56", default-features = false, features = ["tokio", "noise", "yamux", "tcp", "quic", "relay", "dcutr", "identify", "kad", "macros"] }
 libp2p-stream = "0.4.0-alpha"
 tokio-util = { version = "0.7", default-features = false, features = ["compat"] }

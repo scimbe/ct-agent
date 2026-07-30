@@ -34,8 +34,8 @@
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::Resolver;
 
 /// How long to keep waiting for every authoritative server to agree.
@@ -54,7 +54,7 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// addresses — every check of the challenge record itself goes straight to
 /// those authoritative servers, so no cache sits in between.
 pub struct AuthoritativeChecker {
-    system: Resolver<TokioConnectionProvider>,
+    system: Resolver<TokioRuntimeProvider>,
     timeout: Duration,
     interval: Duration,
 }
@@ -66,7 +66,11 @@ impl AuthoritativeChecker {
 
     pub fn with_timeout(timeout: Duration) -> Result<Self, String> {
         let builder = Resolver::builder_tokio().map_err(|e| format!("system resolver unavailable: {e}"))?;
-        Ok(Self { system: builder.build(), timeout, interval: POLL_INTERVAL })
+        Ok(Self {
+            system: builder.build().map_err(|e| format!("system resolver unavailable: {e}"))?,
+            timeout,
+            interval: POLL_INTERVAL,
+        })
     }
 
     /// The zone apex responsible for `name`, per its SOA. Walks up label by
@@ -94,8 +98,11 @@ impl AuthoritativeChecker {
             .await
             .map_err(|e| format!("NS lookup for {zone} failed: {e}"))?;
         let mut out = Vec::new();
-        for rec in ns.iter() {
-            let host = rec.0.to_utf8();
+        for rec in ns.answers() {
+            let hickory_resolver::proto::rr::RData::NS(ns_name) = &rec.data else {
+                continue;
+            };
+            let host = ns_name.0.to_utf8();
             if let Ok(lookup) = self.system.lookup_ip(host.clone()).await {
                 for ip in lookup.iter() {
                     out.push((host.clone(), ip));
@@ -131,32 +138,43 @@ enum Probe {
 impl AuthoritativeChecker {
     /// Ask one specific server, directly, for `name`'s TXT values.
     async fn txt_at(&self, server: IpAddr, name: &str) -> Result<Vec<String>, String> {
-        let group = NameServerConfigGroup::from_ips_clear(&[server], 53, true);
-        let config = ResolverConfig::from_parts(None, Vec::new(), group);
+        let name_server = NameServerConfig::udp_and_tcp(server);
+        let config = ResolverConfig::from_parts(None, Vec::new(), vec![name_server]);
         let mut opts = ResolverOpts::default();
         opts.timeout = QUERY_TIMEOUT;
         opts.attempts = 1;
         // Never let a cached/edns oddity stand in for the server's own answer.
         opts.cache_size = 0;
-        let resolver = Resolver::builder_with_config(config, TokioConnectionProvider::default())
+        let resolver = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
             .with_options(opts)
-            .build();
+            .build()
+            .map_err(|e| e.to_string())?;
         let lookup = resolver.txt_lookup(format!("{name}.")).await.map_err(|e| e.to_string())?;
-        Ok(lookup.iter().map(|txt| txt.to_string()).collect())
+        Ok(lookup
+            .answers()
+            .iter()
+            .filter_map(|rec| match &rec.data {
+                hickory_resolver::proto::rr::RData::TXT(txt) => Some(txt.to_string()),
+                _ => None,
+            })
+            .collect())
     }
 
     /// Ask one server for the zone's SOA -- a record every authoritative
     /// server for that zone must serve. Used purely as a liveness probe.
     async fn soa_reachable(&self, server: IpAddr, zone: &str) -> bool {
-        let group = NameServerConfigGroup::from_ips_clear(&[server], 53, true);
-        let config = ResolverConfig::from_parts(None, Vec::new(), group);
+        let name_server = NameServerConfig::udp_and_tcp(server);
+        let config = ResolverConfig::from_parts(None, Vec::new(), vec![name_server]);
         let mut opts = ResolverOpts::default();
         opts.timeout = QUERY_TIMEOUT;
         opts.attempts = 1;
         opts.cache_size = 0;
-        let resolver = Resolver::builder_with_config(config, TokioConnectionProvider::default())
+        let Ok(resolver) = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
             .with_options(opts)
-            .build();
+            .build()
+        else {
+            return false;
+        };
         resolver.soa_lookup(format!("{zone}.")).await.is_ok()
     }
 
