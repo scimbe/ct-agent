@@ -6,11 +6,11 @@ tunnel operator never sees it. It dials out to a CADS-Tunnel edge, maintains the
 and (via the `certificate` subcommand) drives self-service ACME certificate issuance
 across the Rot → Gelb → Grün tiers, using its own account key end to end.
 
-This repo is the standalone extraction of the `ct-agent` crate from the
-[CADS-Tunnel](https://github.com/scimbe/CADS-Tunnel) monorepo, published separately so it
-can be downloaded and installed without cloning the whole tunnel/edge/control-plane
-workspace. See that repo's docs (`docs/adr`, `docs/agent-onboarding.md`) for the full
-system design.
+This repo is its own related project, extracted from the
+[CADS-Tunnel](https://github.com/scimbe/CADS-Tunnel) monorepo (the core system: control
+plane + edge) and published separately so it can be downloaded and installed without
+cloning the whole tunnel/edge/control-plane workspace. See that repo's docs (`docs/adr`,
+`docs/agent-onboarding.md`) for the full system design.
 
 ## Quick start (recommended)
 
@@ -34,21 +34,11 @@ Add `--docker`/`-Docker` to run as a container instead of directly on the host (
 direct-host path is meant for an isolated VM/container/dedicated host — the script
 warns about this before proceeding). See `scripts/setup.sh --help` for all flags.
 
-## Manual install
-
-Prebuilt binaries are attached to every [release](https://github.com/scimbe/ct-agent/releases)
-for Linux (x86_64, i686, aarch64), Windows (x86_64, i686), and macOS (x86_64, aarch64).
-
-```bash
-curl -fsSL https://github.com/scimbe/ct-agent/releases/latest/download/ct-agent-linux-x86_64 -o ct-agent
-chmod +x ct-agent
-```
-
-Or build from source (Rust 1.85+):
-
-```bash
-cargo build --release
-```
+This is the one supported way to install `ct-agent` — it downloads the right
+[prebuilt release binary](https://github.com/scimbe/ct-agent/releases) for your
+OS/arch itself, so there's no separate manual-download path to keep in sync. If
+you're contributing to `ct-agent` itself, `cargo build --release` (Rust 1.85+) works
+as usual from a clone of this repo.
 
 ## Versioning
 
@@ -62,3 +52,12 @@ on each release rather than tracking `main` — this keeps the wire protocol bet
 PolyForm Noncommercial License 1.0.0 — see [LICENSE](LICENSE). Noncommercial use
 (research, personal, educational, nonprofit) is freely permitted; commercial use requires
 a separate license (contact scimbe@gmail.com).
+
+## Support the project
+
+Bunsenbrenner (the live CADS-Tunnel deployment this agent talks to) is free to use and
+runs on donated time and server costs. If it helped you get something live, a small
+contribution keeps it going:
+
+- [Support as a member](https://steady.page/plans/77a32d9c-c399-4ca1-9515-7a628c7a9413)
+- [Buy me a coffee](https://buymeacoffee.com/bunsenbrenner)
