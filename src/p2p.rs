@@ -743,6 +743,14 @@ where
 {
     let swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
+        // #134-follow (found live E2E-testing the relay-gate): a DCUtR client swarm needs a
+        // REAL TCP transport too, not just QUIC + the pre-connected relay-gate stream --
+        // `add_direct_punch_listeners` binds a `/ip4/0.0.0.0/tcp/0` candidate (TCP hole-punch,
+        // per #136's lab finding that this network's egress only lets TCP Simultaneous Connect
+        // through, not UDP), and with no TCP transport registered that `listen_on` failed
+        // `MultiaddrNotSupported` -- exactly mirroring `build_dcutr_relay_client_swarm`'s TCP
+        // registration below, just alongside the pre-connected transport instead of a bare dial.
+        .with_tcp(Default::default(), noise::Config::new, yamux::Config::default)?
         .with_quic()
         // The pre-connected duplex must itself already be authenticated + multiplexed
         // (`AuthenticatedMultiplexedTransport`) before `.with_other_transport` will accept
