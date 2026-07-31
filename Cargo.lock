@@ -523,7 +523,7 @@ dependencies = [
 [[package]]
 name = "ct-client"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.3.1#bc8b8ad4d8885b8a46157f9f6592e9b54c5b188c"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.1#22a8b2b0b7240660a725aed1572ace418edc679f"
 dependencies = [
  "ct-common",
  "quinn",
@@ -535,7 +535,7 @@ dependencies = [
 [[package]]
 name = "ct-common"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.3.1#bc8b8ad4d8885b8a46157f9f6592e9b54c5b188c"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.1#22a8b2b0b7240660a725aed1572ace418edc679f"
 dependencies = [
  "ed25519-dalek",
  "serde",
@@ -548,7 +548,7 @@ dependencies = [
 [[package]]
 name = "ct-control-plane"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.3.1#bc8b8ad4d8885b8a46157f9f6592e9b54c5b188c"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.1#22a8b2b0b7240660a725aed1572ace418edc679f"
 dependencies = [
  "axum",
  "ct-common",
@@ -568,7 +568,7 @@ dependencies = [
 [[package]]
 name = "ct-dns"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.3.1#bc8b8ad4d8885b8a46157f9f6592e9b54c5b188c"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.1#22a8b2b0b7240660a725aed1572ace418edc679f"
 dependencies = [
  "axum",
  "hickory-resolver 0.26.1",
@@ -580,7 +580,7 @@ dependencies = [
 [[package]]
 name = "ct-edge"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.3.1#bc8b8ad4d8885b8a46157f9f6592e9b54c5b188c"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.1#22a8b2b0b7240660a725aed1572ace418edc679f"
 dependencies = [
  "axum",
  "ct-common",

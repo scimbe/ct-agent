@@ -191,7 +191,7 @@ ensure_env() {
   fi
 
   local missing=()
-  for v in CT_AGENT_CP_URL CT_AGENT_HOSTNAME CT_AGENT_ORIGIN CT_AGENT_ORIGIN_PROTO; do
+  for v in CT_AGENT_CP_URL CT_AGENT_HOSTNAME CT_AGENT_ORIGIN; do
     [ -n "${!v:-}" ] || missing+=("$v")
   done
   [ -n "${CT_AGENT_JOIN_TOKEN:-}" ] || missing+=("CT_AGENT_JOIN_TOKEN (or CT_BOOTSTRAP)")
@@ -208,6 +208,13 @@ ensure_env() {
   # error, so this is defaulted rather than left optional.
   : "${CT_AGENT_MODE:=browser}"
   : "${CT_AGENT_EDGE_CERT_URL:=$CT_AGENT_CP_URL}"
+  # ct-agent itself defaults CT_AGENT_ORIGIN_PROTO to tcp when unset (config.rs) --
+  # this was wrongly required above (pre-dating this default in the .env template),
+  # breaking any .env written before this var existed. Match the binary's own default
+  # instead of hard-requiring it. Found live: a customer with an older .env (no
+  # CT_AGENT_ORIGIN_PROTO line at all) hit "missing/blank in .env" for a value the
+  # agent would have happily defaulted itself.
+  : "${CT_AGENT_ORIGIN_PROTO:=tcp}"
   # A fresh CT_AGENT_ID every run would break restore: ct-agent's onboard_or_restore
   # only reuses persisted identity/tenant when CT_AGENT_ID matches the "agent" file
   # written at onboard time (src/onboard.rs's OnboardedAgent::restore) -- otherwise
@@ -239,7 +246,7 @@ ensure_env() {
   # directory itself -- onboarding fails (ENOENT) on a fresh checkout otherwise.
   mkdir -p "$STATE_DIR"
   export CT_AGENT_MODE CT_AGENT_EDGE_CERT_URL CT_AGENT_ID CT_AGENT_EDGE CT_AGENT_CAPABILITY_OUT \
-    CT_AGENT_STATE_DIR="$STATE_DIR"
+    CT_AGENT_ORIGIN_PROTO CT_AGENT_STATE_DIR="$STATE_DIR"
 }
 
 # --- 4. optional template -------------------------------------------------------

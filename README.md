@@ -6,6 +6,18 @@ tunnel operator never sees it. It dials out to a CADS-Tunnel edge, maintains the
 and (via the `certificate` subcommand) drives self-service ACME certificate issuance
 across the Rot → Gelb → Grün tiers, using its own account key end to end.
 
+> **The one opt-in exception:** an Agent-Fabric channel member normally only ever dials
+> *out* — the edge broker/relay is the only thing it ever reaches, and it never accepts
+> a connection from the open internet. `CT_CHANNEL_ADVERTISE` (see `ct-agent channel`)
+> lets an operator running **directly on a host they control** (not this project's own
+> managed/containerized deployments) advertise a real, directly-dialable address for a
+> peer-to-peer data path instead. It is off by default — unset, nothing changes — and
+> using it means *you* deliberately opened that port on *your own* box; nobody upstream
+> of `ct-agent` does it for you. Once open, the socket is technically reachable by
+> anyone, but only the channel's own operator-signed grant + Noise_IK possession
+> challenge admits a session — an unauthenticated peer that reaches the port gets
+> nothing. This platform's own hosted demos/agents never set it and stay relay-only.
+
 This repo is its own related project, extracted from the
 [CADS-Tunnel](https://github.com/scimbe/CADS-Tunnel) monorepo (the core system: control
 plane + edge) and published separately so it can be downloaded and installed without
