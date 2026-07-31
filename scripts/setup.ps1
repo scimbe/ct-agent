@@ -283,11 +283,22 @@ function Wait-ForTier {
   if ($status -eq 'gelb' -and $Green) {
     Warn "Gelb->Grün: your origin ($($env:CT_AGENT_ORIGIN)) must serve PLAIN HTTP right now,"
     Warn "not TLS -- it only needs its own certificate once Grün is reached."
-    Log "requesting your own certificate (ct-agent certificate)"
-    $env:CT_ACME_CERT_OUT_DIR = if ($env:CT_ACME_CERT_OUT_DIR) { $env:CT_ACME_CERT_OUT_DIR } else { '.\ct-agent-cert' }
-    Start-Process -FilePath .\ct-agent.exe -ArgumentList 'certificate' -WindowStyle Hidden `
-      -RedirectStandardOutput .\ct-agent.log -RedirectStandardError .\ct-agent.err.log
-    Ok "certificate issuance running in the background (watch .\ct-agent.log)"
+    if ($Mode -eq 'docker') {
+      # Same bug as scripts/setup.sh had before its fix: there is no
+      # .\ct-agent.exe on the host in -Docker mode -- Install-Docker only
+      # builds and runs a container, it never places a binary here -- so
+      # Start-Process below would fail outright. Mirroring the bash fix
+      # rather than guessing at an untested docker-exec/docker-cp flow.
+      Warn "-Green isn't automated in -Docker mode yet -- run this yourself once you're ready:"
+      Warn "  docker exec ct-agent sh -c 'CT_ACME_CERT_OUT_DIR=/ct-agent-cert ct-agent certificate' &"
+      Warn "  # then, once it reports Grün above: docker cp ct-agent:/ct-agent-cert .\ct-agent-cert"
+    } else {
+      Log "requesting your own certificate (ct-agent certificate)"
+      $env:CT_ACME_CERT_OUT_DIR = if ($env:CT_ACME_CERT_OUT_DIR) { $env:CT_ACME_CERT_OUT_DIR } else { '.\ct-agent-cert' }
+      Start-Process -FilePath .\ct-agent.exe -ArgumentList 'certificate' -WindowStyle Hidden `
+        -RedirectStandardOutput .\ct-agent.log -RedirectStandardError .\ct-agent.err.log
+      Ok "certificate issuance running in the background (watch .\ct-agent.log)"
+    }
   }
   $script:FinalStatus = if ($status) { $status } else { 'unknown' }
 }
