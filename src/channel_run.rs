@@ -2217,6 +2217,10 @@ async fn serve_admitted_session(
 /// fan-out of handler subprocesses (`claude -p`) a flood of Builds can trigger.
 const DEFAULT_SERVE_CONCURRENCY: usize = 8;
 
+/// #231: ceiling on the exponential backoff a persistent serve loop applies after consecutive
+/// **refused** (not transient) admission attempts — see [`serve_loop_concurrent`].
+const REFUSED_ADMISSION_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Parse `CT_CHANNEL_SERVE_CONCURRENCY` into a concurrency cap: a positive integer overrides the
 /// default; anything absent/blank/zero/malformed falls back to [`DEFAULT_SERVE_CONCURRENCY`]. Pure.
 fn serve_concurrency_from_env(value: Option<&str>) -> usize {
@@ -2232,9 +2236,10 @@ fn serve_concurrency_from_env(value: Option<&str>) -> usize {
 /// the next peer immediately instead of blocking on the whole session. `max` bounds in-flight
 /// sessions via a semaphore whose permit is taken BEFORE parking (backpressure: we never admit a peer
 /// we have no capacity to serve) and released when the session ends. A transient `admit` error is
-/// logged and retried after `retry_backoff`; a `serve` error is a single peer's problem, logged and
-/// dropped. Never returns under normal operation. Injectable so the concurrency contract is
-/// unit-testable without a real broker/relay.
+/// logged and retried after `retry_backoff`; a **refused** (definitive, not-a-member) admission
+/// backs off exponentially instead — see [`admission_retry_backoff`]. A `serve` error is a single
+/// peer's problem, logged and dropped. Never returns under normal operation. Injectable so the
+/// concurrency contract is unit-testable without a real broker/relay.
 async fn serve_loop_concurrent<A, Fa, S, Fs, W>(
     max: usize,
     retry_backoff: std::time::Duration,
@@ -2249,6 +2254,7 @@ where
     W: Send + 'static,
 {
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max.max(1)));
+    let mut consecutive_refusals: u32 = 0;
     loop {
         let permit = sem
             .clone()
@@ -2257,6 +2263,7 @@ where
             .expect("serve concurrency semaphore is never closed");
         match admit().await {
             Ok(work) => {
+                consecutive_refusals = 0;
                 let fut = serve(work);
                 tokio::spawn(async move {
                     let _permit = permit; // held for the whole session; frees a slot on drop
@@ -2267,11 +2274,51 @@ where
             }
             Err(e) => {
                 drop(permit);
+                let refused = is_definitive_admission_refusal(&e);
+                consecutive_refusals = if refused { consecutive_refusals.saturating_add(1) } else { 0 };
+                let backoff = admission_retry_backoff(retry_backoff, refused, consecutive_refusals);
                 eprintln!("ct-agent channel: admission error, re-admitting (#200): {e}");
-                tokio::time::sleep(retry_backoff).await;
+                tokio::time::sleep(backoff).await;
             }
         }
     }
+}
+
+/// #231: does an admission error mean the presenting holder was **definitively** refused (not a
+/// channel member — see `channel-join NO [not-member]` on the edge) rather than a transient
+/// failure (`edge broker/relay refused the channel join` are the exact strings
+/// [`run_one_admission_session`]'s ladder produces for this case; `channel join admission exchange
+/// stalled (#140)` and any other error are treated as transient/retryable-fast)? Pure string match
+/// on `Display` — the call chain flattens every failure to `BoxError` by the time it reaches
+/// [`serve_loop_concurrent`], so this is the only signal available without a wider error-type
+/// refactor across the admission ladder.
+fn is_definitive_admission_refusal(e: &BoxError) -> bool {
+    e.to_string().contains("refused the channel join")
+}
+
+/// #231: how long to wait before the next admission attempt. A definitive refusal (see
+/// [`is_definitive_admission_refusal`]) will never resolve itself without operator action — a
+/// holder that isn't a channel member stays that way until someone adds it — so retrying at the
+/// same fast `retry_backoff` used for transient errors (200ms in production) does nothing but
+/// flood the edge's admission path with attempts that can never succeed. Live-reproduced: an
+/// orphaned process retrying a not-member holder measured at ~24-47 admission attempts/second
+/// against the production edge, plausibly starving OTHER, genuinely valid joins of admission
+/// capacity (the exact symptom #231 describes). Backs off exponentially
+/// (`retry_backoff * 2^consecutive_refusals`), capped at [`REFUSED_ADMISSION_BACKOFF_CAP`]; a
+/// transient error always gets the fast, unchanged `retry_backoff` so a genuine brief CP/edge
+/// blip (#140) still recovers quickly. Pure — the loop supplies `consecutive_refusals`.
+fn admission_retry_backoff(
+    retry_backoff: std::time::Duration,
+    refused: bool,
+    consecutive_refusals: u32,
+) -> std::time::Duration {
+    if !refused {
+        return retry_backoff;
+    }
+    let shift = consecutive_refusals.min(16); // avoids overflow in 2^shift well before the cap binds
+    retry_backoff
+        .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
+        .min(REFUSED_ADMISSION_BACKOFF_CAP)
 }
 
 /// #179: should `ct-agent channel` stay parked and re-admit successive peers? Only the **accept**
@@ -4114,6 +4161,72 @@ mod tests {
 
         assert_eq!(started.load(Ordering::SeqCst), 2, "never exceeded the concurrency cap");
         assert_eq!(admits.load(Ordering::SeqCst), 2, "backpressure stopped admitting a peer we couldn't serve");
+    }
+
+    #[test]
+    fn is_definitive_admission_refusal_matches_only_the_refused_strings() {
+        // #231: exactly the strings run_one_admission_session's ladder produces for a not-a-member
+        // holder (lines 319/400/447/699) — everything else, including the #140 stall symptom, is
+        // transient and must keep the fast retry.
+        assert!(is_definitive_admission_refusal(&"edge broker refused the channel join".into()));
+        assert!(is_definitive_admission_refusal(&"edge relay refused the channel join".into()));
+        assert!(is_definitive_admission_refusal(
+            &"edge relay refused the channel join over the :443 front door".into()
+        ));
+        assert!(
+            !is_definitive_admission_refusal(&"channel join admission exchange stalled (#140)".into()),
+            "#140 stalls are transient, not a definitive refusal"
+        );
+        assert!(!is_definitive_admission_refusal(&"connection reset by peer".into()));
+    }
+
+    #[test]
+    fn admission_retry_backoff_is_flat_for_transient_and_exponential_for_refused() {
+        // #231: a transient error always gets the unchanged fast retry regardless of streak length
+        // (a genuine CP/edge blip must keep recovering quickly, per #140's own fix).
+        let base = std::time::Duration::from_millis(200);
+        assert_eq!(admission_retry_backoff(base, false, 0), base);
+        assert_eq!(admission_retry_backoff(base, false, 50), base, "transient errors never back off");
+
+        // A definitive refusal doubles per consecutive occurrence...
+        assert_eq!(admission_retry_backoff(base, true, 1), base * 2);
+        assert_eq!(admission_retry_backoff(base, true, 2), base * 4);
+        assert_eq!(admission_retry_backoff(base, true, 3), base * 8);
+        // ...and is clamped at the cap instead of growing (or overflowing) without bound.
+        assert_eq!(admission_retry_backoff(base, true, 100), REFUSED_ADMISSION_BACKOFF_CAP);
+        assert_eq!(admission_retry_backoff(base, true, u32::MAX), REFUSED_ADMISSION_BACKOFF_CAP);
+    }
+
+    #[tokio::test]
+    async fn serve_loop_backs_off_a_definitive_refusal_instead_of_hot_looping() {
+        // #231 live reproduction: a holder that will never be a member (a stray/orphaned process,
+        // observed on the real production edge retrying ~24-47x/second at the OLD flat 200ms
+        // backoff) must not keep admitting at the fast transient-error rate — it starves other,
+        // genuinely valid joins of the edge's admission capacity. With a 10ms base backoff and a
+        // 300ms window, an unfixed flat retry would attempt roughly 30 times; the exponential
+        // backoff must land far fewer.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let a = attempts.clone();
+        let admit = move || {
+            let a = a.clone();
+            async move {
+                a.fetch_add(1, Ordering::SeqCst);
+                Err::<(), BoxError>("edge broker refused the channel join".into())
+            }
+        };
+        let serve = move |_w: ()| async move { Ok::<(), BoxError>(()) };
+
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            serve_loop_concurrent(4, std::time::Duration::from_millis(10), admit, serve),
+        )
+        .await;
+
+        let n = attempts.load(Ordering::SeqCst);
+        assert!(n >= 1, "attempted admission at least once");
+        assert!(n < 10, "exponential backoff kept the refused holder well under the flat-retry rate, got {n} attempts");
     }
 
     #[tokio::test]
