@@ -1192,7 +1192,15 @@ where
 {
     Ok((
         build_dcutr_relay_client_swarm_over_stream(stream)?,
-        pre_connected_relay_addr().with(Protocol::P2p(relay_peer)),
+        // #134-follow (found live E2E-testing the relay-gate): a bare `<relay>/p2p/<id>`
+        // address is just "the relay peer" -- it carries no marker telling libp2p's
+        // relay-client `Behaviour` this is a CIRCUIT relay to reserve/dial through, so
+        // `client.listen_on(circuit_relay)` (the Initiate role's reservation) never actually
+        // sent a RESERVE request and `reserved_rx` hung forever. Every other `circuit_relay`
+        // construction in this module appends `Protocol::P2pCircuit` (see e.g.
+        // `nat_lab_relay`'s callers, `dcutr_reserve_and_accept`'s own doc comment); this one
+        // just never did.
+        pre_connected_relay_addr().with(Protocol::P2p(relay_peer)).with(Protocol::P2pCircuit),
     ))
 }
 
