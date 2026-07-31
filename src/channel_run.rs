@@ -1687,6 +1687,38 @@ impl ChannelRegisterRequest {
     }
 }
 
+/// Configuration for `ct-agent channel allowlist add|remove|list` (#248-follow): the
+/// owner-scoped self-service channel-allowlist CLI, so an operator can manage a
+/// channel's e-mail allow-list without leaving the terminal for the portal web UI.
+/// Shares its shape with [`ChannelRegisterRequest`] (same `CT_AGENT_CP_URL`/
+/// `CT_GRANT_CHANNEL`/`CT_OIDC_TOKEN`), minus the operator pubkey — the allow-list
+/// routes are owner-scoped by the bearer token alone, no operator key needed.
+pub struct ChannelAllowlistRequest {
+    /// Control-plane base URL (`{cp_url}/me/channels/:channel/allowlist`).
+    pub cp_url: String,
+    /// The channel id, canonical 64-hex.
+    pub channel_hex: String,
+    /// The OIDC bearer token identifying the owner (the verified subject).
+    pub token: String,
+}
+
+impl ChannelAllowlistRequest {
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let cp_url = f("CT_AGENT_CP_URL")
+            .filter(|s| !s.trim().is_empty())
+            .ok_or("CT_AGENT_CP_URL required (control-plane base URL)")?;
+        let channel_hex = hex_encode(&req_hex32(&f, "CT_GRANT_CHANNEL", "64 hex channel id")?);
+        let token = f("CT_OIDC_TOKEN")
+            .filter(|s| !s.trim().is_empty())
+            .ok_or("CT_OIDC_TOKEN required (OIDC bearer token for the channel owner)")?;
+        Ok(Self { cp_url, channel_hex, token })
+    }
+}
+
 /// The channel session's local application duplex (#135 L2.1-cli). **Pipe** mode (default) is the
 /// CLI's stdin/stdout — the historical one-shot behaviour (stdin-EOF tears the session down).
 /// **Serve** mode (`CT_CHANNEL_SERVE=1`) makes the channel a persistent request/response *service*:

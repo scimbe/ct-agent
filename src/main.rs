@@ -129,6 +129,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             eprintln!("registered channel {} with the control plane", req.channel_hex);
             return Ok(());
         }
+        // #248-follow `ct-agent channel allowlist add|remove|list`: manage a channel's
+        // self-service e-mail allow-list from the CLI (owner-scoped, same
+        // CT_AGENT_CP_URL/CT_GRANT_CHANNEL/CT_OIDC_TOKEN as `register`) — the CLI
+        // counterpart to the portal web UI, so an operator never has to leave the
+        // terminal to grant a teammate self-service channel access.
+        if std::env::args().nth(2).as_deref() == Some("allowlist") {
+            let req = ct_agent::channel_run::ChannelAllowlistRequest::from_env()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            let client = ct_control_plane::client::ControlPlaneClient::new(req.cp_url.clone());
+            match std::env::args().nth(3).as_deref() {
+                Some("add") => {
+                    let email = std::env::args()
+                        .nth(4)
+                        .ok_or("usage: ct-agent channel allowlist add <email>")?;
+                    client
+                        .channel_allowlist_add(&req.channel_hex, &email, &req.token)
+                        .await
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+                    eprintln!("allow-listed {email} on channel {}", req.channel_hex);
+                }
+                Some("remove") => {
+                    let email = std::env::args()
+                        .nth(4)
+                        .ok_or("usage: ct-agent channel allowlist remove <email>")?;
+                    client
+                        .channel_allowlist_remove(&req.channel_hex, &email, &req.token)
+                        .await
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+                    eprintln!("removed {email} from channel {}'s allow-list", req.channel_hex);
+                }
+                Some("list") => {
+                    let emails = client
+                        .channel_allowlist_list(&req.channel_hex, &req.token)
+                        .await
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+                    if emails.is_empty() {
+                        eprintln!("channel {} has no allow-listed emails", req.channel_hex);
+                    } else {
+                        for email in emails {
+                            println!("{email}");
+                        }
+                    }
+                }
+                _ => return Err("usage: ct-agent channel allowlist <add|remove|list> [email]".into()),
+            }
+            return Ok(());
+        }
         // #144 ①-wiring `ct-agent channel agent-card`: assemble + sign this agent's holder
         // AgentCard from CT_CHANNEL_HOLDER_KEY + CT_AGENT_CARD_* claims and write it to
         // <CT_AGENT_CARD_OUT>/.well-known/agent-card.json for the origin to serve — the runnable
