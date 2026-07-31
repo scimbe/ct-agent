@@ -711,8 +711,19 @@ pub struct ChannelJoinCliConfig {
     pub holder: SigningKey,
     /// This member's Noise (X25519) private key (`CT_CHANNEL_NOISE_KEY`, hex). SECRET.
     pub own_noise_private: [u8; 32],
-    /// The host:port this member advertises for the direct path (`CT_CHANNEL_LISTEN`).
+    /// The host:port this member **binds** its direct-path QUIC listener to
+    /// (`CT_CHANNEL_LISTEN`). Inside a NAT/container this is typically `0.0.0.0:<port>`
+    /// or a private bridge address — see `advertise_addr` for what a peer actually dials.
     pub listen_addr: SocketAddr,
+    /// The host:port this member **advertises** to a peer for the direct path
+    /// (`CT_CHANNEL_ADVERTISE`, optional — defaults to `listen_addr` when unset). Exists
+    /// because a containerized/NAT'd accept-side member cannot bind the address the
+    /// outside world reaches it on (e.g. a Docker port-published `<public-ip>:<port>`
+    /// while the process itself binds `0.0.0.0:<port>`) — mirrors the same split
+    /// `CT_AGENT_DIRECT_ADVERTISE` already provides for the Browser-Plane tunnel path.
+    /// Relay-only auto-detection and the peer-facing admission `endpoint` both use THIS
+    /// address, not `listen_addr` — what matters for dialability is what's advertised.
+    pub advertise_addr: SocketAddr,
     /// Whether this member joins in **relay-only** mode (#121): forced by
     /// `CT_CHANNEL_RELAY_ONLY`, or auto-detected when `listen_addr` is not globally routable
     /// (a NAT-only host). A relay-only member skips binding the direct listener and advertises
@@ -887,6 +898,17 @@ impl ChannelJoinCliConfig {
             _ if relay_only_explicit => SocketAddr::from(([0, 0, 0, 0], 0)),
             _ => return Err("CT_CHANNEL_LISTEN required (advertised host:port) — or set CT_CHANNEL_RELAY_ONLY=1 for a relay-only member with no dialable address".to_string()),
         };
+        // Optional: the address a peer actually dials, when it differs from what this
+        // process binds (`listen_addr`) — e.g. a Docker port-published `<public-ip>:<port>`
+        // while the container itself binds `0.0.0.0:<port>`. Absent ⇒ advertise_addr ==
+        // listen_addr, unchanged from before this field existed. A set-but-malformed value
+        // is an error, same treatment as every other CT_CHANNEL_* address.
+        let advertise_addr = match f("CT_CHANNEL_ADVERTISE") {
+            Some(s) if !s.trim().is_empty() => {
+                resolve_socket_addr(s.trim()).map_err(|e| format!("CT_CHANNEL_ADVERTISE invalid: {e}"))?
+            }
+            _ => listen_addr,
+        };
         let grant_bytes = f("CT_CHANNEL_GRANT")
             .as_deref()
             .and_then(hex_bytes)
@@ -914,12 +936,15 @@ impl ChannelJoinCliConfig {
             )),
             _ => None,
         };
-        // Auto-detect relay-only when not forced: a non-globally-routable advertised listen address
+        // Auto-detect relay-only when not forced: a non-globally-routable ADVERTISED address
         // (a NAT-only host the edge would refuse to advertise, #94) is treated as relay-only.
-        let relay_only = relay_only_mode(relay_only_explicit, listen_addr);
+        // Uses advertise_addr, not listen_addr — a container legitimately binds a private/
+        // unspecified address while advertising a real public one; what matters for
+        // dialability is what's advertised, not what's bound.
+        let relay_only = relay_only_mode(relay_only_explicit, advertise_addr);
         // #136 N-wire: optional libp2p circuit-relay multiaddr for the DCUtR NAT-to-NAT punch.
         let circuit_relay = parse_circuit_relay(f("CT_CHANNEL_CIRCUIT_RELAY"))?;
-        Ok(Self { role, broker_addr, relay_addr, grant, holder, own_noise_private, listen_addr, relay_only, front_door, front_door_cert, circuit_relay })
+        Ok(Self { role, broker_addr, relay_addr, grant, holder, own_noise_private, listen_addr, advertise_addr, relay_only, front_door, front_door_cert, circuit_relay })
     }
 }
 
@@ -1953,7 +1978,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
         endpoint: if cfg.relay_only {
             ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string()
         } else {
-            cfg.listen_addr.to_string()
+            cfg.advertise_addr.to_string()
         },
     };
     // #136 N-wire: a relay-only (NAT-to-NAT) member with a libp2p circuit relay configured runs
@@ -4260,6 +4285,70 @@ mod tests {
         let mut bad_fd = base.clone();
         bad_fd.push(("CT_CHANNEL_FRONT_DOOR", "not-an-addr".into()));
         assert!(lookup(&bad_fd).is_err(), "malformed CT_CHANNEL_FRONT_DOOR rejected");
+
+        // CT_CHANNEL_ADVERTISE absent -> advertise_addr defaults to listen_addr, unchanged
+        // behavior from before this field existed.
+        assert_eq!(cfg.advertise_addr, cfg.listen_addr, "advertise defaults to listen when unset");
+    }
+
+    #[test]
+    fn channel_advertise_address_splits_bind_from_dial_target() {
+        // A containerized accept-side member binds a private/unspecified address
+        // (CT_CHANNEL_LISTEN=0.0.0.0:7000, works inside any container) but is reached at
+        // a different, real public one (CT_CHANNEL_ADVERTISE, e.g. a Docker port-published
+        // <public-ip>:<port>) -- mirrors CT_AGENT_DIRECT_ADVERTISE's existing split for the
+        // Browser-Plane tunnel path. Relay-only auto-detection and the peer-facing
+        // admission endpoint must both follow the ADVERTISED address, not the bind one.
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ed25519_dalek::Signer;
+        let op = SigningKey::from_bytes(&[8u8; 32]);
+        let holder = SigningKey::from_bytes(&[0x22u8; 32]);
+        let g = ChannelGrant {
+            channel: ChannelId([0xCDu8; 32]),
+            holder: holder.verifying_key().to_bytes(),
+            direction: Direction::Accept,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        let grant_hex = hex_encode(&SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }.encode());
+        let hk = "3333333333333333333333333333333333333333333333333333333333333333";
+        let nk = "4444444444444444444444444444444444444444444444444444444444444444";
+        let base: Vec<(&str, String)> = vec![
+            ("CT_CHANNEL_ROLE", "accept".into()),
+            ("CT_CHANNEL_BROKER", "203.0.113.5:9443".into()),
+            ("CT_CHANNEL_RELAY", "203.0.113.5:9444".into()),
+            ("CT_CHANNEL_LISTEN", "0.0.0.0:7000".into()),
+            ("CT_CHANNEL_GRANT", grant_hex),
+            ("CT_CHANNEL_HOLDER_KEY", hk.into()),
+            ("CT_CHANNEL_NOISE_KEY", nk.into()),
+        ];
+        let lookup = |pairs: &[(&str, String)]| {
+            let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+            ChannelJoinCliConfig::from_lookup(move |k| m.get(k).cloned())
+        };
+
+        // Bind is 0.0.0.0:7000 (not globally routable) and no CT_CHANNEL_ADVERTISE is set ->
+        // auto-detected relay-only, exactly as before this field existed.
+        let cfg = lookup(&base).expect("binds on 0.0.0.0 without an advertise override");
+        assert!(cfg.relay_only, "an unspecified bind with no advertise override is relay-only");
+
+        // With a real public CT_CHANNEL_ADVERTISE, the member is dialable: relay_only is
+        // false, the bind address is unchanged (still 0.0.0.0:7000, what the process
+        // actually binds), and the admission endpoint sent to the broker is the
+        // ADVERTISED address, not the bind address.
+        let mut with_adv = base.clone();
+        with_adv.push(("CT_CHANNEL_ADVERTISE", "203.0.113.9:7000".into()));
+        let cfg = lookup(&with_adv).expect("advertise override parses");
+        assert!(!cfg.relay_only, "a globally-routable advertise override is directly dialable");
+        assert_eq!(cfg.listen_addr, "0.0.0.0:7000".parse().unwrap(), "bind address is unchanged");
+        assert_eq!(cfg.advertise_addr, "203.0.113.9:7000".parse().unwrap());
+
+        // A set-but-malformed advertise override is a hard error (a typo must not
+        // silently fall back to the unroutable bind address).
+        let mut bad_adv = base.clone();
+        bad_adv.push(("CT_CHANNEL_ADVERTISE", "not-an-addr".into()));
+        assert!(lookup(&bad_adv).is_err(), "malformed CT_CHANNEL_ADVERTISE rejected");
     }
 
     #[test]
