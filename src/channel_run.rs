@@ -653,6 +653,7 @@ where
             // carries the join AND the spliced session, so present without consuming it.
             match crate::transport::tcp_tls_connect_channel(rung.endpoint, edge_cert.clone()).await {
                 Ok(stream) => {
+                    eprintln!("ct-agent channel: relay leg via the :443 front door ({}) (#106)", rung.endpoint);
                     let (mut recv, mut send) = tokio::io::split(stream);
                     let local = local.take().expect("local is committed to exactly one rung");
                     match present_channel_relay_join_on_stream(&mut send, &mut recv, request, holder).await? {
@@ -678,6 +679,7 @@ where
             // Direct: QUIC to the relay port. Unreachable/Failed falls through to :443.
             match dial_peer_direct(rung.endpoint, direct_timeout).await {
                 Ok(conn) => {
+                    eprintln!("ct-agent channel: relay leg via QUIC ({}) (#106)", rung.endpoint);
                     let local = local.take().expect("local is committed to exactly one rung");
                     return join_via_relay(&conn, request, holder, role, own_noise_private, peer_noise_public, local)
                         .await;
