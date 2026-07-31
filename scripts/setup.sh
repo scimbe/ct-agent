@@ -95,6 +95,15 @@ detect_env() {
     command -v docker >/dev/null 2>&1 || die "docker not found — install it from https://docs.docker.com/get-docker/ and re-run with --docker"
     ok "docker present"
   fi
+
+  if [ "$WANT_TEMPLATE" -eq 1 ]; then
+    # maybe_install_template unconditionally shells out to unzip -- found live
+    # (this host has curl but no unzip) that without this check it fails with a
+    # raw "unzip: command not found" instead of this script's own clear,
+    # actionable die messages.
+    command -v unzip >/dev/null 2>&1 || die "unzip is required for --template but not found — install it and re-run"
+    ok "unzip present"
+  fi
 }
 
 # --- 2. mode select + sandbox warning ------------------------------------------
