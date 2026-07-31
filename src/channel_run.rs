@@ -920,11 +920,9 @@ impl ChannelJoinCliConfig {
         // #106: optional :443 front-door fallback. Absent -> direct-only ladder; a set but
         // malformed value is an error (a typo shouldn't silently drop the fallback).
         let front_door = match f("CT_CHANNEL_FRONT_DOOR") {
-            Some(s) if !s.trim().is_empty() => Some(
-                s.trim()
-                    .parse()
-                    .map_err(|e| format!("CT_CHANNEL_FRONT_DOOR invalid: {e}"))?,
-            ),
+            Some(s) if !s.trim().is_empty() => {
+                Some(resolve_socket_addr(s.trim()).map_err(|e| format!("CT_CHANNEL_FRONT_DOOR invalid: {e}"))?)
+            }
             _ => None,
         };
         // #106: the trust anchor for the `:443` front-door TLS-TCP dial. Optional and
@@ -4285,6 +4283,16 @@ mod tests {
         let mut bad_fd = base.clone();
         bad_fd.push(("CT_CHANNEL_FRONT_DOOR", "not-an-addr".into()));
         assert!(lookup(&bad_fd).is_err(), "malformed CT_CHANNEL_FRONT_DOOR rejected");
+
+        // A host:port hostname resolves, exactly like CT_CHANNEL_BROKER/CT_CHANNEL_RELAY
+        // already do (#214) -- a real regression: this used to be a bare SocketAddr parse
+        // with no resolver, so a compose-network service name like "edge:443" failed with
+        // "invalid socket address syntax" even though the identical hostname worked fine
+        // for CT_CHANNEL_BROKER/CT_CHANNEL_RELAY on the same line.
+        let mut hostname_fd = base.clone();
+        hostname_fd.push(("CT_CHANNEL_FRONT_DOOR", "localhost:443".into()));
+        let cfg = lookup(&hostname_fd).expect("a host:port hostname resolves for the front door too");
+        assert!(cfg.front_door.expect("front door set").ip().is_loopback(), "localhost resolves to loopback");
 
         // CT_CHANNEL_ADVERTISE absent -> advertise_addr defaults to listen_addr, unchanged
         // behavior from before this field existed.
