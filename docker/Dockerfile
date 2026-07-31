@@ -7,7 +7,12 @@
 # Built with buildx so $TARGETOS/$TARGETARCH resolve to the host platform automatically:
 #   docker build -t ct-agent:local https://github.com/scimbe/ct-agent.git#main:docker
 
-FROM debian:bookworm-slim
+FROM ubuntu:24.04
+# Must match the glibc the release binaries are actually linked against: the
+# release workflow (.github/workflows/release.yml) builds every Linux target on
+# ubuntu-latest (GLIBC 2.39) -- debian:bookworm-slim's older GLIBC 2.36 makes the
+# downloaded binary fail to even start ("GLIBC_2.39 not found"), confirmed by
+# actually running the built image.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
