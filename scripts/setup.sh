@@ -333,10 +333,23 @@ poll_status() {
   if [ "$status" = "gelb" ] && [ "$WANT_GREEN" -eq 1 ]; then
     warn "Gelb->Grün: your origin (${CT_AGENT_ORIGIN}) must serve PLAIN HTTP right now,"
     warn "not TLS — it only needs its own certificate once Grün is reached."
-    log "requesting your own certificate (ct-agent certificate)"
-    CT_ACME_CERT_OUT_DIR="${CT_ACME_CERT_OUT_DIR:-./ct-agent-cert}" \
-      ./ct-agent certificate >>./ct-agent.log 2>&1 &
-    ok "certificate issuance running in the background (watch ./ct-agent.log)"
+    if [ "$MODE" = "docker" ]; then
+      # There is no ./ct-agent on the host in Docker mode -- only inside the
+      # container -- so the direct-mode "run it locally in the background" path
+      # below would silently fail (exec: no such file) while still printing a
+      # false success message. Found live: reproduced the exact ENOENT/exit-127
+      # failure before this fix. Rather than guess at a docker-exec + docker-cp
+      # flow that can't be round-trip tested here without a real registered
+      # tunnel, tell the customer exactly what to run themselves.
+      warn "--green isn't automated in --docker mode yet — run this yourself once you're ready:"
+      warn "  docker exec ct-agent sh -c 'CT_ACME_CERT_OUT_DIR=/ct-agent-cert ct-agent certificate' &"
+      warn "  # then, once it reports Grün above: docker cp ct-agent:/ct-agent-cert ./ct-agent-cert"
+    else
+      log "requesting your own certificate (ct-agent certificate)"
+      CT_ACME_CERT_OUT_DIR="${CT_ACME_CERT_OUT_DIR:-./ct-agent-cert}" \
+        ./ct-agent certificate >>./ct-agent.log 2>&1 &
+      ok "certificate issuance running in the background (watch ./ct-agent.log)"
+    fi
   fi
   FINAL_STATUS="${status:-unknown}"
 }
