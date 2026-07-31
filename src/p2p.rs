@@ -666,11 +666,28 @@ pub(crate) fn build_dcutr_relay_client_swarm() -> Result<Swarm<DcutrRelayClientB
 /// opposite direction from [`P2pDuplex`]'s own `Compat`, which goes futures → tokio.
 struct PreConnectedTransport<S> {
     stream: Option<S>,
+    listen: PreConnectedListenState,
+}
+
+/// [`PreConnectedTransport`]'s `listen_on` needs to hand out its ONE stream as an
+/// **incoming** connection (the DCUtR-`Initiate` role reserves on the relay via
+/// `client.listen_on(circuit_relay)`, not `dial` — discovered live E2E-testing the
+/// relay-gate: the stream was there, `listen_on` just unconditionally refused it).
+/// `poll` can only return one [`libp2p::core::transport::TransportEvent`] per call, so this
+/// tracks the two-step handoff: announce the listen address first (`NewAddress`, which the
+/// relay-client behaviour/Swarm need before treating a connection on it as legitimate), then
+/// on the next poll hand out the stream as `Incoming`. Only one `listen_on` is ever
+/// serviced — matching the "one connection to give out" design `dial` already has.
+enum PreConnectedListenState {
+    Idle,
+    Requested(libp2p::core::transport::ListenerId, Multiaddr),
+    AddressSent(libp2p::core::transport::ListenerId, Multiaddr),
+    Done,
 }
 
 impl<S> PreConnectedTransport<S> {
     fn new(stream: S) -> Self {
-        Self { stream: Some(stream) }
+        Self { stream: Some(stream), listen: PreConnectedListenState::Idle }
     }
 }
 
@@ -680,19 +697,31 @@ where
 {
     type Output = S;
     type Error = std::io::Error;
-    type ListenerUpgrade = std::future::Pending<Result<S, std::io::Error>>;
+    type ListenerUpgrade = std::future::Ready<Result<S, std::io::Error>>;
     type Dial = std::future::Ready<Result<S, std::io::Error>>;
 
     fn listen_on(
         &mut self,
-        _id: libp2p::core::transport::ListenerId,
+        id: libp2p::core::transport::ListenerId,
         addr: Multiaddr,
     ) -> Result<(), libp2p::core::transport::TransportError<Self::Error>> {
-        Err(libp2p::core::transport::TransportError::MultiaddrNotSupported(addr))
+        if self.stream.is_none() || !matches!(self.listen, PreConnectedListenState::Idle) {
+            return Err(libp2p::core::transport::TransportError::MultiaddrNotSupported(addr));
+        }
+        self.listen = PreConnectedListenState::Requested(id, addr);
+        Ok(())
     }
 
-    fn remove_listener(&mut self, _id: libp2p::core::transport::ListenerId) -> bool {
-        false
+    fn remove_listener(&mut self, id: libp2p::core::transport::ListenerId) -> bool {
+        let active = matches!(
+            &self.listen,
+            PreConnectedListenState::Requested(lid, _) | PreConnectedListenState::AddressSent(lid, _)
+            if *lid == id
+        );
+        if active {
+            self.listen = PreConnectedListenState::Done;
+        }
+        active
     }
 
     fn dial(
@@ -707,10 +736,30 @@ where
     }
 
     fn poll(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<libp2p::core::transport::TransportEvent<Self::ListenerUpgrade, Self::Error>> {
-        std::task::Poll::Pending
+        match std::mem::replace(&mut self.listen, PreConnectedListenState::Done) {
+            PreConnectedListenState::Requested(listener_id, addr) => {
+                self.listen = PreConnectedListenState::AddressSent(listener_id, addr.clone());
+                std::task::Poll::Ready(libp2p::core::transport::TransportEvent::NewAddress { listener_id, listen_addr: addr })
+            }
+            PreConnectedListenState::AddressSent(listener_id, addr) => {
+                match self.stream.take() {
+                    Some(stream) => std::task::Poll::Ready(libp2p::core::transport::TransportEvent::Incoming {
+                        listener_id,
+                        upgrade: std::future::ready(Ok(stream)),
+                        local_addr: addr.clone(),
+                        send_back_addr: addr,
+                    }),
+                    None => std::task::Poll::Pending,
+                }
+            }
+            other @ (PreConnectedListenState::Idle | PreConnectedListenState::Done) => {
+                self.listen = other;
+                std::task::Poll::Pending
+            }
+        }
     }
 }
 
