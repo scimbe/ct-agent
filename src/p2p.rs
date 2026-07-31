@@ -319,6 +319,21 @@ struct RelayServerBehaviour {
     identify: identify::Behaviour,
 }
 
+/// Decode a 64-hex `CT_RELAY_NODE_KEY` into a 32-byte ed25519 seed. `None` on anything but
+/// exactly 64 valid hex characters — no panics on malformed input.
+fn relay_node_key_seed(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut seed = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let byte_str = std::str::from_utf8(chunk).ok()?;
+        seed[i] = u8::from_str_radix(byte_str, 16).ok()?;
+    }
+    Some(seed)
+}
+
 /// Build the **relay node**'s swarm: a Tokio TCP transport upgraded with libp2p-noise +
 /// yamux, driving the Circuit-Relay v2 **server** [`relay::Behaviour`]. This node forwards
 /// circuits between clients; it terminates none of our channel traffic and never sees
@@ -327,8 +342,23 @@ struct RelayServerBehaviour {
 /// ⚠️ This relay is **unguarded** — `relay::Config::default()` accepts a reservation/circuit
 /// from any peer. That is safe **only** because this helper is test-only and in-process; a
 /// live/public relay MUST first gain the invariant-#3 membership gate (`C-membership-gate`).
+///
+/// Identity: `CT_RELAY_NODE_KEY` (64-hex ed25519 seed), when set, gives this swarm a STABLE
+/// libp2p identity instead of a fresh one every run. Production needs this: the edge's
+/// `:443` relay-gate tells a connecting client which `PeerId` to expect (so its relay-client
+/// transport can dial `<relay>/p2p/<id>/p2p-circuit`) — a fresh id per restart would break
+/// every already-configured `CT_EDGE_RELAY_NODE_PEER`. The nat-lab harness leaves it unset
+/// (a fresh identity per lab run is exactly what it wants).
 fn build_relay_swarm() -> Result<Swarm<RelayServerBehaviour>, BoxError> {
-    let swarm = SwarmBuilder::with_new_identity()
+    let identity = match std::env::var("CT_RELAY_NODE_KEY").ok().filter(|s| !s.trim().is_empty()) {
+        Some(hex) => {
+            let seed = relay_node_key_seed(&hex)
+                .ok_or_else(|| -> BoxError { "CT_RELAY_NODE_KEY: expected 64 hex chars (32 bytes)".into() })?;
+            SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::ed25519_from_bytes(seed)?)
+        }
+        None => SwarmBuilder::with_new_identity(),
+    };
+    let swarm = identity
         .with_tokio()
         .with_tcp(Default::default(), noise::Config::new, yamux::Config::default)?
         // #136: also relay over QUIC. If clients reach the relay over QUIC, `identify` observes
@@ -355,16 +385,22 @@ fn build_relay_swarm() -> Result<Swarm<RelayServerBehaviour>, BoxError> {
     Ok(swarm)
 }
 
-/// #136 N-rig-2b (**test-only**, `nat-lab` cargo feature): run the Circuit-Relay v2 relay node
-/// as a standalone process for the Docker 2-NAT hole-punch lab. It listens on `listen`, prints
-/// each bound multiaddr as `<addr>/p2p/<peerid>` on its own stdout line (so the lab's punch
-/// clients can reserve on / dial through it), then drives the swarm forever.
+/// #136 N-rig-2b: run the Circuit-Relay v2 relay node as a standalone process. It listens on
+/// `listen`, prints each bound multiaddr as `<addr>/p2p/<peerid>` on its own stdout line (so a
+/// caller can learn its dialable address), then drives the swarm forever. Named for its
+/// original nat-lab-only use; also the production `ct-agent relay-node` subcommand's core loop
+/// (kept as one function, not duplicated, so both paths run identically-tested code).
 ///
-/// **NEVER a production capability.** This relay is unguarded ([`build_relay_swarm`] uses
-/// `relay::Config::default()`; invariant #3's `C-membership-gate` is not wired here), so it is
-/// compiled ONLY under `--features nat-lab` (the `natlab` bin), never exposed as a `ct-agent`
-/// subcommand — shipping an open relay would be a footgun.
-#[cfg(any(test, feature = "nat-lab"))]
+/// This relay's own protocol-level acceptance is unguarded ([`build_relay_swarm`] uses
+/// `relay::Config::default()`; invariant #3's `C-membership-gate`, `authorize_relay_circuit*`,
+/// is deliberately NOT wired at this layer). That is safe in **exactly one** production
+/// topology: bound to an internal-only address that is never reachable except through the
+/// edge's `:443` relay-gate leg (`crates/edge/src/relay_gate.rs` in CADS-Tunnel), which performs
+/// the grant + possession pre-auth *before* ever splicing a byte here — network isolation is
+/// this relay's gate, not anything it checks itself. **Never bind this to a publicly reachable
+/// address directly** (no CT_CHANNEL_CIRCUIT_RELAY documentation should ever point a client
+/// straight at a `relay-node` port — only at the edge's `:443` relay-gate ALPN); doing so would
+/// ship an open relay.
 pub async fn nat_lab_relay(listen: &str) -> Result<(), BoxError> {
     let mut swarm = build_relay_swarm()?;
     let peer = *swarm.local_peer_id();
@@ -587,7 +623,7 @@ pub(crate) struct DcutrRelayClientBehaviour {
 /// both peers are already directly reachable, so the upgrade is a trivial no-op). As on every
 /// transport, the fresh libp2p identity is plumbing — it never gates channel admission
 /// (invariant #1).
-fn build_dcutr_relay_client_swarm() -> Result<Swarm<DcutrRelayClientBehaviour>, BoxError> {
+pub(crate) fn build_dcutr_relay_client_swarm() -> Result<Swarm<DcutrRelayClientBehaviour>, BoxError> {
     let swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(Default::default(), noise::Config::new, yamux::Config::default)?
@@ -601,6 +637,133 @@ fn build_dcutr_relay_client_swarm() -> Result<Swarm<DcutrRelayClientBehaviour>, 
             relay_client,
             dcutr: dcutr::Behaviour::new(key.public().to_peer_id()),
             // Advertise/observe addresses so DCUtR can discover the reflexive address to punch.
+            identify: identify::Behaviour::new(identify::Config::new(
+                "/ct-dcutr-id/1.0.0".to_string(),
+                key.public(),
+            )),
+            stream: stream::Behaviour::new(),
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
+        .build();
+    Ok(swarm)
+}
+
+/// A [`libp2p::core::Transport`] with exactly one already-established outbound connection to
+/// hand out — the multiplexed-`:443` counterpart of [`MemoryTransport`]'s role in
+/// [`build_memory_swarm`]. `dial` ignores the `Multiaddr` entirely (any address "claims" the
+/// one stream) and returns the pre-connected `S` immediately; a second `dial` fails, since
+/// there is only ever one connection to give out. Never listens (this client only ever dials
+/// the relay it already reached via the edge's `:443` relay-gate pre-auth handshake, never
+/// accepts on this transport). Modeled directly on `libp2p_core::transport::dummy`'s minimal
+/// shape — the smallest correct `Transport` impl, with `dial` doing real work instead of
+/// always erroring.
+///
+/// `S` is bound to `futures`' `AsyncRead`/`AsyncWrite` (`libp2p::futures`), not tokio's —
+/// libp2p's own transport-upgrade chain (`.upgrade().authenticate().multiplex()`, applied at
+/// the [`build_dcutr_relay_client_swarm_over_stream`] call site) requires it. The caller wraps
+/// a tokio stream (e.g. the `:443` `TlsStream`) with `tokio_util::compat`'s
+/// `TokioAsyncReadCompatExt`/`TokioAsyncWriteCompatExt` before constructing this — the
+/// opposite direction from [`P2pDuplex`]'s own `Compat`, which goes futures → tokio.
+struct PreConnectedTransport<S> {
+    stream: Option<S>,
+}
+
+impl<S> PreConnectedTransport<S> {
+    fn new(stream: S) -> Self {
+        Self { stream: Some(stream) }
+    }
+}
+
+impl<S> Transport for PreConnectedTransport<S>
+where
+    S: libp2p::futures::AsyncRead + libp2p::futures::AsyncWrite + Unpin + Send + 'static,
+{
+    type Output = S;
+    type Error = std::io::Error;
+    type ListenerUpgrade = std::future::Pending<Result<S, std::io::Error>>;
+    type Dial = std::future::Ready<Result<S, std::io::Error>>;
+
+    fn listen_on(
+        &mut self,
+        _id: libp2p::core::transport::ListenerId,
+        addr: Multiaddr,
+    ) -> Result<(), libp2p::core::transport::TransportError<Self::Error>> {
+        Err(libp2p::core::transport::TransportError::MultiaddrNotSupported(addr))
+    }
+
+    fn remove_listener(&mut self, _id: libp2p::core::transport::ListenerId) -> bool {
+        false
+    }
+
+    fn dial(
+        &mut self,
+        addr: Multiaddr,
+        _opts: libp2p::core::transport::DialOpts,
+    ) -> Result<Self::Dial, libp2p::core::transport::TransportError<Self::Error>> {
+        match self.stream.take() {
+            Some(s) => Ok(std::future::ready(Ok(s))),
+            None => Err(libp2p::core::transport::TransportError::MultiaddrNotSupported(addr)),
+        }
+    }
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<libp2p::core::transport::TransportEvent<Self::ListenerUpgrade, Self::Error>> {
+        std::task::Poll::Pending
+    }
+}
+
+/// The placeholder `Multiaddr` a [`PreConnectedTransport`]-backed relay circuit is reached at.
+/// Meaningless as an actual address (the transport ignores whatever it's given — see
+/// [`PreConnectedTransport::dial`]) but must be in a scheme no OTHER registered transport
+/// (real TCP/QUIC, carrying the DCUtR punch candidates) would also claim, so libp2p's
+/// transport selection routes to this one unambiguously. `/memory/…` is exactly that: the
+/// same address family [`MemoryTransport`] uses elsewhere in this module, for the same reason.
+fn pre_connected_relay_addr() -> Multiaddr {
+    "/memory/1".parse().expect("a literal /memory/1 multiaddr always parses")
+}
+
+/// Build a **DCUtR-enabled relay client** swarm whose relay-coordination leg rides an
+/// ALREADY-ESTABLISHED duplex `S` (the post-pre-auth-handshake tail of a `:443` connection to
+/// the edge's relay-gate — see `channel_run::dial_relay_gate_over_443`) instead of a real TCP
+/// dial to the relay. Structurally identical to [`build_dcutr_relay_client_swarm`] — same
+/// behaviour, same real TCP+QUIC transports for the DCUtR punch candidates — except
+/// [`PreConnectedTransport`] replaces `.with_tcp(...)` as the transport `.with_relay_client(...)`
+/// extends, so dialing [`pre_connected_relay_addr`] hands out `stream` instead of opening a new
+/// socket. This is how a real relay deployment stays reachable only through the edge's :443
+/// front door (no new public port) while every downstream primitive
+/// (`dcutr_reserve_and_accept`/`dcutr_dial_via_relay`/`run_channel_session_upgradable_dcutr`)
+/// runs completely unchanged.
+fn build_dcutr_relay_client_swarm_over_stream<S>(
+    stream: S,
+) -> Result<Swarm<DcutrRelayClientBehaviour>, BoxError>
+where
+    S: libp2p::futures::AsyncRead + libp2p::futures::AsyncWrite + Unpin + Send + 'static,
+{
+    let swarm = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_quic()
+        // The pre-connected duplex must itself already be authenticated + multiplexed
+        // (`AuthenticatedMultiplexedTransport`) before `.with_other_transport` will accept
+        // it -- the identical upgrade chain `build_memory_swarm` applies to
+        // `MemoryTransport` for the same reason. This is where the raw `:443`
+        // relay-gate stream actually gets its own inner Noise handshake + yamux
+        // multiplexing (a SEPARATE Noise session from our own Noise_IK channel
+        // encryption -- this is libp2p's transport-security layer, invariant #2 is
+        // our own end-to-end Noise_IK running INSIDE whatever substream this yields).
+        .with_other_transport(|keypair| {
+            Ok::<_, BoxError>(
+                PreConnectedTransport::new(stream)
+                    .upgrade(Version::V1)
+                    .authenticate(noise::Config::new(keypair)?)
+                    .multiplex(yamux::Config::default()),
+            )
+        })?
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|key, relay_client| DcutrRelayClientBehaviour {
+            relay_client,
+            dcutr: dcutr::Behaviour::new(key.public().to_peer_id()),
             identify: identify::Behaviour::new(identify::Config::new(
                 "/ct-dcutr-id/1.0.0".to_string(),
                 key.public(),
@@ -954,9 +1117,34 @@ pub(crate) fn dcutr_upgrade_target(offered: &str, trusted_circuit: &Multiaddr) -
 /// establishes as the direct-Noise INITIATOR. Hole-punch failure stays on the relay; the relay leg is
 /// end-to-end throughout. The live cross-NAT punch is proven on the deploy (#136 N136.4); this over an
 /// in-process relay on loopback.
+/// Build the **initiator's/responder's** `:443`-relay-gate `Swarm<DcutrRelayClientBehaviour>`
+/// plus its circuit `Multiaddr` from an already-pre-authed relay-gate `stream` and the
+/// relay-node's `relay_peer` id (learned from the gate's own ack — see
+/// `channel_run::dial_relay_gate_over_443`). Thin wrapper pairing
+/// [`build_dcutr_relay_client_swarm_over_stream`] with [`pre_connected_relay_addr`] so
+/// callers get the exact `(client, circuit_relay)` shape
+/// [`run_channel_session_upgradable_dcutr`] expects, matching what a direct
+/// `CT_CHANNEL_CIRCUIT_RELAY` caller builds by hand
+/// (`build_dcutr_relay_client_swarm()` + its own multiaddr).
+pub(crate) fn build_relay_gate_client<S>(
+    stream: S,
+    relay_peer: libp2p::PeerId,
+) -> Result<(Swarm<DcutrRelayClientBehaviour>, Multiaddr), BoxError>
+where
+    S: libp2p::futures::AsyncRead + libp2p::futures::AsyncWrite + Unpin + Send + 'static,
+{
+    Ok((
+        build_dcutr_relay_client_swarm_over_stream(stream)?,
+        pre_connected_relay_addr().with(Protocol::P2p(relay_peer)),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
-// #136 N-wire: live via `channel_run::join_via_relay_dcutr` (relay-only members with a
-// `CT_CHANNEL_CIRCUIT_RELAY` configured); the cross-NAT punch is proven in the Docker 2-NAT lab.
+// #136 N-wire: live via `channel_run::join_via_relay_dcutr` (a direct `CT_CHANNEL_CIRCUIT_RELAY`
+// multiaddr, `build_dcutr_relay_client_swarm()`) or `join_via_relay_gate_dcutr` (the `:443`
+// relay-gate, `build_relay_gate_client`) -- either way the caller has already built `client`
+// (some `Swarm<DcutrRelayClientBehaviour>`) and its `circuit_relay` before calling this. The
+// cross-NAT punch is proven in the Docker 2-NAT lab.
 pub(crate) async fn run_channel_session_upgradable_dcutr<RW, RR, P>(
     relay_send: RW,
     relay_recv: RR,
@@ -964,6 +1152,7 @@ pub(crate) async fn run_channel_session_upgradable_dcutr<RW, RR, P>(
     role: crate::channel_run::ChannelRole,
     own_noise_private: &[u8; 32],
     peer_noise_public: &[u8; 32],
+    client: Swarm<DcutrRelayClientBehaviour>,
     circuit_relay: Multiaddr,
 ) -> Result<(), BoxError>
 where
@@ -982,7 +1171,6 @@ where
         crate::channel_run::ChannelRole::Initiate => {
             // Reserve on the relay up front → we know our advertised circuit address, and the inbound
             // DCUtR stream (from the responder's dial) arrives on `inbound_rx` later.
-            let client = build_dcutr_relay_client_swarm()?;
             let own_peer = *client.local_peer_id();
             let advertise = circuit_relay.clone().with(Protocol::P2p(own_peer)).to_string();
             let inbound_rx = dcutr_reserve_and_accept(client, circuit_relay).await?;
@@ -1007,7 +1195,6 @@ where
             .map_err(Into::into)
         }
         crate::channel_run::ChannelRole::Accept => {
-            let client = build_dcutr_relay_client_swarm()?;
             let coord = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
             run_upgradable_session_responder(
                 relay_send,
@@ -1464,6 +1651,18 @@ mod tests {
     use crate::channel_run::{run_channel_session_on_stream, ChannelRole};
     use ct_common::noise::generate_static_keypair;
     use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn relay_node_key_seed_accepts_exactly_64_hex_chars_and_rejects_everything_else() {
+        let hex = "aa".repeat(32);
+        assert_eq!(relay_node_key_seed(&hex), Some([0xaau8; 32]));
+        // Whitespace-tolerant (env vars get pasted with stray newlines/spaces sometimes).
+        assert_eq!(relay_node_key_seed(&format!("  {hex}\n")), Some([0xaau8; 32]));
+        assert_eq!(relay_node_key_seed(""), None, "empty");
+        assert_eq!(relay_node_key_seed(&"aa".repeat(31)), None, "too short");
+        assert_eq!(relay_node_key_seed(&"aa".repeat(33)), None, "too long");
+        assert_eq!(relay_node_key_seed(&"zz".repeat(32)), None, "not hex");
+    }
 
     #[tokio::test]
     async fn dcutr_client_offers_both_a_tcp_and_a_quic_direct_punch_candidate() {
@@ -2245,11 +2444,13 @@ mod tests {
             let (mut resp_out, _resp_w) = tokio::io::split(resp_test);
 
             let circ_i = circuit.clone();
+            let client_i = build_dcutr_relay_client_swarm().unwrap();
             let init = tokio::spawn(async move {
-                run_channel_session_upgradable_dcutr(a2b_w, b2a_r, ini_app, ChannelRole::Initiate, &a_priv, &b_pub, circ_i).await
+                run_channel_session_upgradable_dcutr(a2b_w, b2a_r, ini_app, ChannelRole::Initiate, &a_priv, &b_pub, client_i, circ_i).await
             });
+            let client_r = build_dcutr_relay_client_swarm().unwrap();
             let resp = tokio::spawn(async move {
-                run_channel_session_upgradable_dcutr(b2a_w, a2b_r, resp_app, ChannelRole::Accept, &b_priv, &a_pub, circuit).await
+                run_channel_session_upgradable_dcutr(b2a_w, a2b_r, resp_app, ChannelRole::Accept, &b_priv, &a_pub, client_r, circuit).await
             });
 
             let payload: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();

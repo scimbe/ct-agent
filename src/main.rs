@@ -37,6 +37,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
+    // `relay-node` subcommand (#136): run the Circuit-Relay v2 + DCUtR relay node --
+    // the internal-only counterpart to CADS-Tunnel's edge `:443` relay-gate leg
+    // (`crates/edge/src/relay_gate.rs`), which pre-authorizes every connection (grant +
+    // possession) BEFORE ever splicing a byte here. This relay's own protocol-level
+    // acceptance stays deliberately unguarded (see `ct_agent::p2p::nat_lab_relay`'s doc
+    // comment) -- network isolation, not anything checked in this process, is the gate.
+    // Never bind CT_RELAY_LISTEN to a publicly reachable address directly.
+    if std::env::args().nth(1).as_deref() == Some("relay-node") {
+        let listen = std::env::var("CT_RELAY_LISTEN")
+            .map_err(|_| "relay-node requires CT_RELAY_LISTEN (e.g. /ip4/0.0.0.0/tcp/4437)")?;
+        ct_agent::p2p::nat_lab_relay(&listen).await?;
+        return Ok(());
+    }
+
     // `certificate` subcommand (ADR-0003): obtain (and keep renewed) a real,
     // publicly-trusted certificate for this tunnel's hostname via ACME DNS-01 --
     // the agent's own private key never leaves this machine; the operator only

@@ -259,6 +259,7 @@ where
         dial_timeout,
         accept_timeout,
         local,
+        false, // #104: this entry point predates the option and stays opt-out by default
     )
     .await
 }
@@ -286,12 +287,16 @@ pub async fn run_channel_join_with_admission<P>(
     dial_timeout: std::time::Duration,
     accept_timeout: std::time::Duration,
     local: P,
+    // #104, opt-in via CT_CHANNEL_DIRECT_UPGRADE (default false -> unchanged behavior):
+    // whether to attempt the in-band relay->direct upgrade if/when this session ends up
+    // on the relay leg.
+    direct_upgrade: bool,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
 {
-    let (peer_endpoint, peer_noise) = match admission {
-        ChannelJoinOutcome::Admitted { peer_endpoint, peer_noise_pubkey, peer_holder, peer_attestation, observed_reflexive: _ } => {
+    let (peer_endpoint, peer_noise, observed_reflexive) = match admission {
+        ChannelJoinOutcome::Admitted { peer_endpoint, peer_noise_pubkey, peer_holder, peer_attestation, observed_reflexive } => {
             let noise = peer_noise_pubkey
                 .ok_or("broker admitted the join but relayed no peer Noise key (registry has none)")?;
             // #101 SEC101c-ii: verify the peer's Noise key is attested by its
@@ -309,16 +314,20 @@ where
             ) {
                 return Err("peer Noise-key attestation failed — refusing to pin a possibly-substituted key (#101)".into());
             }
-            (peer_endpoint, noise)
+            (peer_endpoint, noise, observed_reflexive)
         }
         ChannelJoinOutcome::Refused => return Err("edge broker refused the channel join".into()),
     };
+    // #104: built once, moved into whichever single relay-fallback call site below
+    // actually fires (they're mutually exclusive). `None` whenever direct_upgrade is off
+    // (the default) or the edge reported no reflexive address for this admission.
+    let upgrade = if direct_upgrade { build_upgrade_candidate(observed_reflexive).await } else { None };
     match role {
         // #121: the paired peer advertised the relay-only sentinel — it has no dialable
         // address, so skip the wasted direct dial + timeout and go straight to the relay.
         ChannelRole::Initiate if peer_endpoint == ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY => {
             eprintln!("ct-agent channel: peer is relay-only (no dialable address) — using the edge relay (#121)");
-            join_via_relay_fallback(relay, request, holder, ChannelRole::Initiate, own_noise_private, &peer_noise, local).await?;
+            join_via_relay_fallback(relay, request, holder, ChannelRole::Initiate, own_noise_private, &peer_noise, local, upgrade).await?;
         }
         ChannelRole::Initiate => {
             let addr = peer_endpoint
@@ -330,7 +339,7 @@ where
                 }
                 Err(ChannelDialError::Unreachable) => {
                     eprintln!("ct-agent channel: direct dial to {addr} unreachable — falling back to the edge relay (#72)");
-                    join_via_relay_fallback(relay, request, holder, ChannelRole::Initiate, own_noise_private, &peer_noise, local).await?;
+                    join_via_relay_fallback(relay, request, holder, ChannelRole::Initiate, own_noise_private, &peer_noise, local, upgrade).await?;
                 }
                 Err(ChannelDialError::Failed(e)) => return Err(e),
             }
@@ -340,7 +349,7 @@ where
             // relays directly instead of waiting for a direct connection that can never come.
             None => {
                 eprintln!("ct-agent channel: relay-only acceptor (no listener) — using the edge relay (#121)");
-                join_via_relay_fallback(relay, request, holder, ChannelRole::Accept, own_noise_private, &peer_noise, local).await?;
+                join_via_relay_fallback(relay, request, holder, ChannelRole::Accept, own_noise_private, &peer_noise, local, upgrade).await?;
             }
             Some(ep) => match tokio::time::timeout(accept_timeout, ep.accept()).await {
                 Ok(Some(incoming)) => {
@@ -350,7 +359,7 @@ where
                 Ok(None) => return Err("channel listener closed with no incoming".into()),
                 Err(_timeout) => {
                     eprintln!("ct-agent channel: no direct connection within {accept_timeout:?} — falling back to the edge relay (#72)");
-                    join_via_relay_fallback(relay, request, holder, ChannelRole::Accept, own_noise_private, &peer_noise, local).await?;
+                    join_via_relay_fallback(relay, request, holder, ChannelRole::Accept, own_noise_private, &peer_noise, local, upgrade).await?;
                 }
             },
         },
@@ -366,6 +375,13 @@ where
 /// preserving the direct-path stream roles, so this simply presents the join and then
 /// reuses [`run_channel_session`] over the edge connection. Noise stays end-to-end —
 /// the edge only forwards ciphertext.
+///
+/// `upgrade`, when `Some((listener, own_direct_endpoint))` (#104, opt-in via
+/// `CT_CHANNEL_DIRECT_UPGRADE`), runs [`run_channel_session_upgradable`] instead of the
+/// plain session: the two peers negotiate a direct-dial candidate **in-band, over this
+/// same already-admitted, already-Noise-authenticated relay stream** and opportunistically
+/// upgrade to it, falling back to the relay transparently on failure. `None` (the default)
+/// is byte-for-byte the pre-existing behavior.
 pub async fn join_via_relay<P>(
     relay_conn: &Connection,
     request: &ChannelJoinRequest,
@@ -374,6 +390,7 @@ pub async fn join_via_relay<P>(
     own_noise_private: &[u8; 32],
     peer_noise_public: &[u8; 32],
     local: P,
+    upgrade: Option<(Endpoint, String)>,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
@@ -382,9 +399,22 @@ where
         ChannelJoinOutcome::Admitted { .. } => {}
         ChannelJoinOutcome::Refused => return Err("edge relay refused the channel join".into()),
     }
-    run_channel_session(relay_conn, role, own_noise_private, peer_noise_public, local)
-        .await
-        .map_err(Into::into)
+    match upgrade {
+        Some((listener, own_direct_endpoint)) => run_channel_session_upgradable(
+            relay_conn,
+            role,
+            own_noise_private,
+            peer_noise_public,
+            local,
+            Some(listener),
+            Some(own_direct_endpoint),
+            DIRECT_DIAL_TIMEOUT,
+        )
+        .await,
+        None => run_channel_session(relay_conn, role, own_noise_private, peer_noise_public, local)
+            .await
+            .map_err(Into::into),
+    }
 }
 
 /// **#136 N-wire — DCUtR-upgradable relay join for a NAT-to-NAT (relay-only) member.** Like
@@ -423,6 +453,7 @@ where
         ChannelRole::Initiate => relay_conn.open_bi().await.map_err(|e| map_err(Box::new(e)))?,
         ChannelRole::Accept => relay_conn.accept_bi().await.map_err(|e| map_err(Box::new(e)))?,
     };
+    let client = crate::p2p::build_dcutr_relay_client_swarm()?;
     crate::p2p::run_channel_session_upgradable_dcutr(
         relay_send,
         relay_recv,
@@ -430,6 +461,101 @@ where
         role,
         own_noise_private,
         &peer_noise,
+        client,
+        circuit_relay,
+    )
+    .await
+}
+
+/// Dial the edge's `:443` **relay-gate** leg (`CT_EDGE_RELAY_GATE`) for a real NAT-to-NAT
+/// hole-punch, multiplexed onto the same front door every other `:443` leg uses — no new
+/// public port. TLS-connects with ALPN `ct-edge-relay`
+/// ([`crate::transport::tcp_tls_connect_with_alpn`]), then runs the pre-auth wire protocol
+/// `crates/edge/src/relay_gate.rs` on the edge side implements: present `grant` (the fixed-size
+/// [`ct_common::channel::SignedChannelGrant`] wire form, no framing needed), sign the edge's
+/// fresh 32-byte challenge with `holder`, and on `OK` read the trailing `u16-BE len + utf8`
+/// relay-node `PeerId` the edge's ack carries (needed because this connection never reaches the
+/// relay-node directly — see `relay_gate.rs`'s own doc comment for why). Returns the
+/// still-open, now-pre-authed TLS stream plus that `PeerId`, ready for
+/// [`crate::p2p::build_relay_gate_client`].
+pub async fn dial_relay_gate_over_443(
+    addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    grant: &ct_common::channel::SignedChannelGrant,
+    holder: &SigningKey,
+) -> Result<(tokio_rustls::client::TlsStream<tokio::net::TcpStream>, libp2p::PeerId), BoxError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = crate::transport::tcp_tls_connect_with_alpn(addr, edge_cert, b"ct-edge-relay").await?;
+    stream.write_all(&grant.encode()).await?;
+    let mut challenge = [0u8; 32];
+    stream.read_exact(&mut challenge).await?;
+    let sig = holder.sign(&challenge).to_bytes();
+    stream.write_all(&sig).await?;
+    let mut ack = [0u8; 2];
+    stream.read_exact(&mut ack).await?;
+    if &ack != b"OK" {
+        return Err("relay-gate: pre-auth refused (grant not authorized -- see the edge's own log)".into());
+    }
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).await?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    let mut peer_buf = vec![0u8; len];
+    stream.read_exact(&mut peer_buf).await?;
+    let peer_str = String::from_utf8(peer_buf)
+        .map_err(|e| -> BoxError { format!("relay-gate: relay-node peer id not utf8: {e}").into() })?;
+    let relay_peer: libp2p::PeerId = peer_str
+        .parse()
+        .map_err(|e| -> BoxError { format!("relay-gate: malformed relay-node peer id {peer_str:?}: {e}").into() })?;
+    Ok((stream, relay_peer))
+}
+
+/// **#136 N-wire — DCUtR-upgradable relay join over the `:443` relay-gate.** Like
+/// [`join_via_relay_dcutr`], but reaches the Circuit-Relay v2 relay through
+/// [`dial_relay_gate_over_443`] instead of a directly-dialable `CT_CHANNEL_CIRCUIT_RELAY`
+/// multiaddr — the deployment this session actually ships: no new public port, the relay-node
+/// gated by grant + possession before a single byte reaches it. `own_grant` is this member's
+/// own signed grant (presented to the relay-gate, distinct from the channel-join grant already
+/// consumed by `present_channel_join`, though today they are the same value).
+#[allow(clippy::too_many_arguments)]
+pub async fn join_via_relay_gate_dcutr<P>(
+    relay_conn: &Connection,
+    request: &ChannelJoinRequest,
+    holder: &SigningKey,
+    role: ChannelRole,
+    own_noise_private: &[u8; 32],
+    local: P,
+    relay_gate_addr: SocketAddr,
+    relay_gate_cert: CertificateDer<'static>,
+    own_grant: &ct_common::channel::SignedChannelGrant,
+) -> Result<(), BoxError>
+where
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+
+    let peer_noise = match present_channel_join(relay_conn, request, holder).await? {
+        ChannelJoinOutcome::Admitted { peer_noise_pubkey: Some(k), .. } => k,
+        ChannelJoinOutcome::Admitted { .. } => {
+            return Err("DCUtR relay-gate join needs the peer's relayed Noise key (register the member's key, #101)".into())
+        }
+        ChannelJoinOutcome::Refused => return Err("edge relay refused the channel join".into()),
+    };
+    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::other(e.to_string());
+    let (relay_send, relay_recv) = match role {
+        ChannelRole::Initiate => relay_conn.open_bi().await.map_err(|e| map_err(Box::new(e)))?,
+        ChannelRole::Accept => relay_conn.accept_bi().await.map_err(|e| map_err(Box::new(e)))?,
+    };
+    let (gate_stream, relay_peer) =
+        dial_relay_gate_over_443(relay_gate_addr, relay_gate_cert, own_grant, holder).await?;
+    let (client, circuit_relay) = crate::p2p::build_relay_gate_client(gate_stream.compat(), relay_peer)?;
+    crate::p2p::run_channel_session_upgradable_dcutr(
+        relay_send,
+        relay_recv,
+        local,
+        role,
+        own_noise_private,
+        &peer_noise,
+        client,
         circuit_relay,
     )
     .await
@@ -490,6 +616,7 @@ where
                 }
             };
             let coord = UpgradeCoordinator::with_backoff(Role::Initiator, 0, 1, 100);
+            eprintln!("ct-agent channel: #104 upgrade — offering direct candidate {endpoint} in-band");
             run_upgradable_session_initiator(
                 relay_send,
                 relay_recv,
@@ -502,10 +629,43 @@ where
                 move || async move {
                     // Accept the incoming direct dial (the responder dials us), then handshake as the
                     // direct-Noise RESPONDER (the dialer is the Noise initiator).
-                    let incoming = tokio::time::timeout(dial_timeout, listener.accept()).await.ok()??;
-                    let conn = incoming.await.ok()?;
-                    let (s, r) = conn.accept_bi().await.ok()?;
-                    establish_direct_session(s, r, false, &direct_priv, &direct_peer).await.ok()
+                    let incoming = match tokio::time::timeout(dial_timeout, listener.accept()).await {
+                        Ok(Some(i)) => i,
+                        Ok(None) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct listener closed with no incoming — staying on relay");
+                            return None;
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "ct-agent channel: #104 upgrade — no incoming direct dial within {dial_timeout:?} — staying on relay"
+                            );
+                            return None;
+                        }
+                    };
+                    let conn = match incoming.await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("ct-agent channel: #104 upgrade — incoming direct connection failed ({e}) — staying on relay");
+                            return None;
+                        }
+                    };
+                    let (s, r) = match conn.accept_bi().await {
+                        Ok(sr) => sr,
+                        Err(e) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct bi-stream accept failed ({e}) — staying on relay");
+                            return None;
+                        }
+                    };
+                    match establish_direct_session(s, r, false, &direct_priv, &direct_peer).await {
+                        Ok(session) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct Noise session established, cutting over from relay");
+                            Some(session)
+                        }
+                        Err(e) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct Noise handshake failed ({e}) — staying on relay");
+                            None
+                        }
+                    }
                 },
             )
             .await
@@ -523,14 +683,45 @@ where
                 // #137 SSRF guard: the offered endpoint is peer-conveyed and never passed the edge
                 // broker's `safe_endpoint` gate, so apply the identical range filter here — refuse
                 // to even signal Ready for an internal/private/metadata target.
-                |ep: String| async move { upgrade_safe_endpoint(&ep).is_some() },
+                |ep: String| async move {
+                    let safe = upgrade_safe_endpoint(&ep).is_some();
+                    eprintln!(
+                        "ct-agent channel: #104 upgrade — peer offered direct candidate {ep}{}",
+                        if safe { "" } else { " (rejected: not a global-unicast address, #137)" }
+                    );
+                    safe
+                },
                 move |ep: String| async move {
                     // Dial the offered endpoint (SSRF-guarded, #137) and handshake as the
                     // direct-Noise INITIATOR. A non-global-unicast target is refused → stay on relay.
-                    let addr = upgrade_safe_endpoint(&ep)?;
-                    let conn = dial_peer_direct(addr, dial_timeout).await.ok()?;
-                    let (s, r) = conn.open_bi().await.ok()?;
-                    establish_direct_session(s, r, true, &direct_priv, &direct_peer).await.ok()
+                    let addr = match upgrade_safe_endpoint(&ep) {
+                        Some(a) => a,
+                        None => return None, // already logged as rejected above
+                    };
+                    let conn = match dial_peer_direct(addr, dial_timeout).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct dial to {addr} failed ({e:?}) — staying on relay");
+                            return None;
+                        }
+                    };
+                    let (s, r) = match conn.open_bi().await {
+                        Ok(sr) => sr,
+                        Err(e) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct bi-stream open to {addr} failed ({e}) — staying on relay");
+                            return None;
+                        }
+                    };
+                    match establish_direct_session(s, r, true, &direct_priv, &direct_peer).await {
+                        Ok(session) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct Noise session established with {addr}, cutting over from relay");
+                            Some(session)
+                        }
+                        Err(e) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct Noise handshake with {addr} failed ({e}) — staying on relay");
+                            None
+                        }
+                    }
                 },
             )
             .await
@@ -580,13 +771,14 @@ async fn join_via_relay_fallback<P>(
     own_noise_private: &[u8; 32],
     peer_noise_public: &[u8; 32],
     local: P,
+    upgrade: Option<(Endpoint, String)>,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
 {
     match relay {
         RelayFallback::Quic(conn) => {
-            join_via_relay(conn, request, holder, role, own_noise_private, peer_noise_public, local).await
+            join_via_relay(conn, request, holder, role, own_noise_private, peer_noise_public, local, upgrade).await
         }
         RelayFallback::QuicLazy(addr) => {
             // #103 fix: dial the relay only now, when the fallback has actually fired —
@@ -594,7 +786,7 @@ where
             let conn = crate::transport::build_channel_dialer()?
                 .connect(addr, "localhost")?
                 .await?;
-            join_via_relay(&conn, request, holder, role, own_noise_private, peer_noise_public, local).await
+            join_via_relay(&conn, request, holder, role, own_noise_private, peer_noise_public, local, upgrade).await
         }
         RelayFallback::Ladder { rungs, edge_cert, direct_timeout } => {
             join_via_relay_ladder(
@@ -607,6 +799,7 @@ where
                 own_noise_private,
                 peer_noise_public,
                 local,
+                upgrade,
             )
             .await
         }
@@ -639,6 +832,11 @@ pub async fn join_via_relay_ladder<P>(
     own_noise_private: &[u8; 32],
     peer_noise_public: &[u8; 32],
     local: P,
+    // #104: only the direct-QUIC rung can carry the in-band upgrade (it hands off a real
+    // `&Connection` to `join_via_relay`); the `:443` front-door rung is a plain TLS-TCP
+    // byte stream with no independent QUIC connection to open a second stream on, so it
+    // stays a plain relay session regardless of this option.
+    upgrade: Option<(Endpoint, String)>,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
@@ -653,6 +851,7 @@ where
             // carries the join AND the spliced session, so present without consuming it.
             match crate::transport::tcp_tls_connect_channel(rung.endpoint, edge_cert.clone()).await {
                 Ok(stream) => {
+                    eprintln!("ct-agent channel: relay leg via the :443 front door ({}) (#106)", rung.endpoint);
                     let (mut recv, mut send) = tokio::io::split(stream);
                     let local = local.take().expect("local is committed to exactly one rung");
                     match present_channel_relay_join_on_stream(&mut send, &mut recv, request, holder).await? {
@@ -678,9 +877,12 @@ where
             // Direct: QUIC to the relay port. Unreachable/Failed falls through to :443.
             match dial_peer_direct(rung.endpoint, direct_timeout).await {
                 Ok(conn) => {
+                    eprintln!("ct-agent channel: relay leg via QUIC ({}) (#106)", rung.endpoint);
                     let local = local.take().expect("local is committed to exactly one rung");
-                    return join_via_relay(&conn, request, holder, role, own_noise_private, peer_noise_public, local)
-                        .await;
+                    return join_via_relay(
+                        &conn, request, holder, role, own_noise_private, peer_noise_public, local, upgrade,
+                    )
+                    .await;
                 }
                 Err(ChannelDialError::Unreachable) => last = Some(ChannelDialError::Unreachable.into()),
                 Err(ChannelDialError::Failed(e)) => last = Some(e),
@@ -711,8 +913,19 @@ pub struct ChannelJoinCliConfig {
     pub holder: SigningKey,
     /// This member's Noise (X25519) private key (`CT_CHANNEL_NOISE_KEY`, hex). SECRET.
     pub own_noise_private: [u8; 32],
-    /// The host:port this member advertises for the direct path (`CT_CHANNEL_LISTEN`).
+    /// The host:port this member **binds** its direct-path QUIC listener to
+    /// (`CT_CHANNEL_LISTEN`). Inside a NAT/container this is typically `0.0.0.0:<port>`
+    /// or a private bridge address — see `advertise_addr` for what a peer actually dials.
     pub listen_addr: SocketAddr,
+    /// The host:port this member **advertises** to a peer for the direct path
+    /// (`CT_CHANNEL_ADVERTISE`, optional — defaults to `listen_addr` when unset). Exists
+    /// because a containerized/NAT'd accept-side member cannot bind the address the
+    /// outside world reaches it on (e.g. a Docker port-published `<public-ip>:<port>`
+    /// while the process itself binds `0.0.0.0:<port>`) — mirrors the same split
+    /// `CT_AGENT_DIRECT_ADVERTISE` already provides for the Browser-Plane tunnel path.
+    /// Relay-only auto-detection and the peer-facing admission `endpoint` both use THIS
+    /// address, not `listen_addr` — what matters for dialability is what's advertised.
+    pub advertise_addr: SocketAddr,
     /// Whether this member joins in **relay-only** mode (#121): forced by
     /// `CT_CHANNEL_RELAY_ONLY`, or auto-detected when `listen_addr` is not globally routable
     /// (a NAT-only host). A relay-only member skips binding the direct listener and advertises
@@ -734,6 +947,28 @@ pub struct ChannelJoinCliConfig {
     /// opportunistically hole-punches to a **direct** NAT-to-NAT link via DCUtR through this
     /// circuit relay ([`join_via_relay_dcutr`]). Absent ⇒ the plain edge-relay session (no punch).
     pub circuit_relay: Option<libp2p::Multiaddr>,
+    /// The edge's `:443` **relay-gate** leg (`CT_CHANNEL_RELAY_GATE`, host:port) — the real
+    /// gated Circuit-Relay v2 hole-punch this project ships (no new public port; grant +
+    /// possession pre-auth before a byte reaches the relay-node, see `crates/edge/src/relay_gate.rs`
+    /// on the edge side). When set for a **relay-only** member, takes priority over
+    /// `circuit_relay` (a directly-dialable relay multiaddr, kept for the nat-lab test rig) —
+    /// [`join_via_relay_gate_dcutr`] is used instead of [`join_via_relay_dcutr`].
+    pub relay_gate_addr: Option<SocketAddr>,
+    /// The trust anchor (DER) for the `:443` relay-gate TLS-TCP dial (`CT_CHANNEL_RELAY_GATE_CERT`,
+    /// hex) — required alongside `relay_gate_addr`, same treatment as `front_door_cert`.
+    pub relay_gate_cert: Option<CertificateDer<'static>>,
+    /// **#104 in-band relay→direct upgrade**, opt-in (`CT_CHANNEL_DIRECT_UPGRADE=1`, default
+    /// off — unset, nothing changes). When true and a relay-leg session forms (this member's
+    /// own [`ChannelJoinOutcome::Admitted::observed_reflexive`] was learned during THIS
+    /// admission), the session negotiates a direct-dial candidate **in-band, over the
+    /// already-Noise_IK-authenticated relay stream itself** — never a new advertised/open
+    /// port, never anything the broker relays — and opportunistically upgrades to it,
+    /// falling back to the relay transparently on failure. This is the real payoff for two
+    /// members on genuinely separate networks; on a single co-located host (e.g. this
+    /// project's own demos) the observed-reflexive address is a private bridge IP, so the
+    /// SSRF guard (`upgrade_safe_endpoint`) correctly refuses it and the session simply
+    /// stays on the relay, exactly as it did before this option existed.
+    pub direct_upgrade: bool,
 }
 
 /// Parse the optional `CT_CHANNEL_CIRCUIT_RELAY` libp2p circuit-relay multiaddr (#136 N-wire):
@@ -887,6 +1122,17 @@ impl ChannelJoinCliConfig {
             _ if relay_only_explicit => SocketAddr::from(([0, 0, 0, 0], 0)),
             _ => return Err("CT_CHANNEL_LISTEN required (advertised host:port) — or set CT_CHANNEL_RELAY_ONLY=1 for a relay-only member with no dialable address".to_string()),
         };
+        // Optional: the address a peer actually dials, when it differs from what this
+        // process binds (`listen_addr`) — e.g. a Docker port-published `<public-ip>:<port>`
+        // while the container itself binds `0.0.0.0:<port>`. Absent ⇒ advertise_addr ==
+        // listen_addr, unchanged from before this field existed. A set-but-malformed value
+        // is an error, same treatment as every other CT_CHANNEL_* address.
+        let advertise_addr = match f("CT_CHANNEL_ADVERTISE") {
+            Some(s) if !s.trim().is_empty() => {
+                resolve_socket_addr(s.trim()).map_err(|e| format!("CT_CHANNEL_ADVERTISE invalid: {e}"))?
+            }
+            _ => listen_addr,
+        };
         let grant_bytes = f("CT_CHANNEL_GRANT")
             .as_deref()
             .and_then(hex_bytes)
@@ -898,11 +1144,9 @@ impl ChannelJoinCliConfig {
         // #106: optional :443 front-door fallback. Absent -> direct-only ladder; a set but
         // malformed value is an error (a typo shouldn't silently drop the fallback).
         let front_door = match f("CT_CHANNEL_FRONT_DOOR") {
-            Some(s) if !s.trim().is_empty() => Some(
-                s.trim()
-                    .parse()
-                    .map_err(|e| format!("CT_CHANNEL_FRONT_DOOR invalid: {e}"))?,
-            ),
+            Some(s) if !s.trim().is_empty() => {
+                Some(resolve_socket_addr(s.trim()).map_err(|e| format!("CT_CHANNEL_FRONT_DOOR invalid: {e}"))?)
+            }
             _ => None,
         };
         // #106: the trust anchor for the `:443` front-door TLS-TCP dial. Optional and
@@ -914,12 +1158,53 @@ impl ChannelJoinCliConfig {
             )),
             _ => None,
         };
-        // Auto-detect relay-only when not forced: a non-globally-routable advertised listen address
+        // Auto-detect relay-only when not forced: a non-globally-routable ADVERTISED address
         // (a NAT-only host the edge would refuse to advertise, #94) is treated as relay-only.
-        let relay_only = relay_only_mode(relay_only_explicit, listen_addr);
+        // Uses advertise_addr, not listen_addr — a container legitimately binds a private/
+        // unspecified address while advertising a real public one; what matters for
+        // dialability is what's advertised, not what's bound.
+        let relay_only = relay_only_mode(relay_only_explicit, advertise_addr);
         // #136 N-wire: optional libp2p circuit-relay multiaddr for the DCUtR NAT-to-NAT punch.
         let circuit_relay = parse_circuit_relay(f("CT_CHANNEL_CIRCUIT_RELAY"))?;
-        Ok(Self { role, broker_addr, relay_addr, grant, holder, own_noise_private, listen_addr, relay_only, front_door, front_door_cert, circuit_relay })
+        // The real gated relay-gate leg: same optional/malformed-is-an-error treatment as
+        // CT_CHANNEL_FRONT_DOOR/_CERT above.
+        let relay_gate_addr = match f("CT_CHANNEL_RELAY_GATE") {
+            Some(s) if !s.trim().is_empty() => {
+                Some(resolve_socket_addr(s.trim()).map_err(|e| format!("CT_CHANNEL_RELAY_GATE invalid: {e}"))?)
+            }
+            _ => None,
+        };
+        let relay_gate_cert = match f("CT_CHANNEL_RELAY_GATE_CERT") {
+            Some(s) if !s.trim().is_empty() => Some(CertificateDer::from(
+                hex_bytes(s.trim()).ok_or("CT_CHANNEL_RELAY_GATE_CERT must be hex DER")?,
+            )),
+            _ => None,
+        };
+        // #104 in-band relay->direct upgrade: opt-in, off by default (unset -> false,
+        // identical truthy-string handling as CT_CHANNEL_RELAY_ONLY above).
+        let direct_upgrade = f("CT_CHANNEL_DIRECT_UPGRADE")
+            .map(|s| {
+                let t = s.trim();
+                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false);
+        Ok(Self {
+            role,
+            broker_addr,
+            relay_addr,
+            grant,
+            holder,
+            own_noise_private,
+            listen_addr,
+            advertise_addr,
+            relay_only,
+            front_door,
+            front_door_cert,
+            circuit_relay,
+            relay_gate_addr,
+            relay_gate_cert,
+            direct_upgrade,
+        })
     }
 }
 
@@ -1953,7 +2238,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
         endpoint: if cfg.relay_only {
             ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string()
         } else {
-            cfg.listen_addr.to_string()
+            cfg.advertise_addr.to_string()
         },
     };
     // #136 N-wire: a relay-only (NAT-to-NAT) member with a libp2p circuit relay configured runs
@@ -1961,6 +2246,35 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // to a direct link via the circuit relay. Both members are NAT'd, so this is the only path that
     // can ever go direct; without a circuit relay it falls through to the plain relay session below.
     if cfg.relay_only {
+        // The real gated relay-gate leg (no new public port, grant+possession pre-auth) takes
+        // priority when configured — `circuit_relay` (a directly-dialable relay multiaddr) is
+        // kept for the nat-lab test rig, not the deployed path.
+        if let Some(relay_gate_addr) = cfg.relay_gate_addr {
+            let relay_gate_cert = cfg
+                .relay_gate_cert
+                .clone()
+                .ok_or("CT_CHANNEL_RELAY_GATE set without CT_CHANNEL_RELAY_GATE_CERT")?;
+            let relay_conn = crate::transport::build_channel_dialer()?
+                .connect(cfg.relay_addr, "localhost")?
+                .await?;
+            let local = channel_local();
+            eprintln!(
+                "ct-agent channel: relay-only DCUtR-upgradable {:?} via relay-gate (relay {}, gate {})",
+                cfg.role, cfg.relay_addr, relay_gate_addr
+            );
+            return join_via_relay_gate_dcutr(
+                &relay_conn,
+                &request,
+                &cfg.holder,
+                cfg.role,
+                &cfg.own_noise_private,
+                local,
+                relay_gate_addr,
+                relay_gate_cert,
+                &cfg.grant,
+            )
+            .await;
+        }
         if let Some(circuit) = cfg.circuit_relay.clone() {
             let relay_conn = crate::transport::build_channel_dialer()?
                 .connect(cfg.relay_addr, "localhost")?
@@ -2035,6 +2349,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
         relay_ladder: relay_ladder.clone(),
         front_door_cert: front_door_cert.clone(),
         listener: shared_listener,
+        direct_upgrade: cfg.direct_upgrade,
     });
     let max = serve_concurrency_from_env(std::env::var("CT_CHANNEL_SERVE_CONCURRENCY").ok().as_deref());
     eprintln!("ct-agent channel: persistent serve — up to {max} concurrent sessions (#200)");
@@ -2071,6 +2386,8 @@ struct ServeSessionCtx {
     /// Bound once (Accept + not relay-only) and cloned per session; `None` for relay-only members
     /// (they can't be dialed directly) — those serve purely over the edge relay.
     listener: Option<Endpoint>,
+    /// #104, mirrors [`ChannelJoinCliConfig::direct_upgrade`] (`CT_CHANNEL_DIRECT_UPGRADE`).
+    direct_upgrade: bool,
 }
 
 /// #200: present the grant to the broker and park until the edge pairs the NEXT peer, returning that
@@ -2120,6 +2437,7 @@ async fn serve_admitted_session(
         DIRECT_DIAL_TIMEOUT,
         CHANNEL_ACCEPT_TIMEOUT,
         local,
+        ctx.direct_upgrade,
     )
     .await
 }
@@ -2128,6 +2446,10 @@ async fn serve_admitted_session(
 /// comfortably covers realistic demo concurrency (central's 5/10-at-once test) while bounding the
 /// fan-out of handler subprocesses (`claude -p`) a flood of Builds can trigger.
 const DEFAULT_SERVE_CONCURRENCY: usize = 8;
+
+/// #231: ceiling on the exponential backoff a persistent serve loop applies after consecutive
+/// **refused** (not transient) admission attempts — see [`serve_loop_concurrent`].
+const REFUSED_ADMISSION_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Parse `CT_CHANNEL_SERVE_CONCURRENCY` into a concurrency cap: a positive integer overrides the
 /// default; anything absent/blank/zero/malformed falls back to [`DEFAULT_SERVE_CONCURRENCY`]. Pure.
@@ -2144,9 +2466,10 @@ fn serve_concurrency_from_env(value: Option<&str>) -> usize {
 /// the next peer immediately instead of blocking on the whole session. `max` bounds in-flight
 /// sessions via a semaphore whose permit is taken BEFORE parking (backpressure: we never admit a peer
 /// we have no capacity to serve) and released when the session ends. A transient `admit` error is
-/// logged and retried after `retry_backoff`; a `serve` error is a single peer's problem, logged and
-/// dropped. Never returns under normal operation. Injectable so the concurrency contract is
-/// unit-testable without a real broker/relay.
+/// logged and retried after `retry_backoff`; a **refused** (definitive, not-a-member) admission
+/// backs off exponentially instead — see [`admission_retry_backoff`]. A `serve` error is a single
+/// peer's problem, logged and dropped. Never returns under normal operation. Injectable so the
+/// concurrency contract is unit-testable without a real broker/relay.
 async fn serve_loop_concurrent<A, Fa, S, Fs, W>(
     max: usize,
     retry_backoff: std::time::Duration,
@@ -2161,6 +2484,7 @@ where
     W: Send + 'static,
 {
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max.max(1)));
+    let mut consecutive_refusals: u32 = 0;
     loop {
         let permit = sem
             .clone()
@@ -2169,6 +2493,7 @@ where
             .expect("serve concurrency semaphore is never closed");
         match admit().await {
             Ok(work) => {
+                consecutive_refusals = 0;
                 let fut = serve(work);
                 tokio::spawn(async move {
                     let _permit = permit; // held for the whole session; frees a slot on drop
@@ -2179,11 +2504,51 @@ where
             }
             Err(e) => {
                 drop(permit);
+                let refused = is_definitive_admission_refusal(&e);
+                consecutive_refusals = if refused { consecutive_refusals.saturating_add(1) } else { 0 };
+                let backoff = admission_retry_backoff(retry_backoff, refused, consecutive_refusals);
                 eprintln!("ct-agent channel: admission error, re-admitting (#200): {e}");
-                tokio::time::sleep(retry_backoff).await;
+                tokio::time::sleep(backoff).await;
             }
         }
     }
+}
+
+/// #231: does an admission error mean the presenting holder was **definitively** refused (not a
+/// channel member — see `channel-join NO [not-member]` on the edge) rather than a transient
+/// failure (`edge broker/relay refused the channel join` are the exact strings
+/// [`run_one_admission_session`]'s ladder produces for this case; `channel join admission exchange
+/// stalled (#140)` and any other error are treated as transient/retryable-fast)? Pure string match
+/// on `Display` — the call chain flattens every failure to `BoxError` by the time it reaches
+/// [`serve_loop_concurrent`], so this is the only signal available without a wider error-type
+/// refactor across the admission ladder.
+fn is_definitive_admission_refusal(e: &BoxError) -> bool {
+    e.to_string().contains("refused the channel join")
+}
+
+/// #231: how long to wait before the next admission attempt. A definitive refusal (see
+/// [`is_definitive_admission_refusal`]) will never resolve itself without operator action — a
+/// holder that isn't a channel member stays that way until someone adds it — so retrying at the
+/// same fast `retry_backoff` used for transient errors (200ms in production) does nothing but
+/// flood the edge's admission path with attempts that can never succeed. Live-reproduced: an
+/// orphaned process retrying a not-member holder measured at ~24-47 admission attempts/second
+/// against the production edge, plausibly starving OTHER, genuinely valid joins of admission
+/// capacity (the exact symptom #231 describes). Backs off exponentially
+/// (`retry_backoff * 2^consecutive_refusals`), capped at [`REFUSED_ADMISSION_BACKOFF_CAP`]; a
+/// transient error always gets the fast, unchanged `retry_backoff` so a genuine brief CP/edge
+/// blip (#140) still recovers quickly. Pure — the loop supplies `consecutive_refusals`.
+fn admission_retry_backoff(
+    retry_backoff: std::time::Duration,
+    refused: bool,
+    consecutive_refusals: u32,
+) -> std::time::Duration {
+    if !refused {
+        return retry_backoff;
+    }
+    let shift = consecutive_refusals.min(16); // avoids overflow in 2^shift well before the cap binds
+    retry_backoff
+        .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
+        .min(REFUSED_ADMISSION_BACKOFF_CAP)
 }
 
 /// #179: should `ct-agent channel` stay parked and re-admit successive peers? Only the **accept**
@@ -2251,6 +2616,7 @@ async fn run_one_admission_session(
         DIRECT_DIAL_TIMEOUT,
         CHANNEL_ACCEPT_TIMEOUT,
         local,
+        cfg.direct_upgrade,
     )
     .await
 }
@@ -2260,6 +2626,21 @@ async fn run_one_admission_session(
 /// fast — the signal to fall back to the edge relay — instead of hanging on the QUIC
 /// handshake's retransmits.
 pub const DIRECT_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #104: build this member's in-band relay->direct upgrade candidate from its own
+/// edge-observed reflexive address (learned during THIS admission — the edge tells a
+/// member its own address as part of `ChannelJoinOutcome::Admitted`, over the same
+/// already-authenticated broker/relay connection, never a new open port). Binds a fresh
+/// ephemeral direct listener (`0.0.0.0:0`) purely for this upgrade attempt — a listener
+/// distinct from `CT_CHANNEL_LISTEN`'s, never advertised to the broker or to anyone but
+/// this one already-Noise-verified peer. `None` when the edge reported no reflexive
+/// address for this admission (e.g. the `:443` front-door leg doesn't observe one) or the
+/// listener fails to bind — the session then simply stays on the relay, unaffected.
+async fn build_upgrade_candidate(observed_reflexive: Option<SocketAddr>) -> Option<(Endpoint, String)> {
+    let addr = observed_reflexive?;
+    let (listener, _cert) = crate::transport::build_direct_listener().ok()?;
+    Some((listener, addr.to_string()))
+}
 
 /// Why a direct dial to a paired peer did not connect (#72 AF4-session-resilience).
 #[derive(Debug)]
@@ -4012,6 +4393,72 @@ mod tests {
         assert_eq!(admits.load(Ordering::SeqCst), 2, "backpressure stopped admitting a peer we couldn't serve");
     }
 
+    #[test]
+    fn is_definitive_admission_refusal_matches_only_the_refused_strings() {
+        // #231: exactly the strings run_one_admission_session's ladder produces for a not-a-member
+        // holder (lines 319/400/447/699) — everything else, including the #140 stall symptom, is
+        // transient and must keep the fast retry.
+        assert!(is_definitive_admission_refusal(&"edge broker refused the channel join".into()));
+        assert!(is_definitive_admission_refusal(&"edge relay refused the channel join".into()));
+        assert!(is_definitive_admission_refusal(
+            &"edge relay refused the channel join over the :443 front door".into()
+        ));
+        assert!(
+            !is_definitive_admission_refusal(&"channel join admission exchange stalled (#140)".into()),
+            "#140 stalls are transient, not a definitive refusal"
+        );
+        assert!(!is_definitive_admission_refusal(&"connection reset by peer".into()));
+    }
+
+    #[test]
+    fn admission_retry_backoff_is_flat_for_transient_and_exponential_for_refused() {
+        // #231: a transient error always gets the unchanged fast retry regardless of streak length
+        // (a genuine CP/edge blip must keep recovering quickly, per #140's own fix).
+        let base = std::time::Duration::from_millis(200);
+        assert_eq!(admission_retry_backoff(base, false, 0), base);
+        assert_eq!(admission_retry_backoff(base, false, 50), base, "transient errors never back off");
+
+        // A definitive refusal doubles per consecutive occurrence...
+        assert_eq!(admission_retry_backoff(base, true, 1), base * 2);
+        assert_eq!(admission_retry_backoff(base, true, 2), base * 4);
+        assert_eq!(admission_retry_backoff(base, true, 3), base * 8);
+        // ...and is clamped at the cap instead of growing (or overflowing) without bound.
+        assert_eq!(admission_retry_backoff(base, true, 100), REFUSED_ADMISSION_BACKOFF_CAP);
+        assert_eq!(admission_retry_backoff(base, true, u32::MAX), REFUSED_ADMISSION_BACKOFF_CAP);
+    }
+
+    #[tokio::test]
+    async fn serve_loop_backs_off_a_definitive_refusal_instead_of_hot_looping() {
+        // #231 live reproduction: a holder that will never be a member (a stray/orphaned process,
+        // observed on the real production edge retrying ~24-47x/second at the OLD flat 200ms
+        // backoff) must not keep admitting at the fast transient-error rate — it starves other,
+        // genuinely valid joins of the edge's admission capacity. With a 10ms base backoff and a
+        // 300ms window, an unfixed flat retry would attempt roughly 30 times; the exponential
+        // backoff must land far fewer.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let a = attempts.clone();
+        let admit = move || {
+            let a = a.clone();
+            async move {
+                a.fetch_add(1, Ordering::SeqCst);
+                Err::<(), BoxError>("edge broker refused the channel join".into())
+            }
+        };
+        let serve = move |_w: ()| async move { Ok::<(), BoxError>(()) };
+
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            serve_loop_concurrent(4, std::time::Duration::from_millis(10), admit, serve),
+        )
+        .await;
+
+        let n = attempts.load(Ordering::SeqCst);
+        assert!(n >= 1, "attempted admission at least once");
+        assert!(n < 10, "exponential backoff kept the refused holder well under the flat-retry rate, got {n} attempts");
+    }
+
     #[tokio::test]
     async fn crew_build_over_runs_the_crew_and_fails_closed() {
         // #171/#173 c2 driver (frozen): safety_check → physics → art over three role channels,
@@ -4260,6 +4707,89 @@ mod tests {
         let mut bad_fd = base.clone();
         bad_fd.push(("CT_CHANNEL_FRONT_DOOR", "not-an-addr".into()));
         assert!(lookup(&bad_fd).is_err(), "malformed CT_CHANNEL_FRONT_DOOR rejected");
+
+        // A host:port hostname resolves, exactly like CT_CHANNEL_BROKER/CT_CHANNEL_RELAY
+        // already do (#214) -- a real regression: this used to be a bare SocketAddr parse
+        // with no resolver, so a compose-network service name like "edge:443" failed with
+        // "invalid socket address syntax" even though the identical hostname worked fine
+        // for CT_CHANNEL_BROKER/CT_CHANNEL_RELAY on the same line.
+        let mut hostname_fd = base.clone();
+        hostname_fd.push(("CT_CHANNEL_FRONT_DOOR", "localhost:443".into()));
+        let cfg = lookup(&hostname_fd).expect("a host:port hostname resolves for the front door too");
+        assert!(cfg.front_door.expect("front door set").ip().is_loopback(), "localhost resolves to loopback");
+
+        // CT_CHANNEL_ADVERTISE absent -> advertise_addr defaults to listen_addr, unchanged
+        // behavior from before this field existed.
+        assert_eq!(cfg.advertise_addr, cfg.listen_addr, "advertise defaults to listen when unset");
+    }
+
+    #[test]
+    fn channel_advertise_address_splits_bind_from_dial_target() {
+        // A containerized accept-side member binds a private/unspecified address
+        // (CT_CHANNEL_LISTEN=0.0.0.0:7000, works inside any container) but is reached at
+        // a different, real public one (CT_CHANNEL_ADVERTISE, e.g. a Docker port-published
+        // <public-ip>:<port>) -- mirrors CT_AGENT_DIRECT_ADVERTISE's existing split for the
+        // Browser-Plane tunnel path. Relay-only auto-detection and the peer-facing
+        // admission endpoint must both follow the ADVERTISED address, not the bind one.
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ed25519_dalek::Signer;
+        let op = SigningKey::from_bytes(&[8u8; 32]);
+        let holder = SigningKey::from_bytes(&[0x22u8; 32]);
+        let g = ChannelGrant {
+            channel: ChannelId([0xCDu8; 32]),
+            holder: holder.verifying_key().to_bytes(),
+            direction: Direction::Accept,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        let grant_hex = hex_encode(&SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }.encode());
+        let hk = "3333333333333333333333333333333333333333333333333333333333333333";
+        let nk = "4444444444444444444444444444444444444444444444444444444444444444";
+        let base: Vec<(&str, String)> = vec![
+            ("CT_CHANNEL_ROLE", "accept".into()),
+            ("CT_CHANNEL_BROKER", "203.0.113.5:9443".into()),
+            ("CT_CHANNEL_RELAY", "203.0.113.5:9444".into()),
+            ("CT_CHANNEL_LISTEN", "0.0.0.0:7000".into()),
+            ("CT_CHANNEL_GRANT", grant_hex),
+            ("CT_CHANNEL_HOLDER_KEY", hk.into()),
+            ("CT_CHANNEL_NOISE_KEY", nk.into()),
+        ];
+        let lookup = |pairs: &[(&str, String)]| {
+            let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+            ChannelJoinCliConfig::from_lookup(move |k| m.get(k).cloned())
+        };
+
+        // Bind is 0.0.0.0:7000 (not globally routable) and no CT_CHANNEL_ADVERTISE is set ->
+        // auto-detected relay-only, exactly as before this field existed.
+        let cfg = lookup(&base).expect("binds on 0.0.0.0 without an advertise override");
+        assert!(cfg.relay_only, "an unspecified bind with no advertise override is relay-only");
+
+        // With a real public CT_CHANNEL_ADVERTISE, the member is dialable: relay_only is
+        // false, the bind address is unchanged (still 0.0.0.0:7000, what the process
+        // actually binds), and the admission endpoint sent to the broker is the
+        // ADVERTISED address, not the bind address.
+        let mut with_adv = base.clone();
+        with_adv.push(("CT_CHANNEL_ADVERTISE", "203.0.113.9:7000".into()));
+        let cfg = lookup(&with_adv).expect("advertise override parses");
+        assert!(!cfg.relay_only, "a globally-routable advertise override is directly dialable");
+        assert_eq!(cfg.listen_addr, "0.0.0.0:7000".parse().unwrap(), "bind address is unchanged");
+        assert_eq!(cfg.advertise_addr, "203.0.113.9:7000".parse().unwrap());
+
+        // A set-but-malformed advertise override is a hard error (a typo must not
+        // silently fall back to the unroutable bind address).
+        let mut bad_adv = base.clone();
+        bad_adv.push(("CT_CHANNEL_ADVERTISE", "not-an-addr".into()));
+        assert!(lookup(&bad_adv).is_err(), "malformed CT_CHANNEL_ADVERTISE rejected");
+
+        // #104: CT_CHANNEL_DIRECT_UPGRADE absent -> off, unchanged behavior from before
+        // this option existed.
+        assert!(!cfg.direct_upgrade, "direct-upgrade defaults to off");
+
+        let mut with_upgrade = base.clone();
+        with_upgrade.push(("CT_CHANNEL_DIRECT_UPGRADE", "1".into()));
+        let cfg = lookup(&with_upgrade).expect("direct-upgrade opt-in parses");
+        assert!(cfg.direct_upgrade, "CT_CHANNEL_DIRECT_UPGRADE=1 opts in");
     }
 
     #[test]
@@ -4611,6 +5141,7 @@ mod tests {
                 std::time::Duration::from_secs(5),
                 std::time::Duration::from_secs(5),
                 a_local_run,
+                false,
             )
             .await
         });
@@ -4679,14 +5210,14 @@ mod tests {
         let a = tokio::spawn(async move {
             let c = build_client_endpoint(cert).expect("client");
             let conn = c.connect(relay_addr, "localhost").expect("cfg").await.expect("conn");
-            join_via_relay(&conn, &req_a, &holder_a, ChannelRole::Initiate, &na, &nbpub, a_local_run).await
+            join_via_relay(&conn, &req_a, &holder_a, ChannelRole::Initiate, &na, &nbpub, a_local_run, None).await
         });
         let (nb, napub) = (noise_b.private, noise_a.public);
         let (mut b_local_test, b_local_run) = tokio::io::duplex(8192);
         let b = tokio::spawn(async move {
             let c = build_client_endpoint(cert_b).expect("client");
             let conn = c.connect(relay_addr, "localhost").expect("cfg").await.expect("conn");
-            join_via_relay(&conn, &req_b, &holder_b, ChannelRole::Accept, &nb, &napub, b_local_run).await
+            join_via_relay(&conn, &req_b, &holder_b, ChannelRole::Accept, &nb, &napub, b_local_run, None).await
         });
 
         // Application data flows A -> B over the relayed, encrypted A2A tunnel.
@@ -4811,6 +5342,7 @@ mod tests {
                 &na,
                 &nbpub,
                 a_local,
+                None,
             )
             .await
         });
@@ -4826,6 +5358,7 @@ mod tests {
                 &nb,
                 &napub,
                 b_local,
+                None,
             )
             .await
         });
@@ -5132,7 +5665,7 @@ mod tests {
         let b = tokio::spawn(async move {
             let rc = build_client_endpoint(relay_cert).expect("rc b");
             let relay_conn = rc.connect(relay_addr, "localhost").expect("cfg").await.expect("rconn b");
-            join_via_relay(&relay_conn, &req_b, &holder_b, ChannelRole::Accept, &nb, &nap, b_local_run).await
+            join_via_relay(&relay_conn, &req_b, &holder_b, ChannelRole::Accept, &nb, &nap, b_local_run, None).await
         });
 
         let payload = b"auto-recovered onto the relay after the direct path was blocked";
@@ -5225,6 +5758,7 @@ mod tests {
                 std::time::Duration::from_millis(400),
                 std::time::Duration::from_secs(2),
                 a_local_run,
+                false,
             )
             .await
         });
@@ -5236,7 +5770,7 @@ mod tests {
         let b = tokio::spawn(async move {
             let rc = build_client_endpoint(relay_cert).expect("rc b");
             let relay_conn = rc.connect(relay_addr, "localhost").expect("cfg").await.expect("rconn b");
-            join_via_relay(&relay_conn, &req_b, &holder_b, ChannelRole::Accept, &nb, &nap, b_local_run).await
+            join_via_relay(&relay_conn, &req_b, &holder_b, ChannelRole::Accept, &nb, &nap, b_local_run, None).await
         });
 
         let payload = b"lazily-dialed relay carries the tunnel (#103)";
@@ -5618,6 +6152,24 @@ mod tests {
         assert!(parse_circuit_relay(Some("not-a-multiaddr".to_string())).is_err());
     }
 
+    #[tokio::test]
+    async fn build_upgrade_candidate_binds_an_ephemeral_listener_only_when_reflexive_is_known() {
+        // #104: no observed_reflexive (e.g. the edge reported none for this admission) ->
+        // no candidate, no listener bound -- direct_upgrade being on is a no-op for this
+        // session, exactly the same as before the option existed.
+        assert!(build_upgrade_candidate(None).await.is_none(), "no reflexive -> no candidate");
+
+        // A real reflexive address -> a real, freshly-bound ephemeral listener plus the
+        // address string unchanged (the candidate offered in-band is exactly what the edge
+        // observed, never anything self-selected).
+        let addr: SocketAddr = "203.0.113.7:4433".parse().unwrap();
+        let (listener, offered) = build_upgrade_candidate(Some(addr)).await.expect("candidate built");
+        assert_eq!(offered, "203.0.113.7:4433", "offers exactly the edge-observed address");
+        let bound = listener.local_addr().expect("listener is actually bound");
+        assert_eq!(bound.ip(), std::net::Ipv4Addr::UNSPECIFIED, "binds 0.0.0.0, not the offered address");
+        assert_ne!(bound.port(), 0, "the ephemeral port was actually assigned by the OS");
+    }
+
     #[test]
     fn upgrade_safe_endpoint_refuses_ssrf_ranges_and_admits_only_global_unicast() {
         // #137 (frozen): the responder's SSRF guard for the peer-conveyed #104 Offer.direct_endpoint.
@@ -5741,6 +6293,7 @@ mod tests {
                 std::time::Duration::from_secs(5),
                 std::time::Duration::from_secs(5),
                 a_local,
+                false,
             )
             .await
         });
@@ -5770,6 +6323,7 @@ mod tests {
                 std::time::Duration::from_secs(5),
                 std::time::Duration::from_secs(5),
                 b_local,
+                false,
             )
             .await
         });
@@ -5788,6 +6342,143 @@ mod tests {
 
         // Both payloads are confirmed received BEFORE any teardown, so there is no last-byte
         // race to lose; abort the tasks to end the still-open sessions.
+        a.abort();
+        b.abort();
+        relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn direct_upgrade_opt_in_still_completes_over_the_relay_when_the_candidate_is_unsafe() {
+        // #104 wiring, real proof: with CT_CHANNEL_DIRECT_UPGRADE on and a real
+        // edge-observed reflexive address baked into the admission (exactly what a live
+        // admission delivers), the session still round-trips a real payload byte-exact —
+        // it does NOT hang, error, or silently drop data. On loopback the "reflexive"
+        // address is necessarily non-global-unicast, so the responder's #137 SSRF guard
+        // (upgrade_safe_endpoint) correctly refuses the in-band upgrade candidate and the
+        // session gracefully stays on the relay -- the same behavior this project's own
+        // single-host demos get in production, and exactly what "on: but nothing routable
+        // to offer" must do: never break the session, never silently accept an unsafe
+        // target.
+        use ct_common::channel::{
+            member_noise_attest_bytes, ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant,
+            CHANNEL_ENDPOINT_RELAY_ONLY,
+        };
+        use ct_common::noise::generate_static_keypair;
+        use ct_edge::channel_broker::broker_channel_relay;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use ed25519_dalek::Signer;
+
+        let op = SigningKey::from_bytes(&[9u8; 32]);
+        let op_pub = op.verifying_key().to_bytes();
+        let holder_a = SigningKey::from_bytes(&[0x31u8; 32]);
+        let holder_b = SigningKey::from_bytes(&[0x32u8; 32]);
+        let channel = [0xE6u8; 32];
+        let noise_a = generate_static_keypair();
+        let noise_b = generate_static_keypair();
+        let signed = |h: &SigningKey, dir| {
+            let g = ChannelGrant {
+                channel: ChannelId(channel),
+                holder: SigningKey::verifying_key(h).to_bytes(),
+                direction: dir,
+                rights: Rights::ReadWrite,
+                delegable: false,
+                expires_at: 1_000,
+            };
+            SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }
+        };
+        let req_a = ChannelJoinRequest {
+            grant: signed(&holder_a, Direction::Initiate),
+            endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+        };
+        let req_b = ChannelJoinRequest {
+            grant: signed(&holder_b, Direction::Accept),
+            endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+        };
+        let ha_pub = holder_a.verifying_key().to_bytes();
+        let hb_pub = holder_b.verifying_key().to_bytes();
+        let a_att = holder_a.sign(&member_noise_attest_bytes(&ChannelId(channel), &ha_pub, &noise_a.public)).to_bytes();
+        let b_att = holder_b.sign(&member_noise_attest_bytes(&ChannelId(channel), &hb_pub, &noise_b.public)).to_bytes();
+
+        let (relay_ep, cert) = build_server_endpoint_with_cert().expect("relay ep");
+        let relay_addr = relay_ep.local_addr().expect("addr");
+        let relay_task = tokio::spawn(async move {
+            broker_channel_relay(&relay_ep, 500, move |c, _h| async move {
+                (c.0 == channel).then_some((op_pub, None, None))
+            })
+            .await
+            .map(|_| ())
+        });
+
+        // Member A: direct_upgrade ON, with a real (loopback) observed_reflexive -- exactly
+        // the shape a live edge admission delivers, just not a globally-routable address.
+        let cert_a = cert.clone();
+        let (mut a_app, a_local) = tokio::io::duplex(8192);
+        let (na, nbpub) = (noise_a.private, noise_b.public);
+        let a = tokio::spawn(async move {
+            let rc = build_client_endpoint(cert_a).expect("rc a");
+            let relay_conn = rc.connect(relay_addr, "localhost").expect("cfg").await.expect("rconn a");
+            let admission = ChannelJoinOutcome::Admitted {
+                peer_endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+                peer_noise_pubkey: Some(nbpub),
+                peer_holder: Some(hb_pub),
+                peer_attestation: Some(b_att),
+                observed_reflexive: Some("127.0.0.1:7001".parse().unwrap()),
+            };
+            run_channel_join_with_admission(
+                admission,
+                RelayFallback::Quic(&relay_conn),
+                &req_a,
+                &holder_a,
+                ChannelRole::Initiate,
+                &na,
+                None,
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+                a_local,
+                true, // #104 direct_upgrade opt-in
+            )
+            .await
+        });
+
+        let cert_b = cert.clone();
+        let (mut b_app, b_local) = tokio::io::duplex(8192);
+        let (nb, napub) = (noise_b.private, noise_a.public);
+        let b = tokio::spawn(async move {
+            let rc = build_client_endpoint(cert_b).expect("rc b");
+            let relay_conn = rc.connect(relay_addr, "localhost").expect("cfg").await.expect("rconn b");
+            let admission = ChannelJoinOutcome::Admitted {
+                peer_endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+                peer_noise_pubkey: Some(napub),
+                peer_holder: Some(ha_pub),
+                peer_attestation: Some(a_att),
+                observed_reflexive: Some("127.0.0.1:7002".parse().unwrap()),
+            };
+            run_channel_join_with_admission(
+                admission,
+                RelayFallback::Quic(&relay_conn),
+                &req_b,
+                &holder_b,
+                ChannelRole::Accept,
+                &nb,
+                None,
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+                b_local,
+                true, // #104 direct_upgrade opt-in
+            )
+            .await
+        });
+
+        a_app.write_all(b"ping-A-to-B").await.expect("a writes");
+        let mut got = [0u8; 11];
+        b_app.read_exact(&mut got).await.expect("b reads A's bytes despite the upgrade attempt");
+        assert_eq!(&got, b"ping-A-to-B", "direct_upgrade=on still delivers real plaintext via the relay");
+
+        b_app.write_all(b"pong-B-to-A").await.expect("b writes");
+        let mut got2 = [0u8; 11];
+        a_app.read_exact(&mut got2).await.expect("a reads B's bytes despite the upgrade attempt");
+        assert_eq!(&got2, b"pong-B-to-A", "full-duplex still works with direct_upgrade on both sides");
+
         a.abort();
         b.abort();
         relay_task.abort();
