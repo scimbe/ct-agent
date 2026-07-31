@@ -520,6 +520,7 @@ where
                 }
             };
             let coord = UpgradeCoordinator::with_backoff(Role::Initiator, 0, 1, 100);
+            eprintln!("ct-agent channel: #104 upgrade — offering direct candidate {endpoint} in-band");
             run_upgradable_session_initiator(
                 relay_send,
                 relay_recv,
@@ -532,10 +533,43 @@ where
                 move || async move {
                     // Accept the incoming direct dial (the responder dials us), then handshake as the
                     // direct-Noise RESPONDER (the dialer is the Noise initiator).
-                    let incoming = tokio::time::timeout(dial_timeout, listener.accept()).await.ok()??;
-                    let conn = incoming.await.ok()?;
-                    let (s, r) = conn.accept_bi().await.ok()?;
-                    establish_direct_session(s, r, false, &direct_priv, &direct_peer).await.ok()
+                    let incoming = match tokio::time::timeout(dial_timeout, listener.accept()).await {
+                        Ok(Some(i)) => i,
+                        Ok(None) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct listener closed with no incoming — staying on relay");
+                            return None;
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "ct-agent channel: #104 upgrade — no incoming direct dial within {dial_timeout:?} — staying on relay"
+                            );
+                            return None;
+                        }
+                    };
+                    let conn = match incoming.await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("ct-agent channel: #104 upgrade — incoming direct connection failed ({e}) — staying on relay");
+                            return None;
+                        }
+                    };
+                    let (s, r) = match conn.accept_bi().await {
+                        Ok(sr) => sr,
+                        Err(e) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct bi-stream accept failed ({e}) — staying on relay");
+                            return None;
+                        }
+                    };
+                    match establish_direct_session(s, r, false, &direct_priv, &direct_peer).await {
+                        Ok(session) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct Noise session established, cutting over from relay");
+                            Some(session)
+                        }
+                        Err(e) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct Noise handshake failed ({e}) — staying on relay");
+                            None
+                        }
+                    }
                 },
             )
             .await
@@ -553,14 +587,45 @@ where
                 // #137 SSRF guard: the offered endpoint is peer-conveyed and never passed the edge
                 // broker's `safe_endpoint` gate, so apply the identical range filter here — refuse
                 // to even signal Ready for an internal/private/metadata target.
-                |ep: String| async move { upgrade_safe_endpoint(&ep).is_some() },
+                |ep: String| async move {
+                    let safe = upgrade_safe_endpoint(&ep).is_some();
+                    eprintln!(
+                        "ct-agent channel: #104 upgrade — peer offered direct candidate {ep}{}",
+                        if safe { "" } else { " (rejected: not a global-unicast address, #137)" }
+                    );
+                    safe
+                },
                 move |ep: String| async move {
                     // Dial the offered endpoint (SSRF-guarded, #137) and handshake as the
                     // direct-Noise INITIATOR. A non-global-unicast target is refused → stay on relay.
-                    let addr = upgrade_safe_endpoint(&ep)?;
-                    let conn = dial_peer_direct(addr, dial_timeout).await.ok()?;
-                    let (s, r) = conn.open_bi().await.ok()?;
-                    establish_direct_session(s, r, true, &direct_priv, &direct_peer).await.ok()
+                    let addr = match upgrade_safe_endpoint(&ep) {
+                        Some(a) => a,
+                        None => return None, // already logged as rejected above
+                    };
+                    let conn = match dial_peer_direct(addr, dial_timeout).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct dial to {addr} failed ({e:?}) — staying on relay");
+                            return None;
+                        }
+                    };
+                    let (s, r) = match conn.open_bi().await {
+                        Ok(sr) => sr,
+                        Err(e) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct bi-stream open to {addr} failed ({e}) — staying on relay");
+                            return None;
+                        }
+                    };
+                    match establish_direct_session(s, r, true, &direct_priv, &direct_peer).await {
+                        Ok(session) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct Noise session established with {addr}, cutting over from relay");
+                            Some(session)
+                        }
+                        Err(e) => {
+                            eprintln!("ct-agent channel: #104 upgrade — direct Noise handshake with {addr} failed ({e}) — staying on relay");
+                            None
+                        }
+                    }
                 },
             )
             .await
