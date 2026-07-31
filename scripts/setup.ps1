@@ -131,7 +131,7 @@ function Import-DotEnv {
   }
 
   $missing = @()
-  foreach ($v in 'CT_AGENT_CP_URL','CT_AGENT_HOSTNAME','CT_AGENT_ORIGIN','CT_AGENT_ORIGIN_PROTO') {
+  foreach ($v in 'CT_AGENT_CP_URL','CT_AGENT_HOSTNAME','CT_AGENT_ORIGIN') {
     if (-not (Get-Item "env:$v" -ErrorAction SilentlyContinue).Value) { $missing += $v }
   }
   if (-not $env:CT_AGENT_JOIN_TOKEN) { $missing += 'CT_AGENT_JOIN_TOKEN (or CT_BOOTSTRAP)' }
@@ -147,6 +147,12 @@ function Import-DotEnv {
   # forever, not just error, so this is defaulted rather than left optional.
   if (-not $env:CT_AGENT_MODE)          { $env:CT_AGENT_MODE = 'browser' }
   if (-not $env:CT_AGENT_EDGE_CERT_URL) { $env:CT_AGENT_EDGE_CERT_URL = $env:CT_AGENT_CP_URL }
+  # ct-agent itself defaults CT_AGENT_ORIGIN_PROTO to tcp when unset (config.rs) --
+  # this was wrongly required above (pre-dating this default in the .env template,
+  # and absent from the portal's own generated .env snippet), breaking any .env
+  # without an explicit CT_AGENT_ORIGIN_PROTO line. Match the binary's own default
+  # instead of hard-requiring it -- parity with setup.sh's identical fix.
+  if (-not $env:CT_AGENT_ORIGIN_PROTO)  { $env:CT_AGENT_ORIGIN_PROTO = 'tcp' }
   # A fresh CT_AGENT_ID every run would break restore: ct-agent's onboard_or_restore
   # only reuses persisted identity/tenant when CT_AGENT_ID matches the "agent" file
   # written at onboard time -- otherwise it silently falls through to re-onboarding
