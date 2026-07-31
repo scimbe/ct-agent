@@ -91,7 +91,7 @@ async fn open_channel_streams(
     role: ChannelRole,
     setup_timeout: std::time::Duration,
 ) -> io::Result<(quinn::SendStream, quinn::RecvStream)> {
-    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::new(io::ErrorKind::Other, e.to_string());
+    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::other(e.to_string());
     let open = async {
         match role {
             ChannelRole::Initiate => conn.open_bi().await.map_err(|e| map_err(Box::new(e))),
@@ -418,7 +418,7 @@ where
     };
     // The DCUtR session runs the Noise_IK over the relay bi-stream as its base leg, punching to
     // direct in the background. Initiator opens the bi-stream; acceptor accepts the edge-opened one.
-    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::new(io::ErrorKind::Other, e.to_string());
+    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::other(e.to_string());
     let (relay_send, relay_recv) = match role {
         ChannelRole::Initiate => relay_conn.open_bi().await.map_err(|e| map_err(Box::new(e)))?,
         ChannelRole::Accept => relay_conn.accept_bi().await.map_err(|e| map_err(Box::new(e)))?,
@@ -467,7 +467,7 @@ where
         run_upgradable_session_initiator, run_upgradable_session_responder, Role, UpgradeCoordinator,
     };
 
-    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::new(io::ErrorKind::Other, e.to_string());
+    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::other(e.to_string());
     let (relay_send, relay_recv) = match role {
         ChannelRole::Initiate => relay_conn.open_bi().await.map_err(|e| map_err(Box::new(e)))?,
         ChannelRole::Accept => relay_conn.accept_bi().await.map_err(|e| map_err(Box::new(e)))?,
@@ -1511,7 +1511,7 @@ where
     let v: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if let Some(err) = v.get("error") {
-        return Err(io::Error::new(io::ErrorKind::Other, format!("service/{slug} returned an error: {err}")));
+        return Err(io::Error::other(format!("service/{slug} returned an error: {err}")));
     }
     v.get("result")
         .and_then(|r| r.get("output"))
@@ -3254,7 +3254,7 @@ mod tests {
             "CT_CHANNEL_NOISE_PUBKEY" => Some(hx(&noise_pub)),
             _ => None,
         };
-        let req = MemberMaterialRequest::from_lookup(&env).unwrap();
+        let req = MemberMaterialRequest::from_lookup(env).unwrap();
         let (channel, holder_pub, attestation) = req.compute();
         assert_eq!(holder_pub, holder.verifying_key().to_bytes(), "holder pubkey derived from the private key");
         assert_eq!(channel, channel_id_for_link(&operator, &bridge, &holder_pub), "canonical operator-scoped link id");
@@ -3289,7 +3289,7 @@ mod tests {
             "CT_CHANNEL_NOISE_PUBKEY" => Some(hx(&noise_pub)),
             _ => None,
         };
-        let req = PipelineRoleMaterialRequest::from_lookup(&env).unwrap();
+        let req = PipelineRoleMaterialRequest::from_lookup(env).unwrap();
         let (channel, holder_pub, attestation) = req.compute();
         assert_eq!(holder_pub, holder.verifying_key().to_bytes(), "holder pubkey derived from the private key");
         assert_eq!(
@@ -3313,7 +3313,7 @@ mod tests {
             "CT_CHANNEL_NOISE_PUBKEY" => Some(hx(&noise_pub)),
             _ => None,
         };
-        let (other_channel, _, _) = PipelineRoleMaterialRequest::from_lookup(&other_env).unwrap().compute();
+        let (other_channel, _, _) = PipelineRoleMaterialRequest::from_lookup(other_env).unwrap().compute();
         assert_eq!(channel, other_channel, "same pipeline+role -> same channel, independent of which holder asks");
 
         // the rendered block carries pipeline_id, role, and all derived values.

@@ -1000,8 +1000,7 @@ mod tests {
         let conn = dial_quic(addr, cert).await.expect("dial");
         let err = register_tunnel(&conn, &RoutingToken([3u8; 32]))
             .await
-            .err()
-            .expect("non-OK ack must error")
+            .expect_err("non-OK ack must error")
             .to_string();
         assert!(err.contains("rejected tunnel registration"), "{err}");
         conn.close(0u32.into(), b"done");
@@ -1021,8 +1020,7 @@ mod tests {
             assert_eq!(res.is_ok(), expect_ok, "ack={ack:?}");
             if !expect_ok {
                 assert!(res
-                    .err()
-                    .expect("rejected")
+                    .expect_err("rejected")
                     .to_string()
                     .contains("advertisement rejected"));
             }
@@ -1048,8 +1046,7 @@ mod tests {
         let conn2 = dial_quic(addr2, cert2).await.expect("dial");
         let err = bind_hostname(&conn2, &token, "x.test")
             .await
-            .err()
-            .expect("non-OK ack must error");
+            .expect_err("non-OK ack must error");
         assert!(err.to_string().contains("rejected hostname"), "{err}");
         conn2.close(0u32.into(), b"done");
         let _ = edge2.await;

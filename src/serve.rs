@@ -237,7 +237,7 @@ where
     let ts = Mutex::new(transport);
     // `e` is inferred as snow::Error from the map_err call sites (naming it would
     // need snow as a direct dep, which ct-agent gets only transitively).
-    let noise_err = |e| io::Error::new(io::ErrorKind::Other, format!("{e}"));
+    let noise_err = |e| io::Error::other(format!("{e}"));
 
     // Client -> decrypt frame -> UDP datagram to Origin.
     let to_origin = async {

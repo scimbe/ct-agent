@@ -1,7 +1,7 @@
 //! Capability minting (ADR-0014).
 //!
-//! The Agent mints a self-contained Capability (Routing Token + Origin Identity
-//! + Edge address) that the customer distributes out of band. P2.2 mints the
+//! The Agent mints a self-contained Capability (Routing Token, Origin Identity,
+//! and Edge address) that the customer distributes out of band. P2.2 mints the
 //! Capability with a fresh random Routing Token; its token is what the control
 //! plane registers in the Tunnel Registry (ADR-0006).
 
@@ -381,8 +381,7 @@ mod tests {
         std::fs::write(&key, b"short").unwrap(); // not 32 bytes
         let dir = tmp("bk-dir");
         let err = rotate_origin_key(&key, &cap, &dir)
-            .err()
-            .expect("a non-32-byte current key must be rejected");
+            .expect_err("a non-32-byte current key must be rejected");
         assert!(err.to_string().contains("not 32 bytes"), "{err}");
         let _ = std::fs::remove_file(&key);
         let _ = std::fs::remove_file(&cap);

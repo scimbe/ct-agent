@@ -80,7 +80,7 @@ impl AccountKey {
             jwk["x"].as_str().unwrap(),
             jwk["y"].as_str().unwrap(),
         );
-        b64url(&ring::digest::digest(&ring::digest::SHA256, canonical.as_bytes()).as_ref()[..])
+        b64url(ring::digest::digest(&ring::digest::SHA256, canonical.as_bytes()).as_ref())
     }
 
     fn sign(&self, signing_input: &str) -> Result<Vec<u8>, BoxError> {
