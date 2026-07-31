@@ -10,11 +10,11 @@ repository = "https://github.com/scimbe/ct-agent"
 [dependencies]
 # Pinned to a CADS-Tunnel tag (not vendored, not crates.io-published yet) so ct-common's
 # breaking changes never silently drift out from under this repo -- bump the tag deliberately.
-ct-common = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.3.1" }
-ct-control-plane = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.3.1" }
+ct-common = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.1" }
+ct-control-plane = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.1" }
 # ACME (ADR-0003): Dns01Provider (SelfHosted ct-dns / deSEC) publishes the
 # _acme-challenge TXT record the DNS-01 validation reads.
-ct-dns = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.3.1" }
+ct-dns = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.1" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time"] }
 # TCP keepalive (#229) for the TLS-TCP fallback: unlike QUIC (which already
@@ -73,5 +73,5 @@ http-body-util = "0.1"
 # Cross-crate integration tests (channel.rs, transport.rs, serve.rs, channel_run.rs) drive
 # a real ct-edge relay / ct-client dialer end-to-end. Same pinned-tag git dependency as the
 # runtime deps above -- these are dev-only, never shipped in a release binary.
-ct-edge = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.3.1" }
-ct-client = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.3.1" }
+ct-edge = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.1" }
+ct-client = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.1" }
