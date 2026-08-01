@@ -14,8 +14,43 @@ use ct_agent::transport::load_cert;
 
 const EDGE_CERT_WAIT_LOG_THROTTLE_SECS: u64 = 5;
 
+/// #239: a bare `ct-agent --help`/`-h`, or any unrecognized first argument, used to
+/// fall straight through every subcommand check below into the default onboard/serve
+/// path -- a typo'd subcommand didn't fail loudly, it started serving. Three separate
+/// docs pages ended up independently documenting "don't rely on --help, read this
+/// page instead" as a workaround. This is the actual reference now; keep it in sync
+/// with the subcommand checks below when one is added, removed, or renamed.
+const USAGE: &str = "\
+ct-agent -- CADS Tunnel agent daemon
+
+USAGE:
+    ct-agent                    Serve using CT_AGENT_* env config (the default; no
+                                 subcommand needed if you already have a routing token)
+    ct-agent onboard            Redeem CT_AGENT_JOIN_TOKEN, then serve
+    ct-agent rotate             Rotate the origin key, keeping the routing token
+    ct-agent certificate        Run the ACME DNS-01 certificate renewal loop
+    ct-agent relay-node         Run a Circuit-Relay v2 / DCUtR relay node
+    ct-agent channel init                 Mint a fresh channel member identity
+    ct-agent channel operator-init        Mint a fresh channel operator identity
+    ct-agent channel member-material      Derive this member's channel_id/attestation
+    ct-agent channel join-pipeline-role   Derive a published pipeline role's channel_id
+    ct-agent channel grant                As operator, sign a member's channel grant
+    ct-agent channel register             Register a channel authority with the CP
+    ct-agent channel allowlist add|remove|list   Manage a channel's self-service allow-list
+    ct-agent channel agent-card           Write (and optionally register) this agent's card
+    ct-agent channel agent-card --verify <file>  Verify a card file's signature/expiry
+    ct-agent channel                      Join a channel (CT_CHANNEL_* env config)
+
+Every subcommand is configured entirely via CT_*/CT_AGENT_*/CT_CHANNEL_* environment
+variables, not flags -- see docs.bunsenbrenner.org for the full reference per command.
+";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if matches!(std::env::args().nth(1).as_deref(), Some("--help") | Some("-h")) {
+        print!("{USAGE}");
+        return Ok(());
+    }
     // `rotate` subcommand (#12 K4): rotate the origin key while KEEPING the
     // routing token, then exit. Re-mints the capability (same token, new origin),
     // retires the old key into CT_AGENT_ORIGIN_KEY_DIR, and promotes the new key.
@@ -248,6 +283,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let cfg = ct_agent::channel_run::ChannelRunConfig::from_env()
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         return ct_agent::channel_run::run_channel_command(cfg).await;
+    }
+
+    // #239: every recognized subcommand above already returned. `onboard` is the
+    // one remaining valid arg1 (checked just below); no other value belongs here at
+    // all -- serving via env config alone means arg1 is simply *absent*, never some
+    // other word. Anything else is almost certainly a typo'd subcommand, and used to
+    // silently fall through to the default serve path instead of failing loudly.
+    if let Some(arg) = std::env::args().nth(1) {
+        if arg != "onboard" {
+            eprintln!("ct-agent: unrecognized argument '{arg}'\n");
+            eprint!("{USAGE}");
+            std::process::exit(1);
+        }
     }
 
     // One-command onboarding: if a join token is present (env or `onboard`
