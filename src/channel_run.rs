@@ -124,7 +124,7 @@ const TRAFFIC_STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// exactly rather than introducing a second, differently-triggered flag) — one switch
 /// turns on both layers of detail. Checked once and cached since it's now read per
 /// handshake/dial, not just at startup.
-fn debug_timing_enabled() -> bool {
+pub(crate) fn debug_timing_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("CT_DEBUG_A2A_TIMING").is_some())
 }
@@ -609,27 +609,48 @@ pub async fn dial_relay_gate_over_443(
     holder: &SigningKey,
 ) -> Result<(tokio_rustls::client::TlsStream<tokio::net::TcpStream>, libp2p::PeerId), BoxError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = crate::transport::tcp_tls_connect_with_alpn(addr, edge_cert, b"ct-edge-relay").await?;
-    stream.write_all(&grant.encode()).await?;
+    // #248: per-step timing under CT_DEBUG_A2A_TIMING -- this function's own errors (from
+    // run_channel_join_command's retry wrapper) were all indistinguishable generic messages
+    // ("Connection refused", "early eof") with no way to tell which of these six sequential
+    // steps actually failed. Live-reproduced needing exactly this while debugging bob1/bob2's
+    // real hole-punch failures.
+    let dbg = debug_timing_enabled();
+    let t0 = std::time::Instant::now();
+    let mut stream = crate::transport::tcp_tls_connect_with_alpn(addr, edge_cert, b"ct-edge-relay").await
+        .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate tcp+tls connect to {addr} failed after {:?}: {e}", t0.elapsed()); } e })?;
+    if dbg { eprintln!("ct-agent channel: debug relay-gate tcp+tls connect to {addr} ok in {:?}", t0.elapsed()); }
+    let t1 = std::time::Instant::now();
+    stream.write_all(&grant.encode()).await
+        .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate write grant failed after {:?}: {e}", t1.elapsed()); } e })?;
     let mut challenge = [0u8; 32];
-    stream.read_exact(&mut challenge).await?;
+    stream.read_exact(&mut challenge).await
+        .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate read challenge failed after {:?}: {e}", t1.elapsed()); } e })?;
+    if dbg { eprintln!("ct-agent channel: debug relay-gate grant+challenge round-trip ok in {:?}", t1.elapsed()); }
     let sig = holder.sign(&challenge).to_bytes();
-    stream.write_all(&sig).await?;
+    stream.write_all(&sig).await
+        .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate write possession sig failed: {e}"); } e })?;
     let mut ack = [0u8; 2];
-    stream.read_exact(&mut ack).await?;
+    let t2 = std::time::Instant::now();
+    stream.read_exact(&mut ack).await
+        .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate read ack failed after {:?}: {e}", t2.elapsed()); } e })?;
     if &ack != b"OK" {
+        if dbg { eprintln!("ct-agent channel: debug relay-gate pre-auth refused, ack={ack:?}"); }
         return Err("relay-gate: pre-auth refused (grant not authorized -- see the edge's own log)".into());
     }
+    if dbg { eprintln!("ct-agent channel: debug relay-gate pre-auth ok (ack=OK) in {:?} total", t0.elapsed()); }
     let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await?;
+    stream.read_exact(&mut len_buf).await
+        .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate read peer-id length failed: {e}"); } e })?;
     let len = u16::from_be_bytes(len_buf) as usize;
     let mut peer_buf = vec![0u8; len];
-    stream.read_exact(&mut peer_buf).await?;
+    stream.read_exact(&mut peer_buf).await
+        .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate read peer-id bytes ({len}B) failed: {e}"); } e })?;
     let peer_str = String::from_utf8(peer_buf)
         .map_err(|e| -> BoxError { format!("relay-gate: relay-node peer id not utf8: {e}").into() })?;
     let relay_peer: libp2p::PeerId = peer_str
         .parse()
         .map_err(|e| -> BoxError { format!("relay-gate: malformed relay-node peer id {peer_str:?}: {e}").into() })?;
+    if dbg { eprintln!("ct-agent channel: debug relay-gate handshake complete, relay-node peer={relay_peer} in {:?} total", t0.elapsed()); }
     Ok((stream, relay_peer))
 }
 

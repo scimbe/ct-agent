@@ -1087,18 +1087,45 @@ pub(crate) async fn dcutr_reserve_and_accept(
     client.listen_on(relay_circuit)?;
     let (reserved_tx, reserved_rx) = tokio::sync::oneshot::channel();
     let (inbound_tx, inbound_rx) = tokio::sync::oneshot::channel();
+    let dbg = crate::channel_run::debug_timing_enabled();
     tokio::spawn(async move {
         let mut reserved_tx = Some(reserved_tx);
         let mut inbound_tx = Some(inbound_tx);
         loop {
             tokio::select! {
                 ev = client.next() => {
-                    if let Some(SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::RelayClient(
-                        relay::client::Event::ReservationReqAccepted { .. },
-                    ))) = ev
-                    {
-                        if let Some(tx) = reserved_tx.take() {
-                            let _ = tx.send(());
+                    match ev {
+                        Some(SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::RelayClient(
+                            relay::client::Event::ReservationReqAccepted { .. },
+                        ))) => {
+                            if let Some(tx) = reserved_tx.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                        // #248: this loop used to silently drop every event except the one
+                        // success case above -- a reservation *failure*, a dial error, or the
+                        // swarm just ending produced no signal at all; the caller's
+                        // `reserved_rx.await` either hung or eventually got only a generic
+                        // "client driver ended" with no reason. Live-reproduced needing this
+                        // while debugging bob1/bob2's real relay-gate DCUtR failures. Same
+                        // "log what actually happened" fix as `nat_lab_relay`'s own event loop.
+                        None => {
+                            eprintln!("ct-agent channel: relay-gate client swarm ended (no more events)");
+                            return;
+                        }
+                        Some(other) => {
+                            if dbg {
+                                eprintln!("ct-agent channel: debug relay-gate client swarm event: {other:?}");
+                            } else if matches!(
+                                &other,
+                                SwarmEvent::OutgoingConnectionError { .. } | SwarmEvent::IncomingConnectionError { .. }
+                            ) {
+                                // relay::client::Event (this libp2p version) has no distinct
+                                // "reservation failed" variant -- a failure only ever surfaces
+                                // as a generic swarm-level connection error, so that's what's
+                                // worth logging even without CT_DEBUG_A2A_TIMING.
+                                eprintln!("ct-agent channel: relay-gate client swarm event: {other:?}");
+                            }
                         }
                     }
                 }
