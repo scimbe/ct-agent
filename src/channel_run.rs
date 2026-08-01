@@ -2244,7 +2244,27 @@ fn channel_local() -> ChannelLocal {
         let registry = std::sync::Arc::new(reg);
         ChannelLocal::Serve(serve_local(move |req: Vec<u8>| {
             let registry = registry.clone();
-            async move { registry.dispatch(&req) }
+            // #248-follow: `ToolRegistry::dispatch` is synchronous, and when a
+            // `CT_AGENT_SERVICE_HANDLER_CMD` service tool is registered it can block this
+            // call for real wall-clock time (`run_service_handler`'s
+            // `std::process::Command::wait`, up to `SERVICE_HANDLER_TIMEOUT`). Calling it
+            // inline inside this async block used to block whichever Tokio worker thread
+            // was running this connection's task for that whole duration -- starving the
+            // SAME connection's own read/write pump (no bytes flow while the handler runs)
+            // and, on a runtime with few worker threads (this host: 2 CPUs), starving
+            // *other* connections' admission/keepalive handling too. Live-reproduced: a
+            // registered service handler -- even a near-instant one -- made the responder's
+            // reply never reach the initiator (seen as a clean, fast "early eof"), and under
+            // slightly different timing a completely unrelated fresh channel's own admission
+            // exchange stalled for the full #140 window while this one was blocked. Moving
+            // the actual dispatch onto Tokio's dedicated blocking-thread pool fixes both:
+            // the async worker stays free to keep pumping bytes and servicing other
+            // connections while the handler subprocess runs.
+            async move {
+                tokio::task::spawn_blocking(move || registry.dispatch(&req))
+                    .await
+                    .unwrap_or_default()
+            }
         }))
     } else {
         ChannelLocal::Pipe(tokio::io::join(tokio::io::stdin(), tokio::io::stdout()))
@@ -4651,6 +4671,62 @@ mod tests {
         });
         let a3 = peer(&[ServiceType::TextGeneration], "{}");
         assert!(crew_build_over("x", safety3, physics3, a3, auction).await.is_err(), "an unreachable role → Err (fail closed)");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn dispatching_a_blocking_service_handler_does_not_starve_the_async_runtime_248() {
+        // #248-follow: live-reproduced this exact bug against production -- a registered
+        // CT_AGENT_SERVICE_HANDLER_CMD (even a near-instant one) made the responder's own
+        // reply never reach the initiator ("early eof"), and under different timing a
+        // completely unrelated channel's own admission exchange stalled for the full #140
+        // window while this one was blocked. Root cause: `registry.dispatch(&req)` is
+        // synchronous, and calling it inline inside an `async move { .. }` block (no
+        // `spawn_blocking`) blocks whichever Tokio worker thread is running it for the
+        // service handler subprocess's whole wall-clock duration.
+        //
+        // Single worker thread makes this deterministic: with the bug, a slow dispatch
+        // occupies the ONLY worker, so a concurrent unrelated task can't run until it's
+        // done. With the fix (spawn_blocking), the blocking work moves to Tokio's separate
+        // blocking-pool, leaving the one async worker free.
+        use ct_common::channel::ServiceType;
+        use ct_common::mcp::{register_service_tools, ToolRegistry};
+
+        let mut reg = ToolRegistry::new();
+        register_service_tools(&mut reg, &[ServiceType::TextGeneration], |_service, input| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok(input.to_string())
+        });
+        let registry = std::sync::Arc::new(reg);
+
+        let req = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "service/text_generation", "arguments": {"input": "x"}}
+        }))
+        .unwrap();
+
+        // The exact pattern this fix applies in `channel_local()`'s --serve construction.
+        let dispatch_task = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                tokio::task::spawn_blocking(move || registry.dispatch(&req)).await.unwrap_or_default()
+            })
+        };
+
+        // A cheap, unrelated async task that should complete almost immediately if the
+        // single worker thread is actually free to run it concurrently.
+        let start = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let concurrent_elapsed = start.elapsed();
+
+        let resp = dispatch_task.await.unwrap();
+        assert!(!resp.is_empty(), "dispatch still produces a real response");
+
+        assert!(
+            concurrent_elapsed < std::time::Duration::from_millis(150),
+            "an unrelated concurrent task took {concurrent_elapsed:?} to complete a 10ms sleep \
+             -- the blocking dispatch starved the runtime's only worker thread instead of \
+             running on the blocking-thread pool"
+        );
     }
 
     #[test]
