@@ -702,6 +702,13 @@ where
     // Live-reproduced: dozens of real relay-gate sessions with admission + circuit
     // genuinely established, never once a completed hole-punch -- this is why.
     let own_reflexive = own_observed_reflexive.filter(|a| ct_common::channel::is_global_unicast(*a));
+    if debug_timing_enabled() {
+        eprintln!(
+            "ct-agent channel: debug relay-gate DCUtR own reflexive: edge observed {:?}, global-unicast (usable) = {}",
+            own_observed_reflexive,
+            own_reflexive.is_some()
+        );
+    }
     let (client, circuit_relay) =
         crate::p2p::build_relay_gate_client(gate_stream.compat(), relay_peer, own_reflexive)?;
     crate::p2p::run_channel_session_upgradable_dcutr(
