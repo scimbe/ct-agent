@@ -75,6 +75,92 @@ impl<W: AsyncWrite + Unpin, R: AsyncRead + Unpin> AsyncWrite for BiStream<W, R> 
     }
 }
 
+/// #248: process-lifetime channel traffic counters — deliberately unconditional (no debug
+/// flag gates this), same "can't be turned off" basic status every other real system
+/// exposes. Counts ciphertext bytes actually pumped over the network transport, at the
+/// one point every channel session (QUIC direct, QUIC relay, `:443` front door, and the
+/// relay-gate/circuit-relay DCUtR paths) converges: [`run_channel_session_on_stream`]'s
+/// `send`/`recv` halves, wrapped in [`CountingWriter`]/[`CountingReader`] before the pump.
+/// Process-wide, not per-session, since a long-lived `--serve` process handles many
+/// sessions over its life and "how much traffic has this identity carried" is the more
+/// useful cumulative number — a per-session breakdown is what the round-level dashboard
+/// events are for.
+static TOTAL_BYTES_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TOTAL_BYTES_RECV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Call once, as early as possible (`main`) — safe to call more than once (only the first
+/// call's instant sticks), but a session that starts before this call would under-report
+/// its own uptime, so this belongs at actual process start, not lazily on first use.
+pub fn mark_process_start() {
+    let _ = PROCESS_START.set(std::time::Instant::now());
+}
+
+fn process_uptime_secs() -> u64 {
+    PROCESS_START.get_or_init(std::time::Instant::now).elapsed().as_secs()
+}
+
+/// The always-on status line itself — callers decide *when* (periodic tick, session end),
+/// this just formats the current unconditional counters.
+fn traffic_status_line() -> String {
+    format!(
+        "ct-agent channel: status uptime={}s sent={}B recv={}B",
+        process_uptime_secs(),
+        TOTAL_BYTES_SENT.load(std::sync::atomic::Ordering::Relaxed),
+        TOTAL_BYTES_RECV.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// How often a live session's background ticker prints [`traffic_status_line`] — frequent
+/// enough to be genuinely live on a monitor channel, not so frequent it floods one.
+const TRAFFIC_STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// #248: extends the *existing* `CT_DEBUG_A2A_TIMING` debug mode (already real —
+/// `ct_common::a2a` uses it for per-message Noise handshake wait timing, the
+/// `ct-a2a-timing: ...` lines already visible in bob-1's logs) with coarser,
+/// crate-level timing this repo is in a better position to measure: total handshake
+/// duration, and direct dial/accept-to-connected duration. Same env var, same
+/// presence-based activation (`is_some()`, matching `ct_common::a2a::debug_a2a_timing_enabled`
+/// exactly rather than introducing a second, differently-triggered flag) — one switch
+/// turns on both layers of detail. Checked once and cached since it's now read per
+/// handshake/dial, not just at startup.
+fn debug_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CT_DEBUG_A2A_TIMING").is_some())
+}
+
+struct CountingWriter<W> {
+    inner: W,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for CountingWriter<W> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let n = std::task::ready!(AsyncWrite::poll_write(Pin::new(&mut self.inner), cx, buf))?;
+        TOTAL_BYTES_SENT.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        Poll::Ready(Ok(n))
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        AsyncWrite::poll_flush(Pin::new(&mut self.inner), cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        AsyncWrite::poll_shutdown(Pin::new(&mut self.inner), cx)
+    }
+}
+
+struct CountingReader<R> {
+    inner: R,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        std::task::ready!(AsyncRead::poll_read(Pin::new(&mut self.inner), cx, buf))?;
+        let n = buf.filled().len() - before;
+        TOTAL_BYTES_RECV.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// #139: how long a channel's QUIC stream setup (`open_bi`/`accept_bi`) may take past a successful
 /// `dial_peer_direct` connect before the direct path is treated as dead. A healthy connection sets
 /// the stream up sub-second; a conn that handshaked then went silent would otherwise hang here
@@ -176,8 +262,8 @@ where
 /// port is also blocked (a truly `:443`-only network) relays over `:443` unchanged; the
 /// Noise_IK session stays end-to-end and the edge only forwards ciphertext.
 pub async fn run_channel_session_on_stream<W, R, P>(
-    mut send: W,
-    mut recv: R,
+    send: W,
+    recv: R,
     role: ChannelRole,
     own_noise_private: &[u8; 32],
     peer_noise_public: &[u8; 32],
@@ -188,11 +274,18 @@ where
     R: AsyncRead + Unpin,
     P: AsyncRead + AsyncWrite + Unpin,
 {
+    // #248: count every wire byte this session moves, handshake included — real traffic
+    // either way, and simpler than carving the handshake out. Shadows send/recv with
+    // counting wrappers for the rest of this function; noise_pump and a2a_initiate/
+    // a2a_respond see the identical AsyncRead/AsyncWrite behavior, just counted.
+    let mut send = CountingWriter { inner: send };
+    let mut recv = CountingReader { inner: recv };
     // #126: bound the post-pairing Noise_IK handshake. Every dial/accept step around this
     // is already timed (DIRECT_DIAL_TIMEOUT / accept_timeout), but the handshake exchange
     // itself was unbounded — a paired peer that never sends its message (crash, partition,
     // a peer that admits then stalls) would block `read_frame` forever, hanging the session.
     const A2A_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let handshake_started = std::time::Instant::now();
     let handshake = async {
         match role {
             ChannelRole::Initiate => {
@@ -205,6 +298,22 @@ where
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "a2a Noise_IK handshake timed out (#126)"))?
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    if debug_timing_enabled() {
+        eprintln!(
+            "ct-agent channel: debug handshake completed in {}ms (role={role:?})",
+            handshake_started.elapsed().as_millis()
+        );
+    }
+
+    eprintln!("{}", traffic_status_line());
+    // #248: unconditional (no debug flag) periodic status while this session's pump runs —
+    // aborted the moment the pump finishes, one way or another, via the handle drop below.
+    let ticker = tokio::spawn(async {
+        loop {
+            tokio::time::sleep(TRAFFIC_STATUS_INTERVAL).await;
+            eprintln!("{}", traffic_status_line());
+        }
+    });
 
     // Reborrow the halves so they survive the pump: after the session ends we must drain before
     // returning (#150), because a caller may exit immediately (a single-shot `ct-agent channel` as a
@@ -213,7 +322,9 @@ where
     // waits (bounded) for the peer to close, keeping the process + netns alive until our tail is
     // delivered. (The QUIC path keeps its stronger `stopped()` ack-wait in `run_channel_session`.)
     let pumped = noise_pump(session, BiStream { send: &mut send, recv: &mut recv }, local).await;
+    ticker.abort();
     graceful_stream_drain(&mut send, &mut recv, RELAY_DRAIN_TIMEOUT).await;
+    eprintln!("{}", traffic_status_line());
     pumped
 }
 
@@ -333,12 +444,19 @@ where
             let addr = peer_endpoint
                 .parse()
                 .map_err(|_| format!("broker returned an unparseable peer endpoint: {peer_endpoint:?}"))?;
+            let dial_started = std::time::Instant::now();
             match dial_peer_direct(addr, dial_timeout).await {
                 Ok(conn) => {
+                    if debug_timing_enabled() {
+                        eprintln!("ct-agent channel: debug direct dial to {addr} connected in {}ms", dial_started.elapsed().as_millis());
+                    }
                     run_channel_session(&conn, ChannelRole::Initiate, own_noise_private, &peer_noise, local).await?;
                 }
                 Err(ChannelDialError::Unreachable) => {
-                    eprintln!("ct-agent channel: direct dial to {addr} unreachable — falling back to the edge relay (#72)");
+                    eprintln!(
+                        "ct-agent channel: direct dial to {addr} unreachable after {}ms — falling back to the edge relay (#72)",
+                        dial_started.elapsed().as_millis()
+                    );
                     join_via_relay_fallback(relay, request, holder, ChannelRole::Initiate, own_noise_private, &peer_noise, local, upgrade).await?;
                 }
                 Err(ChannelDialError::Failed(e)) => return Err(e),
@@ -351,17 +469,23 @@ where
                 eprintln!("ct-agent channel: relay-only acceptor (no listener) — using the edge relay (#121)");
                 join_via_relay_fallback(relay, request, holder, ChannelRole::Accept, own_noise_private, &peer_noise, local, upgrade).await?;
             }
-            Some(ep) => match tokio::time::timeout(accept_timeout, ep.accept()).await {
-                Ok(Some(incoming)) => {
-                    let conn = incoming.await?;
-                    run_channel_session(&conn, ChannelRole::Accept, own_noise_private, &peer_noise, local).await?;
+            Some(ep) => {
+                let accept_started = std::time::Instant::now();
+                match tokio::time::timeout(accept_timeout, ep.accept()).await {
+                    Ok(Some(incoming)) => {
+                        let conn = incoming.await?;
+                        if debug_timing_enabled() {
+                            eprintln!("ct-agent channel: debug direct accept connected in {}ms", accept_started.elapsed().as_millis());
+                        }
+                        run_channel_session(&conn, ChannelRole::Accept, own_noise_private, &peer_noise, local).await?;
+                    }
+                    Ok(None) => return Err("channel listener closed with no incoming".into()),
+                    Err(_timeout) => {
+                        eprintln!("ct-agent channel: no direct connection within {accept_timeout:?} — falling back to the edge relay (#72)");
+                        join_via_relay_fallback(relay, request, holder, ChannelRole::Accept, own_noise_private, &peer_noise, local, upgrade).await?;
+                    }
                 }
-                Ok(None) => return Err("channel listener closed with no incoming".into()),
-                Err(_timeout) => {
-                    eprintln!("ct-agent channel: no direct connection within {accept_timeout:?} — falling back to the edge relay (#72)");
-                    join_via_relay_fallback(relay, request, holder, ChannelRole::Accept, own_noise_private, &peer_noise, local, upgrade).await?;
-                }
-            },
+            }
         },
     }
     Ok(())

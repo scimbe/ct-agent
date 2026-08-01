@@ -47,6 +47,10 @@ variables, not flags -- see docs.bunsenbrenner.org for the full reference per co
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // #248: mark actual process start before anything else, so the always-on
+    // uptime/bytes status line (ct_agent::channel_run::traffic_status_line) reports
+    // real process uptime even for a long-lived --serve process's first session.
+    ct_agent::channel_run::mark_process_start();
     if matches!(std::env::args().nth(1).as_deref(), Some("--help") | Some("-h")) {
         print!("{USAGE}");
         return Ok(());
