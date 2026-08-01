@@ -2431,6 +2431,14 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // perfectly healthy long-lived --serve process instead of just re-admitting. `Initiate`
     // (and `Accept` without `--serve`) stay single-attempt, matching every other one-shot path.
     let serve_loop = should_serve_loop(cfg.role, std::env::var("CT_CHANNEL_SERVE").ok().as_deref());
+    // #248: a one-shot Initiate (or non-serve Accept) on the relay-gate/circuit-relay DCUtR
+    // path shouldn't fail on the very first #140 stall either -- live-reproduced on the
+    // a2a-demo's plain "bob" scenario (previously thought stable, now exercising this same
+    // path): the persistent --serve side eventually gets past a stall by retrying forever,
+    // while the one-shot side had zero tolerance and failed the whole call on one hiccup.
+    // Bounded (unlike `serve_loop`'s retry) because a one-shot CLI/demo call must still
+    // terminate in reasonable time -- a few attempts at the same 200ms backoff, not forever.
+    const ONE_SHOT_DCUTR_ADMISSION_RETRIES: u32 = 2;
     if cfg.relay_only {
         // The real gated relay-gate leg (no new public port, grant+possession pre-auth) takes
         // priority when configured — `circuit_relay` (a directly-dialable relay multiaddr) is
@@ -2445,6 +2453,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                 cfg.role, cfg.relay_addr, relay_gate_addr,
                 if serve_loop { " — persistent serve: retries transient stalls (#248)" } else { "" }
             );
+            let mut attempt: u32 = 0;
             loop {
                 let relay_conn = crate::transport::build_channel_dialer()?
                     .connect(cfg.relay_addr, "localhost")?
@@ -2468,6 +2477,14 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         continue;
                     }
+                    Err(e) if attempt < ONE_SHOT_DCUTR_ADMISSION_RETRIES => {
+                        attempt += 1;
+                        eprintln!(
+                            "ct-agent channel: relay-gate admission error, retrying ({attempt}/{ONE_SHOT_DCUTR_ADMISSION_RETRIES}) (#248): {e}"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
                     other => return other,
                 }
             }
@@ -2478,6 +2495,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                 cfg.role, cfg.relay_addr, circuit,
                 if serve_loop { " — persistent serve: retries transient stalls (#248)" } else { "" }
             );
+            let mut attempt: u32 = 0;
             loop {
                 let relay_conn = crate::transport::build_channel_dialer()?
                     .connect(cfg.relay_addr, "localhost")?
@@ -2496,6 +2514,14 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                 match result {
                     Err(e) if serve_loop => {
                         eprintln!("ct-agent channel: relay-gate admission error, re-admitting (#248): {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
+                    Err(e) if attempt < ONE_SHOT_DCUTR_ADMISSION_RETRIES => {
+                        attempt += 1;
+                        eprintln!(
+                            "ct-agent channel: relay-gate admission error, retrying ({attempt}/{ONE_SHOT_DCUTR_ADMISSION_RETRIES}) (#248): {e}"
+                        );
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         continue;
                     }
