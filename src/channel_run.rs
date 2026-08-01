@@ -2426,17 +2426,42 @@ struct ServeSessionCtx {
 /// peer's admission. This is the sequential part of the serve loop — only one admission is ever
 /// parked, so the pairer is never asked to hold two accepts for one channel. Mirrors the admission
 /// half of [`run_one_admission_session`], reading from the shared `Arc` instead of borrowed config.
+///
+/// A **refused** outcome (a clean broker round-trip whose answer is "no") is turned into an `Err`
+/// here — not returned as `Ok(ChannelJoinOutcome::Refused)` — so [`serve_loop_concurrent`] routes it
+/// through its existing error/backoff path instead of its `Ok(work) => spawn(..)` path. Before this,
+/// a refusal-as-a-value was indistinguishable from a real admission at that match: it got spawned as
+/// a full session (through `channel_local()`'s "--serve mode" setup and the rest of
+/// [`run_channel_join_with_admission`]) only to immediately fail there with the very same "refused
+/// the channel join" message — resetting `consecutive_refusals` to 0 on every attempt (since the
+/// outer loop saw `Ok`, not `Err`) and so **never** engaging #231's exponential backoff for this
+/// failure mode. Live-observed via #248: a channel's outer loop hammering `admit_one_peer` at a near-
+/// zero-backoff rate whenever every admission attempt came back refused-as-a-value, spawning (and
+/// immediately discarding) hundreds of sessions an hour instead of backing off between attempts.
 async fn admit_one_peer(ctx: &ServeSessionCtx) -> Result<ChannelJoinOutcome, BoxError> {
-    match &ctx.front_door_cert {
+    let outcome = match &ctx.front_door_cert {
         Some(edge_cert) => {
-            present_channel_join_via_ladder(&ctx.broker_ladder, &ctx.request, &ctx.holder, edge_cert.clone(), DIRECT_DIAL_TIMEOUT).await
+            present_channel_join_via_ladder(&ctx.broker_ladder, &ctx.request, &ctx.holder, edge_cert.clone(), DIRECT_DIAL_TIMEOUT).await?
         }
         None => {
             let broker_conn = crate::transport::build_channel_dialer()?
                 .connect(ctx.broker_addr, "localhost")?
                 .await?;
-            present_channel_join(&broker_conn, &ctx.request, &ctx.holder).await
+            present_channel_join(&broker_conn, &ctx.request, &ctx.holder).await?
         }
+    };
+    reject_refused_outcome(outcome)
+}
+
+/// Pure translation step for [`admit_one_peer`], pulled out so it's unit-testable without a real
+/// broker: turn a **refused** outcome into the same `Err` string [`is_definitive_admission_refusal`]
+/// already recognizes, so [`serve_loop_concurrent`] routes it through its error/backoff path instead
+/// of spawning it as if it were a real session. See [`admit_one_peer`]'s doc comment for why this
+/// matters (#248).
+fn reject_refused_outcome(outcome: ChannelJoinOutcome) -> Result<ChannelJoinOutcome, BoxError> {
+    match outcome {
+        ChannelJoinOutcome::Refused => Err("edge broker refused the channel join".into()),
+        admitted => Ok(admitted),
     }
 }
 
@@ -4457,6 +4482,67 @@ mod tests {
         // ...and is clamped at the cap instead of growing (or overflowing) without bound.
         assert_eq!(admission_retry_backoff(base, true, 100), REFUSED_ADMISSION_BACKOFF_CAP);
         assert_eq!(admission_retry_backoff(base, true, u32::MAX), REFUSED_ADMISSION_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn reject_refused_outcome_converts_refused_to_the_err_string_is_definitive_admission_refusal_recognizes() {
+        // #248 live-observed bug: `admit_one_peer` used to return `Ok(ChannelJoinOutcome::Refused)`
+        // for a broker round-trip whose answer was "no" — indistinguishable, at `serve_loop_concurrent`'s
+        // `Ok(work) => spawn(..)` match, from a genuine admission. That spawned the refusal as a full
+        // session (through channel_local()'s "--serve mode" setup) which then immediately failed
+        // inside run_channel_join_with_admission with the same message — but because the OUTER loop
+        // saw `Ok`, not `Err`, `consecutive_refusals` reset to 0 every time and #231's exponential
+        // backoff never engaged, hot-looping at near-zero backoff exactly as #231 first fixed for the
+        // transport-level case. This proves the translation: a Refused outcome becomes an Err whose
+        // string `is_definitive_admission_refusal` recognizes as a definitive refusal.
+        let err = reject_refused_outcome(ChannelJoinOutcome::Refused).expect_err("Refused must become an Err");
+        assert!(
+            is_definitive_admission_refusal(&err),
+            "the translated error must be recognized as a definitive refusal so #231's backoff engages, got: {err}"
+        );
+
+        // A genuine admission passes through unchanged (not accidentally rejected).
+        let admitted = ChannelJoinOutcome::Admitted {
+            peer_endpoint: String::new(),
+            peer_noise_pubkey: None,
+            peer_holder: None,
+            peer_attestation: None,
+            observed_reflexive: None,
+        };
+        assert_eq!(
+            reject_refused_outcome(admitted.clone()).unwrap(),
+            admitted,
+            "a real admission must pass through unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_loop_never_spawns_a_refused_outcome_as_a_session() {
+        // #248: the end-to-end proof that a real `Ok(Refused)` outcome — exactly what
+        // `admit_one_peer` used to return before this fix — is rejected before it ever reaches
+        // `serve_loop_concurrent`'s spawn path. `admit` here does what `admit_one_peer` now does
+        // (call `reject_refused_outcome` on its outcome) rather than injecting a raw `Err` directly,
+        // so this covers the actual translation, not just `serve_loop_concurrent`'s own dispatch.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let admit = move || async move { reject_refused_outcome(ChannelJoinOutcome::Refused) };
+        let s = spawned.clone();
+        let serve = move |_w: ChannelJoinOutcome| {
+            let s = s.clone();
+            async move {
+                s.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), BoxError>(())
+            }
+        };
+
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            serve_loop_concurrent(4, std::time::Duration::from_millis(10), admit, serve),
+        )
+        .await;
+
+        assert_eq!(spawned.load(Ordering::SeqCst), 0, "a refused outcome must never be spawned as a session");
     }
 
     #[tokio::test]
