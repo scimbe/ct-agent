@@ -407,14 +407,43 @@ pub async fn nat_lab_relay(listen: &str) -> Result<(), BoxError> {
     swarm.listen_on(listen.parse::<Multiaddr>()?)?;
     eprintln!("nat-lab relay: peer {peer}, requested listen {listen}");
     loop {
-        if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
-            // The Circuit-Relay v2 server MUST advertise its own external address or a client's
-            // reservation is refused (`NoAddressesInReservation`) — confirm the bound address
-            // explicitly (as the in-process harness does). Without this the punch clients never
-            // reserve. (The relay now ALSO runs an identify server — see `RelayServerBehaviour` —
-            // so a connecting client learns its own reflexive address for the DCUtR punch.)
-            swarm.add_external_address(address.clone());
-            println!("{address}/p2p/{peer}");
+        // #248: this loop used to match ONLY `NewListenAddr` and silently drop every other
+        // swarm event -- connections, reservations, circuits, dial errors, all invisible.
+        // Live-reproduced: a real DCUtR round through this exact relay-node failed with a
+        // downstream "early eof", and this process's own log had nothing at all for the
+        // whole window -- no way to tell whether a reservation was ever made, a circuit was
+        // ever opened, or the relay refused/dropped something silently. Logging every event
+        // this behaviour actually produces is the only way to find out.
+        match swarm.select_next_some().await {
+            SwarmEvent::NewListenAddr { address, .. } => {
+                // The Circuit-Relay v2 server MUST advertise its own external address or a
+                // client's reservation is refused (`NoAddressesInReservation`) — confirm the
+                // bound address explicitly (as the in-process harness does). Without this the
+                // punch clients never reserve. (The relay now ALSO runs an identify server —
+                // see `RelayServerBehaviour` — so a connecting client learns its own
+                // reflexive address for the DCUtR punch.)
+                swarm.add_external_address(address.clone());
+                println!("{address}/p2p/{peer}");
+            }
+            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                eprintln!("nat-lab relay: connection established with {peer_id} via {:?}", endpoint.get_remote_address());
+            }
+            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                eprintln!("nat-lab relay: connection closed with {peer_id}: {cause:?}");
+            }
+            SwarmEvent::IncomingConnectionError { error, send_back_addr, .. } => {
+                eprintln!("nat-lab relay: incoming connection from {send_back_addr} failed: {error}");
+            }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                eprintln!("nat-lab relay: outgoing connection to {peer_id:?} failed: {error}");
+            }
+            SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(ev)) => {
+                eprintln!("nat-lab relay: relay event: {ev:?}");
+            }
+            SwarmEvent::Behaviour(RelayServerBehaviourEvent::Identify(identify::Event::Error { peer_id, error, .. })) => {
+                eprintln!("nat-lab relay: identify error with {peer_id}: {error}");
+            }
+            _ => {}
         }
     }
 }
