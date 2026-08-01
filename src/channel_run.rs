@@ -2076,7 +2076,29 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut recv, mut send) = tokio::io::split(local);
-    call_role_service(&mut send, &mut recv, slug, input).await
+    let result = call_role_service(&mut send, &mut recv, slug, input).await;
+    // #248: a one-shot call used to drop `local` (tearing the whole session down) the
+    // INSTANT the reply arrived -- structurally too fast for any concurrent relay->direct
+    // upgrade (#104's in-band candidate exchange, or the relay-gate DCUtR hole-punch,
+    // both of which need real network round-trips: address exchange, then a simultaneous
+    // connect attempt) to ever land, even when the upgrade is actively in flight and
+    // would otherwise have succeeded. Live-reproduced: dozens of real relay-gate DCUtR
+    // sessions, admission+circuit genuinely established, none ever showed a completed
+    // hole-punch -- every one raced the reply against a sub-200ms teardown and lost.
+    // Give a real upgrade attempt a fair window before tearing down, but ONLY when one
+    // could plausibly be in flight (either upgrade mechanism configured) -- unconditional
+    // added latency on every call would be a real regression for latency-sensitive
+    // production use (the crew bridge also drives this same one-shot path).
+    if result.is_ok() {
+        let upgrade_configured = std::env::var_os("CT_CHANNEL_RELAY_GATE").is_some()
+            || std::env::var_os("CT_CHANNEL_CIRCUIT_RELAY").is_some()
+            || std::env::var_os("CT_CHANNEL_DIRECT_UPGRADE").is_some();
+        if upgrade_configured {
+            const UPGRADE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+            tokio::time::sleep(UPGRADE_GRACE).await;
+        }
+    }
+    result
 }
 
 /// The initiator-side one-shot **service** call (#173 distributed crew topology): dial done by the
