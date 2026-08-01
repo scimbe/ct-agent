@@ -1422,7 +1422,18 @@ impl ChannelIdentity {
              #   holder_pubkey = {holder_pub}\n\
              #   noise_pubkey  = {noise_pub}\n\
              export CT_CHANNEL_HOLDER_KEY={holder_priv}\n\
-             export CT_CHANNEL_NOISE_KEY={noise_priv}\n",
+             export CT_CHANNEL_NOISE_KEY={noise_priv}\n\
+             #\n\
+             # #330: if you're behind a NAT and can't reach the operator's broker/relay ports\n\
+             # directly, you ALSO need CT_CHANNEL_RELAY_GATE (+ _CERT) — a separate, relay-gate\n\
+             # protocol from plain CT_CHANNEL_RELAY, not interchangeable with it. Ask your\n\
+             # operator whether this deployment needs it; if so, CT_CHANNEL_RELAY_GATE is the\n\
+             # deployment's unified front-door address (ask the operator, or fetch it from this\n\
+             # control plane's GET /network-info -> channel_relay_gate_port, same host as\n\
+             # CT_AGENT_CP_URL) and CT_CHANNEL_RELAY_GATE_CERT is the DER from GET /pki/ca (same\n\
+             # CA root you already trust for everything else). Omitting this when your side of a\n\
+             # channel pairing needs it fails silently downstream (an unhelpful early-eof), not\n\
+             # with an error naming the missing var — see docs.bunsenbrenner.org for details.\n",
             holder_pub = self.holder_pubkey_hex(),
             noise_pub = self.noise_pubkey_hex(),
             holder_priv = self.holder_key_hex(),
