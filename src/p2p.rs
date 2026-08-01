@@ -448,6 +448,29 @@ pub async fn nat_lab_relay(listen: &str) -> Result<(), BoxError> {
     }
 }
 
+/// #248 (found live by the `#248` intern while chasing a bob-1<->bob-2 DCUtR mismatch,
+/// matches the same bug class `#137`/`883e20f` already closed for the `#104` in-band-upgrade
+/// path): whether a `Multiaddr` carries a global-unicast IP -- the SSRF guard this module's
+/// three `identify::Event::Received` handlers were missing. An `identify`-reported
+/// `observed_addr` is **not** trustworthy by construction; over a proxied hop (e.g. the edge
+/// splicing a relay-gate connection to relay-node) it can be the PROXY's own
+/// internal/Docker-range address, not the real peer's -- registering it via
+/// `add_external_address` would poison the DCUtR candidate pool with a bogus, non-routable
+/// target. Extracts the first `Ip4`/`Ip6` component and defers to
+/// [`ct_common::channel::is_global_unicast`] (the port is irrelevant to that classification,
+/// so `0` is used as a placeholder). A `Multiaddr` with no IP component at all (e.g. a bare
+/// `/memory/...` address) is never global-unicast.
+#[cfg(any(test, feature = "nat-lab"))]
+fn multiaddr_is_global_unicast(ma: &Multiaddr) -> bool {
+    ma.iter()
+        .find_map(|p| match p {
+            Protocol::Ip4(ip) => Some(std::net::IpAddr::V4(ip)),
+            Protocol::Ip6(ip) => Some(std::net::IpAddr::V6(ip)),
+            _ => None,
+        })
+        .is_some_and(|ip| ct_common::channel::is_global_unicast(std::net::SocketAddr::new(ip, 0)))
+}
+
 /// #136 DCUtR **sequencing**: connect to the relay and pump events until identify reports our
 /// **reflexive** (public NAT-mapped) external address, confirming it as an external address
 /// BEFORE we become dialable / dial the peer. This is the standard libp2p DCUtR ordering: the
@@ -471,7 +494,9 @@ async fn await_reflexive_via_relay(
                     identify::Event::Received { info, .. },
                 )) = ev
                 {
-                    if !info.observed_addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                    if !info.observed_addr.iter().any(|p| matches!(p, Protocol::P2pCircuit))
+                        && multiaddr_is_global_unicast(&info.observed_addr)
+                    {
                         eprintln!("reflexive confirmed via relay: {}", info.observed_addr);
                         swarm.add_external_address(info.observed_addr);
                         return Ok(());
@@ -525,7 +550,9 @@ pub async fn nat_lab_listen(relay: Multiaddr) -> Result<(), BoxError> {
                 // knows its private `10.0.x.2` listen addr and the upgrade dies with `NoAddresses`.
                 SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::Identify(
                     identify::Event::Received { info, .. },
-                )) if !info.observed_addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) => {
+                )) if !info.observed_addr.iter().any(|p| matches!(p, Protocol::P2pCircuit))
+                    && multiaddr_is_global_unicast(&info.observed_addr) =>
+                {
                     eprintln!("listen: relay-observed reflexive {}", info.observed_addr);
                     swarm.add_external_address(info.observed_addr);
                 }
@@ -587,7 +614,9 @@ pub async fn nat_lab_dial(peer_via_relay: Multiaddr) -> Result<(), BoxError> {
                     identify::Event::Received { info, .. },
                 )) = &ev
                 {
-                    if !info.observed_addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                    if !info.observed_addr.iter().any(|p| matches!(p, Protocol::P2pCircuit))
+                        && multiaddr_is_global_unicast(&info.observed_addr)
+                    {
                         eprintln!("dial: relay-observed reflexive {}", info.observed_addr);
                         swarm.add_external_address(info.observed_addr.clone());
                     }
@@ -1803,6 +1832,35 @@ mod tests {
         assert_eq!(relay_node_key_seed(&"aa".repeat(31)), None, "too short");
         assert_eq!(relay_node_key_seed(&"aa".repeat(33)), None, "too long");
         assert_eq!(relay_node_key_seed(&"zz".repeat(32)), None, "not hex");
+    }
+
+    #[test]
+    fn multiaddr_is_global_unicast_matches_the_137_ssrf_filter() {
+        // #248 (found live by the bob-1<->bob-2 diagnostic thread): the nat-lab
+        // identify::Event::Received handlers must refuse a non-global-unicast observed_addr --
+        // e.g. a Docker-internal address a proxying hop (the edge, splicing relay-gate traffic
+        // to relay-node) reports as the "observed" remote, which is the PROXY's address, not
+        // the real peer's.
+        let global: Multiaddr = "/ip4/203.0.113.10/tcp/4433".parse().unwrap();
+        assert!(multiaddr_is_global_unicast(&global), "a real public address is accepted");
+
+        let docker_internal: Multiaddr = "/ip4/172.30.0.2/tcp/46336".parse().unwrap();
+        assert!(!multiaddr_is_global_unicast(&docker_internal), "a Docker-internal address is refused");
+
+        let loopback: Multiaddr = "/ip4/127.0.0.1/tcp/4433".parse().unwrap();
+        assert!(!multiaddr_is_global_unicast(&loopback), "loopback is refused");
+
+        let link_local: Multiaddr = "/ip4/169.254.169.254/tcp/80".parse().unwrap();
+        assert!(!multiaddr_is_global_unicast(&link_local), "cloud-metadata-adjacent link-local is refused");
+
+        let no_ip: Multiaddr = "/memory/1".parse().unwrap();
+        assert!(!multiaddr_is_global_unicast(&no_ip), "an address with no IP component is never global-unicast");
+
+        let global_v6: Multiaddr = "/ip6/2001:db8::1/tcp/4433".parse().unwrap();
+        assert!(multiaddr_is_global_unicast(&global_v6), "a real public IPv6 address is accepted");
+
+        let ula_v6: Multiaddr = "/ip6/fd00::1/tcp/4433".parse().unwrap();
+        assert!(!multiaddr_is_global_unicast(&ula_v6), "IPv6 unique-local is refused");
     }
 
     #[tokio::test]
