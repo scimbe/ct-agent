@@ -2274,13 +2274,25 @@ fn channel_local() -> ChannelLocal {
     // the raw CT_CHANNEL_CALL below because it's the service-specific (and jq-free) path.
     if let Ok(slug) = std::env::var("CT_CHANNEL_CALL_SERVICE") {
         let slug = slug.trim().to_string();
-        let mut input = String::new();
-        {
-            use std::io::Read;
-            let _ = std::io::stdin().read_to_string(&mut input);
-        }
+        // #248: cache the stdin read -- this function is called fresh on every
+        // relay-gate/circuit-relay DCUtR retry attempt (each attempt needs its own owned
+        // ChannelLocal), and stdin is only readable to EOF once. A naive re-read on retry
+        // doesn't error, it silently returns empty ("" is a valid, if useless, read) --
+        // the real message only ever reached the FIRST attempt; every retry silently sent
+        // nothing, which the peer can reasonably react to by closing early. Live-reproduced
+        // on bob2's retried rounds: no input-related error anywhere, just an unexplained
+        // "early eof" a step later than expected.
+        static INPUT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let input = INPUT
+            .get_or_init(|| {
+                let mut input = String::new();
+                use std::io::Read;
+                let _ = std::io::stdin().read_to_string(&mut input);
+                input.trim().to_string()
+            })
+            .clone();
         eprintln!("ct-agent channel: --call-service {slug} (one service call over the channel, then exit)");
-        return ChannelLocal::Serve(call_service_local(slug, input.trim().to_string()));
+        return ChannelLocal::Serve(call_service_local(slug, input));
     }
     // #135 L2.3 client: one MCP request/response over the channel, then exit.
     if let Ok(method) = std::env::var("CT_CHANNEL_CALL") {
