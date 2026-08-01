@@ -2297,6 +2297,16 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // the DCUtR-upgradable relay join — start on the edge relay, then opportunistically hole-punch
     // to a direct link via the circuit relay. Both members are NAT'd, so this is the only path that
     // can ever go direct; without a circuit relay it falls through to the plain relay session below.
+    //
+    // #248-follow: a long-lived `Accept`+`--serve` member on this path must retry a transient
+    // stall exactly like the plain broker path a few lines below already does (see that path's
+    // own comment for the #179 lesson this mirrors) -- NOT propagate the error out of this
+    // function and take the whole process down. Live-reproduced: this path's first-ever real
+    // cross-NAT test hit a transient "#140" stall (nothing DCUtR-specific -- the same admission
+    // hiccup the plain path tolerates fine) and, before this fix, that killed an otherwise
+    // perfectly healthy long-lived --serve process instead of just re-admitting. `Initiate`
+    // (and `Accept` without `--serve`) stay single-attempt, matching every other one-shot path.
+    let serve_loop = should_serve_loop(cfg.role, std::env::var("CT_CHANNEL_SERVE").ok().as_deref());
     if cfg.relay_only {
         // The real gated relay-gate leg (no new public port, grant+possession pre-auth) takes
         // priority when configured — `circuit_relay` (a directly-dialable relay multiaddr) is
@@ -2306,46 +2316,68 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                 .relay_gate_cert
                 .clone()
                 .ok_or("CT_CHANNEL_RELAY_GATE set without CT_CHANNEL_RELAY_GATE_CERT")?;
-            let relay_conn = crate::transport::build_channel_dialer()?
-                .connect(cfg.relay_addr, "localhost")?
-                .await?;
-            let local = channel_local();
             eprintln!(
-                "ct-agent channel: relay-only DCUtR-upgradable {:?} via relay-gate (relay {}, gate {})",
-                cfg.role, cfg.relay_addr, relay_gate_addr
+                "ct-agent channel: relay-only DCUtR-upgradable {:?} via relay-gate (relay {}, gate {}){}",
+                cfg.role, cfg.relay_addr, relay_gate_addr,
+                if serve_loop { " — persistent serve: retries transient stalls (#248)" } else { "" }
             );
-            return join_via_relay_gate_dcutr(
-                &relay_conn,
-                &request,
-                &cfg.holder,
-                cfg.role,
-                &cfg.own_noise_private,
-                local,
-                relay_gate_addr,
-                relay_gate_cert,
-                &cfg.grant,
-            )
-            .await;
+            loop {
+                let relay_conn = crate::transport::build_channel_dialer()?
+                    .connect(cfg.relay_addr, "localhost")?
+                    .await?;
+                let local = channel_local();
+                let result = join_via_relay_gate_dcutr(
+                    &relay_conn,
+                    &request,
+                    &cfg.holder,
+                    cfg.role,
+                    &cfg.own_noise_private,
+                    local,
+                    relay_gate_addr,
+                    relay_gate_cert.clone(),
+                    &cfg.grant,
+                )
+                .await;
+                match result {
+                    Err(e) if serve_loop => {
+                        eprintln!("ct-agent channel: relay-gate admission error, re-admitting (#248): {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
+                    other => return other,
+                }
+            }
         }
         if let Some(circuit) = cfg.circuit_relay.clone() {
-            let relay_conn = crate::transport::build_channel_dialer()?
-                .connect(cfg.relay_addr, "localhost")?
-                .await?;
-            let local = channel_local();
             eprintln!(
-                "ct-agent channel: relay-only DCUtR-upgradable {:?} (relay {}, circuit {})",
-                cfg.role, cfg.relay_addr, circuit
+                "ct-agent channel: relay-only DCUtR-upgradable {:?} (relay {}, circuit {}){}",
+                cfg.role, cfg.relay_addr, circuit,
+                if serve_loop { " — persistent serve: retries transient stalls (#248)" } else { "" }
             );
-            return join_via_relay_dcutr(
-                &relay_conn,
-                &request,
-                &cfg.holder,
-                cfg.role,
-                &cfg.own_noise_private,
-                local,
-                circuit,
-            )
-            .await;
+            loop {
+                let relay_conn = crate::transport::build_channel_dialer()?
+                    .connect(cfg.relay_addr, "localhost")?
+                    .await?;
+                let local = channel_local();
+                let result = join_via_relay_dcutr(
+                    &relay_conn,
+                    &request,
+                    &cfg.holder,
+                    cfg.role,
+                    &cfg.own_noise_private,
+                    local,
+                    circuit.clone(),
+                )
+                .await;
+                match result {
+                    Err(e) if serve_loop => {
+                        eprintln!("ct-agent channel: relay-gate admission error, re-admitting (#248): {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
+                    other => return other,
+                }
+            }
         }
     }
     // Broker admission (the grant + possession proof are the auth; Noise_IK authenticates
@@ -2360,7 +2392,8 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // re-park gap dropped real user calls ("art role unreachable" on first try, ok on retry). A
     // transient per-session error (admission stall #140, peer drop) is logged and retried, not fatal;
     // one-shot roles (initiator / `--call` / non-serve) run exactly once, unchanged.
-    let serve_loop = should_serve_loop(cfg.role, std::env::var("CT_CHANNEL_SERVE").ok().as_deref());
+    // (`serve_loop` already computed above, ahead of the relay-gate/circuit-relay block, which
+    // needs the same value.)
     eprintln!(
         "ct-agent channel: plane-brokered {:?} (relay {}){}",
         cfg.role,
