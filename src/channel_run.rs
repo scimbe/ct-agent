@@ -2691,10 +2691,41 @@ pub const DIRECT_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// ephemeral direct listener (`0.0.0.0:0`) purely for this upgrade attempt — a listener
 /// distinct from `CT_CHANNEL_LISTEN`'s, never advertised to the broker or to anyone but
 /// this one already-Noise-verified peer. `None` when the edge reported no reflexive
-/// address for this admission (e.g. the `:443` front-door leg doesn't observe one) or the
-/// listener fails to bind — the session then simply stays on the relay, unaffected.
+/// address for this admission (e.g. the `:443` front-door leg doesn't observe one), the
+/// reflexive address isn't global-unicast, or the listener fails to bind — the session
+/// then simply stays on the relay, unaffected.
+///
+/// Found live (#248, 2026-08-01): a member co-located with the edge on the same Docker
+/// host (e.g. a demo bridge container) has an edge-observed reflexive address on the
+/// **Docker bridge network** (RFC1918, e.g. `172.18.0.19`) — real from the edge's point
+/// of view, but meaningless to any genuinely external peer, who can never route to it.
+/// Offering it anyway isn't just wasted effort: the peer's own SSRF guard
+/// (`upgrade_safe_endpoint`, #137) correctly refuses to dial it, but in production this
+/// consistently left the *initiator* blocked for the full outer session timeout rather
+/// than falling back to the relay promptly (`drive_initiator_upgrade`'s reply wait is
+/// documented as "the caller's concern" to bound and isn't bounded here) — turning an
+/// always-doomed direct attempt into a full session failure instead of a same-second
+/// relay fallback. The responder already validates the *peer's* offered endpoint this
+/// way (#137); this applies the identical filter symmetrically to our OWN candidate
+/// before ever offering it, so an unreachable candidate is never offered in the first
+/// place and the initiator's own coordinator degrades to relay-only immediately (the
+/// `_ => run_channel_session_on_stream(...)` arm in
+/// [`run_channel_session_upgradable`](crate::channel_run::run_channel_session_upgradable))
+/// — same as if the edge had reported no reflexive address at all. A same-Docker-network
+/// peer (this demo's own baseline scenario, both sides on the same host) is unaffected
+/// only in the sense that its reflexive address is *also* RFC1918 and would now also
+/// skip the direct attempt — a strictly safe trade: that pairing was never a
+/// representative test of real cross-network direct-P2P reachability anyway, and it
+/// still relays correctly.
 async fn build_upgrade_candidate(observed_reflexive: Option<SocketAddr>) -> Option<(Endpoint, String)> {
     let addr = observed_reflexive?;
+    if !ct_common::channel::is_global_unicast(addr) {
+        eprintln!(
+            "ct-agent channel: #104 upgrade — our own edge-observed reflexive address {addr} is not \
+             global-unicast (RFC1918/link-local/etc, #248) — skipping the direct-upgrade attempt, staying on relay"
+        );
+        return None;
+    }
     let (listener, _cert) = crate::transport::build_direct_listener().ok()?;
     Some((listener, addr.to_string()))
 }
@@ -6286,6 +6317,33 @@ mod tests {
         let bound = listener.local_addr().expect("listener is actually bound");
         assert_eq!(bound.ip(), std::net::Ipv4Addr::UNSPECIFIED, "binds 0.0.0.0, not the offered address");
         assert_ne!(bound.port(), 0, "the ephemeral port was actually assigned by the OS");
+    }
+
+    #[tokio::test]
+    async fn build_upgrade_candidate_refuses_a_non_global_unicast_reflexive_248() {
+        // #248 (found live, 2026-08-01): a member co-located with the edge on the same
+        // Docker host gets an edge-observed reflexive address on the Docker bridge
+        // network (RFC1918) -- real, but never reachable by a genuinely external peer.
+        // Offering it anyway left the initiator hanging for the full session timeout
+        // instead of degrading to relay-only immediately, since the peer's own SSRF
+        // guard (#137) silently refuses to dial it. Symmetric with `upgrade_safe_endpoint`'s
+        // existing filter on the *peer's* offered endpoint -- applied here to our own.
+        for bad in [
+            "172.18.0.19:4433",  // RFC1918 (the exact address found live, #248)
+            "10.0.0.5:4433",     // RFC1918
+            "192.168.1.9:4433",  // RFC1918
+            "127.0.0.1:4433",    // loopback
+            "169.254.1.1:4433",  // link-local
+        ] {
+            let addr: SocketAddr = bad.parse().unwrap();
+            assert!(
+                build_upgrade_candidate(Some(addr)).await.is_none(),
+                "{bad} is not global-unicast -- must not be offered as a direct candidate"
+            );
+        }
+        // A genuinely global-unicast reflexive still works (unchanged from the test above).
+        let addr: SocketAddr = "203.0.113.7:4433".parse().unwrap();
+        assert!(build_upgrade_candidate(Some(addr)).await.is_some());
     }
 
     #[test]
