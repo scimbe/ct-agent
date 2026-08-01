@@ -1242,12 +1242,32 @@ pub(crate) fn dcutr_upgrade_target(offered: &str, trusted_circuit: &Multiaddr) -
 pub(crate) fn build_relay_gate_client<S>(
     stream: S,
     relay_peer: libp2p::PeerId,
+    own_reflexive: Option<std::net::SocketAddr>,
 ) -> Result<(Swarm<DcutrRelayClientBehaviour>, Multiaddr), BoxError>
 where
     S: libp2p::futures::AsyncRead + libp2p::futures::AsyncWrite + Unpin + Send + 'static,
 {
+    let mut swarm = build_dcutr_relay_client_swarm_over_stream(stream)?;
+    // #248: seed DCUtR's own candidate-address list with this member's real reflexive
+    // address, when the edge observed one (relayed back via the admission ack -- see
+    // channel_run::join_via_relay_gate_dcutr's caller, which already applies the #137
+    // global-unicast filter before this ever sees it). identify running OVER the relay
+    // circuit can't supply this itself: relay-node only ever sees the EDGE's own address
+    // for every relay-gate connection (the edge proxies them), never the real client's --
+    // so without this, DCUtR had no real external address to advertise the peer at all.
+    if let Some(addr) = own_reflexive {
+        let ma: Multiaddr = match addr {
+            std::net::SocketAddr::V4(a) => Multiaddr::empty()
+                .with(Protocol::Ip4(*a.ip()))
+                .with(Protocol::Tcp(a.port())),
+            std::net::SocketAddr::V6(a) => Multiaddr::empty()
+                .with(Protocol::Ip6(*a.ip()))
+                .with(Protocol::Tcp(a.port())),
+        };
+        swarm.add_external_address(ma);
+    }
     Ok((
-        build_dcutr_relay_client_swarm_over_stream(stream)?,
+        swarm,
         // #134-follow (found live E2E-testing the relay-gate): a bare `<relay>/p2p/<id>`
         // address is just "the relay peer" -- it carries no marker telling libp2p's
         // relay-client `Behaviour` this is a CIRCUIT relay to reserve/dial through, so

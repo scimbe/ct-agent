@@ -678,8 +678,8 @@ where
 {
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
-    let peer_noise = match present_channel_join(relay_conn, request, holder).await? {
-        ChannelJoinOutcome::Admitted { peer_noise_pubkey: Some(k), .. } => k,
+    let (peer_noise, own_observed_reflexive) = match present_channel_join(relay_conn, request, holder).await? {
+        ChannelJoinOutcome::Admitted { peer_noise_pubkey: Some(k), observed_reflexive, .. } => (k, observed_reflexive),
         ChannelJoinOutcome::Admitted { .. } => {
             return Err("DCUtR relay-gate join needs the peer's relayed Noise key (register the member's key, #101)".into())
         }
@@ -692,7 +692,18 @@ where
     };
     let (gate_stream, relay_peer) =
         dial_relay_gate_over_443(relay_gate_addr, relay_gate_cert, own_grant, holder).await?;
-    let (client, circuit_relay) = crate::p2p::build_relay_gate_client(gate_stream.compat(), relay_peer)?;
+    // #248: seed the DCUtR swarm with this member's OWN reflexive address, when the edge
+    // observed one and it's actually safe to advertise (same #137 global-unicast filter
+    // every other candidate-address path in this file already applies). Without this,
+    // DCUtR has no real external address to offer the peer at all -- it can only ever
+    // advertise the relay-node's own address (learned via identify over the circuit,
+    // which is the EDGE's address, not this member's own, since the edge proxies every
+    // relay-gate connection) or nothing, so the hole-punch had no real candidate to try.
+    // Live-reproduced: dozens of real relay-gate sessions with admission + circuit
+    // genuinely established, never once a completed hole-punch -- this is why.
+    let own_reflexive = own_observed_reflexive.filter(|a| ct_common::channel::is_global_unicast(*a));
+    let (client, circuit_relay) =
+        crate::p2p::build_relay_gate_client(gate_stream.compat(), relay_peer, own_reflexive)?;
     crate::p2p::run_channel_session_upgradable_dcutr(
         relay_send,
         relay_recv,
