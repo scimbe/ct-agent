@@ -843,21 +843,26 @@ where
                 &relay_priv,
                 coord,
                 1,
-                // #137 SSRF guard: the offered endpoint is peer-conveyed and never passed the edge
-                // broker's `safe_endpoint` gate, so apply the identical range filter here — refuse
-                // to even signal Ready for an internal/private/metadata target.
+                // #137 SSRF guard (reflexive candidate) / #276 same-subnet guard (local
+                // candidate): the offered endpoint is peer-conveyed and never passed the edge
+                // broker's `safe_endpoint` gate, so `select_upgrade_candidate` applies the
+                // appropriate filter to whichever half it ends up choosing — refuse to even
+                // signal Ready when neither candidate is dialable.
                 |ep: String| async move {
-                    let safe = upgrade_safe_endpoint(&ep).is_some();
+                    let chosen = select_upgrade_candidate(&ep);
                     eprintln!(
                         "ct-agent channel: #104 upgrade — peer offered direct candidate {ep}{}",
-                        if safe { "" } else { " (rejected: not a global-unicast address, #137)" }
+                        match chosen {
+                            Some(a) => format!(" -> selected {a}"),
+                            None => " (rejected: no dialable candidate — neither a same-subnet local nor a global-unicast reflexive address, #137/#276)".to_string(),
+                        }
                     );
-                    safe
+                    chosen.is_some()
                 },
                 move |ep: String| async move {
-                    // Dial the offered endpoint (SSRF-guarded, #137) and handshake as the
-                    // direct-Noise INITIATOR. A non-global-unicast target is refused → stay on relay.
-                    let addr = match upgrade_safe_endpoint(&ep) {
+                    // Dial the selected candidate (SSRF/same-subnet-guarded, #137/#276) and
+                    // handshake as the direct-Noise INITIATOR. No dialable candidate → stay on relay.
+                    let addr = match select_upgrade_candidate(&ep) {
                         Some(a) => a,
                         None => return None, // already logged as rejected above
                     };
@@ -3014,7 +3019,82 @@ async fn build_upgrade_candidate(observed_reflexive: Option<SocketAddr>) -> Opti
         return None;
     }
     let (listener, _cert) = crate::transport::build_direct_listener().ok()?;
-    Some((listener, addr.to_string()))
+    // #276 piece 1: also offer a LAN-local candidate, when this host has one -- the same
+    // ephemeral port `listener` bound on 0.0.0.0 accepts on every interface, including the
+    // local one, so pairing the offered local IP with that port is a real, dialable target.
+    // Encoded as `reflexive\0local` (see `split_offered_candidates`) so `ct_common::upgrade`'s
+    // wire format and generic signatures stay completely untouched -- this is purely how
+    // ct-agent packs/unpacks the one `String` field `UpgradeMsg::Offer` already carries. The
+    // offering side announces its own real local address truthfully, same as it already does
+    // for its reflexive address; the RESPONDER is the one that must not trust it outright
+    // (`select_upgrade_candidate`'s `same_local_subnet` gate).
+    let endpoint = match (local_egress_ip(), listener.local_addr().ok()) {
+        (Some(local_ip), Some(bound)) if is_lan_candidate(local_ip) => {
+            format!("{addr}\0{}", SocketAddr::new(local_ip, bound.port()))
+        }
+        _ => addr.to_string(),
+    };
+    Some((listener, endpoint))
+}
+
+/// #276: whether `ip` is the kind of address worth offering as a LAN-local direct-upgrade
+/// candidate at all (private RFC1918 or IPv6 ULA) -- loopback/link-local/multicast/global
+/// addresses are never useful here (a global address already goes through the reflexive
+/// candidate; loopback/link-local/multicast can never be a peer's real LAN address).
+fn is_lan_candidate(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private(),
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00, // unique-local fc00::/7
+    }
+}
+
+/// Best-effort local (LAN-facing) IP: "connect" a UDP socket to an unrouted public address
+/// (no packet is sent -- it only makes the OS pick the default-route source interface) and
+/// read the socket's local address. `None` when there is no route. Mirrors the same trick
+/// `CADS-Tunnel`'s `ct-client` crate already uses for its own local-egress classifier
+/// (`ladder.rs::local_egress_ip`) -- deliberately no new dependency for interface
+/// enumeration.
+fn local_egress_ip() -> Option<std::net::IpAddr> {
+    let sock = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737): never a real host, so nothing is contacted --
+    // connect() only fixes the source interface via the routing table.
+    sock.connect(("192.0.2.1", 9)).ok()?;
+    sock.local_addr().ok().map(|a| a.ip())
+}
+
+/// #276: split a peer-offered direct-upgrade endpoint into its required reflexive
+/// candidate and an optional LAN-local one, the counterpart to `build_upgrade_candidate`'s
+/// `reflexive\0local` encoding. An empty or malformed local segment degrades to "no local
+/// candidate" rather than a parse error -- the reflexive candidate alone is always a
+/// complete, valid offer on its own (unchanged pre-#276 behavior).
+fn split_offered_candidates(ep: &str) -> (&str, Option<&str>) {
+    match ep.split_once('\0') {
+        Some((reflexive, local)) if !local.is_empty() => (reflexive, Some(local)),
+        Some((reflexive, _)) => (reflexive, None),
+        None => (ep, None),
+    }
+}
+
+/// #276: choose which of a peer-offered candidate pair to actually dial. Prefers the
+/// LAN-local candidate — cheap, low-latency, and if it connects it's almost certainly the
+/// same network — but ONLY after `same_local_subnet` confirms it against THIS host's own
+/// local address; a malformed local candidate, a family mismatch, or a candidate outside
+/// our own subnet all fall through to the existing `#137`-guarded reflexive candidate,
+/// never to an ungated dial. This is the one seam both `dial_probe` and
+/// `dial_and_establish` call, so "is this safe" and "what do we actually dial" can never
+/// disagree.
+fn select_upgrade_candidate(ep: &str) -> Option<SocketAddr> {
+    let (reflexive, local) = split_offered_candidates(ep);
+    if let Some(local) = local {
+        if let Ok(candidate) = local.parse::<SocketAddr>() {
+            if let Some(my_local) = local_egress_ip() {
+                if ct_common::channel::same_local_subnet(my_local, candidate.ip()) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    upgrade_safe_endpoint(reflexive)
 }
 
 /// Why a direct dial to a paired peer did not connect (#72 AF4-session-resilience).
@@ -6651,15 +6731,82 @@ mod tests {
         // session, exactly the same as before the option existed.
         assert!(build_upgrade_candidate(None).await.is_none(), "no reflexive -> no candidate");
 
-        // A real reflexive address -> a real, freshly-bound ephemeral listener plus the
-        // address string unchanged (the candidate offered in-band is exactly what the edge
-        // observed, never anything self-selected).
+        // A real reflexive address -> a real, freshly-bound ephemeral listener, and the
+        // offered string's reflexive half is exactly the edge-observed address, never
+        // anything self-selected (#276 piece 1 may additionally append a NUL-separated
+        // local candidate -- see `split_offered_candidates` -- when this host has a real
+        // local egress IP, which the test environment may or may not have).
         let addr: SocketAddr = "203.0.113.7:4433".parse().unwrap();
         let (listener, offered) = build_upgrade_candidate(Some(addr)).await.expect("candidate built");
-        assert_eq!(offered, "203.0.113.7:4433", "offers exactly the edge-observed address");
+        let (reflexive, local) = split_offered_candidates(&offered);
+        assert_eq!(reflexive, "203.0.113.7:4433", "offers exactly the edge-observed address");
+        if let Some(local) = local {
+            let local_addr: SocketAddr = local.parse().expect("appended local candidate is a valid SocketAddr");
+            assert!(
+                is_lan_candidate(local_addr.ip()),
+                "an appended local candidate is always a real private/ULA address, never anything else"
+            );
+        }
         let bound = listener.local_addr().expect("listener is actually bound");
         assert_eq!(bound.ip(), std::net::Ipv4Addr::UNSPECIFIED, "binds 0.0.0.0, not the offered address");
         assert_ne!(bound.port(), 0, "the ephemeral port was actually assigned by the OS");
+    }
+
+    #[test]
+    fn split_offered_candidates_recovers_the_optional_local_half() {
+        // #276 piece 1: the reflexive-only (pre-#276) format still round-trips unchanged.
+        assert_eq!(split_offered_candidates("203.0.113.7:4433"), ("203.0.113.7:4433", None));
+        // The new compound format recovers both halves.
+        assert_eq!(
+            split_offered_candidates("203.0.113.7:4433\0192.168.1.42:5000"),
+            ("203.0.113.7:4433", Some("192.168.1.42:5000"))
+        );
+        // A malformed (empty) local segment degrades to "no local candidate", not a parse
+        // error -- the reflexive candidate alone is always a complete, valid offer.
+        assert_eq!(split_offered_candidates("203.0.113.7:4433\0"), ("203.0.113.7:4433", None));
+    }
+
+    #[test]
+    fn select_upgrade_candidate_prefers_a_genuinely_same_subnet_local_candidate() {
+        // #276 piece 1's core behavior: when the peer-offered local candidate lands in
+        // OUR OWN local subnet, prefer it over the reflexive one.
+        let Some(my_local) = local_egress_ip() else {
+            return; // no route in this sandbox -- nothing to assert against
+        };
+        // Construct a same-subnet candidate at a different last octet (v4) or suffix (v6),
+        // matching same_local_subnet's own /24 (v4) / /64 (v6) heuristic.
+        let same_subnet = match my_local {
+            std::net::IpAddr::V4(v4) => {
+                let mut o = v4.octets();
+                o[3] = o[3].wrapping_add(1).max(1);
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(o[0], o[1], o[2], o[3]))
+            }
+            std::net::IpAddr::V6(_) => return, // v6 egress is environment-dependent; v4 case covers the seam
+        };
+        if !is_lan_candidate(my_local) {
+            return; // this sandbox's egress isn't a private address at all -- nothing to assert
+        }
+        let ep = format!("203.0.113.7:4433\0{same_subnet}:5000");
+        let chosen = select_upgrade_candidate(&ep).expect("a same-subnet local candidate is chosen");
+        assert_eq!(chosen.ip(), same_subnet, "the local candidate was preferred over the reflexive one");
+    }
+
+    #[test]
+    fn select_upgrade_candidate_refuses_an_off_subnet_local_candidate_and_falls_back() {
+        // #276 piece 1's safety property, exercised end-to-end through select_upgrade_candidate:
+        // a local candidate that is NOT in our own subnet must never be dialed, regardless of
+        // how plausible-looking it is -- the reflexive candidate is used instead.
+        let ep = "203.0.113.7:4433\0192.168.250.250:5000";
+        let chosen = select_upgrade_candidate(ep).expect("falls back to the reflexive candidate");
+        assert_eq!(chosen, "203.0.113.7:4433".parse::<SocketAddr>().unwrap(), "off-subnet local candidate refused, reflexive used instead");
+    }
+
+    #[test]
+    fn select_upgrade_candidate_never_dials_an_unsafe_reflexive_fallback_either() {
+        // The pre-#276 #137 guard still applies to the reflexive half when there is no
+        // (or an unusable) local candidate.
+        assert!(select_upgrade_candidate("192.168.1.1:4433").is_none(), "private reflexive with no local candidate -> refused, not silently dialed");
+        assert!(select_upgrade_candidate("203.0.113.7:4433").is_some(), "a plain global-unicast reflexive with no local half still works");
     }
 
     #[tokio::test]
