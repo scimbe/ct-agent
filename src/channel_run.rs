@@ -749,12 +749,22 @@ where
     // relay-gate connection) or nothing, so the hole-punch had no real candidate to try.
     // Live-reproduced: dozens of real relay-gate sessions with admission + circuit
     // genuinely established, never once a completed hole-punch -- this is why.
-    let own_reflexive = own_observed_reflexive.filter(|a| ct_common::channel::is_global_unicast(*a));
-    // #248/#238: own_reflexive above was observed over the :443 relay-gate's TCP admission --
-    // only valid for a TCP direct-dial candidate. Query the edge's 'W' echo (its normal QUIC
-    // :4433 listener) for a GENUINE UDP-observed reflexive address too, so DCUtR's preferred
-    // QUIC direct-dial attempt gets seeded with the right transport's address instead of
-    // silently reusing the TCP one. Best-effort, bounded, never blocks the join on failure.
+    // #248/#238-follow, CORRECTING an earlier (wrong) belief about this value: `own_observed_reflexive`
+    // is NOT observed over any TCP connection -- `relay_conn` (this fn's `present_channel_join` call
+    // just above) is unconditionally a QUIC connection (`dial_relay_preferring_direct` ->
+    // `build_channel_dialer` -> `quinn::Endpoint::connect`), to the relay/broker port, not the
+    // `:443` relay-gate leg at all. It's a real, genuinely-observed external port -- just for an
+    // unrelated ephemeral QUIC socket, not any TCP one and not the swarm's own QUIC punch listener
+    // either. There is currently no TCP-reflexive-discovery mechanism anywhere in this codebase (that
+    // would need the edge to report back the observed remote address for the actual `dial_relay_gate_over_443`
+    // TCP+TLS connection specifically -- a new edge-side wire-protocol addition, mirroring the 'W'
+    // echo op below, not yet built). So `own_observed_reflexive` is diagnostic-only now (logged
+    // below), never used to seed a dial candidate -- see `p2p::build_relay_gate_client`'s doc
+    // comment for why constructing one from it was actively wrong, not just suboptimal.
+    //
+    // Query the edge's 'W' echo (its normal QUIC :4433 listener) for a genuine UDP-observed
+    // reflexive address, so DCUtR's preferred QUIC direct-dial attempt gets seeded with a real
+    // address. Best-effort, bounded, never blocks the join on failure.
     let reflexive_edge_addr = reflexive_query_addr(
         relay_gate_addr,
         std::env::var("CT_CHANNEL_REFLEXIVE_EDGE").ok().as_deref(),
@@ -767,15 +777,14 @@ where
     .filter(|a| ct_common::channel::is_global_unicast(*a));
     if debug_timing_enabled() {
         eprintln!(
-            "ct-agent channel: debug relay-gate DCUtR own reflexive: edge observed (tcp) {:?}, global-unicast (usable) = {}; own reflexive (udp, queried at {:?}) = {:?}",
+            "ct-agent channel: debug relay-gate DCUtR own reflexive: relay/broker-observed (QUIC, NOT a TCP candidate) {:?}; own reflexive (udp, queried at {:?}) = {:?}",
             own_observed_reflexive,
-            own_reflexive.is_some(),
             reflexive_edge_addr,
             own_reflexive_udp
         );
     }
     let (client, circuit_relay) =
-        crate::p2p::build_relay_gate_client(gate_stream.compat(), relay_peer, own_reflexive, own_reflexive_udp)?;
+        crate::p2p::build_relay_gate_client(gate_stream.compat(), relay_peer, own_reflexive_udp)?;
     crate::p2p::run_channel_session_upgradable_dcutr(
         relay_send,
         relay_recv,

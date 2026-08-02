@@ -1421,7 +1421,9 @@ pub(crate) fn dcutr_upgrade_target(offered: &str, trusted_circuit: &Multiaddr) -
 pub(crate) fn build_relay_gate_client<S>(
     stream: S,
     relay_peer: libp2p::PeerId,
-    own_reflexive: Option<std::net::SocketAddr>,
+    // #248/#238-follow: NOT the observed-over-relay-gate-TCP-admission value the name might
+    // suggest -- see the doc comment at this fn's `reflexive_candidates` construction below for
+    // why there is currently no such thing. Only ever QUIC-observed.
     own_reflexive_udp: Option<std::net::SocketAddr>,
 ) -> Result<(Swarm<DcutrRelayClientBehaviour>, Multiaddr), BoxError>
 where
@@ -1445,35 +1447,24 @@ where
     // `NewExternalAddrCandidate` path, never the real seeded reflexive -- proof the old
     // `add_external_address` call was a no-op for DCUtR's purposes.
     //
-    // #248/#238 follow-up: `own_reflexive` alone was observed over the :443 relay-gate's
-    // TCP admission -- valid ONLY for a TCP direct-dial attempt. A NAT maps a TCP flow and a
-    // UDP flow from the same host to DIFFERENT external ports, so DCUtR's QUIC/UDP direct-dial
-    // attempt (its preferred one -- TCP hole-punching through stateful NAT is far less
-    // reliable) was consistently seeded with the wrong transport's address and timed out even
-    // against cone-type (punchable) NATs. `own_reflexive_udp` is the caller's genuinely
-    // QUIC-observed address (see `discover_udp_reflexive`, queried via the edge's 'W' echo op
-    // on its normal QUIC :4433 listener) -- seeded as its own, separate candidate alongside the
-    // TCP one, never replacing it, so both transports DCUtR tries now have a real address.
-    let mut reflexive_candidates: Vec<Multiaddr> = Vec::with_capacity(2);
-    if let Some(addr) = own_reflexive {
-        reflexive_candidates.push(match addr {
-            std::net::SocketAddr::V4(a) => Multiaddr::empty().with(Protocol::Ip4(*a.ip())).with(Protocol::Tcp(a.port())),
-            std::net::SocketAddr::V6(a) => Multiaddr::empty().with(Protocol::Ip6(*a.ip())).with(Protocol::Tcp(a.port())),
-        });
-    }
-    if let Some(addr) = own_reflexive_udp {
-        reflexive_candidates.push(match addr {
-            std::net::SocketAddr::V4(a) => Multiaddr::empty()
-                .with(Protocol::Ip4(*a.ip()))
-                .with(Protocol::Udp(a.port()))
-                .with(Protocol::QuicV1),
-            std::net::SocketAddr::V6(a) => Multiaddr::empty()
-                .with(Protocol::Ip6(*a.ip()))
-                .with(Protocol::Udp(a.port()))
-                .with(Protocol::QuicV1),
-        });
-    }
-    let swarm = build_dcutr_relay_client_swarm_over_stream(stream, reflexive_candidates)?;
+    // #248/#238 follow-up, CORRECTING an earlier (wrong) version of this comment: `own_reflexive`
+    // was never actually TCP-observed at all, despite its name and the "(tcp)" debug label this
+    // whole thread's traces carried. Traced the caller (`channel_run::join_via_relay_gate_dcutr`)
+    // down to the type: it comes from `present_channel_join(relay_conn, ...)`, and `relay_conn`
+    // (`channel_run::dial_relay_preferring_direct` -> `transport::build_channel_dialer` ->
+    // `quinn::Endpoint::connect`) is unconditionally a QUIC/UDP connection to the relay/broker
+    // port -- there is no TCP connection anywhere upstream of this value. So `own_reflexive`'s
+    // port is a real, genuinely-observed external port -- just for an unrelated ephemeral QUIC
+    // socket (the relay/broker dial), not any TCP socket, and not the swarm's own QUIC punch
+    // listener either. There is currently no code path anywhere that discovers a genuine
+    // TCP-observed reflexive (that would need the edge to report back the client's observed
+    // remote address for the actual `:443` relay-gate TCP+TLS admission connection specifically
+    // -- a new edge-side wire-protocol addition, mirroring the QUIC 'W' echo op below, not yet
+    // built). Constructing a `Protocol::Tcp(...)` candidate from this value was therefore
+    // guaranteed-wrong -- not merely suboptimal -- and fed a doomed dial attempt into every
+    // single DCUtR round this whole thread ran. Not seeding a candidate at all until a real
+    // TCP-reflexive mechanism exists, rather than seeding one we already know cannot work.
+    let swarm = build_dcutr_relay_client_swarm_over_stream(stream, relay_gate_reflexive_candidates(own_reflexive_udp))?;
     Ok((
         swarm,
         // #134-follow (found live E2E-testing the relay-gate): a bare `<relay>/p2p/<id>`
@@ -1486,6 +1477,29 @@ where
         // just never did.
         pre_connected_relay_addr().with(Protocol::P2p(relay_peer)).with(Protocol::P2pCircuit),
     ))
+}
+
+/// The `SeedExternalAddr` candidate list [`build_relay_gate_client`] seeds DCUtR with -- pulled
+/// out as its own pure fn (mirroring `dcutr_loop_action`'s extraction, same reasoning: a decision
+/// this easy to get subtly wrong deserves a real unit test, not just live-trace inspection).
+/// **Only ever a QUIC/UDP candidate, never a TCP one** -- see `build_relay_gate_client`'s doc
+/// comment for why: nothing in this codebase currently discovers a genuinely TCP-observed
+/// reflexive, so seeding a `Protocol::Tcp(...)` candidate here would (and, before this fix, did)
+/// always be wrong, not just unverified.
+fn relay_gate_reflexive_candidates(own_reflexive_udp: Option<std::net::SocketAddr>) -> Vec<Multiaddr> {
+    own_reflexive_udp
+        .into_iter()
+        .map(|addr| match addr {
+            std::net::SocketAddr::V4(a) => Multiaddr::empty()
+                .with(Protocol::Ip4(*a.ip()))
+                .with(Protocol::Udp(a.port()))
+                .with(Protocol::QuicV1),
+            std::net::SocketAddr::V6(a) => Multiaddr::empty()
+                .with(Protocol::Ip6(*a.ip()))
+                .with(Protocol::Udp(a.port()))
+                .with(Protocol::QuicV1),
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2072,9 +2086,11 @@ mod tests {
 
     #[test]
     fn seed_external_addr_new_many_emits_every_candidate_then_pends() {
-        // #248/#238: a relay-gate member now seeds BOTH a TCP-observed and a QUIC-observed
-        // reflexive candidate (one per transport DCUtR actually tries) -- both must reach
-        // dcutr's pool, not just the first.
+        // #248/#238: the underlying mechanism supports seeding more than one candidate at once
+        // (e.g. one per transport DCUtR tries) -- generic test of `SeedExternalAddr` itself, not
+        // tied to which candidates the relay-gate path actually constructs (see
+        // `relay_gate_reflexive_candidates_never_seeds_a_tcp_candidate` below for that -- as of
+        // #248/#238-follow it's UDP-only, since nothing discovers a genuine TCP reflexive yet).
         use libp2p::futures::task::noop_waker;
         use libp2p::swarm::ToSwarm;
         use std::task::{Context, Poll};
@@ -2100,6 +2116,31 @@ mod tests {
         // never emits anything, exactly like `new(None)`.
         let mut empty = SeedExternalAddr::new_many(vec![]);
         assert!(matches!(empty.poll(&mut cx), Poll::Pending), "no candidates -> always Pending");
+    }
+
+    #[test]
+    fn relay_gate_reflexive_candidates_never_seeds_a_tcp_candidate() {
+        // #248/#238-follow regression test: the relay-gate path's own_observed_reflexive was
+        // never actually TCP-observed (it's the relay/broker QUIC connection's own reflexive --
+        // see this fn's doc comment and build_relay_gate_client's), so constructing a
+        // Protocol::Tcp(...) candidate from it was guaranteed-wrong, not just unverified. This
+        // asserts the fixed behavior directly: given a real (QUIC-observed) UDP reflexive, the
+        // ONLY candidate produced is a `/udp/.../quic-v1` one -- never a `/tcp/...` one, and there
+        // is no code path here that could accidentally reintroduce one.
+        let udp_reflexive: std::net::SocketAddr = "203.0.113.10:51234".parse().unwrap();
+        let candidates = relay_gate_reflexive_candidates(Some(udp_reflexive));
+
+        assert_eq!(candidates.len(), 1, "exactly one candidate for one observed reflexive");
+        let expected: Multiaddr = "/ip4/203.0.113.10/udp/51234/quic-v1".parse().unwrap();
+        assert_eq!(candidates[0], expected);
+        assert!(
+            !candidates[0].iter().any(|p| matches!(p, Protocol::Tcp(_))),
+            "must never contain a TCP protocol component"
+        );
+
+        // No reflexive discovered (e.g. the edge's 'W' echo query failed/timed out) -> no
+        // candidates at all, not a fallback to some other (wrong) address.
+        assert!(relay_gate_reflexive_candidates(None).is_empty());
     }
 
     #[tokio::test]
