@@ -4,7 +4,6 @@
 # Agent.Dockerfile uses (that one exists to test against unreleased commits); this
 # one is what an end customer's `scripts/setup.sh --docker` actually runs.
 #
-# Built with buildx so $TARGETOS/$TARGETARCH resolve to the host platform automatically:
 #   docker build -t ct-agent:local https://github.com/scimbe/ct-agent.git#main:docker
 
 FROM ubuntu:24.04
@@ -17,19 +16,27 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-ARG TARGETOS
-ARG TARGETARCH
-# Docker's TARGETARCH values (amd64/arm64/386) don't match this repo's release
-# asset names (x86_64/aarch64/i686, see .github/workflows/release.yml) -- map them.
-RUN case "${TARGETARCH}" in \
-      amd64) rel_arch=x86_64 ;; \
-      arm64) rel_arch=aarch64 ;; \
-      386)   rel_arch=i686 ;; \
-      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+# Detect the platform via `uname` at RUN time rather than relying on the
+# `TARGETARCH`/`TARGETOS` build ARGs (#3): those are only auto-populated by
+# BuildKit's multi-platform machinery, which `scripts/setup.sh`'s plain
+# `docker build` invocation (no `buildx`, no `--platform`) doesn't engage on
+# every Docker install -- classic builder, `DOCKER_BUILDKIT=0`, and some buildx
+# driver configs all leave them empty, producing "unsupported TARGETARCH: "
+# with nothing after the colon. `uname` runs unconditionally inside the RUN
+# step's own execution environment, so it reports correctly whether that's the
+# host's native architecture (plain single-platform build) or an emulated
+# target platform (genuine `buildx --platform=...` cross-build under QEMU) --
+# no dependency on which builder or flags produced the image.
+RUN arch="$(uname -m)" \
+    && case "${arch}" in \
+      x86_64|aarch64)  rel_arch="${arch}" ;; \
+      i386|i686)       rel_arch=i686 ;; \
+      *) echo "unsupported architecture: ${arch}" >&2; exit 1 ;; \
     esac \
-    && case "${TARGETOS}" in \
+    && os="$(uname -s | tr '[:upper:]' '[:lower:]')" \
+    && case "${os}" in \
       linux) rel_os=linux ;; \
-      *) echo "unsupported TARGETOS: ${TARGETOS} (this image targets Linux containers)" >&2; exit 1 ;; \
+      *) echo "unsupported OS: ${os} (this image targets Linux containers)" >&2; exit 1 ;; \
     esac \
     && curl -fsSL "https://github.com/scimbe/ct-agent/releases/latest/download/ct-agent-${rel_os}-${rel_arch}" \
        -o /usr/local/bin/ct-agent \
