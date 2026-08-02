@@ -659,7 +659,7 @@ pub async fn dial_relay_gate_over_443(
 /// relay-gate, this deployment's stable QUIC port (4433) unless an operator overrides it
 /// via `CT_CHANNEL_REFLEXIVE_EDGE` (host:port; e.g. if the edge's QUIC listener is
 /// NAT/port-mapped differently from its `:443` front door).
-fn reflexive_query_addr(relay_gate_addr: SocketAddr, override_raw: Option<&str>) -> Result<SocketAddr, String> {
+pub fn reflexive_query_addr(relay_gate_addr: SocketAddr, override_raw: Option<&str>) -> Result<SocketAddr, String> {
     match override_raw {
         Some(s) if !s.trim().is_empty() => resolve_socket_addr(s.trim()),
         _ => Ok(SocketAddr::new(relay_gate_addr.ip(), 4433)),
@@ -686,7 +686,7 @@ fn reflexive_query_addr(relay_gate_addr: SocketAddr, override_raw: Option<&str>)
 /// Deliberately does NOT apply the `#137`/`is_global_unicast` safety filter itself — the
 /// caller does, exactly like `own_observed_reflexive` above, so this function stays testable
 /// against a real (loopback, in tests) server without the filter masking a wiring bug.
-async fn discover_udp_reflexive(edge_quic_addr: SocketAddr, timeout: std::time::Duration) -> Option<SocketAddr> {
+pub async fn discover_udp_reflexive(edge_quic_addr: SocketAddr, timeout: std::time::Duration) -> Option<SocketAddr> {
     let attempt = async {
         let endpoint = crate::transport::build_channel_dialer().ok()?;
         let conn = endpoint.connect(edge_quic_addr, "localhost").ok()?.await.ok()?;
