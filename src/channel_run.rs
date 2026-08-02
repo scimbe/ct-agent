@@ -654,6 +654,54 @@ pub async fn dial_relay_gate_over_443(
     Ok((stream, relay_peer))
 }
 
+/// #248/#238: the edge's QUIC "whoami" query address (its 'W' reflexive-address echo, on
+/// the SAME QUIC listener Browser-Plane agents register on) -- same host as the `:443`
+/// relay-gate, this deployment's stable QUIC port (4433) unless an operator overrides it
+/// via `CT_CHANNEL_REFLEXIVE_EDGE` (host:port; e.g. if the edge's QUIC listener is
+/// NAT/port-mapped differently from its `:443` front door).
+fn reflexive_query_addr(relay_gate_addr: SocketAddr, override_raw: Option<&str>) -> Result<SocketAddr, String> {
+    match override_raw {
+        Some(s) if !s.trim().is_empty() => resolve_socket_addr(s.trim()),
+        _ => Ok(SocketAddr::new(relay_gate_addr.ip(), 4433)),
+    }
+}
+
+/// #248/#238: query the edge's 'W' reflexive-address echo to learn this member's GENUINE
+/// UDP-observed reflexive address -- the piece missing from #248's original candidate-pool
+/// fix, which only ever had a TCP-observed address (from the `:443` relay-gate's own
+/// admission handshake) to seed. A NAT maps a TCP flow and a UDP flow from the same host to
+/// DIFFERENT external ports, so DCUtR's QUIC direct-dial attempt (its preferred one) was
+/// consistently seeded with the wrong transport's address and timed out even against
+/// cone-type (punchable) NATs.
+///
+/// Best-effort by construction: any failure (edge unreachable on that port, timeout,
+/// malformed reply) returns `None`, exactly like an edge that never observed a reflexive
+/// address at all — this is a pure enhancement layered on top of the existing TCP-derived
+/// candidate, never a hard requirement for the relay-gate join to proceed. Uses
+/// [`crate::transport::build_channel_dialer`] (accepts any server cert): the reply isn't
+/// sensitive and needs no authentication — a MITM lying about the observed address can only
+/// make the punch fail, never weaken the channel's real security, which rests entirely on the
+/// Noise_IK/grant/possession layers elsewhere.
+///
+/// Deliberately does NOT apply the `#137`/`is_global_unicast` safety filter itself — the
+/// caller does, exactly like `own_observed_reflexive` above, so this function stays testable
+/// against a real (loopback, in tests) server without the filter masking a wiring bug.
+async fn discover_udp_reflexive(edge_quic_addr: SocketAddr, timeout: std::time::Duration) -> Option<SocketAddr> {
+    let attempt = async {
+        let endpoint = crate::transport::build_channel_dialer().ok()?;
+        let conn = endpoint.connect(edge_quic_addr, "localhost").ok()?.await.ok()?;
+        let (mut send, mut recv) = conn.open_bi().await.ok()?;
+        send.write_all(b"W").await.ok()?;
+        send.finish().ok()?;
+        let mut len = [0u8; 1];
+        recv.read_exact(&mut len).await.ok()?;
+        let mut buf = vec![0u8; len[0] as usize];
+        recv.read_exact(&mut buf).await.ok()?;
+        std::str::from_utf8(&buf).ok()?.parse::<SocketAddr>().ok()
+    };
+    tokio::time::timeout(timeout, attempt).await.ok().flatten()
+}
+
 /// **#136 N-wire — DCUtR-upgradable relay join over the `:443` relay-gate.** Like
 /// [`join_via_relay_dcutr`], but reaches the Circuit-Relay v2 relay through
 /// [`dial_relay_gate_over_443`] instead of a directly-dialable `CT_CHANNEL_CIRCUIT_RELAY`
@@ -702,15 +750,32 @@ where
     // Live-reproduced: dozens of real relay-gate sessions with admission + circuit
     // genuinely established, never once a completed hole-punch -- this is why.
     let own_reflexive = own_observed_reflexive.filter(|a| ct_common::channel::is_global_unicast(*a));
+    // #248/#238: own_reflexive above was observed over the :443 relay-gate's TCP admission --
+    // only valid for a TCP direct-dial candidate. Query the edge's 'W' echo (its normal QUIC
+    // :4433 listener) for a GENUINE UDP-observed reflexive address too, so DCUtR's preferred
+    // QUIC direct-dial attempt gets seeded with the right transport's address instead of
+    // silently reusing the TCP one. Best-effort, bounded, never blocks the join on failure.
+    let reflexive_edge_addr = reflexive_query_addr(
+        relay_gate_addr,
+        std::env::var("CT_CHANNEL_REFLEXIVE_EDGE").ok().as_deref(),
+    )
+    .ok();
+    let own_reflexive_udp = match reflexive_edge_addr {
+        Some(addr) => discover_udp_reflexive(addr, std::time::Duration::from_secs(5)).await,
+        None => None,
+    }
+    .filter(|a| ct_common::channel::is_global_unicast(*a));
     if debug_timing_enabled() {
         eprintln!(
-            "ct-agent channel: debug relay-gate DCUtR own reflexive: edge observed {:?}, global-unicast (usable) = {}",
+            "ct-agent channel: debug relay-gate DCUtR own reflexive: edge observed (tcp) {:?}, global-unicast (usable) = {}; own reflexive (udp, queried at {:?}) = {:?}",
             own_observed_reflexive,
-            own_reflexive.is_some()
+            own_reflexive.is_some(),
+            reflexive_edge_addr,
+            own_reflexive_udp
         );
     }
     let (client, circuit_relay) =
-        crate::p2p::build_relay_gate_client(gate_stream.compat(), relay_peer, own_reflexive)?;
+        crate::p2p::build_relay_gate_client(gate_stream.compat(), relay_peer, own_reflexive, own_reflexive_udp)?;
     crate::p2p::run_channel_session_upgradable_dcutr(
         relay_send,
         relay_recv,
@@ -3810,6 +3875,103 @@ mod tests {
         let got = incoming.await.is_ok();
         tokio::time::sleep(hold).await;
         got
+    }
+
+    #[test]
+    fn reflexive_query_addr_derives_port_4433_by_default_or_honors_an_override() {
+        // #248/#238: same host as the relay-gate, this deployment's stable QUIC port,
+        // unless an operator overrides it entirely via CT_CHANNEL_REFLEXIVE_EDGE.
+        let relay_gate: SocketAddr = "203.0.113.9:443".parse().unwrap();
+        assert_eq!(
+            reflexive_query_addr(relay_gate, None).unwrap(),
+            "203.0.113.9:4433".parse::<SocketAddr>().unwrap(),
+            "defaults to the relay-gate's host on the stable QUIC port"
+        );
+        assert_eq!(
+            reflexive_query_addr(relay_gate, Some("")).unwrap(),
+            "203.0.113.9:4433".parse::<SocketAddr>().unwrap(),
+            "an empty override is treated the same as unset"
+        );
+        assert_eq!(
+            reflexive_query_addr(relay_gate, Some("198.51.100.1:9999")).unwrap(),
+            "198.51.100.1:9999".parse::<SocketAddr>().unwrap(),
+            "an explicit override wins entirely, including a different host"
+        );
+        assert!(reflexive_query_addr(relay_gate, Some("not-an-addr")).is_err(), "malformed override is rejected");
+    }
+
+    /// Test-only "edge": accepts one QUIC connection and answers exactly the 'W' whoami
+    /// wire protocol `discover_udp_reflexive` speaks -- a minimal, from-scratch echo (not
+    /// a reuse of the real edge's `serve_connection`, which lives in a separate crate/repo)
+    /// so this test exercises ct-agent's OWN client-side protocol handling in isolation.
+    async fn serve_one_whoami_echo(server: Endpoint) {
+        let incoming = server.accept().await.expect("one connection arrives");
+        let conn = incoming.await.expect("handshake completes");
+        let remote = conn.remote_address();
+        let (mut send, mut recv) = conn.accept_bi().await.expect("client opens a bi stream");
+        let mut role = [0u8; 1];
+        recv.read_exact(&mut role).await.expect("role byte");
+        assert_eq!(role[0], b'W', "discover_udp_reflexive must send the 'W' role byte");
+        let addr = remote.to_string();
+        let bytes = addr.as_bytes();
+        send.write_all(&[bytes.len() as u8]).await.expect("write len");
+        send.write_all(bytes).await.expect("write addr");
+        send.finish().unwrap();
+        // Give the response a moment to actually reach the client before this task (and
+        // the `Endpoint`/`Connection` it owns) drops -- dropping immediately after
+        // `finish()` can race the client's read with the connection teardown. Not
+        // `conn.closed().await`: the client (production `discover_udp_reflexive`) never
+        // explicitly closes, it just drops its own endpoint/connection at the end of its
+        // async block, so waiting for a graceful close here could hang indefinitely.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn discover_udp_reflexive_queries_the_edges_whoami_echo() {
+        use ct_edge::transport::build_server_endpoint_with_cert;
+
+        let (server, _cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(serve_one_whoami_echo(server));
+
+        let reported = discover_udp_reflexive(addr, Duration::from_secs(2))
+            .await
+            .expect("the edge answered with an observed address");
+        assert_eq!(
+            reported.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            "reports the loopback address this in-process test actually dials from"
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discover_udp_reflexive_returns_none_when_the_edge_is_unreachable() {
+        // A bound-then-dropped UDP socket's address: nothing is listening there.
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let unreachable = probe.local_addr().unwrap();
+        drop(probe);
+
+        assert!(
+            discover_udp_reflexive(unreachable, Duration::from_millis(500)).await.is_none(),
+            "an unreachable edge yields None, never an error the caller has to handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_udp_reflexive_returns_none_on_timeout_not_a_hang() {
+        // A server that accepts the connection but never answers -- discover_udp_reflexive
+        // must still return within its own bounded timeout, not hang forever.
+        use ct_edge::transport::build_server_endpoint_with_cert;
+
+        let (server, _cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().unwrap();
+        let _hold = tokio::spawn(accept_one_and_hold(server, Duration::from_secs(2), Duration::from_secs(2)));
+
+        let started = std::time::Instant::now();
+        let result = discover_udp_reflexive(addr, Duration::from_millis(300)).await;
+        assert!(result.is_none(), "no reply within the timeout -> None");
+        assert!(started.elapsed() < Duration::from_secs(1), "bounded by its own timeout, not the server's hold");
     }
 
     #[tokio::test]
