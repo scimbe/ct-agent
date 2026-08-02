@@ -1137,6 +1137,15 @@ pub struct ChannelJoinCliConfig {
     /// SSRF guard (`upgrade_safe_endpoint`) correctly refuses it and the session simply
     /// stays on the relay, exactly as it did before this option existed.
     pub direct_upgrade: bool,
+    /// #276: this member's OWN genuinely direct edge relay address (`CT_CHANNEL_RELAY_DIRECT`,
+    /// host:port), tried BEFORE `relay_addr` on the relay-gate DCUtR path — "always look for
+    /// direct communication; relay is only the last line of defense," specifically for a
+    /// member whose configured `CT_CHANNEL_RELAY` points at a same-network super-peer relay
+    /// (`#276` piece 2) rather than the real edge. Absent (the common case) ⇒ unchanged
+    /// behavior, dial `relay_addr` directly with no extra latency. Present ⇒ try this address
+    /// first (bounded timeout), falling through to `relay_addr` only on failure — see
+    /// [`dial_relay_preferring_direct`].
+    pub relay_addr_direct: Option<SocketAddr>,
 }
 
 /// Parse the optional `CT_CHANNEL_CIRCUIT_RELAY` libp2p circuit-relay multiaddr (#136 N-wire):
@@ -1356,6 +1365,14 @@ impl ChannelJoinCliConfig {
                 t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
             })
             .unwrap_or(false);
+        // #276: optional, same treatment as CT_CHANNEL_FRONT_DOOR above (a set-but-malformed
+        // value is an error, not a silently-dropped preference).
+        let relay_addr_direct = match f("CT_CHANNEL_RELAY_DIRECT") {
+            Some(s) if !s.trim().is_empty() => {
+                Some(resolve_socket_addr(s.trim()).map_err(|e| format!("CT_CHANNEL_RELAY_DIRECT invalid: {e}"))?)
+            }
+            _ => None,
+        };
         Ok(Self {
             role,
             broker_addr,
@@ -1372,6 +1389,7 @@ impl ChannelJoinCliConfig {
             relay_gate_addr,
             relay_gate_cert,
             direct_upgrade,
+            relay_addr_direct,
         })
     }
 }
@@ -2497,6 +2515,40 @@ fn channel_local() -> ChannelLocal {
     }
 }
 
+/// #276: dial the edge relay leg, preferring a genuinely direct connection over a configured
+/// fallback (e.g. a same-network super-peer relay) whenever one is available and reachable —
+/// "always look for direct communication; relay is only the last line of defense," per
+/// explicit design guidance for the super-peer mechanism. Tries `direct` first, bounded by
+/// `timeout` so an unreachable direct address can't stall the whole join indefinitely; on any
+/// failure (connect error or timeout) falls through to `fallback`. When `direct` is `None` —
+/// the common case, a member with no direct edge reachability of its own, which is PRECISELY
+/// why it configured a super-peer fallback in the first place — dials `fallback` immediately
+/// with no extra latency, unaffected by this preference.
+async fn dial_relay_preferring_direct(
+    direct: Option<SocketAddr>,
+    fallback: SocketAddr,
+    timeout: std::time::Duration,
+) -> Result<Connection, BoxError> {
+    if let Some(direct_addr) = direct {
+        let attempt = async {
+            crate::transport::build_channel_dialer()?.connect(direct_addr, "localhost")?.await.map_err(BoxError::from)
+        };
+        match tokio::time::timeout(timeout, attempt).await {
+            Ok(Ok(conn)) => {
+                eprintln!("ct-agent channel: dialed direct edge {direct_addr} (#276, preferred over the configured relay fallback)");
+                return Ok(conn);
+            }
+            Ok(Err(e)) => {
+                eprintln!("ct-agent channel: direct edge dial to {direct_addr} failed ({e}), falling back to {fallback} (#276)")
+            }
+            Err(_) => eprintln!(
+                "ct-agent channel: direct edge dial to {direct_addr} timed out after {timeout:?}, falling back to {fallback} (#276)"
+            ),
+        }
+    }
+    crate::transport::build_channel_dialer()?.connect(fallback, "localhost")?.await.map_err(BoxError::from)
+}
+
 /// #248: what a relay-gate/circuit-relay DCUtR join loop should do after one attempt,
 /// given whether it succeeded, whether this member is a persistent `--serve`, and the
 /// one-shot retry budget already spent. Pure decision core, extracted from the two live
@@ -2594,9 +2646,8 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             );
             let mut attempt: u32 = 0;
             loop {
-                let relay_conn = crate::transport::build_channel_dialer()?
-                    .connect(cfg.relay_addr, "localhost")?
-                    .await?;
+                let relay_conn =
+                    dial_relay_preferring_direct(cfg.relay_addr_direct, cfg.relay_addr, DIRECT_DIAL_TIMEOUT).await?;
                 let local = channel_local();
                 let result = join_via_relay_gate_dcutr(
                     &relay_conn,
@@ -3742,7 +3793,88 @@ mod tests {
     use ct_common::noise::generate_static_keypair;
     use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
     use std::collections::HashMap;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Test helper: accept exactly one full QUIC connection on `server` (both stages —
+    /// `Incoming` then the handshake-completing `Connecting` — matching the pattern
+    /// `stub_broker_admit` above already establishes) within `timeout`, and report whether
+    /// one arrived. The accepted `Connection` (and the `Endpoint` itself) is held alive for
+    /// the caller-supplied `hold` duration afterward, since a dropped `Endpoint` starts
+    /// tearing down in-flight connections immediately.
+    async fn accept_one_and_hold(server: Endpoint, timeout: Duration, hold: Duration) -> bool {
+        let incoming = match tokio::time::timeout(timeout, server.accept()).await {
+            Ok(Some(incoming)) => incoming,
+            _ => return false,
+        };
+        let got = incoming.await.is_ok();
+        tokio::time::sleep(hold).await;
+        got
+    }
+
+    #[tokio::test]
+    async fn dial_relay_preferring_direct_uses_the_direct_address_when_it_is_reachable() {
+        // #276: "always look for direct communication; relay is only the last line of
+        // defense" -- when a direct address is configured AND reachable, it must be used,
+        // never the fallback (e.g. a same-network super-peer relay), even though the
+        // fallback is also live and would happily accept the connection.
+        use ct_edge::transport::build_server_endpoint_with_cert;
+
+        let (direct_server, _cert) = build_server_endpoint_with_cert().expect("direct server");
+        let direct_addr = direct_server.local_addr().unwrap();
+        let (fallback_server, _cert2) = build_server_endpoint_with_cert().expect("fallback server");
+        let fallback_addr = fallback_server.local_addr().unwrap();
+
+        let direct_hit = tokio::spawn(accept_one_and_hold(direct_server, Duration::from_secs(2), Duration::from_millis(300)));
+        // The fallback server is live too, but must never receive a connection in this test.
+        let fallback_hit = tokio::spawn(accept_one_and_hold(fallback_server, Duration::from_millis(400), Duration::ZERO));
+
+        let conn = dial_relay_preferring_direct(Some(direct_addr), fallback_addr, Duration::from_secs(2))
+            .await
+            .expect("dials the direct address");
+        assert!(conn.close_reason().is_none(), "connection is live");
+
+        assert!(direct_hit.await.unwrap(), "the direct server received the connection");
+        assert!(!fallback_hit.await.unwrap(), "the fallback server never saw a connection attempt");
+    }
+
+    #[tokio::test]
+    async fn dial_relay_preferring_direct_falls_back_when_the_direct_address_is_unreachable() {
+        // A direct address with nothing listening (a closed UDP port) must not hang or
+        // error the whole dial -- it falls through to the fallback within a bounded time.
+        use ct_edge::transport::build_server_endpoint_with_cert;
+
+        let (fallback_server, _cert) = build_server_endpoint_with_cert().expect("fallback server");
+        let fallback_addr = fallback_server.local_addr().unwrap();
+        let fallback_hit = tokio::spawn(accept_one_and_hold(fallback_server, Duration::from_secs(3), Duration::from_millis(300)));
+
+        // A bound-then-dropped UDP socket's address: nothing is listening there, so a QUIC
+        // handshake attempt to it will not complete.
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let unreachable = probe.local_addr().unwrap();
+        drop(probe);
+
+        let conn = dial_relay_preferring_direct(Some(unreachable), fallback_addr, Duration::from_millis(500))
+            .await
+            .expect("falls back to the reachable address");
+        assert!(conn.close_reason().is_none(), "connection to the fallback is live");
+        assert!(fallback_hit.await.unwrap(), "the fallback server received the connection after the direct attempt failed");
+    }
+
+    #[tokio::test]
+    async fn dial_relay_preferring_direct_with_no_direct_address_dials_the_fallback_immediately() {
+        use ct_edge::transport::build_server_endpoint_with_cert;
+
+        let (fallback_server, _cert) = build_server_endpoint_with_cert().expect("fallback server");
+        let fallback_addr = fallback_server.local_addr().unwrap();
+        let fallback_hit = tokio::spawn(accept_one_and_hold(fallback_server, Duration::from_secs(2), Duration::from_millis(300)));
+
+        let conn = dial_relay_preferring_direct(None, fallback_addr, Duration::from_secs(2))
+            .await
+            .expect("dials the fallback directly");
+        assert!(conn.close_reason().is_none());
+        assert!(fallback_hit.await.unwrap());
+    }
 
     #[test]
     fn dcutr_loop_action_a_persistent_serve_member_always_loops_regardless_of_outcome() {
