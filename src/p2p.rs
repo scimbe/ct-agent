@@ -671,6 +671,90 @@ pub(crate) struct DcutrRelayClientBehaviour {
     // it: with no observed address there is nothing for the peer to tell the other to punch to.
     identify: identify::Behaviour,
     stream: stream::Behaviour,
+    // #248: seeds `dcutr::Behaviour`'s own candidate pool with a genuinely trustworthy address
+    // (see `SeedExternalAddr`'s own doc comment for why `Swarm::add_external_address` alone does
+    // NOT reach it).
+    seed_reflexive: SeedExternalAddr,
+}
+
+/// #248: a `NetworkBehaviour` whose only job is to seed the swarm's OTHER behaviours with one
+/// caller-supplied external-address candidate, once, via `ToSwarm::NewExternalAddrCandidate`.
+///
+/// `Swarm::add_external_address` looks like the right API for this (it IS the public,
+/// documented way to register a confirmed external address) — but it isn't: it only broadcasts
+/// `FromSwarm::ExternalAddrConfirmed`, and `dcutr::Behaviour::on_swarm_event` (confirmed via
+/// direct crate-source inspection, `libp2p-dcutr-0.14.1`'s `behaviour.rs`) does not handle that
+/// variant at all — its `match` only has arms for `ConnectionClosed`, `DialFailure`, and
+/// `NewExternalAddrCandidate` (which feeds its own internal `Candidates` LRU cache, the actual
+/// pool DCUtR's hole-punch attempts draw from). `identify::Behaviour` reaches that pool by
+/// emitting `ToSwarm::NewExternalAddrCandidate` from its own `poll()` for every peer-reported
+/// `observed_addr` it sees — unfiltered, which is the root of the ORIGINAL bug this whole thread
+/// chases: a proxied hop's bogus, non-global-unicast "observed" address reaches DCUtR's pool the
+/// same way a real one would, and there is no way to evict it once added (the `Candidates`
+/// LRU has no removal hook, and `dcutr` never listens for `ExternalAddrExpired` either).
+///
+/// There is no public `Swarm`-level API to inject a `NewExternalAddrCandidate` directly — it is
+/// only ever synthesized by the swarm dispatch loop when a COMPOSED behaviour's own `poll()`
+/// returns that `ToSwarm` variant. This behaviour does exactly that, once, for the one address
+/// this member's own admission-time edge-observed reflexive supplies (already filtered through
+/// `#137`'s `is_global_unicast` guard by the caller) — modeled on `libp2p_swarm::dummy` for
+/// everything connection-related, since this behaviour never itself participates in a
+/// connection.
+pub(crate) struct SeedExternalAddr {
+    pending: Option<Multiaddr>,
+}
+
+impl SeedExternalAddr {
+    fn new(addr: Option<Multiaddr>) -> Self {
+        Self { pending: addr }
+    }
+}
+
+impl NetworkBehaviour for SeedExternalAddr {
+    type ConnectionHandler = libp2p::swarm::dummy::ConnectionHandler;
+    type ToSwarm = std::convert::Infallible;
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        _: libp2p::swarm::ConnectionId,
+        _: libp2p::PeerId,
+        _: &Multiaddr,
+        _: &Multiaddr,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        Ok(libp2p::swarm::dummy::ConnectionHandler)
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        _: libp2p::swarm::ConnectionId,
+        _: libp2p::PeerId,
+        _: &Multiaddr,
+        _: libp2p::core::Endpoint,
+        _: libp2p::core::transport::PortUse,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        Ok(libp2p::swarm::dummy::ConnectionHandler)
+    }
+
+    fn on_connection_handler_event(
+        &mut self,
+        _: libp2p::PeerId,
+        _: libp2p::swarm::ConnectionId,
+        event: libp2p::swarm::THandlerOutEvent<Self>,
+    ) {
+        libp2p::core::util::unreachable(event)
+    }
+
+    fn poll(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>> {
+        if let Some(addr) = self.pending.take() {
+            return std::task::Poll::Ready(libp2p::swarm::ToSwarm::NewExternalAddrCandidate(addr));
+        }
+        std::task::Poll::Pending
+    }
+
+    fn on_swarm_event(&mut self, _event: libp2p::swarm::FromSwarm) {}
 }
 
 /// Build a **DCUtR-enabled relay client**'s swarm: identical to [`build_relay_client_swarm`]
@@ -700,6 +784,7 @@ pub(crate) fn build_dcutr_relay_client_swarm() -> Result<Swarm<DcutrRelayClientB
                 key.public(),
             )),
             stream: stream::Behaviour::new(),
+            seed_reflexive: SeedExternalAddr::new(None),
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
         .build();
@@ -844,6 +929,7 @@ fn pre_connected_relay_addr() -> Multiaddr {
 /// runs completely unchanged.
 fn build_dcutr_relay_client_swarm_over_stream<S>(
     stream: S,
+    own_reflexive: Option<Multiaddr>,
 ) -> Result<Swarm<DcutrRelayClientBehaviour>, BoxError>
 where
     S: libp2p::futures::AsyncRead + libp2p::futures::AsyncWrite + Unpin + Send + 'static,
@@ -884,6 +970,10 @@ where
                 key.public(),
             )),
             stream: stream::Behaviour::new(),
+            // #248: THE actual fix -- reaches dcutr::Behaviour's own candidate pool, which
+            // Swarm::add_external_address (broadcasting only ExternalAddrConfirmed, a variant
+            // dcutr never listens for) does not. See SeedExternalAddr's doc comment.
+            seed_reflexive: SeedExternalAddr::new(own_reflexive),
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
         .build();
@@ -1276,25 +1366,28 @@ pub(crate) fn build_relay_gate_client<S>(
 where
     S: libp2p::futures::AsyncRead + libp2p::futures::AsyncWrite + Unpin + Send + 'static,
 {
-    let mut swarm = build_dcutr_relay_client_swarm_over_stream(stream)?;
-    // #248: seed DCUtR's own candidate-address list with this member's real reflexive
-    // address, when the edge observed one (relayed back via the admission ack -- see
+    // #248: seed DCUtR's own candidate pool with this member's real reflexive address, when
+    // the edge observed one (relayed back via the admission ack -- see
     // channel_run::join_via_relay_gate_dcutr's caller, which already applies the #137
     // global-unicast filter before this ever sees it). identify running OVER the relay
-    // circuit can't supply this itself: relay-node only ever sees the EDGE's own address
-    // for every relay-gate connection (the edge proxies them), never the real client's --
-    // so without this, DCUtR had no real external address to advertise the peer at all.
-    if let Some(addr) = own_reflexive {
-        let ma: Multiaddr = match addr {
-            std::net::SocketAddr::V4(a) => Multiaddr::empty()
-                .with(Protocol::Ip4(*a.ip()))
-                .with(Protocol::Tcp(a.port())),
-            std::net::SocketAddr::V6(a) => Multiaddr::empty()
-                .with(Protocol::Ip6(*a.ip()))
-                .with(Protocol::Tcp(a.port())),
-        };
-        swarm.add_external_address(ma);
-    }
+    // circuit can't supply this itself: relay-node only ever sees the EDGE's own address for
+    // every relay-gate connection (the edge proxies them), never the real client's -- so
+    // without this, DCUtR had no real external address to advertise the peer at all.
+    //
+    // Passed into swarm CONSTRUCTION (via SeedExternalAddr, not a post-hoc
+    // `swarm.add_external_address` call) -- that was this fix's original (6af1b10) approach
+    // and looked right, but `add_external_address` only broadcasts `ExternalAddrConfirmed`,
+    // which `dcutr::Behaviour` never listens for at all; only `NewExternalAddrCandidate`
+    // (what `SeedExternalAddr` emits from its own `poll()`) reaches dcutr's actual candidate
+    // pool. Confirmed live: bob-1's #248 trace showed DCUtR dialing exclusively a bogus
+    // Docker-internal address `identify` had auto-registered via that same
+    // `NewExternalAddrCandidate` path, never the real seeded reflexive -- proof the old
+    // `add_external_address` call was a no-op for DCUtR's purposes.
+    let reflexive_ma: Option<Multiaddr> = own_reflexive.map(|addr| match addr {
+        std::net::SocketAddr::V4(a) => Multiaddr::empty().with(Protocol::Ip4(*a.ip())).with(Protocol::Tcp(a.port())),
+        std::net::SocketAddr::V6(a) => Multiaddr::empty().with(Protocol::Ip6(*a.ip())).with(Protocol::Tcp(a.port())),
+    });
+    let swarm = build_dcutr_relay_client_swarm_over_stream(stream, reflexive_ma)?;
     Ok((
         swarm,
         // #134-follow (found live E2E-testing the relay-gate): a bare `<relay>/p2p/<id>`
@@ -1861,6 +1954,34 @@ mod tests {
 
         let ula_v6: Multiaddr = "/ip6/fd00::1/tcp/4433".parse().unwrap();
         assert!(!multiaddr_is_global_unicast(&ula_v6), "IPv6 unique-local is refused");
+    }
+
+    #[test]
+    fn seed_external_addr_emits_the_candidate_once_then_pends() {
+        // #248: this IS the mechanism dcutr::Behaviour actually listens for (confirmed via
+        // direct crate-source inspection of libp2p-dcutr-0.14.1 -- its on_swarm_event only
+        // handles ConnectionClosed/DialFailure/NewExternalAddrCandidate, NOT
+        // ExternalAddrConfirmed, so Swarm::add_external_address alone never reaches it).
+        use libp2p::futures::task::noop_waker;
+        use libp2p::swarm::ToSwarm;
+        use std::task::{Context, Poll};
+
+        let addr: Multiaddr = "/ip4/203.0.113.10/tcp/4433".parse().unwrap();
+        let mut behaviour = SeedExternalAddr::new(Some(addr.clone()));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        match behaviour.poll(&mut cx) {
+            Poll::Ready(ToSwarm::NewExternalAddrCandidate(got)) => assert_eq!(got, addr),
+            other => panic!("expected Poll::Ready(ToSwarm::NewExternalAddrCandidate), got {other:?}"),
+        }
+        // Exactly once: a second poll must not re-emit (and must not panic on the now-empty
+        // `pending`).
+        assert!(matches!(behaviour.poll(&mut cx), Poll::Pending), "must not re-emit on a second poll");
+
+        // `None` (no reflexive known) never emits anything at all.
+        let mut empty = SeedExternalAddr::new(None);
+        assert!(matches!(empty.poll(&mut cx), Poll::Pending), "no address -> always Pending");
     }
 
     #[tokio::test]
