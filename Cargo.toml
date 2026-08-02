@@ -16,6 +16,14 @@ ct-control-plane = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.
 # _acme-challenge TXT record the DNS-01 validation reads.
 ct-dns = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.11" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+# #248-follow: opt-in only (see main.rs -- initialized only when RUST_LOG is set, same
+# off-by-default pattern as CT_DEBUG_A2A_TIMING). quinn/libp2p already emit their own
+# `tracing` spans/events; this crate is the only thing missing to actually see them --
+# without a subscriber installed, quinn's "log" feature above silently falls back to the
+# `log` facade (also unsubscribed here), so today NOTHING quinn/libp2p log internally is
+# visible no matter what env var is set. Needed to investigate #248's QUIC
+# `HandshakeTimedOut` direct-dial failures at the transport level instead of guessing.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "process", "signal"] }
 # TCP keepalive (#229) for the TLS-TCP fallback: unlike QUIC (which already
 # keepalives), a parked fallback registration is a plain, silent TCP

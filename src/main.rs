@@ -48,6 +48,17 @@ variables, not flags -- see docs.bunsenbrenner.org for the full reference per co
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // #248-follow: opt-in only -- quinn and libp2p already emit their own `tracing`
+    // spans/events (DCUtR handshake attempts, QUIC connection state, etc.), but with no
+    // subscriber installed they go nowhere no matter what env var is set. `RUST_LOG`
+    // absent -> zero behavior change (no subscriber installed at all), same off-by-default
+    // pattern as `CT_DEBUG_A2A_TIMING`.
+    if std::env::var_os("RUST_LOG").is_some() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .init();
+    }
     // #248: mark actual process start before anything else, so the always-on
     // uptime/bytes status line (ct_agent::channel_run::traffic_status_line) reports
     // real process uptime even for a long-lived --serve process's first session.
