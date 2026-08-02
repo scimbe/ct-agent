@@ -16,7 +16,7 @@ ct-control-plane = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.
 # _acme-challenge TXT record the DNS-01 validation reads.
 ct-dns = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.11" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "process", "signal"] }
 # TCP keepalive (#229) for the TLS-TCP fallback: unlike QUIC (which already
 # keepalives), a parked fallback registration is a plain, silent TCP
 # connection with nothing else to refresh it -- over a real, geographically
