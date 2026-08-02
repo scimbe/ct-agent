@@ -701,12 +701,21 @@ pub(crate) struct DcutrRelayClientBehaviour {
 /// everything connection-related, since this behaviour never itself participates in a
 /// connection.
 pub(crate) struct SeedExternalAddr {
-    pending: Option<Multiaddr>,
+    pending: Vec<Multiaddr>,
 }
 
 impl SeedExternalAddr {
     fn new(addr: Option<Multiaddr>) -> Self {
-        Self { pending: addr }
+        Self { pending: addr.into_iter().collect() }
+    }
+
+    /// Seed more than one external-address candidate at once — e.g. a TCP-
+    /// observed AND a QUIC-observed reflexive address for the same member
+    /// (#248/#238): each is only useful to DCUtR's direct-dial attempt on the
+    /// transport it was actually observed over, since a NAT maps a TCP flow and
+    /// a UDP flow from the same host to different external ports.
+    fn new_many(addrs: Vec<Multiaddr>) -> Self {
+        Self { pending: addrs }
     }
 }
 
@@ -748,7 +757,7 @@ impl NetworkBehaviour for SeedExternalAddr {
         &mut self,
         _: &mut std::task::Context<'_>,
     ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>> {
-        if let Some(addr) = self.pending.take() {
+        if let Some(addr) = self.pending.pop() {
             return std::task::Poll::Ready(libp2p::swarm::ToSwarm::NewExternalAddrCandidate(addr));
         }
         std::task::Poll::Pending
@@ -929,7 +938,7 @@ fn pre_connected_relay_addr() -> Multiaddr {
 /// runs completely unchanged.
 fn build_dcutr_relay_client_swarm_over_stream<S>(
     stream: S,
-    own_reflexive: Option<Multiaddr>,
+    own_reflexive: Vec<Multiaddr>,
 ) -> Result<Swarm<DcutrRelayClientBehaviour>, BoxError>
 where
     S: libp2p::futures::AsyncRead + libp2p::futures::AsyncWrite + Unpin + Send + 'static,
@@ -973,7 +982,7 @@ where
             // #248: THE actual fix -- reaches dcutr::Behaviour's own candidate pool, which
             // Swarm::add_external_address (broadcasting only ExternalAddrConfirmed, a variant
             // dcutr never listens for) does not. See SeedExternalAddr's doc comment.
-            seed_reflexive: SeedExternalAddr::new(own_reflexive),
+            seed_reflexive: SeedExternalAddr::new_many(own_reflexive),
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
         .build();
@@ -1413,6 +1422,7 @@ pub(crate) fn build_relay_gate_client<S>(
     stream: S,
     relay_peer: libp2p::PeerId,
     own_reflexive: Option<std::net::SocketAddr>,
+    own_reflexive_udp: Option<std::net::SocketAddr>,
 ) -> Result<(Swarm<DcutrRelayClientBehaviour>, Multiaddr), BoxError>
 where
     S: libp2p::futures::AsyncRead + libp2p::futures::AsyncWrite + Unpin + Send + 'static,
@@ -1434,11 +1444,36 @@ where
     // Docker-internal address `identify` had auto-registered via that same
     // `NewExternalAddrCandidate` path, never the real seeded reflexive -- proof the old
     // `add_external_address` call was a no-op for DCUtR's purposes.
-    let reflexive_ma: Option<Multiaddr> = own_reflexive.map(|addr| match addr {
-        std::net::SocketAddr::V4(a) => Multiaddr::empty().with(Protocol::Ip4(*a.ip())).with(Protocol::Tcp(a.port())),
-        std::net::SocketAddr::V6(a) => Multiaddr::empty().with(Protocol::Ip6(*a.ip())).with(Protocol::Tcp(a.port())),
-    });
-    let swarm = build_dcutr_relay_client_swarm_over_stream(stream, reflexive_ma)?;
+    //
+    // #248/#238 follow-up: `own_reflexive` alone was observed over the :443 relay-gate's
+    // TCP admission -- valid ONLY for a TCP direct-dial attempt. A NAT maps a TCP flow and a
+    // UDP flow from the same host to DIFFERENT external ports, so DCUtR's QUIC/UDP direct-dial
+    // attempt (its preferred one -- TCP hole-punching through stateful NAT is far less
+    // reliable) was consistently seeded with the wrong transport's address and timed out even
+    // against cone-type (punchable) NATs. `own_reflexive_udp` is the caller's genuinely
+    // QUIC-observed address (see `discover_udp_reflexive`, queried via the edge's 'W' echo op
+    // on its normal QUIC :4433 listener) -- seeded as its own, separate candidate alongside the
+    // TCP one, never replacing it, so both transports DCUtR tries now have a real address.
+    let mut reflexive_candidates: Vec<Multiaddr> = Vec::with_capacity(2);
+    if let Some(addr) = own_reflexive {
+        reflexive_candidates.push(match addr {
+            std::net::SocketAddr::V4(a) => Multiaddr::empty().with(Protocol::Ip4(*a.ip())).with(Protocol::Tcp(a.port())),
+            std::net::SocketAddr::V6(a) => Multiaddr::empty().with(Protocol::Ip6(*a.ip())).with(Protocol::Tcp(a.port())),
+        });
+    }
+    if let Some(addr) = own_reflexive_udp {
+        reflexive_candidates.push(match addr {
+            std::net::SocketAddr::V4(a) => Multiaddr::empty()
+                .with(Protocol::Ip4(*a.ip()))
+                .with(Protocol::Udp(a.port()))
+                .with(Protocol::QuicV1),
+            std::net::SocketAddr::V6(a) => Multiaddr::empty()
+                .with(Protocol::Ip6(*a.ip()))
+                .with(Protocol::Udp(a.port()))
+                .with(Protocol::QuicV1),
+        });
+    }
+    let swarm = build_dcutr_relay_client_swarm_over_stream(stream, reflexive_candidates)?;
     Ok((
         swarm,
         // #134-follow (found live E2E-testing the relay-gate): a bare `<relay>/p2p/<id>`
@@ -2033,6 +2068,38 @@ mod tests {
         // `None` (no reflexive known) never emits anything at all.
         let mut empty = SeedExternalAddr::new(None);
         assert!(matches!(empty.poll(&mut cx), Poll::Pending), "no address -> always Pending");
+    }
+
+    #[test]
+    fn seed_external_addr_new_many_emits_every_candidate_then_pends() {
+        // #248/#238: a relay-gate member now seeds BOTH a TCP-observed and a QUIC-observed
+        // reflexive candidate (one per transport DCUtR actually tries) -- both must reach
+        // dcutr's pool, not just the first.
+        use libp2p::futures::task::noop_waker;
+        use libp2p::swarm::ToSwarm;
+        use std::task::{Context, Poll};
+
+        let tcp: Multiaddr = "/ip4/203.0.113.10/tcp/4433".parse().unwrap();
+        let udp: Multiaddr = "/ip4/203.0.113.10/udp/51234/quic-v1".parse().unwrap();
+        let mut behaviour = SeedExternalAddr::new_many(vec![tcp.clone(), udp.clone()]);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            match behaviour.poll(&mut cx) {
+                Poll::Ready(ToSwarm::NewExternalAddrCandidate(got)) => seen.push(got),
+                other => panic!("expected Poll::Ready(ToSwarm::NewExternalAddrCandidate), got {other:?}"),
+            }
+        }
+        assert_eq!(seen.len(), 2, "both candidates emitted");
+        assert!(seen.contains(&tcp) && seen.contains(&udp), "both the tcp and udp candidates were seeded");
+        assert!(matches!(behaviour.poll(&mut cx), Poll::Pending), "no third candidate to emit");
+
+        // An empty Vec (e.g. the edge observed neither a TCP nor a genuine UDP reflexive)
+        // never emits anything, exactly like `new(None)`.
+        let mut empty = SeedExternalAddr::new_many(vec![]);
+        assert!(matches!(empty.poll(&mut cx), Poll::Pending), "no candidates -> always Pending");
     }
 
     #[tokio::test]
