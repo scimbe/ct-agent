@@ -18,6 +18,23 @@
 //! super-peer's listen address instead of the real edge — nothing else about that member's
 //! config, grant, or session changes.
 //!
+//! **Relay is the last line of defense, not the default.** A member should still prefer
+//! genuinely direct edge reachability over routing through a super-peer whenever it has
+//! any of its own — `CT_CHANNEL_RELAY_DIRECT` (`channel_run::dial_relay_preferring_direct`,
+//! wired into the relay-gate DCUtR join loop) lets a member configure its OWN direct edge
+//! relay address to try FIRST, bounded by a short timeout, falling through to the
+//! (possibly super-peer'd) `CT_CHANNEL_RELAY` only on failure. **Known limitation, not yet
+//! closed**: a member that DOES end up routing through the super-peer gets its admission-time
+//! `observed_reflexive` reported as the super-peer's own address (since that's genuinely
+//! where its traffic originates from, from the edge's point of view) — this means `#104`'s
+//! plain direct-upgrade candidate is wrong for a super-peer'd member specifically (it would
+//! offer the super-peer's address, not the member's own, to a remote peer). Closing this
+//! fully would need either a NAT-traversal-style discovery independent of the super-peer, or
+//! having the super-peer participate in the admission exchange enough to relay each member's
+//! OWN observed address separately — deliberately not attempted here, since either breaks
+//! the "protocol-unaware, byte-transparent" simplicity this module is built on. Flagging so
+//! this isn't a silent gap.
+//!
 //! **NAT-style demultiplexing.** QUIC (what `CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY` speak)
 //! multiplexes many logical connections over a single UDP 4-tuple by connection ID, so a
 //! single shared upstream socket for every local client would let their datagrams collide on
