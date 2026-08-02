@@ -2497,6 +2497,43 @@ fn channel_local() -> ChannelLocal {
     }
 }
 
+/// #248: what a relay-gate/circuit-relay DCUtR join loop should do after one attempt,
+/// given whether it succeeded, whether this member is a persistent `--serve`, and the
+/// one-shot retry budget already spent. Pure decision core, extracted from the two live
+/// loops (relay-gate, circuit-relay) below so it's unit-testable without a real network.
+///
+/// Found live via bob-2's own crash-log capture: a persistent `--serve` member that
+/// COMPLETES a session -- even one whose DCUtR upgrade attempt failed with
+/// `AttemptsExceeded` and fell back to relay, which is still `Ok(())` ("hole-punch failure
+/// stays on the relay" is this whole mechanism's own design) -- must loop back to admit the
+/// NEXT peer, not stop. Before this fix both live loops only special-cased `Err` for
+/// `serve_loop`; `Ok(())` fell through to an unconditional `return`, silently ending the
+/// whole process after exactly one session. Reproduced 2/2 by bob-2's supervisor: always
+/// exactly 3 DCUtR `OutgoingConnectionError`s (a genuine, correctly-handled hole-punch
+/// failure), then a clean `exit(0)` with no error logged anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DcutrLoopAction {
+    /// This peer's session is over (successfully or not) and this is a persistent serve
+    /// member: sleep, reset the one-shot retry counter to 0, and admit the next peer.
+    RetryReset,
+    /// An error, and a one-shot caller's own bounded retry budget still has room: sleep,
+    /// bump the counter to `next_attempt`, and try again.
+    RetryBounded { next_attempt: u32 },
+    /// Stop the loop; return the original result to the caller (a one-shot caller out of
+    /// retries, or a non-`serve_loop` result of either kind).
+    Stop,
+}
+
+fn dcutr_loop_action(ok: bool, serve_loop: bool, attempt: u32, max_one_shot_retries: u32) -> DcutrLoopAction {
+    if serve_loop {
+        return DcutrLoopAction::RetryReset;
+    }
+    if !ok && attempt < max_one_shot_retries {
+        return DcutrLoopAction::RetryBounded { next_attempt: attempt + 1 };
+    }
+    DcutrLoopAction::Stop
+}
+
 /// Run the plane-brokered `ct-agent channel` flow (#98 / #103): connect to the edge
 /// rendezvous + relay, present the grant, and pipe **stdin/stdout** over the A2A tunnel
 /// with automatic direct-then-relay recovery via [`run_channel_join`]. The broker
@@ -2573,21 +2610,26 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                     &cfg.grant,
                 )
                 .await;
-                match result {
-                    Err(e) if serve_loop => {
-                        eprintln!("ct-agent channel: relay-gate admission error, re-admitting (#248): {e}");
+                match dcutr_loop_action(result.is_ok(), serve_loop, attempt, ONE_SHOT_DCUTR_ADMISSION_RETRIES) {
+                    DcutrLoopAction::RetryReset => {
+                        if let Err(e) = &result {
+                            eprintln!("ct-agent channel: relay-gate admission error, re-admitting (#248): {e}");
+                        }
+                        attempt = 0;
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         continue;
                     }
-                    Err(e) if attempt < ONE_SHOT_DCUTR_ADMISSION_RETRIES => {
-                        attempt += 1;
-                        eprintln!(
-                            "ct-agent channel: relay-gate admission error, retrying ({attempt}/{ONE_SHOT_DCUTR_ADMISSION_RETRIES}) (#248): {e}"
-                        );
+                    DcutrLoopAction::RetryBounded { next_attempt } => {
+                        attempt = next_attempt;
+                        if let Err(e) = &result {
+                            eprintln!(
+                                "ct-agent channel: relay-gate admission error, retrying ({attempt}/{ONE_SHOT_DCUTR_ADMISSION_RETRIES}) (#248): {e}"
+                            );
+                        }
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         continue;
                     }
-                    other => return other,
+                    DcutrLoopAction::Stop => return result,
                 }
             }
         }
@@ -2613,21 +2655,26 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                     circuit.clone(),
                 )
                 .await;
-                match result {
-                    Err(e) if serve_loop => {
-                        eprintln!("ct-agent channel: relay-gate admission error, re-admitting (#248): {e}");
+                match dcutr_loop_action(result.is_ok(), serve_loop, attempt, ONE_SHOT_DCUTR_ADMISSION_RETRIES) {
+                    DcutrLoopAction::RetryReset => {
+                        if let Err(e) = &result {
+                            eprintln!("ct-agent channel: relay-gate admission error, re-admitting (#248): {e}");
+                        }
+                        attempt = 0;
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         continue;
                     }
-                    Err(e) if attempt < ONE_SHOT_DCUTR_ADMISSION_RETRIES => {
-                        attempt += 1;
-                        eprintln!(
-                            "ct-agent channel: relay-gate admission error, retrying ({attempt}/{ONE_SHOT_DCUTR_ADMISSION_RETRIES}) (#248): {e}"
-                        );
+                    DcutrLoopAction::RetryBounded { next_attempt } => {
+                        attempt = next_attempt;
+                        if let Err(e) = &result {
+                            eprintln!(
+                                "ct-agent channel: relay-gate admission error, retrying ({attempt}/{ONE_SHOT_DCUTR_ADMISSION_RETRIES}) (#248): {e}"
+                            );
+                        }
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         continue;
                     }
-                    other => return other,
+                    DcutrLoopAction::Stop => return result,
                 }
             }
         }
@@ -3696,6 +3743,35 @@ mod tests {
     use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
     use std::collections::HashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn dcutr_loop_action_a_persistent_serve_member_always_loops_regardless_of_outcome() {
+        // #248: the actual bug -- a completed session (Ok) used to fall through to an
+        // unconditional Stop even when serve_loop was true, silently ending the whole
+        // process after exactly one session. A persistent serve member must ALWAYS loop
+        // back (reset the one-shot counter), whether the session succeeded or errored.
+        assert_eq!(dcutr_loop_action(true, true, 0, 2), DcutrLoopAction::RetryReset, "Ok + serve_loop -> keep serving");
+        assert_eq!(dcutr_loop_action(false, true, 0, 2), DcutrLoopAction::RetryReset, "Err + serve_loop -> re-admit");
+        // Even with the one-shot retry budget already exhausted, serve_loop still wins --
+        // that budget is only ever relevant to a ONE-SHOT caller.
+        assert_eq!(dcutr_loop_action(false, true, 99, 2), DcutrLoopAction::RetryReset, "serve_loop ignores the one-shot budget entirely");
+    }
+
+    #[test]
+    fn dcutr_loop_action_a_one_shot_caller_retries_errors_up_to_the_bound_then_stops() {
+        assert_eq!(dcutr_loop_action(false, false, 0, 2), DcutrLoopAction::RetryBounded { next_attempt: 1 });
+        assert_eq!(dcutr_loop_action(false, false, 1, 2), DcutrLoopAction::RetryBounded { next_attempt: 2 });
+        // At the bound, no more retries -- stop and return the (error) result.
+        assert_eq!(dcutr_loop_action(false, false, 2, 2), DcutrLoopAction::Stop, "budget exhausted -> stop");
+    }
+
+    #[test]
+    fn dcutr_loop_action_a_one_shot_callers_success_always_stops_immediately() {
+        // A one-shot caller (--call-service, or Accept without --serve) that succeeds must
+        // terminate right away -- it never loops just because it COULD have retried.
+        assert_eq!(dcutr_loop_action(true, false, 0, 2), DcutrLoopAction::Stop);
+        assert_eq!(dcutr_loop_action(true, false, 2, 2), DcutrLoopAction::Stop);
+    }
 
     fn cfg_from(pairs: &[(&str, &str)]) -> Result<ChannelRunConfig, String> {
         let map: HashMap<String, String> =
