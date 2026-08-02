@@ -2128,7 +2128,20 @@ where
             || std::env::var_os("CT_CHANNEL_CIRCUIT_RELAY").is_some()
             || std::env::var_os("CT_CHANNEL_DIRECT_UPGRADE").is_some();
         if upgrade_configured {
-            const UPGRADE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+            // #248: 2s (the original fb5a799 value, tuned against local-loopback tests where a
+            // hole-punch is near-instant) turned out too short for a REAL cross-NAT relay-gate
+            // DCUtR attempt over genuine WAN paths -- live-reproduced on the bob-1<->bob-2
+            // pairing after aad49fb finally got both sides' real reflexive addresses into
+            // DCUtR's candidate pool: the swarm logged `Dialing` toward the peer's real address,
+            // then the one-shot process exited (reply already received over the relay leg,
+            // concurrently) before any `ConnectionEstablished`/`OutgoingConnectionError` for that
+            // dial appeared, even with CT_DEBUG_A2A_TIMING on. A real hole-punch involves actual
+            // network round-trips over the internet (address exchange, then a simultaneous
+            // connect attempt, possibly retried) -- meaningfully slower than anything on
+            // loopback. This is still a blind fixed sleep, not "wait for the actual upgrade
+            // outcome" -- a real fix would have the channel session signal completion
+            // (success/failure/timeout) instead of guessing a window, which remains open.
+            const UPGRADE_GRACE: std::time::Duration = std::time::Duration::from_secs(6);
             tokio::time::sleep(UPGRADE_GRACE).await;
         }
     }
