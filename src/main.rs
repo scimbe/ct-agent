@@ -39,6 +39,7 @@ USAGE:
     ct-agent channel allowlist add|remove|list   Manage a channel's self-service allow-list
     ct-agent channel agent-card           Write (and optionally register) this agent's card
     ct-agent channel agent-card --verify <file>  Verify a card file's signature/expiry
+    ct-agent channel super-peer           Run as an opt-in LAN-local relay for same-network members
     ct-agent channel                      Join a channel (CT_CHANNEL_* env config)
 
 Every subcommand is configured entirely via CT_*/CT_AGENT_*/CT_CHANNEL_* environment
@@ -151,6 +152,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let req = ct_agent::channel_run::OperatorGrantRequest::from_env()
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             println!("{}", req.issue());
+            return Ok(());
+        }
+        // #276 piece 2 `ct-agent channel super-peer`: run this process as an opt-in LAN-local
+        // relay for other same-network channel members, turning N edge-relay connections into
+        // 1 (this process) + N-1 local hops. LISTEN is what LAN-local members point their own
+        // CT_CHANNEL_BROKER/CT_CHANNEL_RELAY at instead of the real edge; UPSTREAM is this
+        // super-peer's own real edge broker/relay address. Deliberately protocol-unaware --
+        // see super_peer.rs's module doc for why a plain byte-transparent relay is the right
+        // (and simplest correct) design, preserving the same end-to-end Noise_IK trust
+        // boundary as the edge relay itself.
+        if std::env::args().nth(2).as_deref() == Some("super-peer") {
+            let listen: std::net::SocketAddr = std::env::var("CT_CHANNEL_SUPER_PEER_LISTEN")
+                .map_err(|_| "CT_CHANNEL_SUPER_PEER_LISTEN required (host:port LAN clients dial)")?
+                .parse()
+                .map_err(|e| format!("CT_CHANNEL_SUPER_PEER_LISTEN invalid: {e}"))?;
+            let upstream: std::net::SocketAddr = std::env::var("CT_CHANNEL_SUPER_PEER_UPSTREAM")
+                .map_err(|_| "CT_CHANNEL_SUPER_PEER_UPSTREAM required (this super-peer's real edge host:port)")?
+                .parse()
+                .map_err(|e| format!("CT_CHANNEL_SUPER_PEER_UPSTREAM invalid: {e}"))?;
+            ct_agent::super_peer::run(listen, upstream).await?;
             return Ok(());
         }
         // #117 `ct-agent channel register`: register the operator's channel authority with

@@ -20,6 +20,7 @@ pub mod origin;
 pub mod p2p;
 pub mod reconnect;
 pub mod serve;
+pub mod super_peer;
 pub mod transport;
 pub mod well_known;
 
