@@ -1284,16 +1284,41 @@ pub(crate) async fn dcutr_dial_via_relay(
     // #136: offer direct TCP+QUIC candidates so DCUtR can punch (else only the relay leg exists).
     add_direct_punch_listeners(&mut client)?;
     let (outbound_tx, outbound_rx) = tokio::sync::oneshot::channel();
+    // #248 (found live: bob-2's accept-role process genuinely emits NOTHING between its own
+    // reflexive line and the A2A handshake -- this loop, unlike dcutr_reserve_and_accept's
+    // (the Initiate-role event loop), had no logging at all, even under CT_DEBUG_A2A_TIMING).
+    let dbg = crate::channel_run::debug_timing_enabled();
+    if dbg {
+        eprintln!("ct-agent channel: debug dcutr_dial_via_relay dialing {peer_via_relay} toward target {target_peer}");
+    }
     tokio::spawn(async move {
-        if client.dial(peer_via_relay).is_err() {
+        if let Err(e) = client.dial(peer_via_relay) {
+            eprintln!("ct-agent channel: dcutr_dial_via_relay dial failed to even start: {e}");
             return;
         }
         // Wait for the RELAYED connection to the target (not the hop to the relay) before opening.
         loop {
             match client.next().await {
-                Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) if peer_id == target_peer => break,
-                Some(_) => {}
-                None => return,
+                Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) if peer_id == target_peer => {
+                    if dbg {
+                        eprintln!("ct-agent channel: debug dcutr_dial_via_relay relayed connection to {target_peer} established");
+                    }
+                    break;
+                }
+                Some(other) => {
+                    if dbg {
+                        eprintln!("ct-agent channel: debug dcutr_dial_via_relay swarm event: {other:?}");
+                    } else if matches!(
+                        &other,
+                        SwarmEvent::OutgoingConnectionError { .. } | SwarmEvent::IncomingConnectionError { .. }
+                    ) {
+                        eprintln!("ct-agent channel: dcutr_dial_via_relay swarm event: {other:?}");
+                    }
+                }
+                None => {
+                    eprintln!("ct-agent channel: dcutr_dial_via_relay swarm ended before the relayed connection to {target_peer} formed");
+                    return;
+                }
             }
         }
         let open = control.open_stream(target_peer, CT_CHANNEL_PROTOCOL);
@@ -1301,10 +1326,36 @@ pub(crate) async fn dcutr_dial_via_relay(
         let mut outbound_tx = Some(outbound_tx);
         loop {
             tokio::select! {
-                _ = client.next() => {}
+                ev = client.next() => {
+                    match ev {
+                        Some(other) => {
+                            if dbg {
+                                eprintln!("ct-agent channel: debug dcutr_dial_via_relay swarm event: {other:?}");
+                            } else if matches!(
+                                &other,
+                                SwarmEvent::OutgoingConnectionError { .. } | SwarmEvent::IncomingConnectionError { .. }
+                            ) {
+                                eprintln!("ct-agent channel: dcutr_dial_via_relay swarm event: {other:?}");
+                            }
+                        }
+                        None => {
+                            eprintln!("ct-agent channel: dcutr_dial_via_relay swarm ended while opening the channel stream");
+                            return;
+                        }
+                    }
+                }
                 res = &mut open, if outbound_tx.is_some() => {
-                    if let (Ok(stream), Some(tx)) = (res, outbound_tx.take()) {
-                        let _ = tx.send(stream);
+                    match (res, outbound_tx.take()) {
+                        (Ok(stream), Some(tx)) => {
+                            if dbg {
+                                eprintln!("ct-agent channel: debug dcutr_dial_via_relay channel stream opened to {target_peer}");
+                            }
+                            let _ = tx.send(stream);
+                        }
+                        (Err(e), Some(_)) => {
+                            eprintln!("ct-agent channel: dcutr_dial_via_relay open_stream to {target_peer} failed: {e}");
+                        }
+                        _ => {}
                     }
                 }
             }
