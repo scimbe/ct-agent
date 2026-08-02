@@ -252,7 +252,11 @@ function Install-Docker {
   Log "building the Docker image"
   # Build straight from this repo's git history (docker supports git-URL build
   # contexts natively) -- this script is commonly run with no local checkout.
-  docker build -t ct-agent:local "https://github.com/scimbe/ct-agent.git#main:docker"
+  # buildx (not the classic builder) is required here: the Dockerfile's
+  # TARGETOS/TARGETARCH build args are only auto-populated by buildx, and a
+  # plain `docker build` leaves them empty, failing with "unsupported
+  # TARGETARCH: " on every platform (#3).
+  docker buildx build --load -t ct-agent:local "https://github.com/scimbe/ct-agent.git#main:docker"
   if ($LASTEXITCODE -ne 0) { Die "docker build failed" }
   Log "starting the container"
   docker rm -f ct-agent 2>$null | Out-Null
