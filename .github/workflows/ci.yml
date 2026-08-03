@@ -47,3 +47,21 @@ jobs:
           # flags this regardless -- a documented class of cargo-audit false positive.
           # Ignored here for that reason; revisit if libp2p ever makes this reachable.
           cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
+
+  wasm:
+    # ct-agent-wasm IS ct-agent for the browser (workspace restructure, see the
+    # root Cargo.toml) -- the `gate` job above builds/tests it NATIVELY (which
+    # exercises its pure logic, e.g. the from_hex/holderSign/SignalMessage tests),
+    # but never actually cross-compiles it to wasm32, its entire reason to exist.
+    # This catches a wasm32-only break (a dependency that silently doesn't support
+    # the target, a #[cfg(target_arch = "wasm32")] path with a typo, ...) that the
+    # native job structurally cannot see.
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Build ct-agent-wasm for wasm32
+        run: cargo build -p ct-agent-wasm --release --target wasm32-unknown-unknown --locked

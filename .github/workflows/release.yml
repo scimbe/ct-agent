@@ -55,7 +55,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib
 
       - name: Build ct-agent (release)
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        # -p ct-agent scopes this to the native/ workspace member only -- since the
+        # #6 workspace restructure (ct-agent-wasm moved in as a sibling member), an
+        # unscoped `cargo build` would ALSO cross-compile ct-agent-wasm (wasm-bindgen/
+        # js-sys/getrandom) for every one of this matrix's native targets, wasted
+        # build time at best and a real risk of an unrelated wasm-crate
+        # cross-compilation quirk breaking an otherwise-unrelated release build.
+        run: cargo build --release --locked --target ${{ matrix.target }} -p ct-agent
 
       - name: Stage + upload asset
         shell: bash

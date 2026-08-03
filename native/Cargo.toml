@@ -1,0 +1,88 @@
+[package]
+name = "ct-agent"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.85"
+license-file = "../LICENSE"
+description = "CADS-Tunnel's zero-knowledge tunnel agent -- outbound-only client that establishes and maintains a tunnel to a CADS-Tunnel edge, with self-service ACME certificate issuance (Rot/Gelb/Grün)."
+repository = "https://github.com/scimbe/ct-agent"
+
+[dependencies]
+# ct-common's pin is inherited from the workspace root (one shared version for both
+# native/ and wasm/, the whole point of this being a workspace -- see the root
+# Cargo.toml's [workspace.dependencies] comment). ct-control-plane/ct-dns are
+# native-only (never needed by the wasm build) so they keep their own explicit
+# pins here, bumped in lockstep with the shared one by convention.
+ct-common.workspace = true
+ct-control-plane = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.12" }
+# ACME (ADR-0003): Dns01Provider (SelfHosted ct-dns / deSEC) publishes the
+# _acme-challenge TXT record the DNS-01 validation reads.
+ct-dns = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.12" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+# #248-follow: opt-in only (see main.rs -- initialized only when RUST_LOG is set, same
+# off-by-default pattern as CT_DEBUG_A2A_TIMING). quinn/libp2p already emit their own
+# `tracing` spans/events; this crate is the only thing missing to actually see them --
+# without a subscriber installed, quinn's "log" feature above silently falls back to the
+# `log` facade (also unsubscribed here), so today NOTHING quinn/libp2p log internally is
+# visible no matter what env var is set. Needed to investigate #248's QUIC
+# `HandshakeTimedOut` direct-dial failures at the transport level instead of guessing.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "process", "signal"] }
+# TCP keepalive (#229) for the TLS-TCP fallback: unlike QUIC (which already
+# keepalives), a parked fallback registration is a plain, silent TCP
+# connection with nothing else to refresh it -- over a real, geographically
+# distant network any NAT/firewall between the Agent and the Edge can drop
+# an idle mapping without either endpoint noticing, so a later Client
+# delivered onto that "parked" connection gets nothing back. tokio's
+# TcpStream/TcpSocket have no keepalive setter of their own; socket2 does.
+socket2 = "0.5"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+rcgen = "0.13"
+axum = "0.7"
+tokio-stream = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+# ACME (ADR-0003): JWS signing (ES256, RFC 7515) for the account-key-signed protocol
+# requests -- a direct dependency (not just transitive via rustls's "ring" feature) so
+# ct-agent can drive ring::signature::EcdsaKeyPair itself.
+ring = "0.17"
+# ACME (ADR-0003): the network driver's HTTP client -- rustls-tls to match the rest of
+# CADS-Tunnel's zero-OpenSSL policy (control-plane/edge/dns already do this).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# ACME (ADR-0003, #229): query the zone's AUTHORITATIVE nameservers directly when
+# confirming a DNS-01 record has propagated. Public resolvers are the wrong thing to
+# ask -- Let's Encrypt validates against the authoritative servers themselves from
+# several perspectives, and a zone's two authoritative servers have been measured
+# drifting ~60s apart, which no resolver-side check can see.
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio", "system-config"] }
+libp2p = { version = "0.56", default-features = false, features = ["tokio", "noise", "yamux", "tcp", "quic", "relay", "dcutr", "identify", "kad", "macros"] }
+libp2p-stream = "0.4.0-alpha"
+tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
+# #183: process-group kill on service-handler timeout -- a negative pid to kill(2) signals the whole
+# group, so a grandchild LLM CLI can't survive as an orphan. Done via libc (there is no dependable
+# `kill` binary in minimal images; the old `Command::new("kill")` silently no-op'd there). POSIX-only
+# (crates/channel_run.rs gates the call site with #[cfg(unix)]; Windows takes a different path).
+libc = "0.2"
+
+[features]
+# p2p.rs's nat_lab_* helpers are `#[cfg(any(test, feature = "nat-lab"))]` -- this repo
+# doesn't ship the natlab test-harness binary (it stayed in CADS-Tunnel's ct-agent-tools
+# crate), but the feature name must still be declared or `-D warnings` CI trips
+# `unexpected_cfgs` on those cfg attributes. Never enabled by anything here.
+nat-lab = []
+
+[dev-dependencies]
+# test-util enables `#[tokio::test(start_paused = true)]` for deterministic timeout tests (#126).
+tokio = { version = "1", features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# Cross-crate integration tests (channel.rs, transport.rs, serve.rs, channel_run.rs) drive
+# a real ct-edge relay / ct-client dialer end-to-end. Same pinned-tag git dependency as the
+# runtime deps above -- these are dev-only, never shipped in a release binary.
+ct-edge = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.12" }
+ct-client = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.12" }
