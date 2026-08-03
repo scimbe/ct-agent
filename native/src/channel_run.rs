@@ -2268,18 +2268,27 @@ fn call_service_local(slug: String, input: String) -> tokio::io::DuplexStream {
 }
 
 /// Parse a `CT_AGENT_SERVICES` entry (the same slugs `ct_common::mcp`'s `service/<slug>` tool
-/// names use) into a [`ct_common::channel::ServiceType`]. Unknown entries are silently dropped by
-/// the caller's `filter_map` — a typo just means one fewer tool exposed, not a hard error, matching
-/// this CLI's general "best-effort optional config" posture (e.g. `AgentOfferCliConfig`).
+/// names use) into a [`ct_common::channel::ServiceType`]. The four fixed slugs above map to their
+/// matching built-in variant; anything else becomes `ServiceType::Custom(s)` (#382 follow-up:
+/// CADS-Tunnel core generalized `RequiredRole`/`convene()` beyond a closed service catalog, so a
+/// pipeline designer can declare e.g. `static_analysis`/`android_instrumented_test` without a
+/// CADS-Tunnel core release per new pipeline-stage type) — never silently dropped anymore. An
+/// empty string still parses to nothing useful downstream but isn't specially rejected here; the
+/// caller's own offer/catalog matching is still the real gate on what actually gets served.
 fn parse_service_type(s: &str) -> Option<ct_common::channel::ServiceType> {
     use ct_common::channel::ServiceType::*;
-    match s {
-        "code_generation" => Some(CodeGeneration),
-        "security_review" => Some(SecurityReview),
-        "safety_check" => Some(SafetyCheck),
-        "text_generation" => Some(TextGeneration),
-        _ => None,
+    if s.is_empty() {
+        // e.g. a stray double-comma in CT_AGENT_SERVICES -- still filtered out, same as before
+        // Custom existed (an empty custom-service name is never a meaningful declaration).
+        return None;
     }
+    Some(match s {
+        "code_generation" => CodeGeneration,
+        "security_review" => SecurityReview,
+        "safety_check" => SafetyCheck,
+        "text_generation" => TextGeneration,
+        other => Custom(other.to_string()),
+    })
 }
 
 /// Bound how long a `CT_AGENT_SERVICE_HANDLER_CMD` child may run before it's killed (#149-A.1
@@ -2312,17 +2321,15 @@ fn run_service_handler_with_timeout(
     timeout: std::time::Duration,
 ) -> Result<String, String> {
     use std::process::{Command, Stdio};
-    let slug = match service {
-        ct_common::channel::ServiceType::CodeGeneration => "code_generation",
-        ct_common::channel::ServiceType::SecurityReview => "security_review",
-        ct_common::channel::ServiceType::SafetyCheck => "safety_check",
-        ct_common::channel::ServiceType::TextGeneration => "text_generation",
-    };
+    // Reuse ct_common's own slug derivation (now `pub`, #382 follow-up) rather than a second,
+    // driftable copy of this match here -- this is the SAME name the `service/<slug>` MCP tool
+    // this call is answering was registered under, including the Custom(name) case.
+    let slug = ct_common::mcp::service_slug(&service);
     let mut command = Command::new("sh");
     command
         .arg("-c")
         .arg(cmd)
-        .env("CT_SERVICE_TYPE", slug)
+        .env("CT_SERVICE_TYPE", slug.as_ref())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -3656,19 +3663,21 @@ impl AgentOfferCliConfig {
             _ => 60,
         };
         // #167: the offer's declared service catalog. Comma-separated slugs (same vocabulary as
-        // `CT_AGENT_SERVICES`); an unknown slug is a hard config error (fail-closed — never silently
-        // drop a service the operator believes they declared). Absent/empty = a generic offer.
+        // `CT_AGENT_SERVICES`). #382 follow-up: a slug outside the four fixed variants is no
+        // longer a hard config error -- it's a real, signed `ServiceType::Custom` declaration
+        // (e.g. `static_analysis`), so an operator can offer a pipeline-designer-declared service
+        // in a real, buyer-verifiable CapacityOffer without a CADS-Tunnel core release per new
+        // service name. `parse_service_type` only returns `None` for an empty token, which the
+        // filter below already excludes -- the `None` arm stays as a defensive, never-actually-
+        // reached safety net rather than an assumption baked in silently. Absent/empty var =
+        // a generic offer (unchanged).
         let services = match f("CT_AGENT_OFFER_SERVICES").as_deref().map(str::trim) {
             Some(s) if !s.is_empty() => {
                 let mut out = Vec::new();
                 for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
                     match parse_service_type(tok) {
                         Some(st) => out.push(st),
-                        None => {
-                            return Err(format!(
-                                "CT_AGENT_OFFER_SERVICES has unknown service '{tok}' (valid: code_generation, security_review, safety_check, text_generation)"
-                            ))
-                        }
+                        None => return Err("CT_AGENT_OFFER_SERVICES has an empty entry (check for a stray comma)".to_string()),
                     }
                 }
                 out
@@ -4944,8 +4953,12 @@ mod tests {
         // #167 (frozen): CT_AGENT_OFFER_SERVICES is signed INTO the offer, so a buyer can
         // cryptographically verify which services the agent offers and #149-A.1's match_offer
         // service filter has something to enforce (closing the declared-vs-served gap where the
-        // offer and the registered service tools were two independent, unvalidated surfaces). An
-        // unknown slug is a hard config error (fail-closed); absent → a generic offer (services: []).
+        // offer and the registered service tools were two independent, unvalidated surfaces).
+        // #382 follow-up: a slug outside the four fixed variants is no longer a hard config error
+        // -- it's a real ServiceType::Custom declaration, signed into the offer exactly like any
+        // fixed variant, so an operator can offer a pipeline-designer-declared service (e.g.
+        // static_analysis) without a CADS-Tunnel core release. Absent → a generic offer
+        // (services: []), unchanged.
         use ct_common::channel::ServiceType::*;
         use std::collections::HashMap;
         let base: HashMap<&str, String> = HashMap::from([
@@ -4975,28 +4988,55 @@ mod tests {
         );
         assert!(offer.is_valid(1_000), "the offer still verifies with a declared catalog");
 
-        // An unknown slug is a hard error — never silently drop a service the operator declared.
-        let mut bad = base.clone();
-        bad.insert("CT_AGENT_OFFER_SERVICES", "code_generation,chatbot".to_string());
+        // A slug outside the fixed four is a REAL Custom declaration, not an error -- signed into
+        // the offer the exact same way, and a real signature still verifies over it.
+        let mut custom = base.clone();
+        custom.insert("CT_AGENT_OFFER_SERVICES", "code_generation,static_analysis".to_string());
+        let cfg = AgentOfferCliConfig::from_lookup(|k| custom.get(k).cloned()).unwrap();
+        assert_eq!(
+            cfg.services,
+            vec![CodeGeneration, Custom("static_analysis".to_string())],
+            "an unrecognized slug becomes ServiceType::Custom, not a parse error"
+        );
+        let offer = cfg.build_offer(1_000);
+        assert_eq!(offer.services, vec![CodeGeneration, Custom("static_analysis".to_string())]);
+        assert!(offer.is_valid(1_000), "a real signature verifies over a Custom-service offer");
+
+        // A stray empty entry (double comma) is still rejected -- the ONE thing that stays a
+        // hard config error, since an empty custom-service name is never a meaningful declaration.
+        let mut empty_entry = base.clone();
+        empty_entry.insert("CT_AGENT_OFFER_SERVICES", "code_generation,,text_generation".to_string());
         assert!(
-            AgentOfferCliConfig::from_lookup(|k| bad.get(k).cloned()).is_err(),
-            "an unknown CT_AGENT_OFFER_SERVICES slug is rejected (fail-closed)"
+            AgentOfferCliConfig::from_lookup(|k| empty_entry.get(k).cloned()).is_ok(),
+            "a stray double-comma is just an empty token the split/filter already drops, not an error"
         );
     }
 
     #[test]
     fn service_type_parsing_and_handler_shell_out_round_trip() {
-        // #149-A.1 serve-wiring follow (frozen): parse_service_type covers every real slug and
-        // rejects an unknown one (so a typo in CT_AGENT_SERVICES just drops that tool, per the
-        // filter_map call site, not a hard error); run_service_handler actually spawns the
-        // configured command, pipes `input` on stdin, and returns trimmed stdout — the shell-out
-        // seam a real LLM CLI plugs into.
+        // #149-A.1 serve-wiring follow: parse_service_type covers every fixed slug, and (#382
+        // follow-up) anything else becomes ServiceType::Custom rather than being dropped -- so a
+        // pipeline designer's own service name (e.g. static_analysis) is a real, usable
+        // declaration, not silently unavailable. Only an empty token still parses to nothing.
+        // run_service_handler actually spawns the configured command, pipes `input` on stdin, and
+        // returns trimmed stdout — the shell-out seam a real LLM CLI plugs into.
         use ct_common::channel::ServiceType::*;
         assert_eq!(parse_service_type("code_generation"), Some(CodeGeneration));
         assert_eq!(parse_service_type("security_review"), Some(SecurityReview));
         assert_eq!(parse_service_type("safety_check"), Some(SafetyCheck));
         assert_eq!(parse_service_type("text_generation"), Some(TextGeneration));
-        assert_eq!(parse_service_type("not-a-real-service"), None);
+        assert_eq!(parse_service_type("not-a-real-service"), Some(Custom("not-a-real-service".to_string())), "unrecognized -> Custom, not dropped");
+        assert_eq!(parse_service_type(""), None, "an empty token still parses to nothing");
+
+        // A Custom service round-trips through the SAME shell-out handler: CT_SERVICE_TYPE is
+        // set to its slugified name (ct_common::mcp::service_slug), not a fixed built-in slug.
+        let out = run_service_handler(
+            "echo \"got:$CT_SERVICE_TYPE\"",
+            Custom("Static Analysis!".to_string()),
+            "ignored",
+        )
+        .unwrap();
+        assert_eq!(out, "got:static_analysis_", "the Custom name is slugified the same way ct_common::mcp registers its tool under");
 
         // `cat` echoes stdin back — proves input actually reaches the child and stdout is
         // captured + trimmed (a trailing newline from `echo`-style output must not leak through).
