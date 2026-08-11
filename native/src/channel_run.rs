@@ -1630,6 +1630,51 @@ impl OperatorIdentity {
         SignedChannelGrant { grant: g, signature }
     }
 
+    /// scimbe/ct-agent#9: sign a `ChannelInvitation` for `invitee_identity` to join `channel`,
+    /// returning the hex the invitee redeems (`ct-agent channel invite` prints this; the
+    /// receiving-side endpoints and `verify_invitation`/`redeem_invitation` already exist in
+    /// `ct_common::channel` and in the control plane — this was the missing producer). Pure
+    /// crypto, same shape as [`issue_member_grant`]: the operator runs this locally, no server
+    /// round-trip, no private key ever leaves either machine. Unlike a grant (which binds a
+    /// `holder` key the operator already has in hand), an invitation targets an **identity**
+    /// key the operator may only know from, e.g., a registry lookup or an out-of-band email —
+    /// this is the actual cross-account case a plain `channel grant` can't cover.
+    pub fn issue_member_invitation(
+        &self,
+        channel: ct_common::channel::ChannelId,
+        invitee_identity: [u8; 32],
+        direction: ct_common::channel::Direction,
+        rights: ct_common::channel::Rights,
+        delegable: bool,
+        expires_at: ct_common::channel::UnixSeconds,
+    ) -> String {
+        hex_encode(
+            &self
+                .sign_member_invitation(channel, invitee_identity, direction, rights, delegable, expires_at)
+                .encode(),
+        )
+    }
+
+    /// Sign a `ChannelInvitation` binding `invitee_identity` to `channel` under the local
+    /// operator key, returning the structured invitation. Mirrors [`sign_member_grant`]:
+    /// `ChannelInvitation::signing_bytes()` is domain-separated from a grant's (`"ct-chan-
+    /// invite:v1|..."` vs. the grant's own prefix), so a captured invitation can never be
+    /// replayed as a grant or vice versa.
+    fn sign_member_invitation(
+        &self,
+        channel: ct_common::channel::ChannelId,
+        invitee_identity: [u8; 32],
+        direction: ct_common::channel::Direction,
+        rights: ct_common::channel::Rights,
+        delegable: bool,
+        expires_at: ct_common::channel::UnixSeconds,
+    ) -> ct_common::channel::SignedChannelInvitation {
+        use ct_common::channel::{ChannelInvitation, SignedChannelInvitation};
+        let i = ChannelInvitation { channel, invitee_identity, direction, rights, delegable, expires_at };
+        let signature = self.key.sign(&i.signing_bytes()).to_bytes();
+        SignedChannelInvitation { invitation: i, signature }
+    }
+
     /// Compile a topology's overlay `plan` into per-link A2A channels (#107-nway): each
     /// link (a canonical pair of agent node-ids) becomes a channel
     /// ([`ct_common::channel::channel_id_for_link`]) plus the two operator-signed grants its
@@ -1844,6 +1889,71 @@ impl OperatorGrantRequest {
             self.channel,
             self.member_holder,
             self.direction,
+            self.expires_at,
+        )
+    }
+}
+
+/// scimbe/ct-agent#9 `ct-agent channel invite`: as the operator, sign an invitation for an
+/// **identity** key you don't otherwise coordinate holder/noise material with directly — the
+/// cross-account case `channel grant`/`provision-link-channel.sh` can't cover, since those
+/// both assume you already have the other side's holder pubkey in hand. Reads
+/// CT_CHANNEL_OPERATOR_KEY + CT_INVITE_*.
+pub struct OperatorInviteRequest {
+    pub operator: SigningKey,
+    pub channel: ct_common::channel::ChannelId,
+    pub invitee_identity: [u8; 32],
+    pub direction: ct_common::channel::Direction,
+    pub rights: ct_common::channel::Rights,
+    pub delegable: bool,
+    pub expires_at: ct_common::channel::UnixSeconds,
+}
+
+impl OperatorInviteRequest {
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let operator = req_key(&f, "CT_CHANNEL_OPERATOR_KEY", "64 hex; from `channel operator-init`")?;
+        let channel = ct_common::channel::ChannelId(req_hex32(&f, "CT_INVITE_CHANNEL", "64 hex channel id")?);
+        let invitee_identity =
+            req_hex32(&f, "CT_INVITE_IDENTITY", "64 hex invitee identity pubkey")?;
+        let direction = match f("CT_INVITE_DIRECTION").as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(ref d) if d == "initiate" || d == "initiator" => ct_common::channel::Direction::Initiate,
+            Some(ref d) if d == "accept" || d == "responder" => ct_common::channel::Direction::Accept,
+            Some(ref d) if d == "both" => ct_common::channel::Direction::Both,
+            other => return Err(format!("CT_INVITE_DIRECTION must be initiate|accept|both, got {other:?}")),
+        };
+        let rights = match f("CT_INVITE_RIGHTS").as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+            None => ct_common::channel::Rights::ReadWrite, // matches OperatorGrantRequest's fixed ReadWrite default
+            Some(ref r) if r == "read" || r == "r" => ct_common::channel::Rights::Read,
+            Some(ref r) if r == "write" || r == "w" => ct_common::channel::Rights::Write,
+            Some(ref r) if r == "readwrite" || r == "read-write" || r == "rw" => {
+                ct_common::channel::Rights::ReadWrite
+            }
+            other => return Err(format!("CT_INVITE_RIGHTS must be read|write|readwrite, got {other:?}")),
+        };
+        let delegable = match f("CT_INVITE_DELEGABLE").as_deref() {
+            None => false,
+            Some(v) => v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"),
+        };
+        let expires_at = req_str(&f, "CT_INVITE_EXPIRES", "unix seconds")?
+            .trim()
+            .parse()
+            .map_err(|e| format!("CT_INVITE_EXPIRES invalid: {e}"))?;
+        Ok(Self { operator, channel, invitee_identity, direction, rights, delegable, expires_at })
+    }
+
+    /// The signed invitation hex the invitee redeems (see `ct_common::channel::redeem_invitation`
+    /// / `invitation_redeem_bytes` for the receiving-side flow this feeds).
+    pub fn issue(&self) -> String {
+        OperatorIdentity { key: self.operator.clone() }.issue_member_invitation(
+            self.channel,
+            self.invitee_identity,
+            self.direction,
+            self.rights,
+            self.delegable,
             self.expires_at,
         )
     }
@@ -4607,6 +4717,95 @@ mod tests {
             "CT_GRANT_MEMBER_HOLDER",
             "CT_GRANT_DIRECTION",
             "CT_GRANT_EXPIRES",
+        ] {
+            let pruned: Vec<(&str, String)> = base.iter().filter(|(k, _)| *k != drop_key).cloned().collect();
+            assert!(lookup(&pruned).is_err(), "missing {drop_key} must be rejected");
+        }
+    }
+
+    #[test]
+    fn operator_invite_request_parses_env_and_issues_a_verifiable_invitation() {
+        // scimbe/ct-agent#9: `ct-agent channel invite` parses the operator key + CT_INVITE_*
+        // from env and issues an invitation that verifies under the operator key and binds the
+        // intended invitee identity/channel/direction/rights/delegable/expiry — the cross-
+        // account producer `ct_common::channel::verify_invitation`'s consumer side was missing.
+        use ct_common::channel::{ChannelId, Direction, Rights, SignedChannelInvitation};
+
+        let op = OperatorIdentity::generate();
+        // The invitee is identified by its IDENTITY key here, not a holder key already
+        // coordinated with the operator -- generate a bare random "identity" the operator has
+        // never otherwise seen, matching the real cross-account use case.
+        let invitee_identity: [u8; 32] = {
+            use rand::RngCore;
+            let mut b = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut b);
+            b
+        };
+        let channel = [0x88u8; 32];
+
+        let base: Vec<(&str, String)> = vec![
+            ("CT_CHANNEL_OPERATOR_KEY", op.key_hex()),
+            ("CT_INVITE_CHANNEL", hex_encode(&channel)),
+            ("CT_INVITE_IDENTITY", hex_encode(&invitee_identity)),
+            ("CT_INVITE_DIRECTION", "initiate".into()),
+            ("CT_INVITE_RIGHTS", "read".into()),
+            ("CT_INVITE_DELEGABLE", "true".into()),
+            ("CT_INVITE_EXPIRES", "1000".into()),
+        ];
+        let lookup = |pairs: &[(&str, String)]| {
+            let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+            OperatorInviteRequest::from_lookup(move |k| m.get(k).cloned())
+        };
+
+        let req = lookup(&base).expect("valid operator invite request parses");
+        assert_eq!(req.channel, ChannelId(channel));
+        assert_eq!(req.invitee_identity, invitee_identity);
+        assert_eq!(req.direction, Direction::Initiate);
+        assert_eq!(req.rights, Rights::Read);
+        assert!(req.delegable);
+
+        // The issued invitation verifies under the operator key and binds the invitee identity.
+        let signed =
+            SignedChannelInvitation::decode(&hex_bytes(&req.issue()).expect("hex")).expect("decode");
+        assert!(
+            ct_common::channel::verify_invitation(&op.key.verifying_key().to_bytes(), &signed, 500).is_ok(),
+            "the issued invitation verifies under the operator key"
+        );
+        assert_eq!(signed.invitation.invitee_identity, invitee_identity);
+        assert_eq!(signed.invitation.channel, ChannelId(channel));
+        assert_eq!(signed.invitation.direction, Direction::Initiate);
+        assert_eq!(signed.invitation.rights, Rights::Read);
+        assert!(signed.invitation.delegable);
+
+        // An invitation must NOT verify as a grant (domain separation) -- decode it as a
+        // SignedChannelGrant and confirm `verify` rejects it rather than accepting garbage.
+        use ct_common::channel::SignedChannelGrant;
+        if let Some(bytes) = hex_bytes(&req.issue()) {
+            if let Ok(as_grant) = SignedChannelGrant::decode(&bytes) {
+                assert!(
+                    ct_common::channel::verify(&op.key.verifying_key().to_bytes(), &as_grant, 500).is_err(),
+                    "an invitation's signature must not verify as a grant's"
+                );
+            }
+        }
+
+        // Default rights (unset) is ReadWrite, matching OperatorGrantRequest's fixed default.
+        let no_rights: Vec<(&str, String)> =
+            base.iter().filter(|(k, _)| *k != "CT_INVITE_RIGHTS").cloned().collect();
+        assert_eq!(lookup(&no_rights).expect("rights optional").rights, Rights::ReadWrite);
+
+        // Default delegable (unset) is false.
+        let no_delegable: Vec<(&str, String)> =
+            base.iter().filter(|(k, _)| *k != "CT_INVITE_DELEGABLE").cloned().collect();
+        assert!(!lookup(&no_delegable).expect("delegable optional").delegable);
+
+        // Each required field is enforced.
+        for drop_key in [
+            "CT_CHANNEL_OPERATOR_KEY",
+            "CT_INVITE_CHANNEL",
+            "CT_INVITE_IDENTITY",
+            "CT_INVITE_DIRECTION",
+            "CT_INVITE_EXPIRES",
         ] {
             let pruned: Vec<(&str, String)> = base.iter().filter(|(k, _)| *k != drop_key).cloned().collect();
             assert!(lookup(&pruned).is_err(), "missing {drop_key} must be rejected");

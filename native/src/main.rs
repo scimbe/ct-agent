@@ -165,6 +165,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("{}", req.issue());
             return Ok(());
         }
+        // scimbe/ct-agent#9 `ct-agent channel invite`: as the operator, sign an invitation for
+        // an identity you don't already have holder/noise material for (the cross-account case
+        // `channel grant` can't cover). Reads CT_CHANNEL_OPERATOR_KEY + CT_INVITE_*, pure local
+        // compute, mirrors `grant`.
+        if std::env::args().nth(2).as_deref() == Some("invite") {
+            let req = ct_agent::channel_run::OperatorInviteRequest::from_env()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            println!("{}", req.issue());
+            return Ok(());
+        }
         // #276 piece 2 `ct-agent channel super-peer`: run this process as an opt-in LAN-local
         // relay for other same-network channel members, turning N edge-relay connections into
         // 1 (this process) + N-1 local hops. LISTEN is what LAN-local members point their own
