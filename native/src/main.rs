@@ -35,6 +35,7 @@ USAGE:
     ct-agent channel member-material      Derive this member's channel_id/attestation
     ct-agent channel join-pipeline-role   Derive a published pipeline role's channel_id
     ct-agent channel grant                As operator, sign a member's channel grant
+    ct-agent channel invite               As operator, sign a cross-account channel invitation
     ct-agent channel register             Register a channel authority with the CP
     ct-agent channel allowlist add|remove|list   Manage a channel's self-service allow-list
     ct-agent channel agent-card           Write (and optionally register) this agent's card
@@ -65,6 +66,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ct_agent::channel_run::mark_process_start();
     if matches!(std::env::args().nth(1).as_deref(), Some("--help") | Some("-h")) {
         print!("{USAGE}");
+        return Ok(());
+    }
+    // scimbe/ct-agent#14: no way to ask a binary what it is was the second, bigger cost in a
+    // real version-skew debugging session (see #12) -- the first thing anyone types to check
+    // whether they have the right build now actually works, instead of falling through to the
+    // default serve path and hanging.
+    if matches!(std::env::args().nth(1).as_deref(), Some("--version") | Some("-V")) {
+        println!("ct-agent {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     // `rotate` subcommand (#12 K4): rotate the origin key while KEEPING the
@@ -317,6 +326,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 ),
             }
             return Ok(());
+        }
+        // scimbe/ct-agent#14: every recognized `channel <subcommand>` above already
+        // returned. A THIRD positional arg that isn't one of them is almost certainly a
+        // typo'd subcommand (reported live: `channel invite` against a pre-#9 binary that
+        // didn't have it fell through here silently and produced a confusing, unrelated
+        // "CT_CHANNEL_ROLE must be initiate|accept" error -- indistinguishable from a real
+        // env-config mistake). Only `channel` with NO third arg is the legitimate "join a
+        // channel via CT_CHANNEL_* env config" mode below; fail loudly otherwise, same
+        // #239 discipline already applied to unrecognized top-level subcommands.
+        if let Some(sub) = std::env::args().nth(2) {
+            const KNOWN: &[&str] = &[
+                "init", "operator-init", "member-material", "join-pipeline-role", "grant",
+                "invite", "super-peer", "register", "allowlist", "agent-card",
+            ];
+            if !KNOWN.contains(&sub.as_str()) {
+                eprintln!("ct-agent: unrecognized channel subcommand '{sub}'\n");
+                eprint!("{USAGE}");
+                std::process::exit(1);
+            }
         }
         // Plane-brokered flow (#98/#103) when an edge rendezvous is configured: present
         // the grant, learn the peer via the broker (keys relayed), connect
