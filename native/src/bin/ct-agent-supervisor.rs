@@ -23,7 +23,6 @@
 //! needs to read the same [`CrashHistory`] this binary already maintains.
 
 use std::collections::VecDeque;
-use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -189,7 +188,14 @@ async fn run_once(bin: &str, args: &[String]) -> std::io::Result<CrashReason> {
     }
 
     let status = child.wait().await?;
-    Ok(classify_exit(status.signal(), status.code(), &ring))
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    };
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
+    Ok(classify_exit(signal, status.code(), &ring))
 }
 
 /// Pure classification core (no process I/O), so the exit-status logic is unit-testable
