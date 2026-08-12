@@ -349,7 +349,58 @@ pub async fn register_tunnel_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut msg = vec![b'A'];
+    register_tunnel_stream_with_role(stream, token, b'A').await
+}
+
+/// First byte of a parked-registration PING frame (Edge → ping-capable Agent):
+/// `0xF9 | counter(8 BE)`, 9 bytes total.
+const TCP_PING_MAGIC: u8 = 0xF9;
+
+/// First byte of the matching PONG reply (Agent → Edge): `0xFA | counter(8 BE)`,
+/// echoing the PING's counter verbatim, 9 bytes total.
+const TCP_PONG_MAGIC: u8 = 0xFA;
+
+/// Single-byte STOP sentinel the Edge writes exactly once, strictly before any
+/// relayed byte, to end the ping phase unambiguously. It is deliberately NOT a
+/// 9-byte frame: the reader must consume this one byte and nothing more, so the
+/// Noise handshake that follows starts on a byte-exact stream boundary.
+const TCP_PING_STOP: u8 = 0xFB;
+
+/// Register this Agent's tunnel over a generic byte stream as **ping-capable**
+/// (ct-agent#15): identical to [`register_tunnel_stream`] except the role byte is
+/// `'K'` instead of `'A'`. A `'K'`-aware Edge parks the registration exactly as
+/// it parks an `'A'`, but additionally sends real-payload PING frames over the
+/// otherwise-idle connection while waiting for a Client — see
+/// [`await_ping_phase_end`], which the caller MUST drive before treating the
+/// stream as carrying relayed bytes.
+///
+/// Why this exists: a bare TCP keepalive is an ACK-only segment, and some
+/// enterprise firewall/DPI/SASE gateways do not count ACK-only segments as
+/// activity for their own idle-timeout bookkeeping, so a parked fallback
+/// connection still got torn down after the 10s/10s keepalive tightening
+/// (9b42d9e). PING/PONG puts genuine payload on the wire in both directions.
+pub async fn register_tunnel_stream_ping_capable<S>(
+    stream: &mut S,
+    token: &RoutingToken,
+) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    register_tunnel_stream_with_role(stream, token, b'K').await
+}
+
+/// Shared body of the `'A'`/`'K'` TCP-fallback registration: both roles have a
+/// byte-identical wire format (`role(1) | token(32)` → 2-byte `OK`/`NO` ack), so
+/// the only thing that varies is the role byte itself.
+async fn register_tunnel_stream_with_role<S>(
+    stream: &mut S,
+    token: &RoutingToken,
+    role: u8,
+) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut msg = vec![role];
     msg.extend_from_slice(&token.0);
     stream.write_all(&msg).await?;
     stream.flush().await?;
@@ -359,6 +410,55 @@ where
         Ok(())
     } else {
         Err("edge rejected tunnel registration".into())
+    }
+}
+
+/// Drive the ping phase of a `'K'` registration to its end: answer every PING
+/// with a PONG until the Edge writes [`TCP_PING_STOP`], then return with the
+/// stream positioned exactly at the first relayed byte.
+///
+/// Wire contract (Edge side: `park_and_ping` / `send_ping_and_await_pong`):
+/// * `0xF9 | counter(8 BE)` — PING. Reply `0xFA | counter(8 BE)`, same counter.
+/// * `0xFB` — STOP, a lone byte. Ping phase over; a Client is now spliced in.
+///
+/// Note the framing asymmetry: STOP is one byte, PING is nine, so this reads the
+/// discriminator byte first and only then the counter. Blindly reading 9 bytes
+/// would swallow the first 8 bytes of the Noise handshake.
+///
+/// The Edge fully awaits each PONG before the next PING and writes STOP strictly
+/// before it starts relaying, so TCP ordering guarantees the only bytes that can
+/// arrive here are `0xF9` and `0xFB` frames. Anything else — an unexpected
+/// discriminator or an I/O error — means the peer is not a conforming Edge or
+/// the stream has desynchronised; both are propagated as a connection error
+/// rather than guessed at, because handing a desynchronised stream to the Noise
+/// handshake would fail later and far more confusingly. The caller's reconnect
+/// ladder then redials, which is the correct recovery.
+pub async fn await_ping_phase_end<S>(stream: &mut S) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let mut disc = [0u8; 1];
+        stream.read_exact(&mut disc).await?;
+        match disc[0] {
+            TCP_PING_MAGIC => {
+                let mut counter = [0u8; 8];
+                stream.read_exact(&mut counter).await?;
+                let mut pong = [0u8; 9];
+                pong[0] = TCP_PONG_MAGIC;
+                pong[1..].copy_from_slice(&counter);
+                stream.write_all(&pong).await?;
+                stream.flush().await?;
+            }
+            TCP_PING_STOP => return Ok(()),
+            other => {
+                return Err(format!(
+                    "edge sent an unexpected byte 0x{other:02X} during the ping phase \
+                     (expected PING 0x{TCP_PING_MAGIC:02X} or STOP 0x{TCP_PING_STOP:02X})"
+                )
+                .into())
+            }
+        }
     }
 }
 
@@ -807,6 +907,217 @@ mod tests {
         register_tunnel_stream_browser(&mut agent_side, &token, host)
             .await
             .expect("browser-register over a TLS-TCP-style stream");
+        edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn register_tunnel_stream_ping_capable_sends_k_and_the_same_token_frame() {
+        // ct-agent#15: the 'K' registration is byte-identical to 'A' except for
+        // the role byte -- 'K' | token(32), then the same 2-byte OK ack.
+        let (mut agent_side, mut edge_side) = tokio::io::duplex(1024);
+        let token = RoutingToken([0x5a; 32]);
+
+        let t = token.clone();
+        let edge = tokio::spawn(async move {
+            let mut hdr = [0u8; 33];
+            edge_side.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(hdr[0], b'K', "ping-capable role byte");
+            assert_eq!(&hdr[1..], &t.0, "token echoed");
+            edge_side.write_all(b"OK").await.unwrap();
+            edge_side.flush().await.unwrap();
+        });
+
+        register_tunnel_stream_ping_capable(&mut agent_side, &token)
+            .await
+            .expect("ping-capable register over a TLS-TCP-style stream");
+        edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ping_phase_answers_every_ping_with_a_counter_echoing_pong_then_stops() {
+        // ct-agent#15 core contract: PING 0xF9|counter(8 BE) -> PONG
+        // 0xFA|<same counter>, repeated, until the single-byte STOP 0xFB ends
+        // the phase. Counters are deliberately NOT 0,1,2 so a PONG that echoed
+        // a loop index instead of the received counter would fail here.
+        let (mut agent_side, mut edge_side) = tokio::io::duplex(1024);
+        let counters: [u64; 3] = [0, 7, u64::MAX];
+
+        let edge = tokio::spawn(async move {
+            for c in counters {
+                let mut ping = [0u8; 9];
+                ping[0] = TCP_PING_MAGIC;
+                ping[1..].copy_from_slice(&c.to_be_bytes());
+                edge_side.write_all(&ping).await.unwrap();
+                edge_side.flush().await.unwrap();
+
+                let mut pong = [0u8; 9];
+                edge_side.read_exact(&mut pong).await.unwrap();
+                assert_eq!(pong[0], TCP_PONG_MAGIC, "PONG magic byte");
+                assert_eq!(
+                    u64::from_be_bytes(pong[1..].try_into().unwrap()),
+                    c,
+                    "PONG echoes the PING's counter verbatim"
+                );
+            }
+            edge_side.write_all(&[TCP_PING_STOP]).await.unwrap();
+            edge_side.flush().await.unwrap();
+            edge_side
+        });
+
+        await_ping_phase_end(&mut agent_side)
+            .await
+            .expect("ping phase ends cleanly on STOP");
+        edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ping_phase_consumes_the_stop_byte_and_not_one_byte_more() {
+        // The whole point of the single-byte STOP sentinel: the Noise handshake
+        // that follows must start on a byte-exact stream boundary. STOP is 1
+        // byte while PING is 9, so a reader that blindly pulled 9 bytes per
+        // frame would swallow the first 8 handshake bytes. Write STOP
+        // immediately followed by relayed payload and prove every payload byte
+        // survives untouched.
+        let (mut agent_side, mut edge_side) = tokio::io::duplex(1024);
+        const RELAYED: &[u8] = b"\xe9first-noise-handshake-bytes";
+
+        let edge = tokio::spawn(async move {
+            let mut ping = [0u8; 9];
+            ping[0] = TCP_PING_MAGIC;
+            ping[1..].copy_from_slice(&42u64.to_be_bytes());
+            edge_side.write_all(&ping).await.unwrap();
+            let mut pong = [0u8; 9];
+            edge_side.read_exact(&mut pong).await.unwrap();
+            // STOP and the relayed bytes in ONE write: nothing about the
+            // hand-off may depend on them arriving in separate segments.
+            let mut tail = vec![TCP_PING_STOP];
+            tail.extend_from_slice(RELAYED);
+            edge_side.write_all(&tail).await.unwrap();
+            edge_side.flush().await.unwrap();
+            edge_side
+        });
+
+        await_ping_phase_end(&mut agent_side).await.unwrap();
+        let mut relayed = [0u8; RELAYED.len()];
+        agent_side.read_exact(&mut relayed).await.unwrap();
+        assert_eq!(
+            &relayed, RELAYED,
+            "the post-STOP stream is handed off completely unmodified"
+        );
+        let _edge = edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ping_phase_rejects_an_unexpected_discriminator_byte() {
+        // A conforming Edge only ever writes 0xF9 or 0xFB before the hand-off,
+        // so anything else means a desynchronised stream / non-conforming peer.
+        // Feeding that to the Noise handshake would fail later and far more
+        // confusingly, so it is surfaced here as a connection error.
+        let (mut agent_side, mut edge_side) = tokio::io::duplex(1024);
+        let edge = tokio::spawn(async move {
+            edge_side.write_all(&[0x01]).await.unwrap();
+            edge_side.flush().await.unwrap();
+            edge_side
+        });
+        let e = await_ping_phase_end(&mut agent_side)
+            .await
+            .expect_err("a non-PING/non-STOP byte is a protocol violation");
+        assert!(
+            e.to_string().contains("0x01"),
+            "the offending byte is named in the error: {e}"
+        );
+        let _edge = edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ping_phase_propagates_eof_mid_frame() {
+        // The Edge died between the PING discriminator and its counter. The
+        // stream is unusable; propagate rather than hand a truncated frame on.
+        let (mut agent_side, mut edge_side) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            edge_side.write_all(&[TCP_PING_MAGIC, 0x00]).await.unwrap();
+            edge_side.flush().await.unwrap();
+            drop(edge_side);
+        });
+        assert!(
+            await_ping_phase_end(&mut agent_side).await.is_err(),
+            "a truncated PING frame is a connection error"
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_capable_registration_round_trips_over_a_real_tcp_socket() {
+        // End-to-end over a real socket rather than an in-memory duplex: a fake
+        // Edge that implements just the 'K' admission + one real PING/PONG +
+        // STOP + a payload echo, driven by the real client functions. Proves
+        // the register -> ping-phase -> hand-off sequence works when the frames
+        // can be split across real TCP segments.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = RoutingToken([0x6b; 32]);
+
+        let t = token.clone();
+        let edge = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; 33];
+            s.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(hdr[0], b'K');
+            assert_eq!(&hdr[1..], &t.0);
+            s.write_all(b"OK").await.unwrap();
+
+            // One parked PING round trip, fully awaited (as the real Edge does).
+            let mut ping = [0u8; 9];
+            ping[0] = TCP_PING_MAGIC;
+            ping[1..].copy_from_slice(&9u64.to_be_bytes());
+            s.write_all(&ping).await.unwrap();
+            let mut pong = [0u8; 9];
+            s.read_exact(&mut pong).await.unwrap();
+            assert_eq!(pong[0], TCP_PONG_MAGIC);
+            assert_eq!(u64::from_be_bytes(pong[1..].try_into().unwrap()), 9);
+
+            // A Client arrived: STOP, then relay (echo one payload).
+            s.write_all(&[TCP_PING_STOP]).await.unwrap();
+            let mut payload = [0u8; 5];
+            s.read_exact(&mut payload).await.unwrap();
+            s.write_all(&payload).await.unwrap();
+            s.flush().await.unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        register_tunnel_stream_ping_capable(&mut stream, &token)
+            .await
+            .unwrap();
+        await_ping_phase_end(&mut stream).await.unwrap();
+        stream.write_all(b"relay").await.unwrap();
+        let mut back = [0u8; 5];
+        stream.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"relay", "post-STOP payload relays verbatim");
+        edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_legacy_edge_drops_a_k_registration_without_any_ack() {
+        // The compatibility premise, pinned as a test: a pre-'K' Edge does NOT
+        // reply "NO" to an unknown role byte -- it treats it as a hard protocol
+        // error and closes the connection with no ack at all. So the failure the
+        // caller's fallback must trigger on is an EOF reading the ack, not a
+        // "NO". (The 'A' path's own "NO" rejection is covered separately by
+        // register_tunnel_stream_errors_on_non_ok_ack.)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let edge = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut role = [0u8; 1];
+            s.read_exact(&mut role).await.unwrap();
+            assert_eq!(role[0], b'K');
+            drop(s); // unknown role byte -> hard error, connection dropped
+        });
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let r = register_tunnel_stream_ping_capable(&mut stream, &RoutingToken([0x11; 32])).await;
+        assert!(
+            r.is_err(),
+            "a legacy Edge's ack-less drop surfaces as a registration error"
+        );
         edge.await.unwrap();
     }
 

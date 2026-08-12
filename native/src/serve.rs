@@ -20,8 +20,9 @@ use tokio::net::{TcpStream, UdpSocket};
 
 use crate::config::{AgentConfig, OriginProto};
 use crate::transport::{
-    bind_hostname, dial_quic, dial_quic_or_blocked_error, register_tunnel, register_tunnel_stream,
-    register_tunnel_stream_browser, tcp_tls_connect,
+    await_ping_phase_end, bind_hostname, dial_quic, dial_quic_or_blocked_error, register_tunnel,
+    register_tunnel_stream, register_tunnel_stream_browser, register_tunnel_stream_ping_capable,
+    tcp_tls_connect,
 };
 use ct_common::metrics::{Metered, TunnelMetrics};
 use ct_common::noise::{frame, noise_pump, origin_handshake, origin_handshake_any};
@@ -591,11 +592,42 @@ async fn tcp_connect_register_serve(
             return serve_duplex_to_origin(stream, config.origin).await;
         }
     }
-    register_tunnel_stream(&mut stream, token).await?;
+    // ct-agent#15: prefer the ping-capable 'K' registration, which has the Edge
+    // put real payload on this connection while it sits parked waiting for a
+    // Client. A bare TCP keepalive is an ACK-only segment that some enterprise
+    // firewall/DPI/SASE gateways don't count as activity, so the parked
+    // connection still flapped after the 10s/10s keepalive tightening (9b42d9e).
+    //
+    // Fallback: a pre-'K' Edge doesn't just refuse 'K', it treats an unknown role
+    // byte as a hard protocol error and drops the connection WITHOUT any ack — so
+    // the failure surfaces here as an EOF reading the ack, not as a "NO". The
+    // stream is unusable either way (a 'K'-aware Edge also shuts down after a
+    // "NO"), so the retry has to be a fresh connection rather than a second
+    // registration on this one. Any 'K' failure therefore falls back to a plain
+    // 'A' on a redial: that keeps us compatible with every Edge without having to
+    // tell "didn't understand 'K'" apart from "refused this token", at the cost
+    // of one extra dial on a registration that was going to fail anyway.
+    let mut ping_capable = true;
+    if let Err(e) = register_tunnel_stream_ping_capable(&mut stream, token).await {
+        eprintln!(
+            "ct-agent: ping-capable ('K') registration at {target} failed ({e}); \
+             falling back to a plain 'A' registration on a fresh connection"
+        );
+        stream = tcp_tls_connect(target, edge_cert.clone()).await?;
+        register_tunnel_stream(&mut stream, token).await?;
+        ping_capable = false;
+    }
     eprintln!(
-        "ct-agent: registered over the TLS-TCP fallback (UDP blocked), serving one tunnel to {}",
+        "ct-agent: registered over the TLS-TCP fallback (UDP blocked){}, serving one tunnel to {}",
+        if ping_capable { ", ping-capable" } else { "" },
         config.origin
     );
+    // Answer the Edge's parked-connection PINGs until it signals STOP. Returns
+    // with the stream byte-exactly at the first relayed byte, so the Noise
+    // handshake below sees an untouched stream.
+    if ping_capable {
+        await_ping_phase_end(&mut stream).await?;
+    }
     let (recv, send) = split(stream);
     serve_noise_stream(send, recv, config.origin, origin_keys, Arc::clone(metrics)).await
 }
@@ -646,9 +678,17 @@ mod tests {
         let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
 
         // Edge: accept each TCP connection and serve it ('A' parks, 'C' delivers).
+        //
+        // ct-agent#15: this is the REAL pinned ct-edge, which predates role 'K'
+        // and rejects an unknown role byte by erroring out and dropping the
+        // connection with no ack. That makes this test a genuine end-to-end proof
+        // of the legacy-Edge fallback: the Agent's 'K' attempt gets dropped
+        // ack-less, it redials and registers with plain 'A', and the tunnel works
+        // exactly as before. Accept in an unbounded loop rather than a fixed count
+        // so the extra probe dial isn't a brittle magic number.
         let state_e = state.clone();
         let edge = tokio::spawn(async move {
-            for _ in 0..2 {
+            loop {
                 let (tcp, _) = tcp_listener.accept().await.unwrap();
                 let (acc, st, ch) = (acceptor.clone(), state_e.clone(), challenge.clone());
                 tokio::spawn(async move {
@@ -680,9 +720,9 @@ mod tests {
         };
 
         // Agent: run the TCP fallback (connect + register + serve one tunnel).
-        // Pool size 1: this test's mock edge accepts exactly 2 connections
-        // total (one Agent registration + one Client), so the default pool
-        // (#229) would have the Agent alone consume both.
+        // Pool size 1: the real edge parks one registration per token, and a
+        // larger pool would just have the Agent's own workers supersede each
+        // other's park slot before the Client arrives.
         let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), &origin_addr.to_string()).unwrap();
         cfg.tcp_fallback_pool_size = 1;
         let ca_root_a = ca_root.clone();
@@ -1131,6 +1171,115 @@ mod tests {
         edge.abort();
     }
 
+    /// ct-agent#15 acceptance for the ping-capable role, end to end through the
+    /// real `tcp_connect_register_serve`: a 'K'-aware Edge admits the Agent,
+    /// keeps the parked connection busy with real payload PING/PONG round trips,
+    /// then writes STOP and splices a Client in — and the Noise tunnel to the
+    /// origin still completes on that same stream. This is the whole point of
+    /// the change: the ping traffic must keep a middlebox from tearing the
+    /// parked connection down WITHOUT disturbing the tunnel that follows.
+    #[tokio::test]
+    async fn tcp_fallback_ping_capable_role_pings_while_parked_then_serves_noise() {
+        use ct_common::noise::{client_handshake_for, frame, generate_static_keypair};
+        use ct_common::{Capability, OriginIdentity};
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use std::net::Ipv4Addr;
+
+        let (origin_addr, origin) = echo_origin().await;
+
+        let ca = Ca::new("k-e2e-ca").unwrap();
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+
+        let token = RoutingToken([0x6b; 32]);
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: tcp_addr.to_string(),
+        };
+
+        // Mock 'K'-aware Edge: admit, ping while parked, STOP, then play the
+        // relayed Client by driving the Noise handshake on the same stream.
+        let t = token.clone();
+        let client_priv = client_kp.private;
+        let edge = tokio::spawn(async move {
+            let (tcp, _) = tcp_listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let mut hdr = [0u8; 33];
+            tls.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(hdr[0], b'K', "agent registers as ping-capable");
+            assert_eq!(&hdr[1..], &t.0, "token echoed");
+            tls.write_all(b"OK").await.unwrap();
+            tls.flush().await.unwrap();
+
+            // Parked: real payload round trips, each fully awaited before the
+            // next, exactly as the Edge's park_and_ping does.
+            for c in [0u64, 1] {
+                let mut ping = [0u8; 9];
+                ping[0] = 0xF9;
+                ping[1..].copy_from_slice(&c.to_be_bytes());
+                tls.write_all(&ping).await.unwrap();
+                tls.flush().await.unwrap();
+                let mut pong = [0u8; 9];
+                tls.read_exact(&mut pong).await.unwrap();
+                assert_eq!(pong[0], 0xFA, "PONG magic");
+                assert_eq!(
+                    u64::from_be_bytes(pong[1..].try_into().unwrap()),
+                    c,
+                    "PONG echoes the counter"
+                );
+            }
+
+            // A Client arrived: STOP, then relayed bytes — written back to back,
+            // so this also proves the Agent stops reading ping frames at exactly
+            // the right byte rather than eating handshake bytes.
+            tls.write_all(&[0xFB]).await.unwrap();
+            let (mut recv, mut send) = split(tls);
+            let mut hs = client_handshake_for(&client_priv, &cap).unwrap();
+            let mut buf = vec![0u8; 65535];
+            let mut tmp = vec![0u8; 65535];
+            let n = hs.write_message(&[], &mut buf).unwrap();
+            send.write_all(&frame(&buf[..n])).await.unwrap();
+            send.flush().await.unwrap();
+            let m2 = read_frame(&mut recv).await.unwrap();
+            hs.read_message(&m2, &mut tmp).unwrap();
+            let mut transport = hs.into_transport_mode().unwrap();
+            let n = transport.write_message(b"ping-role", &mut buf).unwrap();
+            send.write_all(&frame(&buf[..n])).await.unwrap();
+            send.flush().await.unwrap();
+            let resp = read_frame(&mut recv).await.unwrap();
+            let n = transport.read_message(&resp, &mut tmp).unwrap();
+            tmp[..n].to_vec()
+        });
+
+        let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), &origin_addr.to_string()).unwrap();
+        cfg.tcp_fallback_pool_size = 1;
+        let origin_priv = origin_kp.private;
+        let agent = tokio::spawn(async move {
+            let _ = run_agent_tcp_fallback(&cfg, ca_root, token, Arc::new(vec![origin_priv])).await;
+        });
+
+        let echoed = tokio::time::timeout(Duration::from_secs(15), edge)
+            .await
+            .expect("ping-capable round trip timed out")
+            .unwrap();
+        assert_eq!(
+            echoed, b"ping-role",
+            "the Noise tunnel completes on a stream that carried a ping phase first"
+        );
+        agent.abort();
+        let _ = origin.await;
+    }
+
     #[tokio::test]
     async fn tcp_fallback_reconnects_after_a_tunnel_drops() {
         // issue #5 / P1.2b: the TLS-TCP fallback re-registers after each tunnel.
@@ -1152,6 +1301,9 @@ mod tests {
         let regs = Arc::new(AtomicUsize::new(0));
 
         // Edge: accept two TLS registrations, ack each, then drop the stream.
+        // Models a 'K'-aware Edge (ct-agent#15), so this also pins that the
+        // Agent now prefers the ping-capable role -- and that an EOF while it
+        // sits in the ping phase waiting for a Client still drives a reconnect.
         let regs_e = regs.clone();
         let edge = tokio::spawn(async move {
             for _ in 0..2 {
@@ -1159,7 +1311,7 @@ mod tests {
                 let mut tls = acceptor.accept(tcp).await.unwrap();
                 let mut hdr = [0u8; 33];
                 tls.read_exact(&mut hdr).await.unwrap();
-                assert_eq!(hdr[0], b'A');
+                assert_eq!(hdr[0], b'K', "agent prefers the ping-capable role");
                 tls.write_all(b"OK").await.unwrap();
                 tls.flush().await.unwrap();
                 regs_e.fetch_add(1, SeqCst);
@@ -1226,11 +1378,13 @@ mod tests {
                 let mut tls = acceptor.accept(tcp).await.unwrap();
                 let mut hdr = [0u8; 33];
                 tls.read_exact(&mut hdr).await.unwrap();
-                assert_eq!(hdr[0], b'A');
+                assert_eq!(hdr[0], b'K', "agent prefers the ping-capable role");
                 tls.write_all(b"OK").await.unwrap();
                 tls.flush().await.unwrap();
                 registered_e.fetch_add(1, SeqCst);
-                held.push(tls); // keep it open -- prove it doesn't need to close first
+                // Keep it open -- prove it doesn't need to close first. Each
+                // worker is now sitting in its ping phase, i.e. genuinely parked.
+                held.push(tls);
             }
             // Hold until the test has observed all POOL, then let them drop.
             tokio::time::sleep(Duration::from_millis(200)).await;
