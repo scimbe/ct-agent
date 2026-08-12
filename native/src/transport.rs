@@ -454,13 +454,22 @@ pub async fn tcp_tls_connect_channel(
 /// 40s, roughly a 5x cut to the detection blind spot, while keeping probe
 /// traffic light (one 0-byte ACK-only segment every 10s while idle --
 /// negligible bandwidth/battery cost, still well above what would
-/// meaningfully drain a mobile client sitting parked).
+/// meaningfully drain a mobile client sitting parked). Windows is the one exception:
+/// its keepalive API has no TCP_KEEPCNT-equivalent retry-count knob, so it keeps
+/// its own OS-default retry count on top of the tightened time/interval below --
+/// see this function's own `cfg(not(windows))` for why.
 fn apply_tcp_keepalive(stream: &TcpStream) {
     let sock = socket2::SockRef::from(stream);
     let ka = socket2::TcpKeepalive::new()
         .with_time(Duration::from_secs(10))
-        .with_interval(Duration::from_secs(10))
-        .with_retries(3);
+        .with_interval(Duration::from_secs(10));
+    // `with_retries` sets TCP_KEEPCNT, which Windows' keepalive API (WSAIoctl
+    // SIO_KEEPALIVE_VALS) has no equivalent knob for -- socket2 only exposes it on
+    // platforms with a real TCP_KEEPCNT (see socket2::TcpKeepalive::with_retries'
+    // own cfg list, which excludes windows). Windows keeps its own default retry
+    // count; still gets the tightened 10s/10s time/interval above.
+    #[cfg(not(windows))]
+    let ka = ka.with_retries(3);
     let _ = sock.set_tcp_keepalive(&ka);
 }
 
