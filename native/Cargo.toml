@@ -35,7 +35,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 # an idle mapping without either endpoint noticing, so a later Client
 # delivered onto that "parked" connection gets nothing back. tokio's
 # TcpStream/TcpSocket have no keepalive setter of their own; socket2 does.
-socket2 = "0.5"
+# `features = ["all"]` is required for `TcpKeepalive::with_retries` and the
+# `keepalive_time`/`keepalive_interval`/`keepalive_retries` getters (issue #15
+# flap investigation: bounds the keepalive-probe retry count explicitly
+# instead of relying on the OS default) -- without it those methods don't
+# exist on this platform/feature combination. Mirrors CADS-Tunnel's edge-side
+# Cargo.toml (github.com/scimbe/CADS-Tunnel, crates/edge/Cargo.toml).
+socket2 = { version = "0.5", features = ["all"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }

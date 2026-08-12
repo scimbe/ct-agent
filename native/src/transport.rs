@@ -438,15 +438,29 @@ pub async fn tcp_tls_connect_channel(
 /// Client later delivered onto that "parked" connection gets nothing back
 /// (found live: reproduced on hugging's real UDP-blocked network, never on a
 /// same-host hermetic/loopback test, exactly what an idle-NAT-drop
-/// hypothesis predicts). 20s/20s is comfortably under common NAT idle
-/// timeouts (typically 60s+) while staying cheap. Best-effort: unsupported
-/// platforms or an already-broken socket just don't get the option, same as
-/// today.
+/// hypothesis predicts). Best-effort: unsupported platforms or an
+/// already-broken socket just don't get the option, same as today.
+///
+/// `time`/`interval` were originally 20s/20s with the OS-default retry count
+/// (typically 9 on Linux), so a genuinely dead connection could take up to
+/// ~200s (20 + 9*20) to surface as an error -- long enough that a parked
+/// registration sits silently broken for minutes before either side
+/// notices. A matching investigation on the Edge side (issue #15, live flap
+/// monitoring) tightened the Edge's own accept-side keepalive to 10s/10s
+/// with an explicit `with_retries(3)` bound (CADS-Tunnel, `crates/edge/src/
+/// transport.rs`, commit `5e3dd3c`); mirrored here for symmetry on this end
+/// of the same connection, since only one side keepaliving doesn't help
+/// this side's own idle-NAT-drop detection. Worst case is now 10 + 3*10 =
+/// 40s, roughly a 5x cut to the detection blind spot, while keeping probe
+/// traffic light (one 0-byte ACK-only segment every 10s while idle --
+/// negligible bandwidth/battery cost, still well above what would
+/// meaningfully drain a mobile client sitting parked).
 fn apply_tcp_keepalive(stream: &TcpStream) {
     let sock = socket2::SockRef::from(stream);
     let ka = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(20))
-        .with_interval(Duration::from_secs(20));
+        .with_time(Duration::from_secs(10))
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
     let _ = sock.set_tcp_keepalive(&ka);
 }
 
@@ -498,6 +512,41 @@ mod tests {
         assert!(!sock.keepalive().unwrap(), "keepalive is off by default before applying it");
         apply_tcp_keepalive(&client);
         assert!(sock.keepalive().unwrap(), "apply_tcp_keepalive must actually enable SO_KEEPALIVE");
+    }
+
+    #[tokio::test]
+    async fn apply_tcp_keepalive_uses_the_tightened_10s_10s_3_retry_parameters() {
+        // issue #15 flap investigation: the parked TLS-TCP fallback connection was still
+        // flapping under the old 20s/20s + OS-default-retries (~9) keepalive, whose
+        // worst-case dead-connection-detection time was ~200s (20 + 9*20). This proves the
+        // tightened values actually land on the wire (not just that apply_tcp_keepalive
+        // compiles): SO_KEEPALIVE on, TCP_KEEPIDLE=10s, TCP_KEEPINTVL=10s, TCP_KEEPCNT=3 --
+        // worst case now 10 + 3*10 = 40s. Mirrors CADS-Tunnel's matching edge-side test
+        // (crates/edge/src/transport.rs, commit 5e3dd3c).
+        let bind = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = bind.local_addr().unwrap();
+        let accept = tokio::spawn(async move { bind.accept().await.unwrap().0 });
+        let client = TcpStream::connect(addr).await.unwrap();
+        let _server = accept.await.unwrap();
+
+        apply_tcp_keepalive(&client);
+        let sock = socket2::SockRef::from(&client);
+        assert!(sock.keepalive().unwrap_or(false), "SO_KEEPALIVE must be enabled");
+        assert_eq!(
+            sock.keepalive_time().unwrap(),
+            Duration::from_secs(10),
+            "TCP_KEEPIDLE must be tightened to 10s (was 20s)"
+        );
+        assert_eq!(
+            sock.keepalive_interval().unwrap(),
+            Duration::from_secs(10),
+            "TCP_KEEPINTVL must be tightened to 10s (was 20s)"
+        );
+        assert_eq!(
+            sock.keepalive_retries().unwrap(),
+            3,
+            "TCP_KEEPCNT must be explicitly bounded to 3 (was the OS default, ~9 on Linux)"
+        );
     }
 
     #[tokio::test]
