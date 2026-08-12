@@ -3488,22 +3488,42 @@ pub async fn present_channel_join_via_ladder(
         let via_front_door = rung.via_front_door;
         let edge_cert = edge_cert.clone();
         async move {
-            if via_front_door {
+            // Diagnosability (real support case, 2026-08-12): dial_ladder only keeps the
+            // LAST rung's error, and ChannelDialError::Failed's Display hardcodes "direct
+            // dial failed" regardless of which rung actually produced it -- an operator
+            // debugging a blocked-direct-port case sees an identically-worded failure for
+            // both the direct attempt AND a subsequent :443 front-door attempt, with no way
+            // to tell from the log alone whether the fallback even ran. Name the rung being
+            // tried and its outcome explicitly, independent of the generic error text.
+            let rung_label = if via_front_door { "front-door(:443)" } else { "direct" };
+            eprintln!("ct-agent channel: dialing {rung_label} rung {endpoint}");
+            let result = if via_front_door {
                 // #106 fallback: the :443 front door over TLS-TCP (ALPN ct-edge-channel).
-                let stream = crate::transport::tcp_tls_connect_channel(endpoint, edge_cert)
-                    .await
-                    .map_err(ChannelDialError::Failed)?;
-                let (recv, send) = tokio::io::split(stream);
-                present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT)
-                    .await
-                    .map_err(ChannelDialError::Failed)
+                async {
+                    let stream = crate::transport::tcp_tls_connect_channel(endpoint, edge_cert)
+                        .await
+                        .map_err(ChannelDialError::Failed)?;
+                    let (recv, send) = tokio::io::split(stream);
+                    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT)
+                        .await
+                        .map_err(ChannelDialError::Failed)
+                }
+                .await
             } else {
                 // Direct: QUIC to the channel port. Unreachable falls through to :443.
-                let conn = dial_peer_direct(endpoint, direct_timeout).await?;
-                present_channel_join(&conn, request, holder)
-                    .await
-                    .map_err(ChannelDialError::Failed)
+                async {
+                    let conn = dial_peer_direct(endpoint, direct_timeout).await?;
+                    present_channel_join(&conn, request, holder)
+                        .await
+                        .map_err(ChannelDialError::Failed)
+                }
+                .await
+            };
+            match &result {
+                Ok(_) => eprintln!("ct-agent channel: {rung_label} rung {endpoint} succeeded"),
+                Err(e) => eprintln!("ct-agent channel: {rung_label} rung {endpoint} failed: {e}"),
             }
+            result
         }
     })
     .await
