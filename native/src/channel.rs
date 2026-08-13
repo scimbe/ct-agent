@@ -58,8 +58,20 @@ pub enum ChannelJoinOutcome {
 /// possession challenge/response + read the ack) may take. It runs *after* `dial_peer_direct`
 /// connects but *before* #139 (post-admission stream setup) and #126 (Noise handshake) cover, so a
 /// transport-alive-but-stalled admission was previously unbounded — the same hang class as #139/#126,
-/// one layer earlier. Kept in the same 15s band.
-pub(crate) const ADMISSION_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// one layer earlier.
+///
+/// **Why 45s and not the 15s this shipped with**: the edge only sends the ack on the PAIRING
+/// paths once a *partner* arrives, and it keeps a lone first-arriving member parked as pairable
+/// for its full park TTL (30s server-side). With a 15s client bound, any pairing whose second
+/// member takes 15-30s to show up (entirely normal when that member is walking its own dial
+/// ladder off a blocked QUIC rung first) failed DETERMINISTICALLY: this side reported the #140
+/// "stalled" error on every rung while the edge, at handoff time, found a corpse ("relay
+/// handoff failed acking side A ... connection lost" — observed live 2026-08-13 16:48 UTC,
+/// matching the field reports of all-rungs-stall). 45s = the server's 30s park window, plus
+/// margin for the partner's own ladder walk. The exchange stays bounded — a genuinely dead
+/// broker still fails in finite time — it just no longer gives up while the server is still
+/// legitimately waiting for the partner on our behalf.
+pub(crate) const ADMISSION_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 pub async fn present_channel_join(
     conn: &Connection,
