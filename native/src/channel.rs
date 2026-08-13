@@ -101,6 +101,16 @@ where
     let len = u16::try_from(bytes.len()).map_err(|_| "channel join request too large")?;
     send.write_all(&len.to_be_bytes()).await?;
     send.write_all(&bytes).await?;
+    // Flush before awaiting the challenge. On a quinn stream this is a no-op, but this
+    // same function carries the `:443` front-door legs over a tokio-rustls TLS stream
+    // (#106), and tokio-rustls documents that `poll_write` does NOT guarantee
+    // transmission — buffered TLS records need an explicit flush. Without it, the join
+    // request (or its tail) can sit in the TLS writer while both sides wait: the edge's
+    // 15s JOIN_READ bound (#105) and this function's 15s exchange bound (#140) then
+    // expire together as a mutual stall. The relay leg
+    // (`present_channel_relay_join_on_stream`) has flushed at exactly these two points
+    // all along — this leg missing it was an oversight, not a difference in contract.
+    send.flush().await?;
 
     // The edge's response is one of: a 32-byte possession challenge (proceed), a short
     // "NO" (a pre-challenge validation refusal), a genuinely-malformed partial (a broken
