@@ -419,14 +419,30 @@ pub async fn run_agent(
 /// Reconnect backoff parameters (issue #5 / P1.2b).
 const RECONNECT_BASE: Duration = Duration::from_millis(500);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
-const RECONNECT_MAX_ATTEMPTS: u32 = 10;
+/// Reconnect attempts before giving up, when `CT_AGENT_RECONNECT_MAX_ATTEMPTS` is
+/// unset. **Unbounded by default** — an onboarded agent IS the tunnel, so exiting
+/// takes the service down permanently rather than failing over to anything.
+///
+/// This was `10` until a real production outage (2026-08-13) traced to exactly
+/// that: `sort.bunsenbrenner.org`'s agent burned its 10-attempt budget
+/// (0.5s+1+2+4+8+16+30+30+30+30 ≈ **2 minutes** of backoff) during an edge
+/// redeploy that took longer than two minutes, exited, and stayed dead for hours
+/// — the edge answered `no agent tunnel for token` for every request until a human
+/// restarted it by hand. It then died again the same way. A bounded default turns
+/// any edge restart, deploy, or network partition longer than ~2 minutes into a
+/// permanent, human-only-recoverable outage.
+///
+/// Exiting also can't self-heal even with a supervisor: the process holds a
+/// single-use join token, so a bare `restart:` policy just crash-loops redeeming a
+/// spent token (#36). Retrying forever keeps the onboarded credential and simply
+/// waits the edge out — the behavior every long-lived deployment actually wants.
+///
+/// A finite budget remains available via the env var for short-lived or scripted
+/// runs where failing fast genuinely is better than hanging.
+const RECONNECT_MAX_ATTEMPTS: u32 = u32::MAX;
 
-/// How many reconnect attempts before the agent gives up and exits. Configurable
-/// via `CT_AGENT_RECONNECT_MAX_ATTEMPTS`; `0` means retry forever (#36): a
-/// long-lived public demo must rejoin a redeployed edge automatically rather than
-/// exit — the process holds a single-use join token, so exiting can't cleanly
-/// re-onboard, and a bare `restart:` would just crash-loop redeeming a spent token.
-/// Retrying forever keeps the onboarded credential and simply waits out the edge.
+/// How many reconnect attempts before the agent gives up and exits, from the
+/// environment. See [`RECONNECT_MAX_ATTEMPTS`] for why the default is unbounded.
 fn reconnect_max_attempts() -> u32 {
     parse_reconnect_max_attempts(std::env::var("CT_AGENT_RECONNECT_MAX_ATTEMPTS").ok())
 }
@@ -646,6 +662,43 @@ mod tests {
         assert_eq!(parse_reconnect_max_attempts(Some("not-a-number".into())), RECONNECT_MAX_ATTEMPTS);
         assert_eq!(parse_reconnect_max_attempts(Some("0".into())), u32::MAX, "0 -> retry forever");
         assert_eq!(parse_reconnect_max_attempts(Some(" 7 ".into())), 7);
+    }
+
+    #[test]
+    fn the_default_reconnect_budget_is_unbounded_so_an_agent_never_exits_on_a_long_outage() {
+        // Real production outage (2026-08-13): with the previous default of 10, an
+        // onboarded agent burned its whole budget in ~2 minutes of backoff
+        // (0.5+1+2+4+8+16+30+30+30+30 = 151.5s) during an edge redeploy that took
+        // longer than that, exited, and stayed dead for hours -- the edge answered
+        // `no agent tunnel for token` for every request until a human restarted it.
+        // An onboarded agent IS the tunnel: exiting is a permanent outage, not a
+        // failover, and it can't even self-heal under a supervisor because the join
+        // token is single-use. So the DEFAULT specifically must be unbounded.
+        assert_eq!(
+            parse_reconnect_max_attempts(None),
+            u32::MAX,
+            "an agent with no explicit budget must retry forever, never exit"
+        );
+
+        // Prove the claim behind the regression: the old default really did cap out
+        // in ~2 minutes, i.e. it could not survive an ordinary redeploy.
+        let mut b = Backoff::new(RECONNECT_BASE, RECONNECT_MAX, 10);
+        let mut total = Duration::ZERO;
+        let mut handed_out = 0;
+        while let Some(d) = b.next_delay() {
+            total += d;
+            handed_out += 1;
+        }
+        assert_eq!(handed_out, 10, "the old default handed out exactly 10 delays");
+        assert!(
+            total < Duration::from_secs(180),
+            "the old 10-attempt default exhausted in {total:?} -- under 3 minutes, \
+             which is shorter than a routine edge rebuild+restart"
+        );
+
+        // An explicitly-configured finite budget still works, for short-lived or
+        // scripted runs that genuinely want to fail fast.
+        assert_eq!(parse_reconnect_max_attempts(Some("3".into())), 3);
     }
 
     /// issue #3 acceptance: with UDP blocked, the agent registers over the TLS-TCP
