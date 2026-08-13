@@ -2440,6 +2440,105 @@ where
     result
 }
 
+/// #19: the initiator-side PERSISTENT service-call driver — the calling-side counterpart of the
+/// accept side's `--serve` (#200). ONE channel session is established and then held for the
+/// process's whole life; each line arriving on `lines` becomes one `service/<slug>` call over that
+/// same session, answered as one NDJSON envelope line on `out`:
+///
+/// - success: `{"ok":true,"output":"<bare service output>"}`
+/// - failure: `{"ok":false,"error":"<message>"}` — written BEFORE the `Err` return, so the
+///   supervising caller always gets a structured last line to attribute, then sees the non-zero
+///   exit and can re-spawn + retry the in-flight request.
+///
+/// Why this exists (measured, 2026-08-13): a caller making many calls to the same peer (the sort
+/// arena bridge: ~1 call/second for ~95 rounds) previously paid a full join+pair+Noise handshake
+/// per call via the one-shot `--call-service` — and rolled the accept side's re-park gap every
+/// time, a structural 15-22% per-round transport-fault rate (#18). Holding the session makes it
+/// ONE pairing per run: the gap is practically never rolled, and the per-round handshake overhead
+/// disappears. The envelope (rather than raw output lines) is what keeps the stream parseable:
+/// service outputs may legitimately contain anything, including newlines, so raw framing cannot
+/// delimit responses — JSON-string escaping can.
+///
+/// The line source is an injected channel (not `stdin` directly) so the loop is testable without a
+/// real process; production feeds it from a dedicated stdin-reader thread
+/// ([`call_service_persistent_local`]). Returns `Ok(())` on source EOF (clean end-of-run teardown:
+/// the caller closed stdin), `Err` after the first failed call — a persistent session that broke
+/// mid-run is NOT silently re-dialed in-process: the process-supervision model (the bridge spawns
+/// one process per RUN and can retry a round) stays the recovery layer, exactly as before, just at
+/// run granularity instead of round granularity.
+async fn run_service_calls_persistent<S, W>(
+    local: S,
+    slug: &str,
+    lines: &mut tokio::sync::mpsc::Receiver<String>,
+    out: &mut W,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let (mut recv, mut send) = tokio::io::split(local);
+    while let Some(line) = lines.recv().await {
+        let input = line.trim();
+        if input.is_empty() {
+            continue; // a blank line is a keep-alive/no-op, not a call
+        }
+        match call_role_service(&mut send, &mut recv, slug, input).await {
+            Ok(output) => {
+                let envelope = serde_json::json!({ "ok": true, "output": output });
+                out.write_all(format!("{envelope}\n").as_bytes()).await?;
+                out.flush().await?;
+            }
+            Err(e) => {
+                let envelope = serde_json::json!({ "ok": false, "error": e.to_string() });
+                let _ = out.write_all(format!("{envelope}\n").as_bytes()).await;
+                let _ = out.flush().await;
+                return Err(std::io::Error::other(format!(
+                    "persistent service call failed mid-run: {e}"
+                )));
+            }
+        }
+    }
+    Ok(()) // stdin EOF -> drop the halves -> the session ends cleanly
+}
+
+/// #19 production glue for [`run_service_calls_persistent`]: bridge the real process stdin into
+/// the injected line channel via a dedicated blocking reader thread (tokio's async stdin is a
+/// thread pool anyway, and a plain `BufRead::lines` thread is the simplest EOF-correct feed), run
+/// the persistent loop against real stdout, and translate its outcome into the process contract:
+/// clean source EOF ends the session (normal exit through the session driver), a mid-run call
+/// failure exits non-zero AFTER the structured error envelope is out (same #211 fail-closed
+/// discipline as the one-shot mode).
+fn call_service_persistent_local(slug: String) -> tokio::io::DuplexStream {
+    let (session_side, serve_side) = tokio::io::duplex(1 << 16);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(l) => {
+                    if tx.blocking_send(l).is_err() {
+                        break; // consumer gone (session over) -- stop reading
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        // Thread end drops `tx` -> the loop sees source EOF -> clean teardown.
+    });
+    tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        if let Err(e) = run_service_calls_persistent(serve_side, &slug, &mut rx, &mut stdout).await {
+            eprintln!("ct-agent channel --call-service {slug} (persistent): {e}");
+            std::process::exit(1);
+        }
+        // Ok: serve_side was moved+dropped -> session EOF -> the process exits through the
+        // normal session teardown (drain + exit 0), same as the one-shot mode's happy path.
+    });
+    session_side
+}
+
 /// The initiator-side one-shot **service** call (#173 distributed crew topology): dial done by the
 /// channel session, this drives the local side — call the peer's `service/<slug>` with `input`, print
 /// the bare service output, then EOF the session so the process exits. This is exactly the
@@ -2642,6 +2741,24 @@ fn channel_local() -> ChannelLocal {
     // the raw CT_CHANNEL_CALL below because it's the service-specific (and jq-free) path.
     if let Ok(slug) = std::env::var("CT_CHANNEL_CALL_SERVICE") {
         let slug = slug.trim().to_string();
+        // #19: persistent call mode -- hold ONE session and multiplex line-framed calls over it
+        // until stdin EOF, instead of one pairing per call. Checked before the one-shot path so
+        // the flag simply upgrades an existing CT_CHANNEL_CALL_SERVICE deployment. Deliberately
+        // NOT combined with the DCUtR retry modes yet (their per-attempt channel_local() re-entry
+        // would contend for the single stdin feed -- the same class of trap #248 documents below);
+        // the arena/front-door path this exists for calls channel_local() exactly once.
+        let persistent = std::env::var("CT_CHANNEL_CALL_PERSISTENT")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false);
+        if persistent {
+            eprintln!(
+                "ct-agent channel: --call-service {slug} (persistent: one held session, NDJSON calls over stdio until EOF, #19)"
+            );
+            return ChannelLocal::Serve(call_service_persistent_local(slug));
+        }
         // #248: cache the stdin read -- this function is called fresh on every
         // relay-gate/circuit-relay DCUtR retry attempt (each attempt needs its own owned
         // ChannelLocal), and stdin is only readable to EOF once. A naive re-read on retry
@@ -5728,6 +5845,71 @@ mod tests {
             run_service_call(peer2, "safety_check", "x").await.is_err(),
             "an unoffered service fails closed",
         );
+    }
+
+    #[tokio::test]
+    async fn persistent_call_mode_multiplexes_many_calls_over_one_held_session_19() {
+        // #19 (frozen contract): ONE session, many line-framed calls, one NDJSON envelope line per
+        // call, clean teardown on source EOF. This is the initiator-side counterpart of --serve:
+        // the whole point is that call N+1 reuses the SAME session (no re-pairing, no re-park
+        // window on the peer), so all three calls here flow over one serve_local peer.
+        use ct_common::channel::ServiceType;
+        let mut reg = ct_common::mcp::default_registry();
+        ct_common::mcp::register_service_tools(&mut reg, &[ServiceType::TextGeneration], |_svc, input| {
+            Ok(format!("echo:{input}"))
+        });
+        let reg = std::sync::Arc::new(reg);
+        let peer = serve_local(move |req: Vec<u8>| {
+            let reg = reg.clone();
+            async move { reg.dispatch(&req) }
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+        let mut out: Vec<u8> = Vec::new();
+        tx.send("first".into()).await.unwrap();
+        tx.send("   ".into()).await.unwrap(); // blank line = no-op, must not produce output
+        tx.send("second".into()).await.unwrap();
+        tx.send("third with spaces".into()).await.unwrap();
+        drop(tx); // stdin EOF -> clean end of run
+
+        run_service_calls_persistent(peer, "text_generation", &mut rx, &mut out)
+            .await
+            .expect("source EOF is the clean end of a run");
+
+        let lines: Vec<serde_json::Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("every response line is one JSON envelope"))
+            .collect();
+        assert_eq!(lines.len(), 3, "three calls -> three envelopes (blank line produced none)");
+        for (envelope, expect) in lines.iter().zip(["echo:first", "echo:second", "echo:third with spaces"]) {
+            assert_eq!(envelope["ok"], true);
+            assert_eq!(envelope["output"], expect, "bare service output inside the envelope");
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_call_mode_fails_closed_with_a_structured_error_envelope_19() {
+        // #19 + #211 discipline: a failed call mid-run writes {"ok":false,...} as the LAST line
+        // BEFORE the Err return -- the supervising caller can attribute the failure structurally,
+        // then sees the non-zero exit and retries at run granularity.
+        let bare = std::sync::Arc::new(ct_common::mcp::default_registry()); // no services offered
+        let peer = serve_local(move |req: Vec<u8>| {
+            let bare = bare.clone();
+            async move { bare.dispatch(&req) }
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+        let mut out: Vec<u8> = Vec::new();
+        tx.send("doomed".into()).await.unwrap();
+        drop(tx);
+
+        let err = run_service_calls_persistent(peer, "text_generation", &mut rx, &mut out).await;
+        assert!(err.is_err(), "an unoffered service fails the run closed");
+        let last: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out).unwrap().lines().last().expect("an envelope was written"))
+                .expect("the last line is a JSON envelope");
+        assert_eq!(last["ok"], false);
+        assert!(last["error"].as_str().unwrap().len() > 0, "the error is named, not swallowed");
     }
 
     #[test]
