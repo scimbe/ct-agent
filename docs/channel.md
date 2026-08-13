@@ -1,0 +1,98 @@
+# `ct-agent channel` — reference
+
+The Agent-Fabric channel subsystem: end-to-end encrypted (Noise_IK) sessions between two
+members, brokered and — when neither side is dialable — relayed by a CADS-Tunnel edge, which
+only ever sees ciphertext. This page collects the operational knowledge that otherwise lives in
+code comments and incident issues. Where behavior was learned from a real incident, the issue is
+linked — those threads carry the full evidence.
+
+## Modes
+
+| Mode | Selected by | Behavior |
+|---|---|---|
+| One-shot service call | `CT_CHANNEL_CALL_SERVICE=<slug>` | Join → pair → Noise → **one** `service/<slug>` call (stdin = input, stdout = bare output) → exit. The crew-bridge `CREW_*_CMD` contract. |
+| **Persistent call mode** (v0.4.9, [#19](https://github.com/scimbe/ct-agent/issues/19)) | `CT_CHANNEL_CALL_SERVICE=<slug>` **+** `CT_CHANNEL_CALL_PERSISTENT=1` | **One held session** for the process's life; each stdin **line** is one call, each response is one NDJSON envelope line: `{"ok":true,"output":…}` or `{"ok":false,"error":…}` as the structured last line before a non-zero exit. stdin EOF = clean teardown. Measured effect on the sort arena: per-round faults 12–15% → 0%, ~85 ms/round steady state, transport overhead ×27 lower. Will become the **default in v0.5.0** (opt-out `=0`) once the known one-shot consumers migrate. |
+| One-shot raw MCP call | `CT_CHANNEL_CALL=<method>` (+ `CT_CHANNEL_CALL_PARAMS`) | One JSON-RPC request/response, prints the whole envelope, exits. |
+| Persistent serve | `CT_CHANNEL_ROLE=accept` + `CT_CHANNEL_SERVE=1` | Parks at the broker, serves each paired peer's session **concurrently** (up to `CT_CHANNEL_SERVE_CONCURRENCY`, default 8, [#200]) — a JSON-RPC request loop per session, any number of calls per session. `CT_AGENT_SERVICE_HANDLER_CMD` spawns a fresh handler per request (the handler stays stateless even under a held session). |
+| Raw pipe | neither | stdin/stdout spliced over the channel. |
+
+## Transport selection (the dial ladders)
+
+Broker and relay each get a ladder: **direct QUIC** (`CT_CHANNEL_BROKER` :4435 / `CT_CHANNEL_RELAY`
+:4436, UDP) first, then — when `CT_CHANNEL_FRONT_DOOR` (+ `_CERT`, hex DER of the edge CA from
+`GET <cp>/pki/ca`) is set — the `:443` TLS-TCP front door, then the DPI-resistant boring-ALPN
+`:443` rung.
+
+- **`CT_CHANNEL_FRONT_DOOR_ONLY=1`** (v0.4.8, [#16]) drops the direct QUIC rung entirely.
+  Refused at parse time without a configured front door.
+- **`CT_CHANNEL_RELAY_GATE` (+`_CERT`) — read this before using it** ([#330]): the gate is a
+  `:443`-multiplexed **Circuit-Relay v2** path for the NAT-to-NAT hole punch. **Its
+  channel-join admission still runs over plain QUIC to the relay port** — the `:443` gate leg
+  only carries the post-admission circuit. Two consequences, both live-diagnosed
+  (CADS-Tunnel#495 thread, 2026-08-13): a UDP-blocked host cannot use gate mode at all (its
+  admission times out before the gate is ever relevant), and even a UDP-capable gate-mode
+  member parks in the edge's **QUIC pairer**, where it can never meet a front-door-only peer.
+
+### Pairing reality (until CADS-Tunnel#495 lands)
+
+The edge currently runs **disjoint pairers** per transport class (QUIC relay, `:443`
+front door + WebSocket, QUIC rendezvous). Two members pair **only inside the same pairer** — a
+mixed-transport pair parks in two different rooms, never meets, and both sides are silently
+reaped after the ~30 s park TTL (client-visible as a bogus "edge relay refused the channel join"
+~32–41 s in). **Until #495 unifies the pairers: put both halves of a pairing on
+`CT_CHANNEL_FRONT_DOOR_ONLY=1`.** Your own first log line tells you which pairer you landed in:
+`plane-brokered Accept` = front door (correct for arena-style setups); `Accept via relay-gate` =
+QUIC pairer.
+
+## Failure semantics and timers (what an error actually means)
+
+- **`channel join admission exchange stalled (#140)`** — the 45 s admission-exchange bound
+  expired. It is 45 s (not the pre-v0.4.8 15 s) because the edge only acks a pairing-path join
+  once the **partner** arrives, and holds a lone first member parked for a 30 s window; the
+  bound must outlast that window plus the partner's own ladder walk ([#140], live-pinned
+  2026-08-13). Transient: retried fast.
+- **`edge broker/relay refused the channel join`** — a definitive wire `NO` (e.g. not a member).
+  The serve loop backs off exponentially on consecutive refusals (cap 30 s, [#231]) — a
+  not-member holder cannot fix itself by retrying.
+- **`early eof`** is (still) ambiguous — two structurally different causes share the text: the
+  splice ran against an **empty park** on the peer side (the pre-v0.4.9 per-round fault class,
+  [#18]), or a mode/config mismatch such as gate mode without reachable QUIC. [#18] tracks a
+  distinguishable error text.
+- **Flap backoff (v0.4.10, [#250])**: a session that dies within 500 ms of pairing is a "flap";
+  3+ consecutive flaps back off exponentially (cap 10 s) before the next admit — a peer whose
+  connection is killed post-handshake (AV/DPI middleboxes are the leading field cause) no longer
+  drives a pair-and-die storm at native RTT speed. Any session that succeeds or simply lives
+  ≥500 ms resets the streak (real arena rounds run ~85 ms *inside* an already-held session; a
+  fresh session that does real work runs well past 500 ms).
+
+## Registration (the Browser-Plane/mesh tunnel, not channels — but same binary)
+
+Since v0.4.7 ([#16]) a **mid-life** UDP failure falls back to TLS-TCP (pool, [#229]) and probes
+QUIC every 30 s to upgrade back — previously only the *first* dial ever fell back, so a UDP flap
+took the tunnel down for its whole duration. `CT_AGENT_REGISTER_TCP_ONLY=1` pins registration to
+TLS-TCP outright (combine with `CT_AGENT_FALLBACK_443=1` for the `:443` front door).
+
+## Environment variables (channel subsystem)
+
+| Variable | Meaning |
+|---|---|
+| `CT_CHANNEL_ROLE` | `initiate` \| `accept` |
+| `CT_CHANNEL_BROKER` / `CT_CHANNEL_RELAY` | edge rendezvous / relay `host:port` (QUIC/UDP) |
+| `CT_CHANNEL_GRANT` / `CT_CHANNEL_HOLDER_KEY` / `CT_CHANNEL_NOISE_KEY` | the member's grant + private keys (secrets) |
+| `CT_CHANNEL_LISTEN` / `CT_CHANNEL_ADVERTISE` | direct-path bind / advertised address (see the README's opt-in warning) |
+| `CT_CHANNEL_RELAY_ONLY=1` | no dialable address; relay-only member (auto-detected from a non-global advertise address) |
+| `CT_CHANNEL_FRONT_DOOR` / `_CERT` / `_ONLY` | `:443` TLS-TCP fallback rungs; `_ONLY=1` skips direct QUIC (v0.4.8) |
+| `CT_CHANNEL_RELAY_GATE` / `_CERT` | #330 Circuit-Relay gate (admission still needs QUIC — see above) |
+| `CT_CHANNEL_CALL_SERVICE` / `CT_CHANNEL_CALL_PERSISTENT` | service-call modes (see table above) |
+| `CT_CHANNEL_SERVE` / `CT_CHANNEL_SERVE_CONCURRENCY` | accept-side persistent serve, session cap (default 8) |
+| `CT_CHANNEL_DIRECT_UPGRADE=1` | opt-in in-band relay→direct upgrade (#104) |
+| `CT_AGENT_SERVICE_HANDLER_CMD` / `CT_AGENT_SERVICES` | the handler command + offered service slugs on the serve side |
+
+[#16]: https://github.com/scimbe/ct-agent/issues/16
+[#18]: https://github.com/scimbe/ct-agent/issues/18
+[#140]: https://github.com/scimbe/ct-agent/issues/15
+[#200]: https://github.com/scimbe/ct-agent/issues/15
+[#229]: https://github.com/scimbe/ct-agent/issues/16
+[#231]: https://github.com/scimbe/ct-agent/issues/15
+[#250]: https://github.com/scimbe/ct-agent/issues/15
+[#330]: https://github.com/scimbe/ct-agent/issues/16

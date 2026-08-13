@@ -22,7 +22,9 @@ This repo is its own related project, extracted from the
 [CADS-Tunnel](https://github.com/scimbe/CADS-Tunnel) monorepo (the core system: control
 plane + edge) and published separately so it can be downloaded and installed without
 cloning the whole tunnel/edge/control-plane workspace. See that repo's docs (`docs/adr`,
-`docs/agent-onboarding.md`) for the full system design.
+`docs/agent-onboarding.md`) for the full system design — and **[docs/channel.md](docs/channel.md)**
+for the `ct-agent channel` reference (modes incl. the v0.4.9 persistent call mode, transport
+ladders, the front-door-only pairing guidance, and what each failure message actually means).
 
 ## Quick start (recommended)
 
