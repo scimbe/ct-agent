@@ -475,12 +475,52 @@ pub async fn register_tunnel_stream_browser<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    register_tunnel_stream_browser_with_role(stream, token, host, b'B').await
+}
+
+/// The ping-capable Browser-Plane registration: exactly what
+/// [`register_tunnel_stream_ping_capable`] (`'K'`) is to the Noise path's `'A'`,
+/// but for `'B'`. Byte-identical wire format to `'B'` apart from the role byte;
+/// after the `OK`, the Edge PINGs this connection while it sits parked, so the
+/// caller must drive [`await_ping_phase_end`] before treating the stream as
+/// carrying relayed bytes.
+///
+/// Why this exists, beyond symmetry: `'K'` only ever covered the Noise/mesh path,
+/// so a Browser-Plane agent (`CT_AGENT_MODE=browser`) could not benefit from the
+/// ping treatment at all -- upgrading such an agent to the release carrying `'K'`
+/// changed nothing for it. Measured on the deployment where this was found: a
+/// parked fallback connection dies after ~10-15s idle (5s request spacing -> 4/4
+/// OK, 20s spacing -> 1/4), because the middlebox on that path ignores ACK-only
+/// keepalive segments. Real payload traffic is the only thing that keeps it alive.
+pub async fn register_tunnel_stream_browser_ping_capable<S>(
+    stream: &mut S,
+    token: &RoutingToken,
+    host: &str,
+) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    register_tunnel_stream_browser_with_role(stream, token, host, b'L').await
+}
+
+/// Shared body of the `'B'`/`'L'` Browser-Plane registration: both roles have a
+/// byte-identical wire format (`role(1) | token(32) | host_len(2 BE) | host` →
+/// 2-byte `OK`/`NO` ack), so only the role byte varies.
+async fn register_tunnel_stream_browser_with_role<S>(
+    stream: &mut S,
+    token: &RoutingToken,
+    host: &str,
+    role: u8,
+) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let host_bytes = host.as_bytes();
     let host_len: u16 = host_bytes
         .len()
         .try_into()
         .map_err(|_| "hostname too long for the browser-register frame")?;
-    let mut msg = vec![b'B'];
+    let mut msg = vec![role];
     msg.extend_from_slice(&token.0);
     msg.extend_from_slice(&host_len.to_be_bytes());
     msg.extend_from_slice(host_bytes);
@@ -1023,6 +1063,104 @@ mod tests {
         register_tunnel_stream_browser(&mut agent_side, &token, host)
             .await
             .expect("browser-register over a TLS-TCP-style stream");
+        edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn register_tunnel_stream_browser_ping_capable_sends_l_and_an_otherwise_identical_frame() {
+        // The Browser-Plane counterpart to 'K'. 'K' only ever covered the Noise path,
+        // so a CT_AGENT_MODE=browser agent -- which registers with 'B' -- could not
+        // get the ping treatment at all, and kept flapping on every release. Its
+        // parked fallback connection dies after ~10-15s idle when the path's
+        // middlebox ignores ACK-only keepalives (measured live: 5s request spacing
+        // -> 4/4 OK, 20s spacing -> 1/4).
+        //
+        // Pin that 'L' differs from 'B' in the role byte ONLY: same token, same
+        // length-prefixed hostname, same 2-byte ack. Anything else would make the
+        // two arms diverge on the edge, which is exactly what the shared
+        // `admit_tcp_agent_b` there is built to prevent.
+        let (mut agent_side, mut edge_side) = tokio::io::duplex(1024);
+        let token = RoutingToken([0x41; 32]);
+        let host = "sort.bunsenbrenner.org";
+
+        let t = token.clone();
+        let edge = tokio::spawn(async move {
+            let mut role = [0u8; 1];
+            edge_side.read_exact(&mut role).await.unwrap();
+            assert_eq!(role[0], b'L', "ping-capable browser role byte");
+            let mut tok = [0u8; 32];
+            edge_side.read_exact(&mut tok).await.unwrap();
+            assert_eq!(&tok, &t.0, "token echoed, exactly as in 'B'");
+            let mut len = [0u8; 2];
+            edge_side.read_exact(&mut len).await.unwrap();
+            let n = u16::from_be_bytes(len) as usize;
+            let mut host_buf = vec![0u8; n];
+            edge_side.read_exact(&mut host_buf).await.unwrap();
+            assert_eq!(host_buf, b"sort.bunsenbrenner.org", "hostname echoed, exactly as in 'B'");
+            edge_side.write_all(b"OK").await.unwrap();
+            edge_side.flush().await.unwrap();
+        });
+
+        register_tunnel_stream_browser_ping_capable(&mut agent_side, &token, host)
+            .await
+            .expect("ping-capable browser-register over a TLS-TCP-style stream");
+        edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_ping_capable_browser_registration_answers_pings_then_relays_after_stop() {
+        // End-to-end shape of the 'L' path as the agent sees it: register, answer the
+        // Edge's PINGs while parked, and treat the first byte AFTER stop as relayed
+        // browser data -- not as another ping frame. `await_ping_phase_end` is shared
+        // with 'K', so this proves it composes correctly with the browser frame too.
+        let (mut agent_side, mut edge_side) = tokio::io::duplex(1024);
+        let token = RoutingToken([0x42; 32]);
+        let host = "sort.bunsenbrenner.org";
+
+        let edge = tokio::spawn(async move {
+            // Consume the 'L' registration frame.
+            let mut role = [0u8; 1];
+            edge_side.read_exact(&mut role).await.unwrap();
+            assert_eq!(role[0], b'L');
+            let mut tok = [0u8; 32];
+            edge_side.read_exact(&mut tok).await.unwrap();
+            let mut len = [0u8; 2];
+            edge_side.read_exact(&mut len).await.unwrap();
+            let mut host_buf = vec![0u8; u16::from_be_bytes(len) as usize];
+            edge_side.read_exact(&mut host_buf).await.unwrap();
+            edge_side.write_all(b"OK").await.unwrap();
+            edge_side.flush().await.unwrap();
+
+            // Two ping/pong round trips while "parked", each echoed with its counter.
+            for counter in [1u64, 2u64] {
+                let mut ping = [0u8; 9];
+                ping[0] = 0xF9;
+                ping[1..].copy_from_slice(&counter.to_be_bytes());
+                edge_side.write_all(&ping).await.unwrap();
+                edge_side.flush().await.unwrap();
+                let mut pong = [0u8; 9];
+                edge_side.read_exact(&mut pong).await.unwrap();
+                assert_eq!(pong[0], 0xFA, "PONG magic");
+                assert_eq!(&pong[1..], &counter.to_be_bytes(), "counter echoed verbatim");
+            }
+
+            // STOP, then a real relayed byte in the SAME write -- the sharp case: the
+            // agent must consume exactly the 1-byte STOP and leave the payload intact.
+            edge_side.write_all(&[0xFB, b'X']).await.unwrap();
+            edge_side.flush().await.unwrap();
+        });
+
+        register_tunnel_stream_browser_ping_capable(&mut agent_side, &token, host)
+            .await
+            .expect("register");
+        await_ping_phase_end(&mut agent_side).await.expect("ping phase ends at STOP");
+
+        let mut first_relayed = [0u8; 1];
+        agent_side.read_exact(&mut first_relayed).await.expect("relayed byte follows STOP");
+        assert_eq!(
+            first_relayed[0], b'X',
+            "the byte after STOP is relayed payload -- no ping byte may leak into it"
+        );
         edge.await.unwrap();
     }
 

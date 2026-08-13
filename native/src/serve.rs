@@ -21,7 +21,8 @@ use tokio::net::{TcpStream, UdpSocket};
 use crate::config::{AgentConfig, OriginProto};
 use crate::transport::{
     await_ping_phase_end, bind_hostname, dial_quic, dial_quic_or_blocked_error, register_tunnel,
-    register_tunnel_stream, register_tunnel_stream_browser, register_tunnel_stream_ping_capable,
+    register_tunnel_stream, register_tunnel_stream_browser, register_tunnel_stream_browser_ping_capable,
+    register_tunnel_stream_ping_capable,
     tcp_tls_connect,
 };
 use ct_common::metrics::{Metered, TunnelMetrics};
@@ -599,12 +600,42 @@ async fn tcp_connect_register_serve(
     // agent never speaks Noise. Mirrors the QUIC browser path in serve_quic_connection.
     if config.browser_forward {
         if let Some(host) = &config.hostname {
-            register_tunnel_stream_browser(&mut stream, token, host).await?;
+            // Prefer the ping-capable 'L' registration for exactly the reason 'K'
+            // exists on the Noise path (see the comment below): a parked fallback
+            // connection carrying no payload is silently dropped by middleboxes that
+            // ignore ACK-only keepalive segments. Browser-Plane agents were left out
+            // of that fix -- 'K' only ever covered the Noise path, so a
+            // `CT_AGENT_MODE=browser` agent kept flapping no matter which release it
+            // ran. Measured on the live deployment this was found on: a parked
+            // connection dies after ~10-15s idle (5s request spacing -> 4/4 OK, 20s
+            // spacing -> 1/4), which for sporadic real-user traffic means most
+            // requests fail.
+            //
+            // Same fallback shape as 'K': a pre-'L' Edge treats the unknown role byte
+            // as a hard protocol error and drops the connection without an ack, so any
+            // failure means redialing and registering plain 'B' on a fresh stream.
+            let mut ping_capable = true;
+            if let Err(e) = register_tunnel_stream_browser_ping_capable(&mut stream, token, host).await {
+                eprintln!(
+                    "ct-agent: ping-capable browser ('L') registration at {target} failed ({e}); \
+                     falling back to a plain 'B' registration on a fresh connection"
+                );
+                stream = tcp_tls_connect(target, edge_cert.clone()).await?;
+                register_tunnel_stream_browser(&mut stream, token, host).await?;
+                ping_capable = false;
+            }
             eprintln!(
-                "ct-agent: browser-registered '{host}' over the TLS-TCP fallback (UDP blocked), \
+                "ct-agent: browser-registered '{host}' over the TLS-TCP fallback (UDP blocked){}, \
                  raw-forwarding to {}",
+                if ping_capable { ", ping-capable ('L')" } else { "" },
                 config.origin
             );
+            if ping_capable {
+                // Answer the Edge's PINGs until it writes STOP; the stream is then
+                // positioned exactly at the first relayed browser byte. Identical
+                // contract to the 'K' path -- `await_ping_phase_end` is shared.
+                await_ping_phase_end(&mut stream).await?;
+            }
             return serve_duplex_to_origin(stream, config.origin).await;
         }
     }
