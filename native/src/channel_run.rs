@@ -3309,6 +3309,30 @@ const DEFAULT_SERVE_CONCURRENCY: usize = 8;
 /// **refused** (not transient) admission attempts — see [`serve_loop_concurrent`].
 const REFUSED_ADMISSION_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// #250 ("flapping peer"): a session that dies within this long of being admitted is treated as
+/// a FAILED pairing, not a completed one — live-diagnosed 2026-08-13 (a Windows accept-side
+/// member and a front-door-only bridge): admission succeeded every single time (grant verified,
+/// both sides acked), but the underlying TLS-TCP connection then died before/during the Noise
+/// handshake, near-instantly, on essentially every attempt — ~98 pair-then-die cycles in 30s
+/// (~300ms apart), matching this loop's UNTHROTTLED re-admit cadence exactly (there was no
+/// backoff at all between a failed session and the next admit). Root cause (Windows-side
+/// AV/firewall DPI killing the connection post-handshake, or a platform-specific transport bug)
+/// is still open -- but regardless of cause, hammering the edge at native RTT speed while it
+/// persists serves nobody: it floods the edge's admission/relay path for no gain (the failure
+/// recurs every time) and produces a wall of noise that hides every other signal. A genuine
+/// session (even a very short, single-call one) legitimately completes well under this: the
+/// sort arena's own measured per-round session lifetime is ~85ms end-to-end including the Noise
+/// handshake -- this threshold is 6x that, so a real, working session is never mistaken for a
+/// flap.
+const FLAPPING_SESSION_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// #250: ceiling on the exponential backoff applied after consecutive flapping (pair-then-
+/// near-instant-death) sessions — same shape as [`REFUSED_ADMISSION_BACKOFF_CAP`], deliberately
+/// shorter: unlike a definitive refusal (which literally cannot resolve without operator
+/// action), a flap's underlying cause (a transient AV heuristic, a flaky corporate firewall
+/// rule) can clear on its own, so this loop should keep checking meaningfully sooner.
+const FLAPPING_SESSION_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Parse `CT_CHANNEL_SERVE_CONCURRENCY` into a concurrency cap: a positive integer overrides the
 /// default; anything absent/blank/zero/malformed falls back to [`DEFAULT_SERVE_CONCURRENCY`]. Pure.
 fn serve_concurrency_from_env(value: Option<&str>) -> usize {
@@ -3343,19 +3367,54 @@ where
 {
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max.max(1)));
     let mut consecutive_refusals: u32 = 0;
+    // #250: shared across spawned sessions (all admissions on this loop are for the SAME
+    // channel/holder -- an accept-side member has exactly one fixed remote grant, so there is
+    // no "other peer" a global backoff could unfairly delay). Incremented by a session that
+    // dies within FLAPPING_SESSION_THRESHOLD of being admitted; reset by any session that
+    // either succeeds or simply lives long enough to not look like a flap.
+    let consecutive_flaps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     loop {
         let permit = sem
             .clone()
             .acquire_owned()
             .await
             .expect("serve concurrency semaphore is never closed");
+        // #250: back off BEFORE the next admit if the last several sessions all died
+        // near-instantly -- otherwise a flapping peer re-pairs and dies again at native RTT
+        // speed forever, with no gap for the underlying interference (if transient) to clear
+        // and no relief for the edge (every pairing round-trips a full admission + relay
+        // splice for nothing).
+        let flaps = consecutive_flaps.load(std::sync::atomic::Ordering::Relaxed);
+        if flaps > 0 {
+            let backoff = flapping_session_backoff(retry_backoff, flaps);
+            eprintln!(
+                "ct-agent channel: {flaps} consecutive session(s) died within {}ms of pairing (#250) -- \
+                 backing off {backoff:?} before the next admit (peer may be experiencing network \
+                 interference: AV/firewall DPI killing the connection post-handshake is the leading \
+                 cause seen in the field)",
+                FLAPPING_SESSION_THRESHOLD.as_millis()
+            );
+            tokio::time::sleep(backoff).await;
+        }
         match admit().await {
             Ok(work) => {
                 consecutive_refusals = 0;
                 let fut = serve(work);
+                let flap_counter = consecutive_flaps.clone();
                 tokio::spawn(async move {
                     let _permit = permit; // held for the whole session; frees a slot on drop
-                    if let Err(e) = fut.await {
+                    let started = std::time::Instant::now();
+                    let result = fut.await;
+                    let flapped = is_flapping_session(started.elapsed(), result.is_err());
+                    flap_counter.store(
+                        if flapped {
+                            flap_counter.load(std::sync::atomic::Ordering::Relaxed).saturating_add(1)
+                        } else {
+                            0
+                        },
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    if let Err(e) = result {
                         eprintln!("ct-agent channel: serve session ended with error (#200): {e}");
                     }
                 });
@@ -3370,6 +3429,27 @@ where
             }
         }
     }
+}
+
+/// #250: pure classifier -- did a just-ended session look like a "flap" (pair, then die near-
+/// instantly)? Only an ERRORED session that ended within [`FLAPPING_SESSION_THRESHOLD`]
+/// qualifies; a session that succeeded (even a fast single-call one) or that ran long before
+/// failing is a real session, not a flap, and must reset the counter rather than extend it.
+fn is_flapping_session(elapsed: std::time::Duration, errored: bool) -> bool {
+    errored && elapsed < FLAPPING_SESSION_THRESHOLD
+}
+
+/// #250: exponential backoff after `consecutive_flaps` near-instant session deaths in a row,
+/// same shape as [`admission_retry_backoff`]'s refused-admission path but capped lower (see
+/// [`FLAPPING_SESSION_BACKOFF_CAP`]'s doc for why). Pure.
+fn flapping_session_backoff(
+    retry_backoff: std::time::Duration,
+    consecutive_flaps: u32,
+) -> std::time::Duration {
+    let shift = consecutive_flaps.min(16);
+    retry_backoff
+        .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
+        .min(FLAPPING_SESSION_BACKOFF_CAP)
 }
 
 /// #231: does an admission error mean the presenting holder was **definitively** refused (not a
@@ -6086,6 +6166,87 @@ mod tests {
         // ...and is clamped at the cap instead of growing (or overflowing) without bound.
         assert_eq!(admission_retry_backoff(base, true, 100), REFUSED_ADMISSION_BACKOFF_CAP);
         assert_eq!(admission_retry_backoff(base, true, u32::MAX), REFUSED_ADMISSION_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn is_flapping_session_only_flags_a_short_errored_session_250() {
+        // #250: the classifier's whole job is telling "pair, then die near-instantly" (flap)
+        // apart from every other outcome -- success, a fast-but-real session, or a slow failure.
+        let short = FLAPPING_SESSION_THRESHOLD - std::time::Duration::from_millis(1);
+        let long = FLAPPING_SESSION_THRESHOLD + std::time::Duration::from_millis(1);
+        assert!(is_flapping_session(short, true), "short + errored = a flap");
+        assert!(!is_flapping_session(short, false), "short + SUCCEEDED is a fast real session, not a flap");
+        assert!(!is_flapping_session(long, true), "a failure that took a while is a real failure, not a flap");
+        assert!(!is_flapping_session(long, false), "long + succeeded is obviously not a flap");
+        // Exactly-at-threshold is NOT a flap (strict `<`) -- a session that runs the full
+        // threshold did real work, it didn't die instantly.
+        assert!(!is_flapping_session(FLAPPING_SESSION_THRESHOLD, true));
+    }
+
+    #[test]
+    fn flapping_session_backoff_is_exponential_and_capped_lower_than_refusal_250() {
+        let base = std::time::Duration::from_millis(200);
+        assert_eq!(flapping_session_backoff(base, 0), base, "zero flaps -> the unchanged fast retry");
+        assert_eq!(flapping_session_backoff(base, 1), base * 2);
+        assert_eq!(flapping_session_backoff(base, 2), base * 4);
+        assert_eq!(flapping_session_backoff(base, 100), FLAPPING_SESSION_BACKOFF_CAP, "clamped, never overflows");
+        assert!(
+            FLAPPING_SESSION_BACKOFF_CAP < REFUSED_ADMISSION_BACKOFF_CAP,
+            "a flap's cause can clear on its own (unlike a definitive refusal) -- keep checking sooner"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_loop_concurrent_backs_off_after_repeated_flapping_sessions_then_recovers_250() {
+        // #250 end-to-end (frozen contract): live-diagnosed 2026-08-13 -- admission succeeded on
+        // EVERY attempt (this stub always admits), but the session died near-instantly each
+        // time, and the unthrottled loop re-admitted at native speed forever (~98 cycles in 30s
+        // against a real edge). This proves the loop now inserts a growing gap between the
+        // (n-1)th flap's end and the nth admit, and that a session that finally SUCCEEDS resets
+        // the streak so a recovered peer isn't punished by a backoff earned before it recovered.
+        use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+        let admits = std::sync::Arc::new(AtomicUsize::new(0));
+        let should_succeed = std::sync::Arc::new(AtomicU32::new(0)); // flips to 1 after N flaps
+        let admits2 = admits.clone();
+        let admit = move || {
+            admits2.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<(), BoxError>(()) }
+        };
+        let succeed_flag = should_succeed.clone();
+        let serve_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let serve_calls2 = serve_calls.clone();
+        let serve = move |_: ()| {
+            let succeed_flag = succeed_flag.clone();
+            let serve_calls = serve_calls2.clone();
+            async move {
+                let n = serve_calls.fetch_add(1, Ordering::SeqCst);
+                if n < 3 {
+                    // Instant death -- a flap, exactly the field-observed pattern.
+                    Err::<(), BoxError>("session died near-instantly".into())
+                } else {
+                    // The 4th session "recovers": runs long enough to be a real session, then
+                    // succeeds -- must reset the flap streak.
+                    succeed_flag.store(1, Ordering::SeqCst);
+                    tokio::time::sleep(FLAPPING_SESSION_THRESHOLD * 2).await;
+                    Ok(())
+                }
+            }
+        };
+        // max=1: forces strictly serial admit -> session -> (backoff) -> next admit, matching
+        // the field scenario (one channel, one fixed remote peer) with no concurrency-ordering
+        // ambiguity in the test itself.
+        let driver = tokio::spawn(serve_loop_concurrent(1, std::time::Duration::from_millis(50), admit, serve));
+
+        // Let the first 3 (flapping) sessions run out and the backoff-then-4th-admit sequence
+        // complete, then the 4th (recovering) session's deliberate sleep.
+        for _ in 0..20 {
+            tokio::time::advance(std::time::Duration::from_secs(3)).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert!(admits.load(Ordering::SeqCst) >= 4, "the loop kept making progress, not wedged");
+        assert_eq!(should_succeed.load(Ordering::SeqCst), 1, "the recovering session was reached and ran");
+        driver.abort();
     }
 
     #[test]
