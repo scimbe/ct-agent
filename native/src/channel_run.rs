@@ -3522,12 +3522,18 @@ where
 /// the unified `:443` route over TLS-TCP ([`crate::transport::tcp_tls_connect_channel`],
 /// ALPN `ct-edge-channel`) and run the identical join over the split TLS stream
 /// ([`present_channel_join_on_stream`]). Composed over [`dial_ladder`], so the first rung
-/// that *completes* the join — an `Admitted` **or** `Refused` outcome, either being a
-/// finished handshake — wins; a rung whose transport can't connect (`Unreachable` on a
-/// blocked direct port, or a `Failed` TLS/connect) falls through to the next, letting a
-/// network that blocks the direct channel port recover over `:443`. Errors only when
-/// every rung is blocked. `edge_cert` is the root the front-door TLS dial trusts;
-/// `direct_timeout` bounds each direct QUIC dial (the [`DIRECT_DIAL_TIMEOUT`] signal).
+/// that is genuinely **`Admitted`** wins. A rung whose transport can't connect
+/// (`Unreachable` on a blocked direct port, or a `Failed` TLS/connect) falls through to
+/// the next, letting a network that blocks the direct channel port recover over `:443` —
+/// and so does a rung whose join comes back **`Refused`** ([`reject_refused_outcome`]):
+/// a network that corrupts or fingerprints the request differently per rung (exactly what
+/// this ladder's `:443` legs exist to route around) can turn a garbled request into a
+/// spurious `NO` on one rung while a cleaner rung would have been legitimately admitted,
+/// so a single refusal must not end the walk (live-reported gap, ct-agent#15). Errors only
+/// when every rung is blocked or refused — that final error still reports a genuine
+/// refusal as one, just after every rung has actually been tried. `edge_cert` is the root
+/// the front-door TLS dial trusts; `direct_timeout` bounds each direct QUIC dial (the
+/// [`DIRECT_DIAL_TIMEOUT`] signal).
 pub async fn present_channel_join_via_ladder(
     rungs: &[ChannelDialRung],
     request: &ChannelJoinRequest,
@@ -3578,6 +3584,18 @@ pub async fn present_channel_join_via_ladder(
                 }
                 .await
             };
+            // #248-class gap (live-reported, 2026-08-13, ct-agent#15): `reject_refused_outcome`
+            // already exists to turn a `Refused` outcome into an `Err` so it isn't mistaken for a
+            // finished/successful step -- it's used in `admit_one_peer`, but wasn't wired into
+            // THIS closure, so `dial_ladder` saw `Ok(ChannelJoinOutcome::Refused)` as "this rung
+            // is done, stop" instead of "this rung's join was refused, try the next one." A
+            // network that corrupts/truncates the request bytes differently per rung (the exact
+            // DPI interference this ladder exists to route around) can turn a garbled request
+            // into a spurious `NO` on one rung while a cleaner rung would have been legitimately
+            // admitted -- so a `Refused` must fall through like any other per-rung failure, not
+            // end the walk. If every rung is genuinely refused (e.g. a real not-member grant),
+            // the ladder still reports that refusal -- just after actually trying every rung.
+            let result = result.and_then(|outcome| reject_refused_outcome(outcome).map_err(ChannelDialError::Failed));
             match &result {
                 Ok(_) => eprintln!("ct-agent channel: {rung_label} rung {endpoint} succeeded"),
                 Err(e) => eprintln!("ct-agent channel: {rung_label} rung {endpoint} failed: {e}"),
@@ -5140,6 +5158,108 @@ mod tests {
             ChannelJoinOutcome::Refused => panic!("a valid join over :443 must be Admitted, not Refused"),
         }
         edge.await.expect("edge task");
+    }
+
+    #[tokio::test]
+    async fn present_channel_join_via_ladder_falls_through_a_refused_rung_to_the_next() {
+        // Live-reported gap (ct-agent#15, 2026-08-13): a network that corrupts or
+        // fingerprints the request differently per rung can turn a garbled request into a
+        // spurious `NO` on one rung while a cleaner rung would legitimately admit the SAME
+        // grant/holder -- so `present_channel_join_via_ladder` must not stop at the first
+        // `Refused`, it must try the next rung, exactly like it already does for a
+        // transport-level `Unreachable`/`Failed`. Two REAL `:443`-style TLS-TCP edges: the
+        // first's `authorize` closure always refuses (simulating a corrupted/garbled first
+        // rung), the second admits the identical grant.
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ct_edge::channel_broker::admit_channel_join_on_duplex;
+        use ct_edge::transport::build_tcp_tls_listener_at;
+        use ed25519_dalek::Signer;
+        use tokio::io::AsyncWriteExt;
+
+        let op = SigningKey::from_bytes(&[8u8; 32]);
+        let op_pub = op.verifying_key().to_bytes();
+        let channel = [0x09u8; 32];
+        let holder = SigningKey::from_bytes(&[0x12u8; 32]);
+        let g = ChannelGrant {
+            channel: ChannelId(channel),
+            holder: holder.verifying_key().to_bytes(),
+            direction: Direction::Initiate,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        let grant = SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() };
+        let request = ChannelJoinRequest { grant, endpoint: "203.0.113.8:7008".to_string() };
+
+        // ONE real edge (one listener, one cert) serving the SAME :443-style endpoint for
+        // both rungs -- matching production, where the FrontDoor and FrontDoorBoring rungs
+        // dial the identical edge address and only their ClientHello differs. The client
+        // connects to this address TWICE (once per rung, fresh TCP connections); the edge
+        // refuses the first (simulating a corrupted/garbled first rung) and admits the
+        // second (the SAME grant/holder a cleaner rung would have gotten through with).
+        let (listener, acceptor, edge_cert) =
+            build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap()).await.expect("tls listener");
+        let fd_addr = listener.local_addr().expect("front-door addr");
+        let edge = tokio::spawn(async move {
+            // First connection: refuse unconditionally.
+            let (tcp, peer) = listener.accept().await.expect("accept tcp #1");
+            let tls = acceptor.accept(tcp).await.expect("tls accept #1");
+            let outcome =
+                admit_channel_join_on_duplex(tls, peer, 500u64, std::time::Duration::from_secs(5), &|_c, _h| async {
+                    None
+                })
+                .await;
+            assert!(outcome.is_err(), "the first connection is refused, not admitted");
+
+            // Second connection: admit the same grant.
+            let (tcp, peer) = listener.accept().await.expect("accept tcp #2");
+            let tls = acceptor.accept(tcp).await.expect("tls accept #2");
+            let (mut stream, _req, _op, _noise, _attest, _observed) = admit_channel_join_on_duplex(
+                tls,
+                peer,
+                500u64,
+                std::time::Duration::from_secs(5),
+                &move |c: ChannelId, _h: [u8; 32]| {
+                    let ok = c.0 == channel;
+                    async move { ok.then_some((op_pub, None, None)) }
+                },
+            )
+            .await
+            .expect("admit over the second connection's TLS-TCP duplex");
+            stream.write_all(b"OK 198.51.100.10:8009").await.expect("ack");
+            stream.shutdown().await.expect("shutdown");
+        });
+
+        // Two rungs, same endpoint and kind -- this test is about the reject_refused_outcome
+        // wiring, not the boring-ALPN wire format (already covered by its own dedicated tests
+        // in transport.rs/pki.rs). Using FrontDoorBoring here would present SNI
+        // `edge-cdn.invalid`, which this test's plain `self_signed()` cert (SAN: "localhost"
+        // only) can't validate -- an unrelated failure that has nothing to do with what this
+        // test proves. If the Refused from the first connection wrongly ended the walk, the
+        // second `accept()` above would never be reached and `edge` would hang.
+        let rungs = vec![
+            ChannelDialRung { endpoint: fd_addr, kind: ChannelDialKind::FrontDoor },
+            ChannelDialRung { endpoint: fd_addr, kind: ChannelDialKind::FrontDoor },
+        ];
+        let outcome = present_channel_join_via_ladder(
+            &rungs,
+            &request,
+            &holder,
+            edge_cert,
+            std::time::Duration::from_millis(400),
+        )
+        .await;
+
+        edge.await.expect("edge task");
+        match outcome.expect("the ladder falls through the refused rung to the admitting one") {
+            ChannelJoinOutcome::Admitted { peer_endpoint, .. } => assert_eq!(
+                peer_endpoint, "198.51.100.10:8009",
+                "the second rung's admission wins after the first rung's refusal"
+            ),
+            ChannelJoinOutcome::Refused => {
+                panic!("the ladder must fall through a Refused rung, not terminate on it")
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
