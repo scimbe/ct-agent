@@ -1232,6 +1232,15 @@ pub struct ChannelJoinCliConfig {
     /// first (bounded timeout), falling through to `relay_addr` only on failure — see
     /// [`dial_relay_preferring_direct`].
     pub relay_addr_direct: Option<SocketAddr>,
+    /// #16 escape hatch, channel-path counterpart of `CT_AGENT_REGISTER_TCP_ONLY`:
+    /// when true (`CT_CHANNEL_FRONT_DOOR_ONLY`), the broker/relay dial ladders skip
+    /// the direct QUIC rung entirely and dial the `:443` front door exclusively —
+    /// for deployments whose UDP path to the edge is known-flaky ("UDP flapping"),
+    /// where a session admitted over QUIC dies with the next flap while the TLS-TCP
+    /// front door stays up. Requires `front_door` + `front_door_cert` (refused at
+    /// parse time otherwise — a front-door-only ladder with no front door would have
+    /// zero rungs). Default `false`: ladder order unchanged.
+    pub front_door_only: bool,
 }
 
 /// Parse the optional `CT_CHANNEL_CIRCUIT_RELAY` libp2p circuit-relay multiaddr (#136 N-wire):
@@ -1369,15 +1378,17 @@ impl ChannelJoinCliConfig {
     }
 
     /// The ordered dial plan for the **rendezvous broker**: the direct port first, then
-    /// (if `CT_CHANNEL_FRONT_DOOR` is configured) the `:443` front door. Pure.
+    /// (if `CT_CHANNEL_FRONT_DOOR` is configured) the `:443` front door — or the front
+    /// door alone under `CT_CHANNEL_FRONT_DOOR_ONLY` (#16). Pure.
     pub fn broker_ladder(&self) -> Vec<ChannelDialRung> {
-        Self::ladder(self.broker_addr, self.front_door)
+        Self::ladder(self.broker_addr, self.front_door, self.front_door_only)
     }
 
     /// The ordered dial plan for the **relay** (used on direct-dial failure): the direct
-    /// port first, then (if configured) the `:443` front door. Pure.
+    /// port first, then (if configured) the `:443` front door — or the front door alone
+    /// under `CT_CHANNEL_FRONT_DOOR_ONLY` (#16). Pure.
     pub fn relay_ladder(&self) -> Vec<ChannelDialRung> {
-        Self::ladder(self.relay_addr, self.front_door)
+        Self::ladder(self.relay_addr, self.front_door, self.front_door_only)
     }
 
     /// Direct QUIC first, then — if a front door is configured — the two `:443` rungs, the
@@ -1386,8 +1397,19 @@ impl ChannelJoinCliConfig {
     /// fingerprint the ClientHello (#106 boring-alpn, from a real 2026-08-12 support case),
     /// so on every network where the existing rungs work, nothing about the dial changes.
     /// Pure.
-    fn ladder(direct: SocketAddr, front_door: Option<SocketAddr>) -> Vec<ChannelDialRung> {
-        let mut rungs = vec![ChannelDialRung { endpoint: direct, kind: ChannelDialKind::Direct }];
+    fn ladder(
+        direct: SocketAddr,
+        front_door: Option<SocketAddr>,
+        front_door_only: bool,
+    ) -> Vec<ChannelDialRung> {
+        // #16: `front_door_only` drops the direct QUIC rung — an operator pinning a
+        // known-flaky-UDP deployment to the TLS-TCP front door outright. Guarded at
+        // parse time to require a configured front door, so this can never yield an
+        // empty ladder.
+        let mut rungs = Vec::with_capacity(3);
+        if !(front_door_only && front_door.is_some()) {
+            rungs.push(ChannelDialRung { endpoint: direct, kind: ChannelDialKind::Direct });
+        }
         if let Some(fd) = front_door {
             rungs.push(ChannelDialRung { endpoint: fd, kind: ChannelDialKind::FrontDoor });
             rungs.push(ChannelDialRung { endpoint: fd, kind: ChannelDialKind::FrontDoorBoring });
@@ -1499,6 +1521,21 @@ impl ChannelJoinCliConfig {
             }
             _ => None,
         };
+        // #16: front-door-only dialing (same truthy handling as CT_CHANNEL_RELAY_ONLY).
+        // Requires a usable front door — refusing at parse time beats a zero-rung ladder
+        // that would fail every join with an unhelpful "no rungs to dial".
+        let front_door_only = f("CT_CHANNEL_FRONT_DOOR_ONLY")
+            .map(|s| {
+                let t = s.trim();
+                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false);
+        if front_door_only && (front_door.is_none() || front_door_cert.is_none()) {
+            return Err(
+                "CT_CHANNEL_FRONT_DOOR_ONLY requires CT_CHANNEL_FRONT_DOOR and CT_CHANNEL_FRONT_DOOR_CERT"
+                    .to_string(),
+            );
+        }
         Ok(Self {
             role,
             broker_addr,
@@ -1516,6 +1553,7 @@ impl ChannelJoinCliConfig {
             relay_gate_cert,
             direct_upgrade,
             relay_addr_direct,
+            front_door_only,
         })
     }
 }
@@ -4490,6 +4528,86 @@ mod tests {
     }
 
     #[test]
+    fn front_door_only_drops_the_direct_quic_rung_and_requires_a_front_door_16() {
+        // #16 ("UDP flapping"): CT_CHANNEL_FRONT_DOOR_ONLY pins the dial ladders to the
+        // TLS-TCP `:443` front door — no direct QUIC rung at all — and is refused at
+        // parse time without a usable front door (addr + cert), because a ladder with
+        // zero rungs would fail every join with an unhelpful error.
+        let direct: SocketAddr = "203.0.113.5:9443".parse().unwrap();
+        let fd: SocketAddr = "203.0.113.5:443".parse().unwrap();
+
+        // Default order unchanged: direct first, then the two :443 rungs.
+        let rungs = ChannelJoinCliConfig::ladder(direct, Some(fd), false);
+        assert_eq!(rungs.len(), 3, "default ladder keeps all three rungs");
+        assert!(matches!(rungs[0].kind, ChannelDialKind::Direct), "direct QUIC dials first by default");
+
+        // Front-door-only: exactly the two :443 rungs, nothing dials UDP.
+        let rungs = ChannelJoinCliConfig::ladder(direct, Some(fd), true);
+        assert_eq!(rungs.len(), 2, "front-door-only drops the direct rung");
+        assert!(
+            rungs.iter().all(|r| r.kind.is_front_door() && r.endpoint == fd),
+            "every remaining rung is a :443 front-door dial"
+        );
+
+        // Without a configured front door the flag never yields an empty ladder
+        // (belt-and-suspenders — the parse guard below refuses the combination first).
+        let rungs = ChannelJoinCliConfig::ladder(direct, None, true);
+        assert_eq!(rungs.len(), 1, "no front door -> the direct rung survives");
+
+        // Parse guard: FRONT_DOOR_ONLY without FRONT_DOOR(+_CERT) is a clear error.
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ed25519_dalek::Signer;
+        let id = ChannelIdentity::generate();
+        let op = SigningKey::from_bytes(&[9u8; 32]);
+        let g = ChannelGrant {
+            channel: ChannelId([0x5Du8; 32]),
+            holder: id.holder.verifying_key().to_bytes(),
+            direction: Direction::Initiate,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        let grant_hex = hex_encode(
+            &SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }.encode(),
+        );
+        let base: Vec<(&str, String)> = vec![
+            ("CT_CHANNEL_ROLE", "initiate".into()),
+            ("CT_CHANNEL_BROKER", "203.0.113.5:9443".into()),
+            ("CT_CHANNEL_RELAY", "203.0.113.5:9444".into()),
+            ("CT_CHANNEL_LISTEN", "203.0.113.5:7000".into()),
+            ("CT_CHANNEL_GRANT", grant_hex),
+            ("CT_CHANNEL_HOLDER_KEY", id.holder_key_hex()),
+            ("CT_CHANNEL_NOISE_KEY", id.noise_key_hex()),
+            ("CT_CHANNEL_FRONT_DOOR_ONLY", "1".into()),
+        ];
+        let lookup = |pairs: &[(&str, String)]| {
+            let m: HashMap<String, String> =
+                pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+            ChannelJoinCliConfig::from_lookup(move |k| m.get(k).cloned())
+        };
+        let err = lookup(&base).err().expect("FRONT_DOOR_ONLY without a front door is refused");
+        assert!(
+            err.contains("CT_CHANNEL_FRONT_DOOR_ONLY"),
+            "the error names the flag and what it needs, got: {err}"
+        );
+
+        // With both front-door values present the flag parses and the ladders obey it.
+        let mut full = base.clone();
+        full.push(("CT_CHANNEL_FRONT_DOOR", "203.0.113.5:443".into()));
+        full.push(("CT_CHANNEL_FRONT_DOOR_CERT", "aa".into())); // any hex DER parses here
+        let cfg = lookup(&full).expect("a usable front door satisfies the guard");
+        assert!(cfg.front_door_only);
+        assert!(
+            cfg.broker_ladder().iter().all(|r| r.kind.is_front_door()),
+            "the broker ladder is :443-only under the flag"
+        );
+        assert!(
+            cfg.relay_ladder().iter().all(|r| r.kind.is_front_door()),
+            "the relay ladder is :443-only under the flag"
+        );
+    }
+
+    #[test]
     fn channel_identity_env_block_exports_the_keys_the_cli_reads() {
         // #117-cli-subcommand (frozen): `ct-agent channel init` prints this block; it must
         // `export` exactly the two private-key env vars the CLI consumes, surface the two
@@ -5003,7 +5121,7 @@ mod tests {
         // the front-door rung too, so BOTH earlier rungs fail and the walk must reach the
         // third rung, which dials the SAME :443 endpoint with an ordinary-HTTPS ClientHello.
         let fd_addr: SocketAddr = "203.0.113.5:443".parse().unwrap();
-        let rungs = ChannelJoinCliConfig::ladder("203.0.113.5:9443".parse().unwrap(), Some(fd_addr));
+        let rungs = ChannelJoinCliConfig::ladder("203.0.113.5:9443".parse().unwrap(), Some(fd_addr), false);
 
         let tried = std::sync::Arc::new(std::sync::Mutex::new(Vec::<ChannelDialKind>::new()));
         let seen = tried.clone();

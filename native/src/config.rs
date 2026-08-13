@@ -66,6 +66,14 @@ pub struct AgentConfig {
     /// (`wait_for_tcp_agent`) rather than failing outright. Only used in
     /// TLS-TCP fallback mode; QUIC already multiplexes and needs no pool.
     pub tcp_fallback_pool_size: usize,
+    /// #16 operational escape hatch: when true, the Agent registers over the
+    /// TLS-TCP fallback **exclusively** -- no QUIC dial at all, ever. For
+    /// deployments whose UDP path to the edge is known-flaky ("UDP flapping"):
+    /// rather than riding the automatic flap-through-and-upgrade cycle, the
+    /// operator pins the agent to the transport that is actually stable for
+    /// them (combine with `CT_AGENT_FALLBACK_443` to reach the `:443` front
+    /// door). `CT_AGENT_REGISTER_TCP_ONLY`; default `false`.
+    pub register_tcp_only: bool,
 }
 
 /// Resolve a `host:port` (or `IP:port`) to a [`SocketAddr`] (#45). A literal
@@ -95,6 +103,7 @@ impl AgentConfig {
             hostname: None,
             fallback_443: false,
             tcp_fallback_pool_size: DEFAULT_TCP_FALLBACK_POOL_SIZE,
+            register_tcp_only: false,
         })
     }
 
@@ -142,6 +151,13 @@ impl AgentConfig {
             .filter(|h| !h.is_empty());
         // Firewall-fallback (#46): CT_AGENT_FALLBACK_443 truthy -> also try :443.
         cfg.fallback_443 = get("CT_AGENT_FALLBACK_443")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
+            })
+            == Some(true);
+        // #16: CT_AGENT_REGISTER_TCP_ONLY truthy -> never dial QUIC, TLS-TCP only.
+        cfg.register_tcp_only = get("CT_AGENT_REGISTER_TCP_ONLY")
             .map(|v| {
                 let v = v.trim();
                 !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
@@ -210,6 +226,29 @@ mod tests {
             })
             .unwrap()
             .fallback_443
+        };
+        assert!(!base(None), "default off");
+        assert!(!base(Some("0")), "0 -> off");
+        assert!(!base(Some("false")), "false -> off");
+        assert!(!base(Some("")), "empty -> off");
+        assert!(base(Some("1")), "1 -> on");
+        assert!(base(Some("true")), "true -> on");
+    }
+
+    #[test]
+    fn register_tcp_only_reads_the_env_flag() {
+        // #16: off by default; truthy values enable it; 0/false/empty keep it off —
+        // the same truthiness contract as CT_AGENT_FALLBACK_443, which it is meant
+        // to be combined with.
+        let base = |v: Option<&str>| {
+            AgentConfig::from_env_with(|k| match k {
+                "CT_AGENT_EDGE" => Some("127.0.0.1:4433".into()),
+                "CT_AGENT_ORIGIN" => Some("127.0.0.1:8080".into()),
+                "CT_AGENT_REGISTER_TCP_ONLY" => v.map(str::to_string),
+                _ => None,
+            })
+            .unwrap()
+            .register_tcp_only
         };
         assert!(!base(None), "default off");
         assert!(!base(Some("0")), "0 -> off");

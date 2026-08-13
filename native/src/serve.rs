@@ -349,36 +349,52 @@ pub async fn run_agent(
 
     // Reconnect loop (issue #5 / P1.2b): (re)dial + (re)register + serve until the
     // connection drops, then back off and retry, so a transient edge/network
-    // failure doesn't kill the tunnel. A *first*-dial failure means UDP is blocked
-    // → the TLS-TCP fallback (issue #3).
+    // failure doesn't kill the tunnel. ANY dial failure means UDP is (currently)
+    // blocked → serve over the TLS-TCP fallback until UDP/QUIC answers again
+    // (issue #3, regression re-fixed as #16).
+    //
+    // #16: this used to fall back only on the *first* dial (`if first { ... }`) —
+    // an agent that had ever registered over QUIC retried QUIC-only forever, so a
+    // mid-life UDP outage ("UDP flapping") took the whole demo down for exactly as
+    // long as the flap lasted, with the working, tested TCP fallback sitting
+    // unused. Live-diagnosed 2026-08-13 across four production demos flapping in
+    // unison. Now every dial failure enters the fallback, and the fallback itself
+    // returns once a QUIC probe succeeds (see
+    // [`run_agent_tcp_fallback_until_quic_recovers`]) — so the agent serves over
+    // TCP through the flap and upgrades back to QUIC afterwards, instead of
+    // choosing between "down until UDP heals" and "TCP forever".
+    // #16 escape hatch: CT_AGENT_REGISTER_TCP_ONLY pins the agent to the TLS-TCP
+    // fallback permanently — no QUIC dial, no probing, no upgrade. For operators
+    // whose UDP path is known-flaky and who prefer the stable transport outright.
+    if config.register_tcp_only {
+        eprintln!(
+            "ct-agent: CT_AGENT_REGISTER_TCP_ONLY set — registering over TLS-TCP exclusively (no QUIC)"
+        );
+        return run_agent_tcp_fallback(config, edge_cert, token, origin_keys).await;
+    }
     let mut backoff = Backoff::new(RECONNECT_BASE, RECONNECT_MAX, reconnect_max_attempts());
-    let mut first = true;
     loop {
         let conn = match dial_quic_or_blocked_error(config.edge, edge_cert.clone(), Duration::from_secs(5))
             .await
         {
             Ok(conn) => conn,
             Err(e) => {
-                if first {
-                    return run_agent_tcp_fallback(
-                        config,
-                        edge_cert.clone(),
-                        token.clone(),
-                        Arc::clone(&origin_keys),
-                    )
-                    .await;
-                }
-                eprintln!("ct-agent: edge dial failed ({e}); will reconnect");
-                match backoff.next_delay_jittered(rand::random::<f64>()) {
-                    Some(d) => {
-                        tokio::time::sleep(d).await;
-                        continue;
-                    }
-                    None => return Err("ct-agent: gave up reconnecting to the edge".into()),
-                }
+                eprintln!(
+                    "ct-agent: edge dial failed ({e}); serving over the TLS-TCP fallback until UDP/QUIC recovers (#16)"
+                );
+                run_agent_tcp_fallback_until_quic_recovers(
+                    config,
+                    edge_cert.clone(),
+                    token.clone(),
+                    Arc::clone(&origin_keys),
+                )
+                .await?;
+                // A QUIC probe answered — start over with a fresh budget and dial it
+                // for real.
+                backoff.reset();
+                continue;
             }
         };
-        first = false;
         if let Err(e) = register_tunnel(&conn, &token).await {
             eprintln!("ct-agent: registration failed ({e}); will reconnect");
             match backoff.next_delay_jittered(rand::random::<f64>()) {
@@ -503,6 +519,14 @@ async fn serve_quic_connection(
 /// old, implicit one-at-a-time behavior exactly.
 ///
 /// [`config.tcp_fallback_pool_size`]: AgentConfig::tcp_fallback_pool_size
+///
+/// #16: on a DIAL failure `run_agent` now uses
+/// [`run_agent_tcp_fallback_until_quic_recovers`] (serve through the flap, then
+/// upgrade back to QUIC); this PERMANENT variant remains the entry point for
+/// `CT_AGENT_REGISTER_TCP_ONLY` (an operator pinning a known-flaky-UDP
+/// deployment to TCP outright) and for the e2e tests of the pool/worker
+/// mechanics (they need "fallback forever", deterministically, without a 30s
+/// probe racing the assertion).
 async fn run_agent_tcp_fallback(
     config: &AgentConfig,
     edge_cert: CertificateDer<'static>,
@@ -528,6 +552,68 @@ async fn run_agent_tcp_fallback(
         w.await??;
     }
     Ok(())
+}
+
+/// How often the TCP-fallback mode probes whether UDP/QUIC to the edge has
+/// recovered (#16). One cheap dial per interval: rare enough to cost nothing,
+/// frequent enough that a healed network upgrades the agent back to QUIC (and
+/// its multiplexed, pooled-connection-free serving) within a minute.
+const QUIC_REPROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// [`run_agent_tcp_fallback`], but temporary (#16): serve over the TLS-TCP
+/// fallback pool while probing UDP/QUIC every [`QUIC_REPROBE_INTERVAL`], and
+/// return `Ok(())` as soon as a probe dial succeeds — the caller
+/// ([`run_agent`]'s reconnect loop) then re-dials QUIC for real. The pool
+/// workers are spawned on a [`tokio::task::JoinSet`], whose drop ABORTS them —
+/// so returning here (probe success) tears the whole pool down rather than
+/// leaking N workers that would keep re-registering over TCP alongside the
+/// revived QUIC registration. A worker that gives up (its bounded
+/// `CT_AGENT_RECONNECT_MAX_ATTEMPTS` budget exhausted) is fatal to the whole
+/// fallback, exactly as in [`run_agent_tcp_fallback`].
+async fn run_agent_tcp_fallback_until_quic_recovers(
+    config: &AgentConfig,
+    edge_cert: CertificateDer<'static>,
+    token: RoutingToken,
+    origin_keys: Arc<Vec<[u8; 32]>>,
+) -> Result<(), BoxError> {
+    let n = config.tcp_fallback_pool_size.max(1);
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..n {
+        let config = config.clone();
+        let edge_cert = edge_cert.clone();
+        let token = token.clone();
+        let origin_keys = Arc::clone(&origin_keys);
+        workers.spawn(async move {
+            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys).await
+        });
+    }
+    loop {
+        tokio::select! {
+            // A worker only ever ends by giving up (backoff exhausted) — fatal to the
+            // whole fallback mode, matching `run_agent_tcp_fallback`'s posture.
+            Some(res) = workers.join_next() => {
+                return match res {
+                    Ok(r) => r,
+                    Err(join) => Err(join.into()),
+                };
+            }
+            _ = tokio::time::sleep(QUIC_REPROBE_INTERVAL) => {
+                if let Ok(Ok(conn)) = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    dial_quic(config.edge, edge_cert.clone()),
+                )
+                .await
+                {
+                    conn.close(0u32.into(), b"udp recovered - upgrading back to QUIC (#16)");
+                    eprintln!(
+                        "ct-agent: UDP/QUIC to {} recovered — leaving the TLS-TCP fallback (#16)",
+                        config.edge
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 /// One TCP-fallback pool worker (#229): connect, register, serve one Client,
@@ -1560,6 +1646,7 @@ mod tests {
             hostname: None,
             fallback_443: false,
             tcp_fallback_pool_size: 4,
+            register_tcp_only: false,
         };
         let token_a = token.clone();
         let origin_priv = origin_kp.private;
