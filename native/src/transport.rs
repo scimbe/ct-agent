@@ -523,6 +523,39 @@ pub async fn tcp_tls_connect_channel(
     tcp_tls_connect_with_alpn(addr, edge_cert, b"ct-edge-channel").await
 }
 
+/// The SNI every non-fallback TLS-TCP dial presents. The client pins the edge's raw
+/// certificate (`roots.add(edge_cert)`) instead of doing hostname-based CA validation, so
+/// this value is never checked against the certificate — it is pure ClientHello metadata.
+const DEFAULT_SNI: &str = "localhost";
+
+/// The synthetic SNI hostname of the DPI-resistant `:443` fallback route (#106
+/// boring-alpn). An RFC 2606 `.invalid` TLD: it deliberately never resolves, and never
+/// needs to — the client dials a raw [`SocketAddr`], so no name lookup happens on either
+/// end; the edge uses it purely as a routing key in the ClientHello. Locked in lockstep
+/// with the edge side (CADS-Tunnel front door): changing it here alone breaks the route.
+pub const CHANNEL_FALLBACK_SNI: &str = "edge-cdn.invalid";
+
+/// The "boring" ALPN of the DPI-resistant `:443` fallback route (#106 boring-alpn):
+/// ordinary HTTP/2, i.e. exactly what a middlebox expects to see offered to a `:443`
+/// endpoint. Paired with [`CHANNEL_FALLBACK_SNI`]; also locked with the edge side.
+pub const CHANNEL_FALLBACK_ALPN: &[u8] = b"h2";
+
+/// Connect to the unified `:443` front door for the channel route the **DPI-resistant**
+/// way (#106 boring-alpn): same endpoint and same wire protocol as
+/// [`tcp_tls_connect_channel`], but the ClientHello offers ALPN `h2` under SNI
+/// `edge-cdn.invalid` instead of the distinctive `ct-edge-channel` ALPN under an
+/// obviously-wrong `localhost` SNI. Motivated by a real support case (2026-08-12): a
+/// corporate/sandbox network fingerprinted both giveaways and dropped the join bytes
+/// before they ever reached the broker. The edge routes this pair to the SAME channel
+/// broker handler, so nothing about the join/possession/ack protocol changes — only the
+/// outer TLS ClientHello.
+pub async fn tcp_tls_connect_channel_boring(
+    addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
+    tcp_tls_connect_with_alpn_sni(addr, edge_cert, CHANNEL_FALLBACK_ALPN, CHANNEL_FALLBACK_SNI).await
+}
+
 /// TLS-over-TCP dialer to `addr` trusting `edge_cert`, advertising `alpn` in the
 /// ClientHello (issue #3 / P1.2c-4 core, generalized for #106). The ALPN selects
 /// which unified `:443` front-door route the connection is classified into:
@@ -578,6 +611,23 @@ pub async fn tcp_tls_connect_with_alpn(
     edge_cert: CertificateDer<'static>,
     alpn: &[u8],
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
+    tcp_tls_connect_with_alpn_sni(addr, edge_cert, alpn, DEFAULT_SNI).await
+}
+
+/// [`tcp_tls_connect_with_alpn`] with the ClientHello's **SNI** chosen by the caller too.
+/// Both are free-form here: the certificate is pinned by value, so neither participates in
+/// validation — they are the two routing keys the unified `:443` front door classifies on,
+/// and (being plaintext in the ClientHello) the only part of the connection a middlebox can
+/// see. The existing `ct-edge` / `ct-edge-channel` / `ct-edge-relay` callers keep
+/// [`DEFAULT_SNI`] deliberately: those routes work on the networks that already use them,
+/// and the edge now classifies on SNI as well (#106 boring-alpn), so changing their SNI
+/// would silently re-route them. Only the new fallback rung opts into a different pair.
+pub async fn tcp_tls_connect_with_alpn_sni(
+    addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    alpn: &[u8],
+    sni: &str,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
     install_crypto_provider();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(edge_cert)?;
@@ -588,7 +638,7 @@ pub async fn tcp_tls_connect_with_alpn(
     let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
     let tcp = TcpStream::connect(addr).await?;
     apply_tcp_keepalive(&tcp);
-    let server_name = rustls::pki_types::ServerName::try_from("localhost")?;
+    let server_name = rustls::pki_types::ServerName::try_from(sni)?.to_owned();
     Ok(connector.connect(server_name, tcp).await?)
 }
 
@@ -852,6 +902,72 @@ mod tests {
             "agent registered through the front door (ALPN=ct-edge -> EdgeRelay)"
         );
         edge.abort();
+    }
+
+    /// Accept one TCP connection on `listener` and return the raw ClientHello's SNI and
+    /// ALPN offer, without completing the handshake — the only place those two values are
+    /// observable is the plaintext ClientHello, which is exactly what a DPI middlebox sees.
+    async fn observe_client_hello(
+        listener: tokio::net::TcpListener,
+    ) -> (Option<String>, Vec<Vec<u8>>) {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let start = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp)
+            .await
+            .expect("read ClientHello");
+        let hello = start.client_hello();
+        let sni = hello.server_name().map(|s| s.to_string());
+        let alpn = hello
+            .alpn()
+            .map(|it| it.map(|p| p.to_vec()).collect())
+            .unwrap_or_default();
+        (sni, alpn)
+    }
+
+    #[tokio::test]
+    async fn the_boring_fallback_dial_puts_h2_and_the_invalid_sni_on_the_wire() {
+        // #106 boring-alpn (real 2026-08-12 support case): the whole point of this rung is
+        // what a middlebox sees in the plaintext ClientHello. The distinctive
+        // `ct-edge-channel` ALPN and the obviously-wrong `localhost` SNI are the two
+        // fingerprints that got the tester's join dropped, so assert the ACTUAL bytes
+        // offered, not just that the wrapper compiles.
+        install_crypto_provider();
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(observe_client_hello(listener));
+
+        let (cert, _key) = self_signed().unwrap();
+        // The handshake cannot complete (the server never answers), which is fine: the
+        // ClientHello is already on the wire by then.
+        let _ = tcp_tls_connect_channel_boring(addr, cert).await;
+
+        let (sni, alpn) = server.await.unwrap();
+        assert_eq!(
+            sni.as_deref(),
+            Some(CHANNEL_FALLBACK_SNI),
+            "the fallback rung presents the reserved .invalid SNI, not {DEFAULT_SNI:?}"
+        );
+        assert_eq!(alpn, vec![CHANNEL_FALLBACK_ALPN.to_vec()], "and offers only the boring ALPN");
+        assert_eq!(CHANNEL_FALLBACK_SNI, "edge-cdn.invalid", "locked with the edge front door");
+        assert_eq!(CHANNEL_FALLBACK_ALPN, b"h2", "locked with the edge front door");
+    }
+
+    #[tokio::test]
+    async fn the_existing_channel_front_door_dial_keeps_its_alpn_and_sni() {
+        // The DPI-resistant rung is ADDITIVE: the established `ct-edge-channel` route must
+        // keep offering exactly what today's edge classifies on, or every network where the
+        // current fallback already works would silently re-route (the edge now dispatches on
+        // SNI as well). This pins that the boring dialer did not leak into the shared path.
+        install_crypto_provider();
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(observe_client_hello(listener));
+
+        let (cert, _key) = self_signed().unwrap();
+        let _ = tcp_tls_connect_channel(addr, cert).await;
+
+        let (sni, alpn) = server.await.unwrap();
+        assert_eq!(sni.as_deref(), Some(DEFAULT_SNI), "unchanged SNI on the established route");
+        assert_eq!(alpn, vec![b"ct-edge-channel".to_vec()], "unchanged ALPN on the established route");
     }
 
     #[tokio::test]

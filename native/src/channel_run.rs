@@ -1088,12 +1088,24 @@ where
     let mut local = Some(local);
     let mut last: Option<BoxError> = None;
     for rung in rungs {
-        if rung.via_front_door {
-            // The `:443` front door over TLS-TCP (ALPN ct-edge-channel). The SAME stream
-            // carries the join AND the spliced session, so present without consuming it.
-            match crate::transport::tcp_tls_connect_channel(rung.endpoint, edge_cert.clone()).await {
+        if rung.kind.is_front_door() {
+            // The `:443` front door over TLS-TCP. The SAME stream carries the join AND the
+            // spliced session, so present without consuming it. The boring rung differs
+            // only in its ClientHello (ALPN h2 / SNI edge-cdn.invalid); the edge
+            // routes both to the same handler, so the leg below is identical.
+            let connect = match rung.kind {
+                ChannelDialKind::FrontDoorBoring => {
+                    crate::transport::tcp_tls_connect_channel_boring(rung.endpoint, edge_cert.clone()).await
+                }
+                _ => crate::transport::tcp_tls_connect_channel(rung.endpoint, edge_cert.clone()).await,
+            };
+            match connect {
                 Ok(stream) => {
-                    eprintln!("ct-agent channel: relay leg via the :443 front door ({}) (#106)", rung.endpoint);
+                    eprintln!(
+                        "ct-agent channel: relay leg via the {} rung ({}) (#106)",
+                        rung.kind.label(),
+                        rung.endpoint
+                    );
                     let (mut recv, mut send) = tokio::io::split(stream);
                     let local = local.take().expect("local is committed to exactly one rung");
                     match present_channel_relay_join_on_stream(&mut send, &mut recv, request, holder).await? {
@@ -1237,16 +1249,49 @@ pub fn parse_circuit_relay(value: Option<String>) -> Result<Option<libp2p::Multi
     }
 }
 
+/// How one rung of the channel dial ladder reaches the edge (#106). Ordered from the most
+/// direct transport to the least conspicuous one; see [`ChannelJoinCliConfig::ladder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelDialKind {
+    /// A direct QUIC dial to the channel port.
+    Direct,
+    /// The unified `:443` front door (TLS-TCP) advertising the `ct-edge-channel` ALPN, so a
+    /// network that blocks the channel ports can still reach the broker/relay (the #31/#46
+    /// pattern). Presents SNI `localhost`.
+    FrontDoor,
+    /// The same `:443` front door, dialed so that the ClientHello looks like ordinary
+    /// HTTPS: ALPN `h2` under SNI `edge-cdn.invalid`
+    /// ([`crate::transport::tcp_tls_connect_channel_boring`]). For networks whose DPI
+    /// fingerprints the distinctive `ct-edge-channel` ALPN or the obviously-wrong
+    /// `localhost` SNI and drops the connection before the join bytes reach the broker.
+    FrontDoorBoring,
+}
+
+impl ChannelDialKind {
+    /// Whether this rung goes over the `:443` front door (either ClientHello flavour)
+    /// rather than a direct QUIC dial.
+    pub fn is_front_door(self) -> bool {
+        matches!(self, Self::FrontDoor | Self::FrontDoorBoring)
+    }
+
+    /// The operator-facing rung name used in the dial diagnostics.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::FrontDoor => "front-door(:443)",
+            Self::FrontDoorBoring => "front-door-boring-alpn(:443)",
+        }
+    }
+}
+
 /// One rung of the channel dial **fallback ladder** (#106): where + how to reach the edge
 /// channel broker or relay. Tried in order; the first rung that connects wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChannelDialRung {
     /// The endpoint to dial.
     pub endpoint: SocketAddr,
-    /// `false` = a direct QUIC dial to the channel port; `true` = the unified `:443` front
-    /// door (TLS-TCP) advertising the `ct-edge-channel` ALPN, so a network that blocks the
-    /// channel ports can still reach the broker/relay (#106, the #31/#46 pattern).
-    pub via_front_door: bool,
+    /// Which transport/ClientHello flavour to reach [`Self::endpoint`] with.
+    pub kind: ChannelDialKind,
 }
 
 /// Decide whether this member joins in **relay-only** mode (#121): `explicit` (the
@@ -1335,10 +1380,17 @@ impl ChannelJoinCliConfig {
         Self::ladder(self.relay_addr, self.front_door)
     }
 
+    /// Direct QUIC first, then — if a front door is configured — the two `:443` rungs, the
+    /// established `ct-edge-channel` one before the DPI-resistant boring-ALPN one. That
+    /// order is deliberate: the boring rung is strictly a last resort for networks that
+    /// fingerprint the ClientHello (#106 boring-alpn, from a real 2026-08-12 support case),
+    /// so on every network where the existing rungs work, nothing about the dial changes.
+    /// Pure.
     fn ladder(direct: SocketAddr, front_door: Option<SocketAddr>) -> Vec<ChannelDialRung> {
-        let mut rungs = vec![ChannelDialRung { endpoint: direct, via_front_door: false }];
+        let mut rungs = vec![ChannelDialRung { endpoint: direct, kind: ChannelDialKind::Direct }];
         if let Some(fd) = front_door {
-            rungs.push(ChannelDialRung { endpoint: fd, via_front_door: true });
+            rungs.push(ChannelDialRung { endpoint: fd, kind: ChannelDialKind::FrontDoor });
+            rungs.push(ChannelDialRung { endpoint: fd, kind: ChannelDialKind::FrontDoorBoring });
         }
         rungs
     }
@@ -3485,7 +3537,7 @@ pub async fn present_channel_join_via_ladder(
 ) -> Result<ChannelJoinOutcome, BoxError> {
     dial_ladder(rungs, |rung: &ChannelDialRung| {
         let endpoint = rung.endpoint;
-        let via_front_door = rung.via_front_door;
+        let kind = rung.kind;
         let edge_cert = edge_cert.clone();
         async move {
             // Diagnosability (real support case, 2026-08-12): dial_ladder only keeps the
@@ -3495,14 +3547,21 @@ pub async fn present_channel_join_via_ladder(
             // both the direct attempt AND a subsequent :443 front-door attempt, with no way
             // to tell from the log alone whether the fallback even ran. Name the rung being
             // tried and its outcome explicitly, independent of the generic error text.
-            let rung_label = if via_front_door { "front-door(:443)" } else { "direct" };
+            let rung_label = kind.label();
             eprintln!("ct-agent channel: dialing {rung_label} rung {endpoint}");
-            let result = if via_front_door {
-                // #106 fallback: the :443 front door over TLS-TCP (ALPN ct-edge-channel).
+            let result = if kind.is_front_door() {
+                // #106 fallback: the :443 front door over TLS-TCP. Both flavours run the
+                // identical join on the resulting stream -- the edge dispatches the boring
+                // ClientHello (ALPN h2 / SNI edge-cdn.invalid) to the same channel
+                // broker as the ct-edge-channel ALPN, so only the dialer differs.
                 async {
-                    let stream = crate::transport::tcp_tls_connect_channel(endpoint, edge_cert)
-                        .await
-                        .map_err(ChannelDialError::Failed)?;
+                    let stream = match kind {
+                        ChannelDialKind::FrontDoorBoring => {
+                            crate::transport::tcp_tls_connect_channel_boring(endpoint, edge_cert).await
+                        }
+                        _ => crate::transport::tcp_tls_connect_channel(endpoint, edge_cert).await,
+                    }
+                    .map_err(ChannelDialError::Failed)?;
                     let (recv, send) = tokio::io::split(stream);
                     present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT)
                         .await
@@ -4886,12 +4945,12 @@ mod tests {
         // #106-client-dial (frozen): the ladder-walk tries rungs in order and returns the
         // first that connects, so a direct rung blocked by a restrictive network falls
         // back to the :443 front-door rung; it errors only when EVERY rung is blocked.
-        let direct = ChannelDialRung { endpoint: "203.0.113.5:9443".parse().unwrap(), via_front_door: false };
-        let fd = ChannelDialRung { endpoint: "203.0.113.5:443".parse().unwrap(), via_front_door: true };
+        let direct = ChannelDialRung { endpoint: "203.0.113.5:9443".parse().unwrap(), kind: ChannelDialKind::Direct };
+        let fd = ChannelDialRung { endpoint: "203.0.113.5:443".parse().unwrap(), kind: ChannelDialKind::FrontDoor };
 
         // Direct blocked -> fall through to the :443 front-door rung.
         let picked: &str = dial_ladder(&[direct, fd], |r: &ChannelDialRung| {
-            let via = r.via_front_door;
+            let via = r.kind.is_front_door();
             async move {
                 if via { Ok("front-door") } else { Err(ChannelDialError::Unreachable) }
             }
@@ -4902,7 +4961,7 @@ mod tests {
 
         // First success short-circuits: direct connects -> the front door is never tried.
         let picked: &str = dial_ladder(&[direct, fd], |r: &ChannelDialRung| {
-            let via = r.via_front_door;
+            let via = r.kind.is_front_door();
             async move {
                 assert!(!via, "the front-door rung must not be tried once the direct rung connects");
                 Ok("direct")
@@ -4917,6 +4976,82 @@ mod tests {
             dial_ladder(&[direct, fd], |_r: &ChannelDialRung| async move { Err(ChannelDialError::Unreachable) })
                 .await;
         assert!(all_blocked.is_err(), "all rungs blocked surfaces an error");
+    }
+
+    #[tokio::test]
+    async fn dial_ladder_falls_through_to_the_boring_alpn_rung_when_the_front_door_is_fingerprinted() {
+        // #106 boring-alpn: the DPI case from the real 2026-08-12 support call -- a network
+        // that fingerprints the distinctive `ct-edge-channel` ALPN / `localhost` SNI drops
+        // the front-door rung too, so BOTH earlier rungs fail and the walk must reach the
+        // third rung, which dials the SAME :443 endpoint with an ordinary-HTTPS ClientHello.
+        let fd_addr: SocketAddr = "203.0.113.5:443".parse().unwrap();
+        let rungs = ChannelJoinCliConfig::ladder("203.0.113.5:9443".parse().unwrap(), Some(fd_addr));
+
+        let tried = std::sync::Arc::new(std::sync::Mutex::new(Vec::<ChannelDialKind>::new()));
+        let seen = tried.clone();
+        let picked: SocketAddr = dial_ladder(&rungs, |r: &ChannelDialRung| {
+            let (kind, endpoint) = (r.kind, r.endpoint);
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(kind);
+                // Everything but the boring ClientHello is blocked/fingerprinted.
+                match kind {
+                    ChannelDialKind::FrontDoorBoring => Ok(endpoint),
+                    _ => Err(ChannelDialError::Unreachable),
+                }
+            }
+        })
+        .await
+        .expect("the boring-ALPN rung carries the join when the other two are blocked");
+
+        assert_eq!(picked, fd_addr, "the boring rung dials the same :443 endpoint");
+        assert_eq!(
+            *tried.lock().unwrap(),
+            vec![ChannelDialKind::Direct, ChannelDialKind::FrontDoor, ChannelDialKind::FrontDoorBoring],
+            "rungs are tried in order, boring last"
+        );
+
+        // The boring rung must NOT be reached once the ordinary front door works -- it is a
+        // fallback, not a behaviour change for networks that are already fine.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<ChannelDialKind>::new()));
+        let log = seen.clone();
+        let _: SocketAddr = dial_ladder(&rungs, |r: &ChannelDialRung| {
+            let (kind, endpoint) = (r.kind, r.endpoint);
+            let log = log.clone();
+            async move {
+                log.lock().unwrap().push(kind);
+                match kind {
+                    ChannelDialKind::Direct => Err(ChannelDialError::Unreachable),
+                    _ => Ok(endpoint),
+                }
+            }
+        })
+        .await
+        .expect("the ordinary front door still wins when it connects");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![ChannelDialKind::Direct, ChannelDialKind::FrontDoor],
+            "the boring rung is never dialed once the ct-edge-channel front door connects"
+        );
+    }
+
+    #[test]
+    fn every_dial_rung_has_a_distinct_operator_facing_label() {
+        // The dial diagnostics (`ct-agent channel: dialing {label} rung {endpoint}`) are the
+        // only way an operator debugging a live case can tell WHICH rung produced a failure
+        // -- the two :443 rungs share an endpoint, so a shared label would make the boring
+        // fallback indistinguishable from the front-door attempt in the log.
+        let labels = [
+            ChannelDialKind::Direct.label(),
+            ChannelDialKind::FrontDoor.label(),
+            ChannelDialKind::FrontDoorBoring.label(),
+        ];
+        let mut sorted: Vec<&str> = labels.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "labels must be distinct: {labels:?}");
+        assert!(ChannelDialKind::FrontDoorBoring.is_front_door(), "the boring rung goes over :443");
+        assert!(!ChannelDialKind::Direct.is_front_door());
     }
 
     #[tokio::test]
@@ -4983,8 +5118,8 @@ mod tests {
         let dead_addr = dead.local_addr().unwrap();
         drop(dead); // nothing on that UDP port -> the direct QUIC dial is Unreachable
         let rungs = vec![
-            ChannelDialRung { endpoint: dead_addr, via_front_door: false },
-            ChannelDialRung { endpoint: fd_addr, via_front_door: true },
+            ChannelDialRung { endpoint: dead_addr, kind: ChannelDialKind::Direct },
+            ChannelDialRung { endpoint: fd_addr, kind: ChannelDialKind::FrontDoor },
         ];
 
         let outcome = present_channel_join_via_ladder(
@@ -5903,7 +6038,7 @@ mod tests {
         assert_eq!(cfg.front_door, None);
         assert_eq!(
             cfg.broker_ladder(),
-            vec![ChannelDialRung { endpoint: "203.0.113.5:9443".parse().unwrap(), via_front_door: false }]
+            vec![ChannelDialRung { endpoint: "203.0.113.5:9443".parse().unwrap(), kind: ChannelDialKind::Direct }]
         );
 
         // With CT_CHANNEL_FRONT_DOOR set, each ladder tries the direct port then the :443
@@ -5915,15 +6050,36 @@ mod tests {
         assert_eq!(
             cfg.broker_ladder(),
             vec![
-                ChannelDialRung { endpoint: "203.0.113.5:9443".parse().unwrap(), via_front_door: false },
-                ChannelDialRung { endpoint: "203.0.113.5:443".parse().unwrap(), via_front_door: true },
+                ChannelDialRung { endpoint: "203.0.113.5:9443".parse().unwrap(), kind: ChannelDialKind::Direct },
+                ChannelDialRung { endpoint: "203.0.113.5:443".parse().unwrap(), kind: ChannelDialKind::FrontDoor },
+                ChannelDialRung { endpoint: "203.0.113.5:443".parse().unwrap(), kind: ChannelDialKind::FrontDoorBoring },
             ],
-            "broker: direct then :443 front door"
+            "broker: direct, then the :443 front door, then the same :443 with a boring ClientHello"
         );
         assert_eq!(
-            cfg.relay_ladder().last().unwrap(),
-            &ChannelDialRung { endpoint: "203.0.113.5:443".parse().unwrap(), via_front_door: true },
-            "relay also falls back to the front door"
+            cfg.relay_ladder(),
+            vec![
+                ChannelDialRung { endpoint: "203.0.113.5:9444".parse().unwrap(), kind: ChannelDialKind::Direct },
+                ChannelDialRung { endpoint: "203.0.113.5:443".parse().unwrap(), kind: ChannelDialKind::FrontDoor },
+                ChannelDialRung { endpoint: "203.0.113.5:443".parse().unwrap(), kind: ChannelDialKind::FrontDoorBoring },
+            ],
+            "relay falls back the same way"
+        );
+
+        // #106 boring-alpn: the DPI-resistant rung is strictly LAST -- on any network where
+        // the existing rungs work it is never reached, so this is purely additive.
+        let boring: Vec<usize> = cfg
+            .broker_ladder()
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.kind == ChannelDialKind::FrontDoorBoring)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(boring, vec![2], "exactly one boring rung, and it is the last one tried");
+        assert_eq!(
+            cfg.broker_ladder()[2].endpoint,
+            cfg.broker_ladder()[1].endpoint,
+            "the boring rung reuses the SAME :443 endpoint -- only its ClientHello differs"
         );
 
         // A set-but-malformed front door is a hard error (a typo must not silently drop it).
@@ -6321,8 +6477,8 @@ mod tests {
         let dead_addr = dead.local_addr().unwrap();
         drop(dead);
         let rungs = vec![
-            ChannelDialRung { endpoint: dead_addr, via_front_door: false },
-            ChannelDialRung { endpoint: fd_addr, via_front_door: true },
+            ChannelDialRung { endpoint: dead_addr, kind: ChannelDialKind::Direct },
+            ChannelDialRung { endpoint: fd_addr, kind: ChannelDialKind::FrontDoor },
         ];
 
         // Admit over the ladder: direct is Unreachable → the `:443` front door completes it.
@@ -6543,8 +6699,8 @@ mod tests {
         let dead_addr = dead.local_addr().unwrap();
         drop(dead); // nothing on that UDP port -> the direct QUIC relay dial is Unreachable
         let rungs = vec![
-            ChannelDialRung { endpoint: dead_addr, via_front_door: false },
-            ChannelDialRung { endpoint: fd_addr, via_front_door: true },
+            ChannelDialRung { endpoint: dead_addr, kind: ChannelDialKind::Direct },
+            ChannelDialRung { endpoint: fd_addr, kind: ChannelDialKind::FrontDoor },
         ];
 
         // Two members drive `join_via_relay_ladder`: A initiates, B accepts. Each pins the
