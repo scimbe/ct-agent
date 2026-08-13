@@ -427,7 +427,7 @@ where
             }
             (peer_endpoint, noise, observed_reflexive)
         }
-        ChannelJoinOutcome::Refused => return Err("edge broker refused the channel join".into()),
+        ChannelJoinOutcome::Refused => return Err(AdmissionRefused::boxed("edge broker refused the channel join")),
     };
     // #104: built once, moved into whichever single relay-fallback call site below
     // actually fires (they're mutually exclusive). `None` whenever direct_upgrade is off
@@ -521,7 +521,7 @@ where
 {
     match present_channel_join(relay_conn, request, holder).await? {
         ChannelJoinOutcome::Admitted { .. } => {}
-        ChannelJoinOutcome::Refused => return Err("edge relay refused the channel join".into()),
+        ChannelJoinOutcome::Refused => return Err(AdmissionRefused::boxed("edge relay refused the channel join")),
     }
     match upgrade {
         Some((listener, own_direct_endpoint)) => run_channel_session_upgradable(
@@ -568,7 +568,7 @@ where
         ChannelJoinOutcome::Admitted { .. } => {
             return Err("DCUtR relay join needs the peer's relayed Noise key (register the member's key, #101)".into())
         }
-        ChannelJoinOutcome::Refused => return Err("edge relay refused the channel join".into()),
+        ChannelJoinOutcome::Refused => return Err(AdmissionRefused::boxed("edge relay refused the channel join")),
     };
     // The DCUtR session runs the Noise_IK over the relay bi-stream as its base leg, punching to
     // direct in the background. Initiator opens the bi-stream; acceptor accepts the edge-opened one.
@@ -731,7 +731,7 @@ where
         ChannelJoinOutcome::Admitted { .. } => {
             return Err("DCUtR relay-gate join needs the peer's relayed Noise key (register the member's key, #101)".into())
         }
-        ChannelJoinOutcome::Refused => return Err("edge relay refused the channel join".into()),
+        ChannelJoinOutcome::Refused => return Err(AdmissionRefused::boxed("edge relay refused the channel join")),
     };
     let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::other(e.to_string());
     let (relay_send, relay_recv) = match role {
@@ -1111,7 +1111,7 @@ where
                     match present_channel_relay_join_on_stream(&mut send, &mut recv, request, holder).await? {
                         ChannelJoinOutcome::Admitted { .. } => {}
                         ChannelJoinOutcome::Refused => {
-                            return Err("edge relay refused the channel join over the :443 front door".into());
+                            return Err(AdmissionRefused::boxed("edge relay refused the channel join over the :443 front door"));
                         }
                     }
                     return run_channel_session_on_stream(
@@ -3261,7 +3261,7 @@ async fn admit_one_peer(ctx: &ServeSessionCtx) -> Result<ChannelJoinOutcome, Box
 /// matters (#248).
 fn reject_refused_outcome(outcome: ChannelJoinOutcome) -> Result<ChannelJoinOutcome, BoxError> {
     match outcome {
-        ChannelJoinOutcome::Refused => Err("edge broker refused the channel join".into()),
+        ChannelJoinOutcome::Refused => Err(AdmissionRefused::boxed("edge broker refused the channel join")),
         admitted => Ok(admitted),
     }
 }
@@ -3461,7 +3461,41 @@ fn flapping_session_backoff(
 /// [`serve_loop_concurrent`], so this is the only signal available without a wider error-type
 /// refactor across the admission ladder.
 fn is_definitive_admission_refusal(e: &BoxError) -> bool {
+    // #20 (consolidation): typed classification first -- every in-process creation site now
+    // returns [`AdmissionRefused`], so a future rewording of the operator-facing text can no
+    // longer silently disable the #231 backoff (the failure mode of the old substring-only
+    // check was not an error but a behavioral regression: definitive refusals retried at the
+    // fast cadence, i.e. the exact edge-flood #231 was filed about). The substring fallback
+    // stays for ONE release, documented: it covers errors that crossed a stringifying boundary
+    // (e.g. a subprocess's stderr re-parsed into a fresh error) and is scheduled for removal
+    // once no such path exists.
+    if e.downcast_ref::<AdmissionRefused>().is_some() {
+        return true;
+    }
     e.to_string().contains("refused the channel join")
+}
+
+/// #20: typed marker for a DEFINITIVE broker/relay refusal -- the peer's wire `NO`. `Display`
+/// emits the exact historical strings (field-visible contract: operators grep these, docs quote
+/// them, the sort bridge's fault attribution matches on them), but in-process classification
+/// ([`is_definitive_admission_refusal`]) is a downcast, not a substring search. The client-side
+/// sibling of the edge's `DefinitiveJoinRefusal` (CADS-Tunnel, same day, same class of fix).
+#[derive(Debug)]
+pub(crate) struct AdmissionRefused(pub(crate) &'static str);
+
+impl std::fmt::Display for AdmissionRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for AdmissionRefused {}
+
+impl AdmissionRefused {
+    /// The one constructor every refusal site uses -- boxed, ready to return.
+    fn boxed(text: &'static str) -> BoxError {
+        Box::new(AdmissionRefused(text))
+    }
 }
 
 /// #231: how long to wait before the next admission attempt. A definitive refusal (see
@@ -6135,10 +6169,31 @@ mod tests {
     }
 
     #[test]
+    fn admission_refusal_classification_is_typed_and_survives_rewording_20() {
+        // #20 (consolidation): the classification is a DOWNCAST now, not a substring search --
+        // proven by classifying an AdmissionRefused whose text deliberately contains none of the
+        // historical wording. Under the old substring-only check this would silently fall back
+        // to the fast retry cadence (#231's edge-flood failure mode); typed, it stays a
+        // definitive refusal no matter how the operator-facing text evolves.
+        let reworded: BoxError = AdmissionRefused::boxed("the peer's broker said no");
+        assert!(
+            is_definitive_admission_refusal(&reworded),
+            "a typed AdmissionRefused classifies regardless of its display text"
+        );
+        // And the Display contract still emits exactly what was constructed (operators grep it).
+        assert_eq!(reworded.to_string(), "the peer's broker said no");
+
+        // The real production values are typed too -- classify + display both hold.
+        let real = AdmissionRefused::boxed("edge broker refused the channel join");
+        assert!(is_definitive_admission_refusal(&real));
+        assert_eq!(real.to_string(), "edge broker refused the channel join");
+    }
+
+    #[test]
     fn is_definitive_admission_refusal_matches_only_the_refused_strings() {
-        // #231: exactly the strings run_one_admission_session's ladder produces for a not-a-member
-        // holder (lines 319/400/447/699) — everything else, including the #140 stall symptom, is
-        // transient and must keep the fast retry.
+        // #231 + #20: the substring FALLBACK (kept one release for errors that crossed a
+        // stringifying boundary) still recognizes exactly the historical strings -- everything
+        // else, including the #140 stall symptom, is transient and must keep the fast retry.
         assert!(is_definitive_admission_refusal(&"edge broker refused the channel join".into()));
         assert!(is_definitive_admission_refusal(&"edge relay refused the channel join".into()));
         assert!(is_definitive_admission_refusal(
