@@ -656,9 +656,16 @@ pub(crate) fn channel_local() -> ChannelLocal {
                 cfg.max_bids_per_window,
                 cfg.window_secs,
             );
-            eprintln!(
-                "ct-agent channel: --serve also exposing auction/offer + auction/bid (CT_AGENT_OFFER_*)"
-            );
+            // ct-agent#17: ONCE per process, and worded as the config report it is --
+            // channel_local() is rebuilt on every (re-)admission attempt, and the old
+            // per-attempt print was misread as "handler is live" during a 49-cycle
+            // admission hot-loop that never admitted once.
+            static AUCTION_LINE: std::sync::Once = std::sync::Once::new();
+            AUCTION_LINE.call_once(|| {
+                eprintln!(
+                    "ct-agent channel: --serve configured to expose auction/offer + auction/bid (CT_AGENT_OFFER_*) -- served to peers only after a confirmed admission"
+                );
+            });
         }
         // #149-A.1 serve-wiring + #167 declared-vs-served: expose one schema-typed `service/<slug>`
         // tool per service, backed by shelling out to `CT_AGENT_SERVICE_HANDLER_CMD` (`input` on
@@ -697,9 +704,13 @@ pub(crate) fn channel_local() -> ChannelLocal {
                 ct_common::mcp::register_service_tools(&mut reg, &services, move |service, input| {
                     run_service_handler(&handler_cmd, service, input)
                 });
-                eprintln!(
-                    "ct-agent channel: --serve also exposing {n} service tool(s) via CT_AGENT_SERVICE_HANDLER_CMD"
-                );
+                // ct-agent#17: same Once + honest wording as the auction line above.
+                static SERVICE_LINE: std::sync::Once = std::sync::Once::new();
+                SERVICE_LINE.call_once(|| {
+                    eprintln!(
+                        "ct-agent channel: --serve configured to expose {n} service tool(s) via CT_AGENT_SERVICE_HANDLER_CMD -- served to peers only after a confirmed admission"
+                    );
+                });
             }
         }
         let registry = std::sync::Arc::new(reg);
