@@ -7,6 +7,23 @@
 //! client half; dialing the edge endpoint and custody of the channel key are the
 //! caller's. (The broker is not yet mounted in the live edge — #81 SEC81c-c — so this
 //! drives exactly the protocol the broker's own tests exercise.)
+//!
+//! ## Ack contract (normative — both ack readers implement THIS, #23)
+//!
+//! The edge's admission ack is a single line — `OK …` / `NO` / `EX` — terminated by
+//! `\n` on stream legs; on QUIC the ack is delimiter-free by design and EOF (quinn's
+//! `finish`) terminates it. A reader completes on the FIRST of: a `\n` (consumed,
+//! never read past — session bytes may follow on the same stream), EOF, or the
+//! [`CHANNEL_ACK_MAX_BYTES`] cap — exceeding the cap without a terminator is a
+//! protocol violation and a hard error on both legs. LEADING NULs are the #500 park
+//! keepalive and are skipped (no ack byte is 0x00). Classification: a non-empty ack
+//! parses via `parse_channel_ack` (`OK…` → `Admitted`, `EX` → `ParkExpired`,
+//! anything else → `Refused`). An EMPTY ack AFTER the possession handshake
+//! completed is a dropped leg / handoff race ([`DroppedLegBeforeAck`], #148) —
+//! retryable, NEVER `Refused`: on every leg a genuine refusal is an explicit `NO`.
+//! (Pre-challenge is different: there an empty response stays `Refused`, because
+//! over QUIC an explicit `NO` can race the teardown and arrive empty — see the
+//! pre-challenge read in [`present_channel_join_on_stream`].)
 
 use ct_common::channel::ChannelJoinRequest;
 use ed25519_dalek::{Signer, SigningKey};
@@ -102,6 +119,38 @@ pub(crate) fn phase_marker_enabled() -> bool {
 pub(crate) fn phase_marker_enabled_from(v: Option<&str>) -> bool {
     !matches!(v.map(str::trim), Some("off") | Some("0"))
 }
+
+/// One cap, one posture (#23): the bound both ack readers enforce. A well-formed
+/// ack line is far below this; reaching it without a terminator is a malformed
+/// peer and a hard error on both legs (the readers used to disagree — the
+/// rendezvous leg classified whatever arrived, the relay leg errored at 513).
+pub(crate) const CHANNEL_ACK_MAX_BYTES: usize = 512;
+
+/// #148/#23: a leg closed with ZERO ack bytes AFTER the possession handshake
+/// completed — a transport/handoff race (the paired peer's stream died
+/// mid-pairing), NOT an authorization refusal: a genuine refusal is always an
+/// explicit `NO` (see the module header's ack contract). Typed so retry policies
+/// classify it without string-matching; it must never be treated as definitive —
+/// before #23 the rendezvous leg fell through to `Refused` here and paid the
+/// #231 definitive 30 s backoff for a transport race.
+#[derive(Debug)]
+pub struct DroppedLegBeforeAck {
+    /// Which leg observed it (`"rendezvous"` / `"relay"`), for operator logs.
+    pub leg: &'static str,
+}
+
+impl std::fmt::Display for DroppedLegBeforeAck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} pairing dropped after admission before the edge ack — a transport/handoff race \
+             (the peer connection likely died mid-pairing, #148), not an authorization refusal; retry",
+            self.leg
+        )
+    }
+}
+
+impl std::error::Error for DroppedLegBeforeAck {}
 
 pub(crate) const PHASE_PREAMBLE_MAGIC: u8 = 0xFF;
 /// Phase byte: rendezvous admission (the parked ack-and-close leg).
@@ -212,28 +261,29 @@ where
         let _ = send.shutdown().await;
     }
 
-    // #494: read the ack up to its `\n` delimiter OR EOF — never `read_to_end` alone.
-    // The old `take(512).read_to_end` completed only at EOF (or 512 bytes): correct on
-    // QUIC (the edge `finish()`es the rendezvous stream), but the `:443` front door acks
-    // `OK ...\n` and then keeps the SAME stream open for the relay splice — so two fresh
+    // This reader implements the module header's ack contract (#23). The #494 history
+    // of why it is byte-wise: the old `take(512).read_to_end` completed only at EOF (or
+    // 512 bytes) — correct on QUIC (the edge `finish()`es the rendezvous stream), but
+    // the `:443` edge acks `OK ...\n` and never sends an EOF on this leg — so two fresh
     // members each sat on a fully-delivered ack waiting for an EOF only the OTHER side's
     // stall-timeout death could produce. Every fresh `:443` pairing paid 45–100 s this
-    // way (the whole first-contact class of ct-agent#18/CADS-Tunnel#494). A newline
-    // completes the read immediately; EOF still completes it for the QUIC path (whose
-    // ack is delimiter-free by design) and for `NO`/`EX` teardowns; the 512-byte cap
-    // bounds a malformed peer. Leading NULs are the #500 park keepalive — skipped
-    // exactly as before (no ack byte is 0x00).
+    // way (the whole first-contact class of ct-agent#18/CADS-Tunnel#494).
     let mut ack = Vec::new();
     let mut byte = [0u8; 1];
     loop {
         match recv.read(&mut byte).await {
-            Ok(0) => break, // EOF: QUIC finish, or a NO/EX teardown
+            // EOF: QUIC finish, a NO/EX teardown — or a leg dropped before any ack
+            // byte, classified as [`DroppedLegBeforeAck`] below the loop (#23).
+            Ok(0) => break,
             Ok(_) if byte[0] == b'\n' => break,
             Ok(_) if byte[0] == 0 && ack.is_empty() => continue, // #500 leading park NULs
             Ok(_) => {
                 ack.push(byte[0]);
-                if ack.len() >= 512 {
-                    break; // cap: classify what arrived, same lenient posture as before
+                if ack.len() >= CHANNEL_ACK_MAX_BYTES {
+                    return Err(format!(
+                        "channel ack exceeded {CHANNEL_ACK_MAX_BYTES} bytes without a terminator — malformed peer"
+                    )
+                    .into());
                 }
             }
             Err(e) => {
@@ -250,6 +300,11 @@ where
                 break;
             }
         }
+    }
+    // Empty after a completed possession handshake = dropped leg (#148), mirrored
+    // from the relay leg — see the module header's ack contract (#23).
+    if ack.is_empty() {
+        return Err(Box::new(DroppedLegBeforeAck { leg: "rendezvous" }) as BoxError);
     }
     let ack = String::from_utf8_lossy(&ack);
     Ok(parse_channel_ack(&ack))
@@ -379,8 +434,11 @@ where
             Ok(_) if byte[0] == 0 && line.is_empty() => continue,
             Ok(_) => {
                 line.push(byte[0]);
-                if line.len() > 512 {
-                    return Err("relay ack exceeded 512 bytes without a newline delimiter".into());
+                if line.len() >= CHANNEL_ACK_MAX_BYTES {
+                    return Err(format!(
+                        "channel ack exceeded {CHANNEL_ACK_MAX_BYTES} bytes without a terminator — malformed peer"
+                    )
+                    .into());
                 }
             }
             // EOF before a newline — a bare `NO` refusal, or a dropped relay leg. Classify
@@ -388,19 +446,12 @@ where
             Err(_) => break,
         }
     }
-    // #148 client-facing: on the relay path a genuine refusal is ALWAYS an explicit `NO`
-    // (`finish_relay_pair_over_streams` writes `b"NO"` before closing). We only reach here after the
-    // edge's possession challenge was received and answered — i.e. admission already succeeded — so an
-    // **empty** ack (the leg closed without any `OK`/`NO`) is a dropped relay leg / handoff race (the
-    // peer's stream dying mid-pairing, #148), NOT an authorization refusal. Surface it as a DISTINCT,
-    // retryable error instead of the generic `Refused` that reads like the join was denied — closing
-    // the client-facing half of #148 (the edge already logs the race server-side). An explicit `NO`
-    // (non-empty) still parses to `Refused` exactly as before.
+    // Empty after a completed possession handshake = dropped leg / handoff race
+    // (#148: `finish_relay_pair_over_streams` writes an explicit `b"NO"` before
+    // closing on a genuine refusal, and the edge logs the race server-side) — see
+    // the module header's ack contract (#23).
     if line.is_empty() {
-        return Err("relay pairing dropped after admission before the edge ack — a transport/handoff \
-                    race (the peer connection likely died mid-pairing, #148), not an authorization \
-                    refusal; retry"
-            .into());
+        return Err(Box::new(DroppedLegBeforeAck { leg: "relay" }) as BoxError);
     }
     let ack = String::from_utf8_lossy(&line);
     Ok(parse_channel_ack(&ack))
@@ -605,6 +656,92 @@ mod tests {
         );
         drop(ew);
         drop(er);
+    }
+
+    /// #23 (ack contract): a leg that closes with ZERO ack bytes after the possession
+    /// handshake completed is a dropped leg / handoff race — the typed, retryable
+    /// [`DroppedLegBeforeAck`] — and must NOT classify as `Refused`, which the ladder
+    /// escalates to `AdmissionRefused` and #231 punishes with the definitive 30 s
+    /// backoff. (The relay leg has said so since #148; this pins the same rule on the
+    /// rendezvous leg, where the empty ack silently fell through to `Refused`.)
+    #[tokio::test]
+    async fn an_empty_ack_after_possession_is_a_dropped_leg_not_a_refusal_23() {
+        use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+
+        let channel = [0x51u8; 32];
+        let holder = SigningKey::from_bytes(&[0x29u8; 32]);
+        let grant = signed_grant(channel, &holder, Direction::Initiate);
+        let request = ChannelJoinRequest { grant, endpoint: "203.0.113.5:5005".to_string() };
+
+        let (client_end, edge_end) = tokio::io::duplex(4096);
+        let (cli_r, cli_w) = split(client_end);
+        let client = tokio::spawn(async move {
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
+        });
+
+        let (mut er, mut ew) = split(edge_end);
+        let mut len_buf = [0u8; 2];
+        er.read_exact(&mut len_buf).await.expect("len");
+        let mut body = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+        er.read_exact(&mut body).await.expect("request");
+        ew.write_all(&[0xAu8; 32]).await.expect("challenge");
+        let mut sig = [0u8; 64];
+        er.read_exact(&mut sig).await.expect("sig");
+        // Possession complete — now the leg dies without a single ack byte.
+        drop(ew);
+        drop(er);
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), client)
+            .await
+            .expect("EOF completes the read promptly")
+            .expect("client task")
+            .expect_err("an empty post-possession ack is an error, not an outcome");
+        assert!(
+            err.downcast_ref::<DroppedLegBeforeAck>().is_some(),
+            "typed as DroppedLegBeforeAck (retryable), got: {err}"
+        );
+    }
+
+    /// #23 (ack contract): reaching [`CHANNEL_ACK_MAX_BYTES`] without a terminator is a
+    /// malformed peer and a hard error — the rendezvous leg used to "classify what
+    /// arrived", which let 512 garbage bytes parse into `Refused` (definitive backoff)
+    /// or even a bogus `Admitted`.
+    #[tokio::test]
+    async fn an_oversized_unterminated_ack_is_a_hard_error_23() {
+        use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+
+        let channel = [0x52u8; 32];
+        let holder = SigningKey::from_bytes(&[0x2Au8; 32]);
+        let grant = signed_grant(channel, &holder, Direction::Initiate);
+        let request = ChannelJoinRequest { grant, endpoint: "203.0.113.6:6006".to_string() };
+
+        let (client_end, edge_end) = tokio::io::duplex(4096);
+        let (cli_r, cli_w) = split(client_end);
+        let client = tokio::spawn(async move {
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
+        });
+
+        let (mut er, mut ew) = split(edge_end);
+        let mut len_buf = [0u8; 2];
+        er.read_exact(&mut len_buf).await.expect("len");
+        let mut body = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+        er.read_exact(&mut body).await.expect("request");
+        ew.write_all(&[0xAu8; 32]).await.expect("challenge");
+        let mut sig = [0u8; 64];
+        er.read_exact(&mut sig).await.expect("sig");
+        // 512 bytes of garbage, no terminator, stream held open (a newline or EOF
+        // would end the read legitimately).
+        ew.write_all(&[b'X'; CHANNEL_ACK_MAX_BYTES]).await.expect("garbage");
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), client)
+            .await
+            .expect("the cap completes the read without needing EOF")
+            .expect("client task")
+            .expect_err("an unterminated oversized ack is a protocol violation");
+        assert!(
+            err.to_string().contains("without a terminator"),
+            "names the cap violation, got: {err}"
+        );
     }
 
     #[tokio::test]
