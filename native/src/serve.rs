@@ -408,11 +408,22 @@ pub async fn run_agent(
         backoff.reset();
         // Browser Plane (#23 BP3b): bind the public hostname to this token so an
         // SNI-routed browser reaches this tunnel. Re-bound on every reconnect.
+        // Retried with backoff (#502): a fresh onboard's authorize-host call can
+        // reach the edge a moment after this bind, and a one-shot bind then left
+        // the agent serving without its hostname until a process restart.
         if config.browser_forward {
             if let Some(host) = &config.hostname {
-                if let Err(e) = bind_hostname(&conn, &token, host).await {
-                    eprintln!("ct-agent: hostname binding for '{host}' failed ({e})");
-                }
+                let conn = conn.clone();
+                let token = token.clone();
+                let host = host.clone();
+                tokio::spawn(async move {
+                    let backoff = Backoff::new(
+                        HOST_BIND_RETRY_BASE,
+                        HOST_BIND_RETRY_MAX,
+                        HOST_BIND_RETRY_ATTEMPTS,
+                    );
+                    bind_hostname_with_retry(&conn, &token, &host, backoff).await;
+                });
             }
         }
         eprintln!("ct-agent: registered with edge {} (serving)", config.edge);
@@ -429,6 +440,67 @@ pub async fn run_agent(
         match backoff.next_delay_jittered(rand::random::<f64>()) {
             Some(d) => tokio::time::sleep(d).await,
             None => return Err("ct-agent: gave up reconnecting after the connection dropped".into()),
+        }
+    }
+}
+
+/// Hostname-bind retry parameters (#502). The window they span (~75s) is sized
+/// for the race they heal: an agent that onboards at boot binds its hostname
+/// within milliseconds of the control plane's authorize-host call reaching the
+/// edge, so a lost race resolves in seconds — not minutes.
+const HOST_BIND_RETRY_BASE: Duration = Duration::from_secs(1);
+const HOST_BIND_RETRY_MAX: Duration = Duration::from_secs(15);
+const HOST_BIND_RETRY_ATTEMPTS: u32 = 8;
+
+/// Bind the public hostname, retrying a rejection with backoff (#502).
+///
+/// The edge answers `NO` both for a *permanent* refusal (hostname bound to a
+/// different token, no authorization) and for the *transient* case where this
+/// token's authorize-host call from the control plane hasn't landed yet — a
+/// freshly onboarded agent loses that race routinely. A one-shot bind turned
+/// the transient case into "serving without a hostname until process restart"
+/// (help.bunsenbrenner.org, field incident 2026-08-14). Retrying is safe for
+/// the permanent case too: the edge's answer is idempotent and the budget is
+/// bounded. Gives up early once the connection is gone — the reconnect loop
+/// re-binds on the next connection anyway.
+async fn bind_hostname_with_retry(
+    conn: &Connection,
+    token: &RoutingToken,
+    host: &str,
+    mut backoff: Backoff,
+) {
+    let mut retries = 0u32;
+    loop {
+        match bind_hostname(conn, token, host).await {
+            Ok(()) => {
+                if retries > 0 {
+                    eprintln!(
+                        "ct-agent: hostname binding for '{host}' established after {retries} retry(s) (#502)"
+                    );
+                }
+                return;
+            }
+            Err(e) => {
+                if conn.close_reason().is_some() {
+                    return;
+                }
+                match backoff.next_delay_jittered(rand::random::<f64>()) {
+                    Some(d) => {
+                        eprintln!(
+                            "ct-agent: hostname binding for '{host}' failed ({e}); retrying in {}ms (#502)",
+                            d.as_millis()
+                        );
+                        tokio::time::sleep(d).await;
+                        retries += 1;
+                    }
+                    None => {
+                        eprintln!(
+                            "ct-agent: hostname binding for '{host}' failed ({e}); giving up until the next reconnect"
+                        );
+                        return;
+                    }
+                }
+            }
         }
     }
 }
@@ -816,6 +888,58 @@ mod tests {
         // An explicitly-configured finite budget still works, for short-lived or
         // scripted runs that genuinely want to fail fast.
         assert_eq!(parse_reconnect_max_attempts(Some("3".into())), 3);
+    }
+
+    /// #502: a mock edge whose 'H' arm answers a fixed sequence of acks over
+    /// successive bi-streams — drives the refuse-then-accept race a freshly
+    /// onboarded agent loses against the control plane's authorize-host call.
+    async fn mock_edge_ack_sequence(
+        acks: &'static [&'static [u8]],
+    ) -> (SocketAddr, rustls::pki_types::CertificateDer<'static>, tokio::task::JoinHandle<u32>) {
+        let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let h = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let mut served = 0u32;
+            for ack in acks {
+                let Ok((mut send, mut recv)) = conn.accept_bi().await else { break };
+                let _ = recv.read_to_end(8192).await.unwrap();
+                send.write_all(ack).await.unwrap();
+                send.finish().unwrap();
+                served += 1;
+            }
+            conn.closed().await;
+            served
+        });
+        (addr, cert, h)
+    }
+
+    /// #502 acceptance: a bind the edge first refuses (authorize-host not yet
+    /// landed) is retried and establishes once the edge accepts — the agent no
+    /// longer serves hostname-less until a process restart.
+    #[tokio::test]
+    async fn hostname_bind_retries_a_transient_rejection_until_it_lands() {
+        let (addr, cert, edge) = mock_edge_ack_sequence(&[b"NO", b"OK"]).await;
+        let conn = dial_quic(addr, cert).await.expect("dial");
+        let backoff = Backoff::new(Duration::from_millis(20), Duration::from_millis(40), 5);
+        bind_hostname_with_retry(&conn, &RoutingToken([9u8; 32]), "retry.example.test", backoff)
+            .await;
+        conn.close(0u32.into(), b"done");
+        assert_eq!(edge.await.unwrap(), 2, "exactly one refused bind + one accepted retry");
+    }
+
+    /// #502: the retry budget is bounded — a permanently refused bind (hostname
+    /// owned by another token) stops after the configured attempts instead of
+    /// hammering the edge for the connection's whole life.
+    #[tokio::test]
+    async fn hostname_bind_gives_up_after_the_retry_budget() {
+        let (addr, cert, edge) = mock_edge_ack_sequence(&[b"NO", b"NO", b"NO", b"NO"]).await;
+        let conn = dial_quic(addr, cert).await.expect("dial");
+        let backoff = Backoff::new(Duration::from_millis(10), Duration::from_millis(20), 2);
+        bind_hostname_with_retry(&conn, &RoutingToken([9u8; 32]), "taken.example.test", backoff)
+            .await;
+        conn.close(0u32.into(), b"done");
+        assert_eq!(edge.await.unwrap(), 3, "initial attempt + exactly 2 budgeted retries");
     }
 
     /// issue #3 acceptance: with UDP blocked, the agent registers over the TLS-TCP
