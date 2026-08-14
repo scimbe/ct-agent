@@ -99,11 +99,23 @@ picture first.
   while the `:443` edge acks `OK …\n` and keeps the stream open for the splice — both fresh
   members deadlocked on delivered acks until one side's timeout death handed the other its
   EOF (CADS-Tunnel#494; field-confirmed fixed: 8/8 fresh first contacts 124–823 ms). The
-  read now completes at the newline, at EOF (QUIC's delimiter-free `finish()`, `NO`/`EX`
-  teardowns), or at the 512-byte cap.
+  read now completes at the newline or at EOF (QUIC's delimiter-free `finish()`, `NO`/`EX`
+  teardowns); since **v0.4.18** reaching the 512-byte cap without a terminator is a hard
+  protocol error on both legs (`channel ack exceeded 512 bytes without a terminator`) —
+  the normative ack contract lives in `channel.rs`'s module header (#23).
+- **`… pairing dropped after admission before the edge ack — a transport/handoff race
+  (… #148) … retry`** — the leg closed with **zero** ack bytes after the possession
+  handshake completed. Retryable on **both** legs since **v0.4.18** (typed
+  `DroppedLegBeforeAck`, #23): a genuine refusal is always an explicit `NO`. Before
+  v0.4.18 the **rendezvous** leg silently classified this as `Refused` and paid the
+  [#231] definitive 30 s backoff for what is a transport race.
 - **`edge broker/relay refused the channel join`** — a definitive wire `NO` (e.g. not a member).
   The serve loop backs off exponentially on consecutive refusals (cap 30 s, [#231]) — a
-  not-member holder cannot fix itself by retrying.
+  not-member holder cannot fix itself by retrying. Since **v0.4.18** the relay-gate /
+  circuit-relay DCUtR serve loops obey the same policy (#24) — they previously re-admitted
+  at a flat 200 ms forever regardless of the error class — and a one-shot caller stops
+  immediately on a definitive refusal; circuit-relay error lines now say `circuit-relay`
+  (they printed `relay-gate` from a copied loop body).
 - **`channel park expired ... (#21) -- re-parking`** — the edge reaped an idle park and SAID so
   (bare `EX` on stream legs, a named `park-expired:` close reason on QUIC). Not an error in any
   operational sense: the member re-parks the same rung immediately, with no ladder advance and
