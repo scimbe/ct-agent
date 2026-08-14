@@ -3916,7 +3916,12 @@ pub async fn present_channel_join_via_ladder(
                     }
                     .map_err(ChannelDialError::Failed)?;
                     let (recv, send) = tokio::io::split(stream);
-                    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT)
+                    // finish_send_after_sig = false (#21 follow-up): on this TCP/TLS leg the
+                    // old post-signature shutdown was a close_notify+FIN that half-closed the
+                    // whole connection -- the parked member then waited out its park as a
+                    // closing flow, and the edge's reap teardown RST'd the in-flight EX away
+                    // (packet-capture-proven). The edge needs no EOF; keep the leg fully open.
+                    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT, false)
                         .await
                         .map_err(ChannelDialError::Failed)
                 }

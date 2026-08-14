@@ -91,7 +91,9 @@ pub async fn present_channel_join(
     let (send, recv) = tokio::time::timeout(ADMISSION_EXCHANGE_TIMEOUT, conn.open_bi())
         .await
         .map_err(|_| -> BoxError { "channel join open_bi stalled after connect (#140)".into() })??;
-    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT).await
+    // finish_send_after_sig = true: on QUIC the post-signature shutdown is quinn's clean
+    // per-stream finish() -- connection-scoped state is untouched (unlike a TCP/TLS leg).
+    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT, true).await
 }
 
 /// The transport-agnostic core of [`present_channel_join`]: run the channel-join wire
@@ -100,13 +102,24 @@ pub async fn present_channel_join(
 /// identical protocol — length-framed request, possession challenge/response, `OK`/`NO`
 /// ack — runs over *any* duplex, so a TLS-over-TCP `:443` front-door stream (the
 /// fallback when the channel UDP/TCP ports are blocked) speaks it unchanged. `send`/
-/// `recv` are the write/read halves; the send half is closed after the possession step.
+/// `recv` are the write/read halves.
+///
+/// `finish_send_after_sig` (#21 follow-up, packet-capture-proven 2026-08-14): whether to
+/// close the send half after the possession signature. On QUIC (`true`) this is quinn's
+/// clean stream `finish()`. On a TCP/TLS stream leg it MUST be `false`: the "stream
+/// finish" there is a close_notify + TCP FIN that half-closes the WHOLE connection, so a
+/// parked member waits out its park as a half-closed flow — its unread close_notify then
+/// makes the edge's post-reap teardown emit an RST that races (and at real-world RTT
+/// beats) the in-flight `EX` record out of the receive buffer, and every stateful
+/// middlebox on the path sees a closing flow where a live park is meant to be. The edge
+/// never needed the EOF (every read on its side is exact-length).
 pub async fn present_channel_join_on_stream<W, R>(
     mut send: W,
     mut recv: R,
     request: &ChannelJoinRequest,
     holder: &SigningKey,
     exchange_timeout: std::time::Duration,
+    finish_send_after_sig: bool,
 ) -> Result<ChannelJoinOutcome, BoxError>
 where
     W: AsyncWrite + Unpin,
@@ -158,9 +171,12 @@ where
     let challenge: [u8; 32] = resp.try_into().expect("length checked == 32");
     let sig = holder.sign(&challenge).to_bytes();
     send.write_all(&sig).await?;
-    // Close the write half (EOF to the edge) — the QUIC `finish()` equivalent over a
-    // generic stream. Lenient: on a refusal the edge may already have closed.
-    let _ = send.shutdown().await;
+    send.flush().await?;
+    if finish_send_after_sig {
+        // QUIC only: the clean stream `finish()`. Lenient: on a refusal the edge may
+        // already have closed. See the doc comment for why a stream leg must NOT do this.
+        let _ = send.shutdown().await;
+    }
 
     // The ack can carry endpoint + noise(64) + holder(64) + attestation(128) hex plus the
     // #121 `r=<reflexive>` token and separators — well over 256 bytes; cap at 512 so nothing
@@ -389,7 +405,7 @@ mod tests {
         let (client_end, _silent_edge) = tokio::io::duplex(4096); // held open, never responds
         let (cli_r, cli_w) = split(client_end);
         let start = std::time::Instant::now();
-        let r = present_channel_join_on_stream(cli_w, cli_r, &request, &holder, std::time::Duration::from_millis(200)).await;
+        let r = present_channel_join_on_stream(cli_w, cli_r, &request, &holder, std::time::Duration::from_millis(200), false).await;
         assert!(r.is_err(), "a stalled admission exchange errors, it does not hang (#140)");
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
@@ -418,7 +434,7 @@ mod tests {
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
             // send = write half, recv = read half — no quinn anywhere.
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false).await
         });
 
         // Minimal "edge": read the framed request, challenge, verify possession, ack OK.
@@ -464,7 +480,7 @@ mod tests {
         let (client_end, edge_end) = tokio::io::duplex(4096);
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false).await
         });
         // "edge": read the framed request, then send a malformed partial (neither 32 bytes
         // nor "NO") and close — a broken stream.
@@ -502,7 +518,7 @@ mod tests {
         let (client_end, edge_end) = tokio::io::duplex(4096);
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false).await
         });
         let (mut er, mut ew) = split(edge_end);
         let mut len_buf = [0u8; 2];
@@ -534,7 +550,7 @@ mod tests {
         let (client_end, edge_end) = tokio::io::duplex(4096);
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false).await
         });
         let (mut er, mut ew) = split(edge_end);
         let mut len_buf = [0u8; 2];
@@ -918,7 +934,7 @@ mod tests {
 
         let client_tls = tcp_tls_connect(listen_addr, cert).await.expect("tls-tcp connect");
         let (cli_r, cli_w) = split(client_tls);
-        let outcome = present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT)
+        let outcome = present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false)
             .await
             .expect("join drives over the :443 duplex");
         let observed = srv.await.expect("edge task");
