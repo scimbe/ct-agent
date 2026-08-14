@@ -6,6 +6,25 @@
 //! handshake and then pumps a local byte stream (the CLI's stdin/stdout, or any
 //! `AsyncRead + AsyncWrite`) over the encrypted tunnel — a "netcat over the channel".
 //! A thin `ct-agent` subcommand feeds it stdio; tests feed it an in-memory duplex.
+//!
+//! ## Mode landscape (#25)
+//!
+//! Three independent axes select the code path a `ct-agent channel` process runs;
+//! confusing them has cost real debugging hours, so they are named here once:
+//!
+//! 1. **Direct-address vs. Plane** (`main.rs` dispatch): `CT_CHANNEL_BROKER` set means
+//!    plane-brokered ([`ChannelJoinCliConfig`] → [`run_channel_join_command`]); unset
+//!    means the direct-address [`ChannelRunConfig`] path (`CT_CHANNEL_ADDR` +
+//!    `CT_CHANNEL_PEER_NOISE_KEY`, no edge involved at all).
+//! 2. **Plain broker vs. Ladder** (within the plane mode): a configured
+//!    `CT_CHANNEL_FRONT_DOOR` cert selects the dial LADDER
+//!    ([`present_channel_join_via_ladder`]); without it, admission is a single direct
+//!    QUIC dial to the broker. The `dialing … rung …` log lines exist ONLY on the
+//!    ladder path — their absence on a plain-broker member is a different code path,
+//!    not a failure.
+//! 3. **Relay-only DCUtR variants** (`CT_CHANNEL_RELAY_GATE`, preferred over
+//!    `CT_CHANNEL_CIRCUIT_RELAY`; both via [`run_dcutr_join_loop`]): the gated
+//!    relay leg for NAT-hostile networks and the nat-lab rig.
 
 use std::io;
 use std::net::SocketAddr;
@@ -1085,6 +1104,11 @@ where
 /// finished handshake, not a transport failure, so it errors rather than falling through.
 /// This is what lets a fully `:443`-only member (relay port also blocked) relay at all —
 /// closing the exact gap the #103 sink reported. Errors only when every rung is blocked.
+///
+/// #25: this walks the same rung sequence as [`dial_ladder`] but cannot be composed over
+/// it — `local` is single-move (committed to exactly one rung's session), while
+/// `dial_ladder`'s per-rung closure must be re-callable for every rung. The hand-rolled
+/// `last: Option<BoxError>` accumulator here is that constraint, not an oversight.
 #[allow(clippy::too_many_arguments)]
 pub async fn join_via_relay_ladder<P>(
     rungs: &[ChannelDialRung],
@@ -1131,9 +1155,7 @@ where
                     // #495 slice 2a (v0.4.14): mark this leg's PHASE when the edge speaks
                     // the KA generation -- phase-compatible pairing removes the mixed-phase
                     // early-eof class. An old edge negotiated a legacy id: no marker sent.
-                    let phase_marker = (crate::channel::phase_marker_enabled()
-                        && crate::transport::ka_negotiated(&stream))
-                        .then_some(crate::channel::PHASE_MARKER_RELAY);
+                    let phase_marker = crate::channel::phase_marker_for(&stream, crate::channel::PHASE_MARKER_RELAY);
                     let (mut recv, mut send) = tokio::io::split(stream);
                     let local = local.take().expect("local is committed to exactly one rung");
                     match present_channel_relay_join_on_stream(&mut send, &mut recv, request, holder, phase_marker).await? {
@@ -2604,6 +2626,9 @@ async fn admit_one_peer(ctx: &ServeSessionCtx) -> Result<ChannelJoinOutcome, Box
             present_channel_join_via_ladder(&ctx.broker_ladder, &ctx.request, &ctx.holder, edge_cert.clone(), DIRECT_DIAL_TIMEOUT).await?
         }
         None => {
+            // #25: name the path -- rung log lines exist only on the ladder above, and
+            // their absence here has been misread as a failure during live debugging.
+            eprintln!("ct-agent channel: direct-QUIC broker admission (no front-door cert configured -- no ladder)");
             let broker_conn = crate::transport::build_channel_dialer()?
                 .connect(ctx.broker_addr, "localhost")?
                 .await?;
@@ -2669,9 +2694,6 @@ async fn serve_admitted_session(
 /// comfortably covers realistic demo concurrency (central's 5/10-at-once test) while bounding the
 /// fan-out of handler subprocesses (`claude -p`) a flood of Builds can trigger.
 const DEFAULT_SERVE_CONCURRENCY: usize = 8;
-
-
-
 
 /// Parse `CT_CHANNEL_SERVE_CONCURRENCY` into a concurrency cap: a positive integer overrides the
 /// default; anything absent/blank/zero/malformed falls back to [`DEFAULT_SERVE_CONCURRENCY`]. Pure.
@@ -2782,19 +2804,6 @@ where
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// #179: should `ct-agent channel` stay parked and re-admit successive peers? Only the **accept**
 /// side in **serve** mode (`CT_CHANNEL_SERVE` truthy) — the parking side of a role a pipeline dials
@@ -3112,9 +3121,7 @@ pub async fn present_channel_join_via_ladder(
                     .map_err(ChannelDialError::Failed)?;
                     // #495 slice 2a (v0.4.14): mark the RENDEZVOUS phase on KA-generation
                     // edges (see the relay ladder's twin comment for the why).
-                    let phase_marker = (crate::channel::phase_marker_enabled()
-                        && crate::transport::ka_negotiated(&stream))
-                        .then_some(crate::channel::PHASE_MARKER_RENDEZVOUS);
+                    let phase_marker = crate::channel::phase_marker_for(&stream, crate::channel::PHASE_MARKER_RENDEZVOUS);
                     let (recv, send) = tokio::io::split(stream);
                     // finish_send_after_sig = false (#21 follow-up): on this TCP/TLS leg the
                     // old post-signature shutdown was a close_notify+FIN that half-closed the

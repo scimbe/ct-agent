@@ -61,12 +61,12 @@ pub(crate) fn flapping_session_backoff(
 
 /// #231: does an admission error mean the presenting holder was **definitively** refused (not a
 /// channel member — see `channel-join NO [not-member]` on the edge) rather than a transient
-/// failure (`edge broker/relay refused the channel join` are the exact strings
-/// [`run_one_admission_session`]'s ladder produces for this case; `channel join admission exchange
-/// stalled (#140)` and any other error are treated as transient/retryable-fast)? Pure string match
-/// on `Display` — the call chain flattens every failure to `BoxError` by the time it reaches
-/// [`serve_loop_concurrent`], so this is the only signal available without a wider error-type
-/// refactor across the admission ladder.
+/// failure (`channel join admission exchange stalled (#140)` and any other unrecognized error
+/// are treated as transient/retryable-fast)? The `… refused the channel join` strings are
+/// produced at several refusal sites across the join paths (the broker/relay ladders, the
+/// relay-gate pre-auth, `reject_refused_outcome` for the serve loop) — all of them typed
+/// [`AdmissionRefused`] (#20/#24), so classification is a downcast first; the substring half
+/// below is the stringifying-boundary fallback.
 pub(crate) fn is_definitive_admission_refusal(e: &BoxError) -> bool {
     // #20 (consolidation): typed classification first -- every in-process creation site now
     // returns [`AdmissionRefused`], so a future rewording of the operator-facing text can no

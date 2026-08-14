@@ -619,13 +619,6 @@ pub async fn tcp_tls_connect_channel_boring(
     .await
 }
 
-/// TLS-over-TCP dialer to `addr` trusting `edge_cert`, advertising `alpn` in the
-/// ClientHello (issue #3 / P1.2c-4 core, generalized for #106). The ALPN selects
-/// which unified `:443` front-door route the connection is classified into:
-/// `ct-edge` → the data-plane relay, `ct-edge-channel` → the A2A channel broker.
-/// Harmless on the direct TLS listeners (they advertise no ALPN, so the offer is
-/// ignored). The thin [`tcp_tls_connect`] / [`tcp_tls_connect_channel`] wrappers
-/// pin the two protocol strings.
 /// Enable TCP keepalive on `stream` (#229): a parked TLS-TCP fallback
 /// registration is otherwise a plain, silent TCP connection with nothing to
 /// refresh it over however long it sits waiting for a Client -- over a real,
@@ -651,9 +644,6 @@ pub async fn tcp_tls_connect_channel_boring(
 /// traffic light (one 0-byte ACK-only segment every 10s while idle --
 /// negligible bandwidth/battery cost, still well above what would
 /// meaningfully drain a mobile client sitting parked). Windows is the one exception:
-/// its keepalive API has no TCP_KEEPCNT-equivalent retry-count knob, so it keeps
-/// its own OS-default retry count on top of the tightened time/interval below --
-/// see this function's own `cfg(not(windows))` for why.
 /// #500/#495-2a: whether this channel dial's TLS negotiation selected a KA-generation id
 /// (plain `ct-edge-channel-ka`, or `http/1.1` on the boring leg -- the edge's deliberate
 /// keepalive signal). A KA-generation edge understands the park keepalive AND the
@@ -666,6 +656,17 @@ pub fn ka_negotiated(tls: &tokio_rustls::client::TlsStream<TcpStream>) -> bool {
     )
 }
 
+/// Enable TCP keepalive on `stream` (#229): a parked TLS-TCP fallback
+/// registration is otherwise a plain, silent TCP connection with nothing to
+/// refresh it over however long it sits waiting for a Client -- over a real,
+/// geographically distant network, any NAT/firewall between the Agent and
+/// the Edge can drop an idle mapping without either endpoint noticing, so a
+/// Client later delivered onto that "parked" connection gets nothing back.
+/// Best-effort: unsupported platforms or an already-broken socket just
+/// don't get the option. 10s/10s + `with_retries(3)` mirrors the edge's
+/// accept-side keepalive (CADS-Tunnel #15, commit `5e3dd3c`) -- worst-case
+/// dead-connection detection 40s; Windows has no TCP_KEEPCNT knob and keeps
+/// its OS-default retry count (see the `cfg(not(windows))` below).
 fn apply_tcp_keepalive(stream: &TcpStream) {
     let sock = socket2::SockRef::from(stream);
     let ka = socket2::TcpKeepalive::new()
@@ -681,6 +682,13 @@ fn apply_tcp_keepalive(stream: &TcpStream) {
     let _ = sock.set_tcp_keepalive(&ka);
 }
 
+/// TLS-over-TCP dialer to `addr` trusting `edge_cert`, advertising `alpn` in the
+/// ClientHello (issue #3 / P1.2c-4 core, generalized for #106). The ALPN selects
+/// which unified `:443` front-door route the connection is classified into:
+/// `ct-edge` → the data-plane relay, `ct-edge-channel` → the A2A channel broker.
+/// Harmless on the direct TLS listeners (they advertise no ALPN, so the offer is
+/// ignored). The thin [`tcp_tls_connect`] / [`tcp_tls_connect_channel`] wrappers
+/// pin the two protocol strings.
 pub async fn tcp_tls_connect_with_alpn(
     addr: SocketAddr,
     edge_cert: CertificateDer<'static>,
@@ -1043,6 +1051,50 @@ mod tests {
         );
         assert_eq!(CHANNEL_FALLBACK_SNI, "edge-cdn.invalid", "locked with the edge front door");
         assert_eq!(CHANNEL_FALLBACK_ALPN, b"h2", "locked with the edge front door");
+    }
+
+    /// #25 (the v0.4.14 compatibility promise, previously untested): [`ka_negotiated`]
+    /// is the half of the phase-marker gate that keeps a legacy edge byte-identical —
+    /// complete a REAL TLS handshake with [`tcp_tls_connect_channel`] against a server
+    /// that only speaks the legacy channel id and assert the dial is classified non-KA
+    /// (so no `[0xFF, phase]` preamble may ever be sent there); a `-ka`-selecting
+    /// server is the positive control.
+    #[tokio::test]
+    async fn ka_negotiated_is_false_on_a_legacy_alpn_edge_and_true_on_a_ka_edge_25() {
+        install_crypto_provider();
+        async fn handshake_with_server_alpns(
+            alpns: Vec<Vec<u8>>,
+        ) -> tokio_rustls::client::TlsStream<TcpStream> {
+            let (cert, key) = self_signed().unwrap();
+            let mut sc = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key)
+                .unwrap();
+            sc.alpn_protocols = alpns;
+            let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(sc));
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                if let Ok(mut tls) = acceptor.accept(tcp).await {
+                    // Hold the accepted stream open until the client side is done.
+                    let _ = tokio::io::AsyncReadExt::read(&mut tls, &mut [0u8; 1]).await;
+                }
+            });
+            tcp_tls_connect_channel(addr, cert).await.expect("handshake completes")
+        }
+
+        let legacy = handshake_with_server_alpns(vec![b"ct-edge-channel".to_vec()]).await;
+        assert!(
+            !ka_negotiated(&legacy),
+            "a legacy-only edge must classify non-KA -- no marker, no NUL keepalive"
+        );
+        let ka = handshake_with_server_alpns(vec![
+            b"ct-edge-channel-ka".to_vec(),
+            b"ct-edge-channel".to_vec(),
+        ])
+        .await;
+        assert!(ka_negotiated(&ka), "a -ka-selecting edge classifies KA-generation");
     }
 
     #[tokio::test]

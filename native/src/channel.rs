@@ -69,16 +69,6 @@ pub enum ChannelJoinOutcome {
     ParkExpired,
 }
 
-/// Present `request` on `conn` and complete the edge's possession handshake, signing
-/// the edge-issued challenge with `holder` — whose public key must equal the grant's
-/// `holder`. Returns whether the edge admitted the join and, if paired, the peer's
-/// advertised endpoint.
-///
-/// Wire protocol (matches `ct_edge::channel_broker`): send a `u16`-BE length prefix +
-/// the encoded request, keeping the stream open; if the edge replies with a 32-byte
-/// challenge, answer with a 64-byte ed25519 signature over it; then read the
-/// `OK[ <endpoint>]` / `NO` ack. A refusal before the possession step finishes the
-/// stream with no challenge, which surfaces as [`ChannelJoinOutcome::Refused`].
 /// #140: how long the broker admission exchange (open the stream + send the join request + the
 /// possession challenge/response + read the ack) may take. It runs *after* `dial_peer_direct`
 /// connects but *before* #139 (post-admission stream setup) and #126 (Noise handshake) cover, so a
@@ -158,6 +148,30 @@ pub(crate) const PHASE_MARKER_RENDEZVOUS: u8 = 0x01;
 /// Phase byte: relay leg (ack then spliced session on the same stream).
 pub(crate) const PHASE_MARKER_RELAY: u8 = 0x02;
 
+/// #495 2a: the ONE gate for sending a `[0xFF, phase]` preamble on a `:443` TLS
+/// channel leg — the operator switch (v0.4.17, [`phase_marker_enabled`]) AND the
+/// edge having negotiated a KA-generation ALPN ([`crate::transport::ka_negotiated`]).
+/// A legacy edge selected a legacy id and must receive byte-identical legacy
+/// traffic, so this returns `None` there regardless of the switch. Shared by the
+/// rendezvous- and relay-leg dial sites so the two cannot drift (#25).
+pub(crate) fn phase_marker_for(
+    tls: &tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    phase: u8,
+) -> Option<u8> {
+    (phase_marker_enabled() && crate::transport::ka_negotiated(tls)).then_some(phase)
+}
+
+/// Present `request` on `conn` and complete the edge's possession handshake, signing
+/// the edge-issued challenge with `holder` — whose public key must equal the grant's
+/// `holder`. Returns whether the edge admitted the join and, if paired, the peer's
+/// advertised endpoint.
+///
+/// Wire protocol (matches `ct_edge::channel_broker`): send a `u16`-BE length prefix +
+/// the encoded request, keeping the stream open; if the edge replies with a 32-byte
+/// challenge, answer with a 64-byte ed25519 signature over it; then read the
+/// `OK[ <endpoint>]` / `NO` ack (see the module header's ack contract). A refusal
+/// before the possession step finishes the stream with no challenge, which surfaces
+/// as [`ChannelJoinOutcome::Refused`].
 pub async fn present_channel_join(
     conn: &Connection,
     request: &ChannelJoinRequest,
@@ -315,14 +329,6 @@ where
     }
 }
 
-/// Parse a broker/relay admission ack into a [`ChannelJoinOutcome`]. `ack` is the whole ack
-/// text (the relay leg strips its trailing `\n` delimiter first). An `OK`-prefixed ack is
-/// `OK[ <endpoint>[ <noise_hex> <holder_hex> <attest_hex>]][ r=<reflexive>]`: the broker
-/// appends the peer's attested Noise key, its holder, and the holder-signed attestation
-/// (#101) when the registry has them (all-or-nothing), plus (#121 Phase B1) the joining
-/// member's OWN edge-observed reflexive address as a tagged `r=<addr>` token. The `r=` token
-/// is pulled out first (it is self-addressed, not peer material, and order-independent); a
-/// missing field yields `None` — backward-additive. Anything else is a refusal.
 /// #21: does this error (anywhere in its source chain) carry the edge's named QUIC park-expiry
 /// close reason? The edge reaps an idle QUIC park by closing the connection with the
 /// ApplicationClose reason `park-expired: no partner within the park TTL` — quinn flattens that
@@ -340,6 +346,14 @@ pub(crate) fn error_names_park_expiry(e: &(dyn std::error::Error + 'static)) -> 
     false
 }
 
+/// Parse a broker/relay admission ack into a [`ChannelJoinOutcome`]. `ack` is the whole ack
+/// text (the relay leg strips its trailing `\n` delimiter first). An `OK`-prefixed ack is
+/// `OK[ <endpoint>[ <noise_hex> <holder_hex> <attest_hex>]][ r=<reflexive>]`: the broker
+/// appends the peer's attested Noise key, its holder, and the holder-signed attestation
+/// (#101) when the registry has them (all-or-nothing), plus (#121 Phase B1) the joining
+/// member's OWN edge-observed reflexive address as a tagged `r=<addr>` token. The `r=` token
+/// is pulled out first (it is self-addressed, not peer material, and order-independent); a
+/// missing field yields `None` — backward-additive. Anything else is a refusal.
 fn parse_channel_ack(ack: &str) -> ChannelJoinOutcome {
     // #21: the edge's park-expiry token (a reaped park announcing itself) — checked before
     // the OK/Refused fallthrough so it can never be mistaken for a refusal. Wire contract:
