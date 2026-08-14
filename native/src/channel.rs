@@ -193,7 +193,13 @@ where
             return Ok(ChannelJoinOutcome::ParkExpired);
         }
     }
-    let ack = String::from_utf8_lossy(&ack);
+    // #500 K2 (v0.4.13): a keepalive-negotiated park receives one NUL of application
+    // payload per 10s while parked; the real ack/EX follows them. Strip leading NULs
+    // UNCONDITIONALLY -- no legitimate ack starts with 0x00 ("OK"/"NO"/"EX" are all
+    // printable) and a non-KA edge never sends any, so no capability flag needs
+    // threading here.
+    let first_non_nul = ack.iter().position(|b| *b != 0).unwrap_or(ack.len());
+    let ack = String::from_utf8_lossy(&ack[first_non_nul..]);
     Ok(parse_channel_ack(&ack))
     };
     match tokio::time::timeout(exchange_timeout, exchange).await {
@@ -309,6 +315,11 @@ where
     loop {
         match recv.read_exact(&mut byte).await {
             Ok(_) if byte[0] == b'\n' => break,
+            // #500 K2 (v0.4.13): LEADING NULs are the edge's park keepalive (one per 10s
+            // while this leg waited for its partner) -- skip them before the ack starts.
+            // Unconditional and unambiguous: no ack byte is 0x00, and NULs only ever
+            // precede the ack, never follow its first byte.
+            Ok(_) if byte[0] == 0 && line.is_empty() => continue,
             Ok(_) => {
                 line.push(byte[0]);
                 if line.len() > 512 {
@@ -567,6 +578,78 @@ mod tests {
         match client.await.expect("client task").expect("EX is a clean ParkExpired, not an error") {
             ChannelJoinOutcome::ParkExpired => {}
             other => panic!("the bare EX token must classify as ParkExpired (#21), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn keepalive_nuls_are_stripped_before_the_ack_on_both_readers_500() {
+        // #500 K2 client half (v0.4.13): a KA-negotiated park receives NUL bytes while
+        // waiting; the classifiers must see the ack EXACTLY as if the NULs were never
+        // there -- on the broker leg (read-to-EOF) and the relay leg (line reader) alike.
+        use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+
+        // Broker leg: NULs then EX -> ParkExpired; NULs then OK -> Admitted.
+        for (tail, want_ex) in [(&b"EX"[..], true), (&b"OK 198.51.100.9:8008"[..], false)] {
+            let channel = [0x77u8; 32];
+            let holder = SigningKey::from_bytes(&[0x31u8; 32]);
+            let grant = signed_grant(channel, &holder, Direction::Accept);
+            let request = ChannelJoinRequest { grant, endpoint: "203.0.113.9:7009".to_string() };
+            let (client_end, edge_end) = tokio::io::duplex(4096);
+            let (cli_r, cli_w) = split(client_end);
+            let client = tokio::spawn(async move {
+                present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false).await
+            });
+            let (mut er, mut ew) = split(edge_end);
+            let mut len_buf = [0u8; 2];
+            er.read_exact(&mut len_buf).await.expect("len");
+            let mut body = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+            er.read_exact(&mut body).await.expect("request");
+            ew.write_all(&[0x42u8; 32]).await.expect("challenge");
+            let mut sig = [0u8; 64];
+            er.read_exact(&mut sig).await.expect("sig");
+            ew.write_all(&[0u8, 0u8, 0u8]).await.expect("keepalive NULs");
+            ew.write_all(tail).await.expect("ack tail");
+            let _ = ew.shutdown().await;
+            let outcome = client.await.expect("client").expect("clean outcome");
+            if want_ex {
+                assert!(matches!(outcome, ChannelJoinOutcome::ParkExpired), "NULs+EX -> ParkExpired, got {outcome:?}");
+            } else {
+                assert!(matches!(outcome, ChannelJoinOutcome::Admitted { .. }), "NULs+OK -> Admitted, got {outcome:?}");
+            }
+        }
+
+        // Relay leg (line reader): NULs before the OK line are skipped, the line parses.
+        let channel = [0x78u8; 32];
+        let holder = SigningKey::from_bytes(&[0x32u8; 32]);
+        let request = ChannelJoinRequest {
+            grant: signed_grant(channel, &holder, Direction::Initiate),
+            endpoint: "203.0.113.9:6052".to_string(),
+        };
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut cr, mut cw) = split(client);
+        let srv = tokio::spawn(async move {
+            let (mut sr, mut sw) = split(server);
+            let mut len = [0u8; 2];
+            sr.read_exact(&mut len).await.unwrap();
+            let mut req = vec![0u8; u16::from_be_bytes(len) as usize];
+            sr.read_exact(&mut req).await.unwrap();
+            sw.write_all(&[0u8; 32]).await.unwrap();
+            sw.flush().await.unwrap();
+            let mut sig = [0u8; 64];
+            sr.read_exact(&mut sig).await.unwrap();
+            sw.write_all(&[0u8, 0u8]).await.unwrap(); // parked-phase keepalives
+            sw.write_all(b"OK 198.51.100.7:7007\n").await.unwrap();
+            sw.flush().await.unwrap();
+        });
+        let outcome = present_channel_relay_join_on_stream(&mut cw, &mut cr, &request, &holder)
+            .await
+            .expect("relay join with leading NULs");
+        srv.await.unwrap();
+        match outcome {
+            ChannelJoinOutcome::Admitted { peer_endpoint, .. } => {
+                assert_eq!(peer_endpoint, "198.51.100.7:7007", "the ack parses exactly as without NULs");
+            }
+            other => panic!("NULs+OK line must be Admitted, got {other:?}"),
         }
     }
 

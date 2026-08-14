@@ -560,7 +560,19 @@ pub async fn tcp_tls_connect_channel(
     addr: SocketAddr,
     edge_cert: CertificateDer<'static>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
-    tcp_tls_connect_with_alpn(addr, edge_cert, b"ct-edge-channel").await
+    // #500 K2 (v0.4.13): offer the park-keepalive-capable id FIRST, the legacy id as
+    // fallback. A current edge's server-preference selects `-ka` (it will send one NUL of
+    // application payload per 10s while this member is parked -- stripped by the ack
+    // readers -- and treats a clean EOF as unambiguous member death, enabling instant
+    // corpse detection); an older edge only knows the bare id and behaves exactly as
+    // before. The whole capability handshake lives in this ALPN list.
+    tcp_tls_connect_with_alpns_sni(
+        addr,
+        edge_cert,
+        &[b"ct-edge-channel-ka", b"ct-edge-channel"],
+        DEFAULT_SNI,
+    )
+    .await
 }
 
 /// The SNI every non-fallback TLS-TCP dial presents. The client pins the edge's raw
@@ -593,7 +605,18 @@ pub async fn tcp_tls_connect_channel_boring(
     addr: SocketAddr,
     edge_cert: CertificateDer<'static>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
-    tcp_tls_connect_with_alpn_sni(addr, edge_cert, CHANNEL_FALLBACK_ALPN, CHANNEL_FALLBACK_SNI).await
+    // #500 K2 (v0.4.13): [h2, http/1.1] -- the single most ordinary ClientHello on the
+    // internet, so the DPI camouflage is fully preserved. A current edge deliberately
+    // SELECTS `http/1.1` as the keepalive signal (its server-preference lists it before
+    // h2); an older edge only knows h2 and behaves exactly as before. Unremarkable to any
+    // observer, unambiguous to both ends.
+    tcp_tls_connect_with_alpns_sni(
+        addr,
+        edge_cert,
+        &[CHANNEL_FALLBACK_ALPN, b"http/1.1"],
+        CHANNEL_FALLBACK_SNI,
+    )
+    .await
 }
 
 /// TLS-over-TCP dialer to `addr` trusting `edge_cert`, advertising `alpn` in the
@@ -668,13 +691,25 @@ pub async fn tcp_tls_connect_with_alpn_sni(
     alpn: &[u8],
     sni: &str,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
+    tcp_tls_connect_with_alpns_sni(addr, edge_cert, &[alpn], sni).await
+}
+
+/// [`tcp_tls_connect_with_alpn_sni`] offering an ordered LIST of ALPN ids (#500 K2): the
+/// server's preference over this list is the capability negotiation -- see the channel
+/// dialers above for the two concrete offer tables. Single-id callers use the thin wrapper.
+pub async fn tcp_tls_connect_with_alpns_sni(
+    addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    alpns: &[&[u8]],
+    sni: &str,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
     install_crypto_provider();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(edge_cert)?;
     let mut cfg = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    cfg.alpn_protocols = vec![alpn.to_vec()];
+    cfg.alpn_protocols = alpns.iter().map(|a| a.to_vec()).collect();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
     let tcp = TcpStream::connect(addr).await?;
     apply_tcp_keepalive(&tcp);
@@ -986,7 +1021,14 @@ mod tests {
             Some(CHANNEL_FALLBACK_SNI),
             "the fallback rung presents the reserved .invalid SNI, not {DEFAULT_SNI:?}"
         );
-        assert_eq!(alpn, vec![CHANNEL_FALLBACK_ALPN.to_vec()], "and offers only the boring ALPN");
+        // #500 K2 (v0.4.13): [h2, http/1.1] -- both ids ordinary web ALPNs, camouflage
+        // preserved; a current edge selects http/1.1 as the keepalive signal, an old edge
+        // (h2-only list) keeps behaving exactly as before.
+        assert_eq!(
+            alpn,
+            vec![CHANNEL_FALLBACK_ALPN.to_vec(), b"http/1.1".to_vec()],
+            "the boring offer is the ordinary [h2, http/1.1] pair"
+        );
         assert_eq!(CHANNEL_FALLBACK_SNI, "edge-cdn.invalid", "locked with the edge front door");
         assert_eq!(CHANNEL_FALLBACK_ALPN, b"h2", "locked with the edge front door");
     }
@@ -1007,7 +1049,14 @@ mod tests {
 
         let (sni, alpn) = server.await.unwrap();
         assert_eq!(sni.as_deref(), Some(DEFAULT_SNI), "unchanged SNI on the established route");
-        assert_eq!(alpn, vec![b"ct-edge-channel".to_vec()], "unchanged ALPN on the established route");
+        // #500 K2 (v0.4.13): the -ka id is offered FIRST, the legacy id stays as the
+        // fallback every old edge selects -- the route itself is unchanged (both ids
+        // classify to the channel broker).
+        assert_eq!(
+            alpn,
+            vec![b"ct-edge-channel-ka".to_vec(), b"ct-edge-channel".to_vec()],
+            "the channel offer is [ka, legacy] with the legacy id preserved"
+        );
     }
 
     #[tokio::test]
