@@ -196,28 +196,46 @@ where
         let _ = send.shutdown().await;
     }
 
-    // The ack can carry endpoint + noise(64) + holder(64) + attestation(128) hex plus the
-    // #121 `r=<reflexive>` token and separators — well over 256 bytes; cap at 512 so nothing
-    // is truncated (the `take` bound is the generic-stream equivalent of quinn `read_to_end`).
+    // #494: read the ack up to its `\n` delimiter OR EOF — never `read_to_end` alone.
+    // The old `take(512).read_to_end` completed only at EOF (or 512 bytes): correct on
+    // QUIC (the edge `finish()`es the rendezvous stream), but the `:443` front door acks
+    // `OK ...\n` and then keeps the SAME stream open for the relay splice — so two fresh
+    // members each sat on a fully-delivered ack waiting for an EOF only the OTHER side's
+    // stall-timeout death could produce. Every fresh `:443` pairing paid 45–100 s this
+    // way (the whole first-contact class of ct-agent#18/CADS-Tunnel#494). A newline
+    // completes the read immediately; EOF still completes it for the QUIC path (whose
+    // ack is delimiter-free by design) and for `NO`/`EX` teardowns; the 512-byte cap
+    // bounds a malformed peer. Leading NULs are the #500 park keepalive — skipped
+    // exactly as before (no ack byte is 0x00).
     let mut ack = Vec::new();
-    if let Err(e) = recv.take(512).read_to_end(&mut ack).await {
-        // #21 QUIC half: a reaped park does not write an ack at all — the edge closes the
-        // whole connection with the NAMED ApplicationClose reason "park-expired: ...", which
-        // quinn surfaces through this read as an error. Recognizing the reason string here is
-        // WIRE parsing (the reason IS the wire token, same contract as the stream leg's bare
-        // `EX`), not a fragile in-process substring match. Any other read error keeps today's
-        // lenient behavior: classify from whatever arrived (an empty ack stays `Refused`).
-        if error_names_park_expiry(&e) {
-            return Ok(ChannelJoinOutcome::ParkExpired);
+    let mut byte = [0u8; 1];
+    loop {
+        match recv.read(&mut byte).await {
+            Ok(0) => break, // EOF: QUIC finish, or a NO/EX teardown
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) if byte[0] == 0 && ack.is_empty() => continue, // #500 leading park NULs
+            Ok(_) => {
+                ack.push(byte[0]);
+                if ack.len() >= 512 {
+                    break; // cap: classify what arrived, same lenient posture as before
+                }
+            }
+            Err(e) => {
+                // #21 QUIC half: a reaped park does not write an ack at all — the edge
+                // closes the whole connection with the NAMED ApplicationClose reason
+                // "park-expired: ...", which quinn surfaces through this read as an
+                // error. Recognizing the reason string here is WIRE parsing (the reason
+                // IS the wire token, same contract as the stream leg's bare `EX`), not a
+                // fragile in-process substring match. Any other read error keeps the
+                // lenient behavior: classify from whatever arrived.
+                if error_names_park_expiry(&e) {
+                    return Ok(ChannelJoinOutcome::ParkExpired);
+                }
+                break;
+            }
         }
     }
-    // #500 K2 (v0.4.13): a keepalive-negotiated park receives one NUL of application
-    // payload per 10s while parked; the real ack/EX follows them. Strip leading NULs
-    // UNCONDITIONALLY -- no legitimate ack starts with 0x00 ("OK"/"NO"/"EX" are all
-    // printable) and a non-KA edge never sends any, so no capability flag needs
-    // threading here.
-    let first_non_nul = ack.iter().position(|b| *b != 0).unwrap_or(ack.len());
-    let ack = String::from_utf8_lossy(&ack[first_non_nul..]);
+    let ack = String::from_utf8_lossy(&ack);
     Ok(parse_channel_ack(&ack))
     };
     match tokio::time::timeout(exchange_timeout, exchange).await {
@@ -496,6 +514,67 @@ mod tests {
             ),
             other => panic!("a valid join over the duplex must be Admitted, got {other:?}"),
         }
+    }
+
+    /// #494 (CADS-Tunnel): the `:443` front door acks `OK ...\n` and then keeps the SAME
+    /// stream open for the relay splice — no EOF ever arrives. The old
+    /// `take(512).read_to_end` ack read therefore sat on a fully-delivered ack until the
+    /// PEER's stall-timeout death produced an EOF: every fresh `:443` pairing paid
+    /// 45–100s (the entire first-contact class). The newline must complete the read
+    /// immediately, with leading #500 keepalive NULs still stripped.
+    #[tokio::test]
+    async fn a_newline_terminated_ack_on_a_held_open_stream_completes_immediately_494() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+
+        let channel = [0x3Eu8; 32];
+        let holder = SigningKey::from_bytes(&[0x23u8; 32]);
+        let holder_pub = holder.verifying_key().to_bytes();
+        let grant = signed_grant(channel, &holder, Direction::Initiate);
+        let request = ChannelJoinRequest { grant, endpoint: "203.0.113.8:8008".to_string() };
+
+        let (client_end, edge_end) = tokio::io::duplex(4096);
+        let (cli_r, cli_w) = split(client_end);
+        let client = tokio::spawn(async move {
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
+        });
+
+        let (mut er, mut ew) = split(edge_end);
+        let mut len_buf = [0u8; 2];
+        er.read_exact(&mut len_buf).await.expect("len");
+        let n = u16::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; n];
+        er.read_exact(&mut body).await.expect("request");
+        let challenge = [0xAu8; 32];
+        ew.write_all(&challenge).await.expect("challenge");
+        let mut sig = [0u8; 64];
+        er.read_exact(&mut sig).await.expect("sig");
+        VerifyingKey::from_bytes(&holder_pub)
+            .unwrap()
+            .verify(&challenge, &Signature::from_bytes(&sig))
+            .expect("possession");
+        // Two leading park-keepalive NULs (#500), then the newline-terminated relay-style
+        // ack — and the stream is deliberately HELD OPEN (no shutdown): the #494 shape.
+        ew.write_all(b"\0\0OK 198.51.100.10:9009\n").await.expect("ack");
+
+        let start = std::time::Instant::now();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), client)
+            .await
+            .expect("the ack must complete WITHOUT an EOF -- hanging here is the #494 deadlock")
+            .expect("client task")
+            .expect("join");
+        match outcome {
+            ChannelJoinOutcome::Admitted { peer_endpoint, .. } => {
+                assert_eq!(peer_endpoint, "198.51.100.10:9009");
+            }
+            other => panic!("expected Admitted, got {other:?}"),
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "the newline completes the ack immediately, not via a timeout"
+        );
+        drop(ew);
+        drop(er);
     }
 
     #[tokio::test]
