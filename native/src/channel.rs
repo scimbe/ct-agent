@@ -42,6 +42,14 @@ pub enum ChannelJoinOutcome {
     /// Refused: a bad/expired grant, a non-member holder, an unsafe advertised
     /// endpoint, or a failed possession proof.
     Refused,
+    /// #21: the edge reaped this member's park (no partner arrived within the park TTL)
+    /// and SAID SO — the bare `EX` token on a stream leg, or a `park-expired` close reason
+    /// on QUIC. Explicitly NOT a refusal and NOT a transport failure: the correct reaction
+    /// is to re-park immediately (same transport), not to advance the dial ladder or back
+    /// off. Before this variant existed the client read the silent close as a rung failure
+    /// — measured live as 271 phantom "rung failures" and a 0–40s first-contact latency
+    /// roulette (ct-agent#21).
+    ParkExpired,
 }
 
 /// Present `request` on `conn` and complete the edge's possession handshake, signing
@@ -158,7 +166,17 @@ where
     // #121 `r=<reflexive>` token and separators — well over 256 bytes; cap at 512 so nothing
     // is truncated (the `take` bound is the generic-stream equivalent of quinn `read_to_end`).
     let mut ack = Vec::new();
-    let _ = recv.take(512).read_to_end(&mut ack).await;
+    if let Err(e) = recv.take(512).read_to_end(&mut ack).await {
+        // #21 QUIC half: a reaped park does not write an ack at all — the edge closes the
+        // whole connection with the NAMED ApplicationClose reason "park-expired: ...", which
+        // quinn surfaces through this read as an error. Recognizing the reason string here is
+        // WIRE parsing (the reason IS the wire token, same contract as the stream leg's bare
+        // `EX`), not a fragile in-process substring match. Any other read error keeps today's
+        // lenient behavior: classify from whatever arrived (an empty ack stays `Refused`).
+        if error_names_park_expiry(&e) {
+            return Ok(ChannelJoinOutcome::ParkExpired);
+        }
+    }
     let ack = String::from_utf8_lossy(&ack);
     Ok(parse_channel_ack(&ack))
     };
@@ -176,7 +194,30 @@ where
 /// member's OWN edge-observed reflexive address as a tagged `r=<addr>` token. The `r=` token
 /// is pulled out first (it is self-addressed, not peer material, and order-independent); a
 /// missing field yields `None` — backward-additive. Anything else is a refusal.
+/// #21: does this error (anywhere in its source chain) carry the edge's named QUIC park-expiry
+/// close reason? The edge reaps an idle QUIC park by closing the connection with the
+/// ApplicationClose reason `park-expired: no partner within the park TTL` — quinn flattens that
+/// reason into the error `Display` at some nesting depth depending on which read/open call
+/// observed the close, so every level of the chain is checked. This is the QUIC analog of the
+/// stream leg's bare `EX` token: parsing a wire-carried string, not matching in-process text.
+pub(crate) fn error_names_park_expiry(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: Option<&dyn std::error::Error> = Some(e);
+    while let Some(err) = cur {
+        if err.to_string().contains("park-expired") {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
+
 fn parse_channel_ack(ack: &str) -> ChannelJoinOutcome {
+    // #21: the edge's park-expiry token (a reaped park announcing itself) — checked before
+    // the OK/Refused fallthrough so it can never be mistaken for a refusal. Wire contract:
+    // the bare token, nothing else (CADS-Tunnel's PARK_EXPIRED_TOKEN).
+    if ack.trim() == "EX" {
+        return ChannelJoinOutcome::ParkExpired;
+    }
     match ack.strip_prefix("OK") {
         Some(rest) => {
             let mut observed_reflexive = None;
@@ -403,7 +444,7 @@ mod tests {
                 peer_endpoint, "198.51.100.9:8008",
                 "the client learns the peer endpoint over a non-QUIC stream",
             ),
-            ChannelJoinOutcome::Refused => panic!("a valid join over the duplex must be Admitted, not Refused"),
+            other => panic!("a valid join over the duplex must be Admitted, got {other:?}"),
         }
     }
 
@@ -474,8 +515,57 @@ mod tests {
 
         match client.await.expect("client task").expect("an explicit NO is a clean Refused, not an error") {
             ChannelJoinOutcome::Refused => {}
-            ChannelJoinOutcome::Admitted { .. } => panic!("an explicit NO must be Refused"),
+            other => panic!("an explicit NO must be Refused, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn present_channel_join_classifies_the_ex_token_as_park_expired_21() {
+        // #21: after a fully successful admission (challenge answered), a reaped park's stream
+        // carries exactly the bare `EX` token before the close. That must classify as the
+        // DISTINCT `ParkExpired` — never as `Refused` (nothing was refused: there was simply no
+        // partner within the park TTL) and never as a transport error (the leg worked end to end).
+        use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+        let channel = [0x21u8; 32];
+        let holder = SigningKey::from_bytes(&[0x24u8; 32]);
+        let grant = signed_grant(channel, &holder, Direction::Accept);
+        let request = ChannelJoinRequest { grant, endpoint: "203.0.113.8:7008".to_string() };
+
+        let (client_end, edge_end) = tokio::io::duplex(4096);
+        let (cli_r, cli_w) = split(client_end);
+        let client = tokio::spawn(async move {
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT).await
+        });
+        let (mut er, mut ew) = split(edge_end);
+        let mut len_buf = [0u8; 2];
+        er.read_exact(&mut len_buf).await.expect("len");
+        let n = u16::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; n];
+        er.read_exact(&mut body).await.expect("request");
+        ew.write_all(&[0x42u8; 32]).await.expect("challenge");
+        let mut sig = [0u8; 64];
+        er.read_exact(&mut sig).await.expect("possession signature");
+        ew.write_all(b"EX").await.expect("park-expiry token");
+        let _ = ew.shutdown().await;
+
+        match client.await.expect("client task").expect("EX is a clean ParkExpired, not an error") {
+            ChannelJoinOutcome::ParkExpired => {}
+            other => panic!("the bare EX token must classify as ParkExpired (#21), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_names_park_expiry_walks_the_source_chain_21() {
+        // #21 QUIC half: quinn buries the ApplicationClose reason at a nesting depth that
+        // depends on which call observed the close — the classifier must find the wire token
+        // at any level of the source chain, and must not fire on unrelated errors.
+        let inner = std::io::Error::other("connection lost: closed by peer: 0: park-expired: no partner within the park TTL");
+        let outer = std::io::Error::other(inner);
+        assert!(error_names_park_expiry(&outer), "the nested close reason is recognized");
+        let direct = std::io::Error::other("park-expired: no partner within the park TTL");
+        assert!(error_names_park_expiry(&direct), "the top-level reason is recognized");
+        let unrelated = std::io::Error::other("connection reset by peer");
+        assert!(!error_names_park_expiry(&unrelated), "an unrelated error never classifies as park expiry");
     }
 
     #[tokio::test]
@@ -779,7 +869,7 @@ mod tests {
                 );
                 assert!(observed.ip().is_loopback(), "the test's source is loopback");
             }
-            ChannelJoinOutcome::Refused => panic!("a valid join must be Admitted, not Refused"),
+            other => panic!("a valid join must be Admitted, got {other:?}"),
         }
     }
 
@@ -842,7 +932,7 @@ mod tests {
                 );
                 assert!(observed.ip().is_loopback(), "the test's TCP source is loopback");
             }
-            ChannelJoinOutcome::Refused => panic!("a valid :443 join must be Admitted, not Refused"),
+            other => panic!("a valid :443 join must be Admitted, got {other:?}"),
         }
     }
 
@@ -911,5 +1001,23 @@ mod tests {
             .expect("an explicit NO is a clean outcome, not an error");
         srv2.await.unwrap();
         assert!(matches!(outcome, ChannelJoinOutcome::Refused), "an explicit post-pairing NO stays Refused");
+
+        // (3) #21: the bare `EX` park-expiry token on the relay leg classifies as ParkExpired —
+        // neither the #148 dropped-leg error nor a Refused.
+        let (client3, server3) = duplex(4096);
+        let (mut cr3, mut cw3) = split(client3);
+        let srv3 = tokio::spawn(async move {
+            let (_sr, mut sw) = edge_until_ack(server3).await;
+            sw.write_all(b"EX").await.unwrap();
+            sw.flush().await.unwrap();
+        });
+        let outcome = present_channel_relay_join_on_stream(&mut cw3, &mut cr3, &request, &holder)
+            .await
+            .expect("the EX token is a clean outcome, not an error");
+        srv3.await.unwrap();
+        assert!(
+            matches!(outcome, ChannelJoinOutcome::ParkExpired),
+            "the relay leg's bare EX classifies as ParkExpired (#21), got {outcome:?}"
+        );
     }
 }

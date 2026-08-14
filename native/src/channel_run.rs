@@ -428,6 +428,11 @@ where
             (peer_endpoint, noise, observed_reflexive)
         }
         ChannelJoinOutcome::Refused => return Err(AdmissionRefused::boxed("edge broker refused the channel join")),
+        // #21: unreachable in practice (admit_one_peer converts a ParkExpired before spawning a
+        // session), kept as the typed error so a future caller can never misread it as refused.
+        ChannelJoinOutcome::ParkExpired => {
+            return Err(ParkExpired::boxed("channel park expired with no partner within the edge park window (#21) -- re-parking"))
+        }
     };
     // #104: built once, moved into whichever single relay-fallback call site below
     // actually fires (they're mutually exclusive). `None` whenever direct_upgrade is off
@@ -522,6 +527,10 @@ where
     match present_channel_join(relay_conn, request, holder).await? {
         ChannelJoinOutcome::Admitted { .. } => {}
         ChannelJoinOutcome::Refused => return Err(AdmissionRefused::boxed("edge relay refused the channel join")),
+        // #21: the relay park was reaped before a partner arrived -- retryable, not a refusal.
+        ChannelJoinOutcome::ParkExpired => {
+            return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
+        }
     }
     match upgrade {
         Some((listener, own_direct_endpoint)) => run_channel_session_upgradable(
@@ -569,6 +578,10 @@ where
             return Err("DCUtR relay join needs the peer's relayed Noise key (register the member's key, #101)".into())
         }
         ChannelJoinOutcome::Refused => return Err(AdmissionRefused::boxed("edge relay refused the channel join")),
+        // #21: the relay park was reaped before a partner arrived -- retryable, not a refusal.
+        ChannelJoinOutcome::ParkExpired => {
+            return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
+        }
     };
     // The DCUtR session runs the Noise_IK over the relay bi-stream as its base leg, punching to
     // direct in the background. Initiator opens the bi-stream; acceptor accepts the edge-opened one.
@@ -732,6 +745,10 @@ where
             return Err("DCUtR relay-gate join needs the peer's relayed Noise key (register the member's key, #101)".into())
         }
         ChannelJoinOutcome::Refused => return Err(AdmissionRefused::boxed("edge relay refused the channel join")),
+        // #21: the relay park was reaped before a partner arrived -- retryable, not a refusal.
+        ChannelJoinOutcome::ParkExpired => {
+            return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
+        }
     };
     let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::other(e.to_string());
     let (relay_send, relay_recv) = match role {
@@ -1112,6 +1129,12 @@ where
                         ChannelJoinOutcome::Admitted { .. } => {}
                         ChannelJoinOutcome::Refused => {
                             return Err(AdmissionRefused::boxed("edge relay refused the channel join over the :443 front door"));
+                        }
+                        // #21: the relay park was reaped before a partner arrived -- return the
+                        // typed error immediately (no further rungs: the rung WORKED, there was
+                        // just nobody to pair with yet; re-dialing this same leg is the recovery).
+                        ChannelJoinOutcome::ParkExpired => {
+                            return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"));
                         }
                     }
                     return run_channel_session_on_stream(
@@ -3262,6 +3285,12 @@ async fn admit_one_peer(ctx: &ServeSessionCtx) -> Result<ChannelJoinOutcome, Box
 fn reject_refused_outcome(outcome: ChannelJoinOutcome) -> Result<ChannelJoinOutcome, BoxError> {
     match outcome {
         ChannelJoinOutcome::Refused => Err(AdmissionRefused::boxed("edge broker refused the channel join")),
+        // #21: a park expiry becomes the DISTINCT typed error so [`serve_loop_concurrent`]
+        // routes it through its immediate-re-park path (no refusal backoff, no ladder advance)
+        // instead of spawning it as a session or backing off as if refused.
+        ChannelJoinOutcome::ParkExpired => Err(ParkExpired::boxed(
+            "channel park expired with no partner within the edge park window (#21) -- re-parking",
+        )),
         admitted => Ok(admitted),
     }
 }
@@ -3421,6 +3450,18 @@ where
             }
             Err(e) => {
                 drop(permit);
+                // #21: a park expiry re-parks IMMEDIATELY on the same transport -- it is neither
+                // a refusal (never counts toward the #231 backoff) nor a failure worth the
+                // generic "admission error" log line (the named line below is the field-visible
+                // contract the #21 measurement greps for). The single fast `retry_backoff` sleep
+                // (200ms in production) is only a tight-loop guard against a misbehaving edge
+                // that reaps instantly; a healthy edge parks for the full TTL between expiries.
+                if is_park_expired(&e) {
+                    consecutive_refusals = 0;
+                    eprintln!("ct-agent channel: {e}");
+                    tokio::time::sleep(retry_backoff).await;
+                    continue;
+                }
                 let refused = is_definitive_admission_refusal(&e);
                 consecutive_refusals = if refused { consecutive_refusals.saturating_add(1) } else { 0 };
                 let backoff = admission_retry_backoff(retry_backoff, refused, consecutive_refusals);
@@ -3496,6 +3537,43 @@ impl AdmissionRefused {
     fn boxed(text: &'static str) -> BoxError {
         Box::new(AdmissionRefused(text))
     }
+}
+
+/// #21: typed marker for a park expiry -- the edge reaped this member's park because no partner
+/// arrived within the park TTL, and SAID SO on the wire (the bare `EX` token / the named QUIC
+/// close reason). Deliberately a DISTINCT type from [`AdmissionRefused`]: a park expiry is
+/// neither a refusal (nothing about the grant or holder is wrong -- there was simply nobody to
+/// pair with yet) nor a transport failure (the rung worked end to end). The correct reaction is
+/// to re-park immediately on the same transport; before this type existed the silent reap was
+/// misread as a rung failure, advancing the dial ladder and burning a fresh 0-40s window per
+/// expiry (the tester's measured 271 phantom "rung failures").
+#[derive(Debug)]
+pub(crate) struct ParkExpired(pub(crate) &'static str);
+
+impl std::fmt::Display for ParkExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ParkExpired {}
+
+impl ParkExpired {
+    fn boxed(text: &'static str) -> BoxError {
+        Box::new(ParkExpired(text))
+    }
+}
+
+/// #21: is this admission error a park expiry (see [`ParkExpired`])? Typed downcast first; the
+/// string half covers a park-expiry close reason that reached us flattened inside some other
+/// error (e.g. an `open_bi`/write failure racing the edge's ApplicationClose) -- like
+/// [`crate::channel::error_names_park_expiry`], that is wire-token parsing, not an in-process
+/// substring contract.
+fn is_park_expired(e: &BoxError) -> bool {
+    if e.downcast_ref::<ParkExpired>().is_some() {
+        return true;
+    }
+    crate::channel::error_names_park_expiry(e.as_ref())
 }
 
 /// #231: how long to wait before the next admission attempt. A definitive refusal (see
@@ -3864,7 +3942,16 @@ pub async fn present_channel_join_via_ladder(
             // admitted -- so a `Refused` must fall through like any other per-rung failure, not
             // end the walk. If every rung is genuinely refused (e.g. a real not-member grant),
             // the ladder still reports that refusal -- just after actually trying every rung.
-            let result = result.and_then(|outcome| reject_refused_outcome(outcome).map_err(ChannelDialError::Failed));
+            let result = result.and_then(|outcome| match outcome {
+                // #21: a park expiry is NOT a rung failure -- this rung worked end to end (the
+                // join was admitted into a park; the edge answered), there was simply no partner
+                // within the park TTL. It must STOP the walk as a successful outcome (the caller
+                // converts it to the typed [`ParkExpired`] and re-parks on the same transport),
+                // never fall through like `Refused` does -- the fall-through is exactly the
+                // ladder-advance misclassification #21 was filed about.
+                ChannelJoinOutcome::ParkExpired => Ok(ChannelJoinOutcome::ParkExpired),
+                other => reject_refused_outcome(other).map_err(ChannelDialError::Failed),
+            });
             match &result {
                 Ok(_) => eprintln!("ct-agent channel: {rung_label} rung {endpoint} succeeded"),
                 Err(e) => eprintln!("ct-agent channel: {rung_label} rung {endpoint} failed: {e}"),
@@ -5504,7 +5591,7 @@ mod tests {
                 peer_endpoint, "198.51.100.9:8008",
                 "the agent learns the peer endpoint over the :443 TLS-TCP fallback rung"
             ),
-            ChannelJoinOutcome::Refused => panic!("a valid join over :443 must be Admitted, not Refused"),
+            other => panic!("a valid join over :443 must be Admitted, got {other:?}"),
         }
         edge.await.expect("edge task");
     }
@@ -5605,10 +5692,115 @@ mod tests {
                 peer_endpoint, "198.51.100.10:8009",
                 "the second rung's admission wins after the first rung's refusal"
             ),
-            ChannelJoinOutcome::Refused => {
-                panic!("the ladder must fall through a Refused rung, not terminate on it")
+            other => {
+                panic!("the ladder must fall through a Refused rung, not terminate on it -- got {other:?}")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn present_channel_join_via_ladder_stops_on_a_park_expiry_instead_of_advancing_21() {
+        // #21: a park expiry (the edge's bare `EX` after a fully successful admission) is NOT a
+        // rung failure -- the rung worked, there was simply no partner within the park TTL. The
+        // ladder must STOP and surface `ParkExpired` so the caller re-parks on the same
+        // transport; falling through to the next rung (like `Refused` deliberately does) is
+        // exactly the ladder-advance misclassification measured live as 271 phantom "rung
+        // failures" and a 0-40s first-contact roulette. The edge below accepts exactly ONE
+        // connection then drops the listener: if the walk wrongly advanced, the second rung's
+        // dial would fail and the outcome would be that error instead of a clean ParkExpired.
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ct_edge::channel_broker::admit_channel_join_on_duplex;
+        use ct_edge::transport::build_tcp_tls_listener_at;
+        use ed25519_dalek::Signer;
+        use tokio::io::AsyncWriteExt;
+
+        let op = SigningKey::from_bytes(&[8u8; 32]);
+        let op_pub = op.verifying_key().to_bytes();
+        let channel = [0x21u8; 32];
+        let holder = SigningKey::from_bytes(&[0x13u8; 32]);
+        let g = ChannelGrant {
+            channel: ChannelId(channel),
+            holder: holder.verifying_key().to_bytes(),
+            direction: Direction::Accept,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        let grant = SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() };
+        let request = ChannelJoinRequest { grant, endpoint: "203.0.113.8:7009".to_string() };
+
+        let (listener, acceptor, edge_cert) =
+            build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap()).await.expect("tls listener");
+        let fd_addr = listener.local_addr().expect("front-door addr");
+        let edge = tokio::spawn(async move {
+            let (tcp, peer) = listener.accept().await.expect("accept tcp");
+            let tls = acceptor.accept(tcp).await.expect("tls accept");
+            let (mut stream, _req, _op, _noise, _attest, _observed) = admit_channel_join_on_duplex(
+                tls,
+                peer,
+                500u64,
+                std::time::Duration::from_secs(5),
+                &move |c: ChannelId, _h: [u8; 32]| {
+                    let ok = c.0 == channel;
+                    async move { ok.then_some((op_pub, None, None)) }
+                },
+            )
+            .await
+            .expect("admit over the TLS-TCP duplex");
+            // The reaper's park-expiry notification: the bare token, then the close.
+            stream.write_all(b"EX").await.expect("park-expiry token");
+            stream.shutdown().await.expect("shutdown");
+            drop(listener); // any second dial (a wrong ladder advance) now fails loudly
+        });
+
+        let rungs = vec![
+            ChannelDialRung { endpoint: fd_addr, kind: ChannelDialKind::FrontDoor },
+            ChannelDialRung { endpoint: fd_addr, kind: ChannelDialKind::FrontDoor },
+        ];
+        let outcome = present_channel_join_via_ladder(
+            &rungs,
+            &request,
+            &holder,
+            edge_cert,
+            std::time::Duration::from_millis(400),
+        )
+        .await;
+
+        edge.await.expect("edge task");
+        match outcome.expect("a park expiry is a clean outcome, not a walk failure") {
+            ChannelJoinOutcome::ParkExpired => {}
+            other => panic!("the ladder must stop on ParkExpired without advancing (#21), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn park_expired_is_neither_a_refusal_nor_a_generic_error_21() {
+        // #21: the serve loop's routing contract. `reject_refused_outcome` turns the ParkExpired
+        // outcome into the TYPED error; `is_park_expired` recognizes it (and the QUIC close
+        // reason that arrives flattened inside another error), while the #231 refusal backoff
+        // must never see it as refused -- counting park expiries as refusals would back an
+        // idle acceptor off exponentially for the crime of having no partner yet.
+        let err = reject_refused_outcome(ChannelJoinOutcome::ParkExpired)
+            .expect_err("ParkExpired must become the typed error, not pass as admitted");
+        assert!(is_park_expired(&err), "the typed ParkExpired is recognized");
+        assert!(
+            !is_definitive_admission_refusal(&err),
+            "a park expiry must NEVER count toward the #231 refusal backoff"
+        );
+        assert!(
+            err.to_string().contains("park expired") && err.to_string().contains("#21"),
+            "the field-visible message names the park expiry and the issue: {err}"
+        );
+        // The QUIC half: a close reason that crossed a stringifying boundary still classifies.
+        let flattened: BoxError =
+            "connection lost: closed by peer: 0: park-expired: no partner within the park TTL".into();
+        assert!(is_park_expired(&flattened), "the wire close reason classifies at any nesting");
+        // And plain transport errors never do.
+        let transport: BoxError = "connection reset by peer".into();
+        assert!(!is_park_expired(&transport));
+        // Refusals stay refusals: the two classifiers are disjoint.
+        let refused = reject_refused_outcome(ChannelJoinOutcome::Refused).expect_err("refused");
+        assert!(is_definitive_admission_refusal(&refused) && !is_park_expired(&refused));
     }
 
     #[tokio::test(start_paused = true)]
@@ -7537,7 +7729,7 @@ mod tests {
                     );
                     n
                 }
-                ChannelJoinOutcome::Refused => panic!("A's :443 join must be Admitted"),
+                other => panic!("A's :443 join must be Admitted, got {other:?}"),
             };
             run_channel_session_on_stream(send, recv, ChannelRole::Initiate, &na, &peer_noise, a_local).await
         });
@@ -7562,7 +7754,7 @@ mod tests {
                     );
                     n
                 }
-                ChannelJoinOutcome::Refused => panic!("B's :443 join must be Admitted"),
+                other => panic!("B's :443 join must be Admitted, got {other:?}"),
             };
             run_channel_session_on_stream(send, recv, ChannelRole::Accept, &nb, &peer_noise, b_local).await
         });
