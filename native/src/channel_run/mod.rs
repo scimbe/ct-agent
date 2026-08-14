@@ -648,7 +648,12 @@ pub async fn dial_relay_gate_over_443(
         .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate read ack failed after {:?}: {e}", t2.elapsed()); } e })?;
     if &ack != b"OK" {
         if dbg { eprintln!("ct-agent channel: debug relay-gate pre-auth refused, ack={ack:?}"); }
-        return Err("relay-gate: pre-auth refused (grant not authorized -- see the edge's own log)".into());
+        // #24: typed -- this is the relay-gate's wire `NO`, a DEFINITIVE refusal the
+        // retry policy must back off on (it was a bare string before, invisible to
+        // `is_definitive_admission_refusal`, so the serve loop hot-looped on it).
+        return Err(AdmissionRefused::boxed(
+            "relay-gate: pre-auth refused (grant not authorized -- see the edge's own log)",
+        ));
     }
     if dbg { eprintln!("ct-agent channel: debug relay-gate pre-auth ok (ack=OK) in {:?} total", t0.elapsed()); }
     let mut len_buf = [0u8; 2];
@@ -2271,24 +2276,108 @@ async fn dial_relay_preferring_direct(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DcutrLoopAction {
     /// This peer's session is over (successfully or not) and this is a persistent serve
-    /// member: sleep, reset the one-shot retry counter to 0, and admit the next peer.
-    RetryReset,
-    /// An error, and a one-shot caller's own bounded retry budget still has room: sleep,
-    /// bump the counter to `next_attempt`, and try again.
-    RetryBounded { next_attempt: u32 },
+    /// member: sleep `delay`, reset the one-shot retry counter to 0, carry
+    /// `consecutive_refusals` forward, and admit the next peer.
+    RetryReset { delay: std::time::Duration, consecutive_refusals: u32 },
+    /// An error, and a one-shot caller's own bounded retry budget still has room: sleep
+    /// `delay`, bump the counter to `next_attempt`, and try again.
+    RetryBounded { next_attempt: u32, delay: std::time::Duration },
     /// Stop the loop; return the original result to the caller (a one-shot caller out of
-    /// retries, or a non-`serve_loop` result of either kind).
+    /// retries or definitively refused, or a non-`serve_loop` result of either kind).
     Stop,
 }
 
-fn dcutr_loop_action(ok: bool, serve_loop: bool, attempt: u32, max_one_shot_retries: u32) -> DcutrLoopAction {
+/// The fast inter-session cadence of the DCUtR loops (#248) — the delay after a
+/// SUCCESSFUL session or a transient error; refusals and park expiries get the
+/// policy delays from [`errors`] instead (#24).
+const DCUTR_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// #248: a one-shot Initiate (or non-serve Accept) on the relay-gate/circuit-relay
+/// DCUtR path shouldn't fail on the very first #140 stall either -- live-reproduced
+/// on the a2a-demo's plain "bob" scenario: the persistent --serve side eventually
+/// gets past a stall by retrying forever, while the one-shot side had zero tolerance
+/// and failed the whole call on one hiccup. Bounded (unlike `serve_loop`'s retry)
+/// because a one-shot CLI/demo call must still terminate in reasonable time.
+const ONE_SHOT_DCUTR_ADMISSION_RETRIES: u32 = 2;
+
+/// #24: the DCUtR loops used to route on `result.is_ok()` alone, which threw the
+/// error CLASS away — a serve member with a definitively refused grant hot-looped
+/// at ~5 attempts/s against the edge forever, the exact flood #231 was filed
+/// about. This now applies the same policy [`errors`] documents and
+/// `serve_loop_concurrent` already follows: definitive refusals back off
+/// exponentially (capped, [`admission_retry_backoff`]), park expiries re-park
+/// immediately, transients and completed sessions keep the fast cadence. A
+/// one-shot caller stops right away on a definitive refusal — its bounded
+/// retries cannot succeed without operator action. Pure.
+fn dcutr_loop_action<T>(
+    result: &Result<T, BoxError>,
+    serve_loop: bool,
+    attempt: u32,
+    max_one_shot_retries: u32,
+    consecutive_refusals: u32,
+) -> DcutrLoopAction {
+    let (errored, refused, expired) = match result {
+        Ok(_) => (false, false, false),
+        Err(e) => (true, is_definitive_admission_refusal(e), is_park_expired(e)),
+    };
     if serve_loop {
-        return DcutrLoopAction::RetryReset;
+        let (delay, refusals) = if expired {
+            (std::time::Duration::ZERO, 0) // #21: re-park immediately
+        } else if refused {
+            (admission_retry_backoff(DCUTR_RETRY_BACKOFF, true, consecutive_refusals), consecutive_refusals + 1)
+        } else {
+            // A completed session or a transient error: fast cadence, streak broken.
+            let _ = errored;
+            (DCUTR_RETRY_BACKOFF, 0)
+        };
+        return DcutrLoopAction::RetryReset { delay, consecutive_refusals: refusals };
     }
-    if !ok && attempt < max_one_shot_retries {
-        return DcutrLoopAction::RetryBounded { next_attempt: attempt + 1 };
+    if refused {
+        return DcutrLoopAction::Stop; // definitive: retrying cannot succeed
+    }
+    if errored && attempt < max_one_shot_retries {
+        let delay = if expired { std::time::Duration::ZERO } else { DCUTR_RETRY_BACKOFF };
+        return DcutrLoopAction::RetryBounded { next_attempt: attempt + 1, delay };
     }
     DcutrLoopAction::Stop
+}
+
+/// #24: the shared DCUtR join loop both relay-only variants run — deduplicated
+/// from two near-verbatim ~45-line copies whose diverged `label` printed
+/// "relay-gate" in the circuit-relay branch. `join` performs ONE dial+admission
+/// attempt; its **outer** `Err` is a dial/setup failure and stays terminal
+/// (exactly the old `?`-propagation), while the **inner** `Result` is the
+/// admission outcome and is routed through [`dcutr_loop_action`]'s policy.
+async fn run_dcutr_join_loop<T, F, Fut>(label: &str, serve_loop: bool, join: F) -> Result<T, BoxError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<Result<T, BoxError>, BoxError>>,
+{
+    let mut attempt: u32 = 0;
+    let mut consecutive_refusals: u32 = 0;
+    loop {
+        let result = join().await?;
+        match dcutr_loop_action(&result, serve_loop, attempt, ONE_SHOT_DCUTR_ADMISSION_RETRIES, consecutive_refusals) {
+            DcutrLoopAction::RetryReset { delay, consecutive_refusals: refusals } => {
+                if let Err(e) = &result {
+                    eprintln!("ct-agent channel: {label} admission error, re-admitting in {delay:?} (#248/#24): {e}");
+                }
+                attempt = 0;
+                consecutive_refusals = refusals;
+                tokio::time::sleep(delay).await;
+            }
+            DcutrLoopAction::RetryBounded { next_attempt, delay } => {
+                attempt = next_attempt;
+                if let Err(e) = &result {
+                    eprintln!(
+                        "ct-agent channel: {label} admission error, retrying ({attempt}/{ONE_SHOT_DCUTR_ADMISSION_RETRIES}) (#248): {e}"
+                    );
+                }
+                tokio::time::sleep(delay).await;
+            }
+            DcutrLoopAction::Stop => return result,
+        }
+    }
 }
 
 /// Run the plane-brokered `ct-agent channel` flow (#98 / #103): connect to the edge
@@ -2332,9 +2421,6 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // a2a-demo's plain "bob" scenario (previously thought stable, now exercising this same
     // path): the persistent --serve side eventually gets past a stall by retrying forever,
     // while the one-shot side had zero tolerance and failed the whole call on one hiccup.
-    // Bounded (unlike `serve_loop`'s retry) because a one-shot CLI/demo call must still
-    // terminate in reasonable time -- a few attempts at the same 200ms backoff, not forever.
-    const ONE_SHOT_DCUTR_ADMISSION_RETRIES: u32 = 2;
     if cfg.relay_only {
         // The real gated relay-gate leg (no new public port, grant+possession pre-auth) takes
         // priority when configured — `circuit_relay` (a directly-dialable relay multiaddr) is
@@ -2349,14 +2435,16 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                 cfg.role, cfg.relay_addr, relay_gate_addr,
                 if serve_loop { " — persistent serve: retries transient stalls (#248)" } else { "" }
             );
-            let mut attempt: u32 = 0;
-            loop {
+            let request = &request;
+            let cfg = &cfg;
+            let relay_gate_cert = &relay_gate_cert;
+            return run_dcutr_join_loop("relay-gate", serve_loop, move || async move {
                 let relay_conn =
                     dial_relay_preferring_direct(cfg.relay_addr_direct, cfg.relay_addr, DIRECT_DIAL_TIMEOUT).await?;
                 let local = channel_local();
-                let result = join_via_relay_gate_dcutr(
+                Ok(join_via_relay_gate_dcutr(
                     &relay_conn,
-                    &request,
+                    request,
                     &cfg.holder,
                     cfg.role,
                     &cfg.own_noise_private,
@@ -2365,29 +2453,9 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                     relay_gate_cert.clone(),
                     &cfg.grant,
                 )
-                .await;
-                match dcutr_loop_action(result.is_ok(), serve_loop, attempt, ONE_SHOT_DCUTR_ADMISSION_RETRIES) {
-                    DcutrLoopAction::RetryReset => {
-                        if let Err(e) = &result {
-                            eprintln!("ct-agent channel: relay-gate admission error, re-admitting (#248): {e}");
-                        }
-                        attempt = 0;
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        continue;
-                    }
-                    DcutrLoopAction::RetryBounded { next_attempt } => {
-                        attempt = next_attempt;
-                        if let Err(e) = &result {
-                            eprintln!(
-                                "ct-agent channel: relay-gate admission error, retrying ({attempt}/{ONE_SHOT_DCUTR_ADMISSION_RETRIES}) (#248): {e}"
-                            );
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        continue;
-                    }
-                    DcutrLoopAction::Stop => return result,
-                }
-            }
+                .await)
+            })
+            .await;
         }
         if let Some(circuit) = cfg.circuit_relay.clone() {
             eprintln!(
@@ -2395,44 +2463,28 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                 cfg.role, cfg.relay_addr, circuit,
                 if serve_loop { " — persistent serve: retries transient stalls (#248)" } else { "" }
             );
-            let mut attempt: u32 = 0;
-            loop {
+            let request = &request;
+            let cfg = &cfg;
+            let circuit = &circuit;
+            // #24: the label is a parameter now -- this branch used to print
+            // "relay-gate admission error" from its copied loop body.
+            return run_dcutr_join_loop("circuit-relay", serve_loop, move || async move {
                 let relay_conn = crate::transport::build_channel_dialer()?
                     .connect(cfg.relay_addr, "localhost")?
                     .await?;
                 let local = channel_local();
-                let result = join_via_relay_dcutr(
+                Ok(join_via_relay_dcutr(
                     &relay_conn,
-                    &request,
+                    request,
                     &cfg.holder,
                     cfg.role,
                     &cfg.own_noise_private,
                     local,
                     circuit.clone(),
                 )
-                .await;
-                match dcutr_loop_action(result.is_ok(), serve_loop, attempt, ONE_SHOT_DCUTR_ADMISSION_RETRIES) {
-                    DcutrLoopAction::RetryReset => {
-                        if let Err(e) = &result {
-                            eprintln!("ct-agent channel: relay-gate admission error, re-admitting (#248): {e}");
-                        }
-                        attempt = 0;
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        continue;
-                    }
-                    DcutrLoopAction::RetryBounded { next_attempt } => {
-                        attempt = next_attempt;
-                        if let Err(e) = &result {
-                            eprintln!(
-                                "ct-agent channel: relay-gate admission error, retrying ({attempt}/{ONE_SHOT_DCUTR_ADMISSION_RETRIES}) (#248): {e}"
-                            );
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        continue;
-                    }
-                    DcutrLoopAction::Stop => return result,
-                }
-            }
+                .await)
+            })
+            .await;
         }
     }
     // Broker admission (the grant + possession proof are the auth; Noise_IK authenticates

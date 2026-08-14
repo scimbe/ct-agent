@@ -73,9 +73,11 @@ pub(crate) fn is_definitive_admission_refusal(e: &BoxError) -> bool {
     // longer silently disable the #231 backoff (the failure mode of the old substring-only
     // check was not an error but a behavioral regression: definitive refusals retried at the
     // fast cadence, i.e. the exact edge-flood #231 was filed about). The substring fallback
-    // stays for ONE release, documented: it covers errors that crossed a stringifying boundary
-    // (e.g. a subprocess's stderr re-parsed into a fresh error) and is scheduled for removal
-    // once no such path exists.
+    // is a DELIBERATE, permanent second line (#24 review decision -- the "one release"
+    // deadline it used to carry was never tracked and is withdrawn): it covers errors that
+    // crossed a stringifying boundary (e.g. a subprocess's stderr re-parsed into a fresh
+    // error), costs one frozen operator-visible string, and fails safe (worst case: a
+    // refusal-shaped transient backs off too long, never the reverse).
     if e.downcast_ref::<AdmissionRefused>().is_some() {
         return true;
     }

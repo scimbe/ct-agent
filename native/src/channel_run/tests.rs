@@ -185,33 +185,107 @@ async fn dial_relay_preferring_direct_with_no_direct_address_dials_the_fallback_
     assert!(fallback_hit.await.unwrap());
 }
 
+/// #24 test helpers: one result per admission-outcome class.
+fn dcutr_ok() -> Result<(), BoxError> {
+    Ok(())
+}
+fn dcutr_transient() -> Result<(), BoxError> {
+    Err("channel join admission exchange stalled (#140)".into())
+}
+fn dcutr_refused() -> Result<(), BoxError> {
+    Err(AdmissionRefused::boxed("edge broker refused the channel join"))
+}
+fn dcutr_expired() -> Result<(), BoxError> {
+    Err(ParkExpired::boxed("park expired (EX)"))
+}
+
 #[test]
 fn dcutr_loop_action_a_persistent_serve_member_always_loops_regardless_of_outcome() {
     // #248: the actual bug -- a completed session (Ok) used to fall through to an
     // unconditional Stop even when serve_loop was true, silently ending the whole
     // process after exactly one session. A persistent serve member must ALWAYS loop
     // back (reset the one-shot counter), whether the session succeeded or errored.
-    assert_eq!(dcutr_loop_action(true, true, 0, 2), DcutrLoopAction::RetryReset, "Ok + serve_loop -> keep serving");
-    assert_eq!(dcutr_loop_action(false, true, 0, 2), DcutrLoopAction::RetryReset, "Err + serve_loop -> re-admit");
+    assert_eq!(
+        dcutr_loop_action(&dcutr_ok(), true, 0, 2, 0),
+        DcutrLoopAction::RetryReset { delay: DCUTR_RETRY_BACKOFF, consecutive_refusals: 0 },
+        "Ok + serve_loop -> keep serving at the fast cadence"
+    );
+    assert_eq!(
+        dcutr_loop_action(&dcutr_transient(), true, 0, 2, 0),
+        DcutrLoopAction::RetryReset { delay: DCUTR_RETRY_BACKOFF, consecutive_refusals: 0 },
+        "transient Err + serve_loop -> re-admit fast"
+    );
     // Even with the one-shot retry budget already exhausted, serve_loop still wins --
     // that budget is only ever relevant to a ONE-SHOT caller.
-    assert_eq!(dcutr_loop_action(false, true, 99, 2), DcutrLoopAction::RetryReset, "serve_loop ignores the one-shot budget entirely");
+    assert!(
+        matches!(dcutr_loop_action(&dcutr_transient(), true, 99, 2, 0), DcutrLoopAction::RetryReset { .. }),
+        "serve_loop ignores the one-shot budget entirely"
+    );
+}
+
+#[test]
+fn dcutr_loop_action_routes_on_the_error_class_not_just_is_ok_24() {
+    // #24: the loop used to see only `result.is_ok()` -- a serve member with a
+    // definitively refused grant re-admitted at the flat 200ms cadence forever
+    // (~5 attempts/s against the edge, the exact flood #231 was filed about).
+    // Refusals now follow admission_retry_backoff's exponential (200ms doubling,
+    // capped), with the streak carried in `consecutive_refusals`:
+    let first = dcutr_loop_action(&dcutr_refused(), true, 0, 2, 0);
+    assert_eq!(
+        first,
+        DcutrLoopAction::RetryReset { delay: DCUTR_RETRY_BACKOFF, consecutive_refusals: 1 },
+        "first refusal: base delay, streak starts"
+    );
+    let fifth = dcutr_loop_action(&dcutr_refused(), true, 0, 2, 4);
+    assert_eq!(
+        fifth,
+        DcutrLoopAction::RetryReset { delay: DCUTR_RETRY_BACKOFF * 16, consecutive_refusals: 5 },
+        "refusal streak doubles the delay"
+    );
+    assert!(
+        matches!(
+            dcutr_loop_action(&dcutr_refused(), true, 0, 2, 30),
+            DcutrLoopAction::RetryReset { delay: REFUSED_ADMISSION_BACKOFF_CAP, .. }
+        ),
+        "the refusal backoff caps at #231's ceiling"
+    );
+    // A park expiry re-parks IMMEDIATELY (#21) -- it is neither a refusal nor a flap.
+    assert_eq!(
+        dcutr_loop_action(&dcutr_expired(), true, 0, 2, 3),
+        DcutrLoopAction::RetryReset { delay: std::time::Duration::ZERO, consecutive_refusals: 0 },
+        "park expiry: zero delay, streak broken"
+    );
+    // A transient (or a success) breaks the refusal streak back to the fast cadence.
+    assert_eq!(
+        dcutr_loop_action(&dcutr_transient(), true, 0, 2, 7),
+        DcutrLoopAction::RetryReset { delay: DCUTR_RETRY_BACKOFF, consecutive_refusals: 0 },
+        "transient after refusals: streak resets"
+    );
+    // A ONE-SHOT caller stops on a definitive refusal right away: its bounded
+    // retries cannot succeed without operator action.
+    assert_eq!(dcutr_loop_action(&dcutr_refused(), false, 0, 2, 0), DcutrLoopAction::Stop);
 }
 
 #[test]
 fn dcutr_loop_action_a_one_shot_caller_retries_errors_up_to_the_bound_then_stops() {
-    assert_eq!(dcutr_loop_action(false, false, 0, 2), DcutrLoopAction::RetryBounded { next_attempt: 1 });
-    assert_eq!(dcutr_loop_action(false, false, 1, 2), DcutrLoopAction::RetryBounded { next_attempt: 2 });
+    assert_eq!(
+        dcutr_loop_action(&dcutr_transient(), false, 0, 2, 0),
+        DcutrLoopAction::RetryBounded { next_attempt: 1, delay: DCUTR_RETRY_BACKOFF }
+    );
+    assert_eq!(
+        dcutr_loop_action(&dcutr_transient(), false, 1, 2, 0),
+        DcutrLoopAction::RetryBounded { next_attempt: 2, delay: DCUTR_RETRY_BACKOFF }
+    );
     // At the bound, no more retries -- stop and return the (error) result.
-    assert_eq!(dcutr_loop_action(false, false, 2, 2), DcutrLoopAction::Stop, "budget exhausted -> stop");
+    assert_eq!(dcutr_loop_action(&dcutr_transient(), false, 2, 2, 0), DcutrLoopAction::Stop, "budget exhausted -> stop");
 }
 
 #[test]
 fn dcutr_loop_action_a_one_shot_callers_success_always_stops_immediately() {
     // A one-shot caller (--call-service, or Accept without --serve) that succeeds must
     // terminate right away -- it never loops just because it COULD have retried.
-    assert_eq!(dcutr_loop_action(true, false, 0, 2), DcutrLoopAction::Stop);
-    assert_eq!(dcutr_loop_action(true, false, 2, 2), DcutrLoopAction::Stop);
+    assert_eq!(dcutr_loop_action(&dcutr_ok(), false, 0, 2, 0), DcutrLoopAction::Stop);
+    assert_eq!(dcutr_loop_action(&dcutr_ok(), false, 2, 2, 0), DcutrLoopAction::Stop);
 }
 
 fn cfg_from(pairs: &[(&str, &str)]) -> Result<ChannelRunConfig, String> {
