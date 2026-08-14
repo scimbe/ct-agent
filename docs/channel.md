@@ -68,8 +68,9 @@ sequenceDiagram
         Note over A: ParkExpired → re-park SAME rung,<br/>no ladder advance, no backoff (#21)
     else initiator arrives
         I->>E: join + challenge + signature (same protocol)
-        E->>A: OK + peer identity (noise/holder/attestation)
+        E->>A: OK + peer identity (noise/holder/attestation)\n — newline-terminated, stream stays OPEN
         E->>I: OK + peer identity
+        Note over A,I: v0.4.16 (#494): the client completes this ack at its NEWLINE.<br/>Older clients read to EOF — which the :443 edge never sends<br/>(it splices onward on the same stream), so two fresh members<br/>deadlocked on fully-delivered acks until one side's 45 s<br/>stall-timeout death handed the other its EOF. Every fresh<br/>:443 pairing paid 45–100 s; one v0.4.16 side heals the pair<br/>(its prompt close is the peer's EOF).
     end
     Note over A,I: Phase 2 — relay leg (fresh connections)
     A->>E: [0xFF,0x02]? + relay join (#121 relay-only fast-path skips the 8 s accept wait)
@@ -80,9 +81,11 @@ sequenceDiagram
 
 Reading a trace against this picture: every failure of the last two days sat on exactly one
 arrow — `EX` lost to an RST race (edge teardown), the park dying as a half-closed flow
-(client FIN after the signature), or Phase 2 splicing a corpse park (`early eof`, retried on
-the 10 s sweep grid). When a symptom doesn't map to an arrow here, the picture is
-incomplete — fix the picture first.
+(client FIN after the signature), Phase 2 splicing a corpse park (`early eof`, retried on
+the 10 s sweep grid), or the Phase 1 ack sitting unread in a pre-v0.4.16 client that waited
+for an EOF the `:443` edge never sends (#494 — the week's entire 60–100 s first-contact
+class). When a symptom doesn't map to an arrow here, the picture is incomplete — fix the
+picture first.
 
 ## Failure semantics and timers (what an error actually means)
 
@@ -90,7 +93,14 @@ incomplete — fix the picture first.
   expired. It is 45 s (not the pre-v0.4.8 15 s) because the edge only acks a pairing-path join
   once the **partner** arrives, and holds a lone first member parked for a 30 s window; the
   bound must outlast that window plus the partner's own ladder walk ([#140], live-pinned
-  2026-08-13). Transient: retried fast.
+  2026-08-13). Since **v0.4.16** this line means what it says — no partner showed up.
+  **Before v0.4.16 it fired on every fresh `:443` pairing even with both partners present**:
+  the rendezvous ack read was `take(512).read_to_end`, completing only at EOF/512 bytes,
+  while the `:443` edge acks `OK …\n` and keeps the stream open for the splice — both fresh
+  members deadlocked on delivered acks until one side's timeout death handed the other its
+  EOF (CADS-Tunnel#494; field-confirmed fixed: 8/8 fresh first contacts 124–823 ms). The
+  read now completes at the newline, at EOF (QUIC's delimiter-free `finish()`, `NO`/`EX`
+  teardowns), or at the 512-byte cap.
 - **`edge broker/relay refused the channel join`** — a definitive wire `NO` (e.g. not a member).
   The serve loop backs off exponentially on consecutive refusals (cap 30 s, [#231]) — a
   not-member holder cannot fix itself by retrying.
@@ -108,7 +118,8 @@ incomplete — fix the picture first.
   the ack and closes) — is fixed by the v0.4.14 phase preamble + the edge's phase-compatible
   pairing (CADS-Tunnel#495 slice 2a); legacy/unmarked joins keep the historical mixed
   behavior. Remaining causes: a mode/config mismatch such as gate mode without reachable
-  QUIC; [#18] tracks a distinguishable error text.
+  QUIC. ([#18] closed 2026-08-14 as superseded — its first-contact premise resolved into
+  the #494 ack deadlock plus the already-fixed corpse/supersede classes.)
 - **Flap backoff (v0.4.10, [#250])**: a session that dies within 500 ms of pairing is a "flap";
   3+ consecutive flaps back off exponentially (cap 10 s) before the next admit — a peer whose
   connection is killed post-handshake (AV/DPI middleboxes are the leading field cause) no longer
