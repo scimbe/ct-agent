@@ -44,6 +44,45 @@ reaped after the ~30 s park TTL (client-visible as a bogus "edge relay refused t
 `plane-brokered Accept` = front door (correct for arena-style setups); `Accept via relay-gate` =
 QUIC pairer.
 
+## Wire sequence — the big picture
+
+The full first-contact message sequence over the `:443` front door (both members
+`FRONT_DOOR_ONLY`, acceptor in `--serve`), every hop of which was packet-verified in
+production on 2026-08-14. Two independent phases ride separate TLS connections: the
+**rendezvous** (who pairs with whom) and the **relay leg** (the spliced byte pipe the
+Noise session runs over).
+
+```mermaid
+sequenceDiagram
+    participant A as Acceptor (serve)
+    participant E as Edge (:443 broker)
+    participant I as Initiator
+    Note over A,E: Phase 1 — rendezvous admission
+    A->>E: TLS (ALPN ct-edge-channel[-ka] / boring h2) + join request
+    E->>A: 32-byte possession challenge
+    A->>E: 64-byte signature — connection stays FULLY OPEN (v0.4.12: no half-close)
+    Note over E: A parks (TTL 30 s; pump monitors liveness,<br/>KA-negotiated legs get 1 NUL / 10 s)
+    alt no partner within TTL
+        E->>A: bare EX token + clean FIN (drained, no RST)
+        Note over A: ParkExpired → re-park SAME rung,<br/>no ladder advance, no backoff (#21)
+    else initiator arrives
+        I->>E: join + challenge + signature (same protocol)
+        E->>A: OK + peer identity (noise/holder/attestation)
+        E->>I: OK + peer identity
+    end
+    Note over A,I: Phase 2 — relay leg (fresh connections)
+    A->>E: relay join (#121 relay-only fast-path skips the 8 s accept wait)
+    I->>E: relay join (#121 skips the 5 s direct dial)
+    Note over E: pairer splices the two LIVE legs<br/>(#499: corpse parks are skipped, never spliced)
+    A-->>I: Noise_IK handshake + session (end-to-end, edge is payload-blind)
+```
+
+Reading a trace against this picture: every failure of the last two days sat on exactly one
+arrow — `EX` lost to an RST race (edge teardown), the park dying as a half-closed flow
+(client FIN after the signature), or Phase 2 splicing a corpse park (`early eof`, retried on
+the 10 s sweep grid). When a symptom doesn't map to an arrow here, the picture is
+incomplete — fix the picture first.
+
 ## Failure semantics and timers (what an error actually means)
 
 - **`channel join admission exchange stalled (#140)`** — the 45 s admission-exchange bound
@@ -54,10 +93,18 @@ QUIC pairer.
 - **`edge broker/relay refused the channel join`** — a definitive wire `NO` (e.g. not a member).
   The serve loop backs off exponentially on consecutive refusals (cap 30 s, [#231]) — a
   not-member holder cannot fix itself by retrying.
-- **`early eof`** is (still) ambiguous — two structurally different causes share the text: the
-  splice ran against an **empty park** on the peer side (the pre-v0.4.9 per-round fault class,
-  [#18]), or a mode/config mismatch such as gate mode without reachable QUIC. [#18] tracks a
-  distinguishable error text.
+- **`channel park expired ... (#21) -- re-parking`** — the edge reaped an idle park and SAID so
+  (bare `EX` on stream legs, a named `park-expired:` close reason on QUIC). Not an error in any
+  operational sense: the member re-parks the same rung immediately, with no ladder advance and
+  no backoff. A healthy idle serve loop cycles this line every 30 s (the park TTL). Requires
+  v0.4.12 on NAT'd paths — v0.4.11 half-closed the parked leg after the possession signature,
+  which put the flow into the NAT's short FIN-WAIT timer and ate the `EX` on the way back.
+- **`early eof`** right after pairing — historically ambiguous; the dominant cause (the splice
+  ran against a **corpse park** left by a peer process that died while parked, retried on the
+  edge's 10 s sweep grid → the N×10 s first-contact staircase) is fixed edge-side since #499
+  slice B (corpses are live-flagged and never spliced). Remaining causes: a mode/config
+  mismatch such as gate mode without reachable QUIC; [#18] tracks a distinguishable error
+  text.
 - **Flap backoff (v0.4.10, [#250])**: a session that dies within 500 ms of pairing is a "flap";
   3+ consecutive flaps back off exponentially (cap 10 s) before the next admit — a peer whose
   connection is killed post-handshake (AV/DPI middleboxes are the leading field cause) no longer
