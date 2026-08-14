@@ -1126,7 +1126,8 @@ where
                     // #495 slice 2a (v0.4.14): mark this leg's PHASE when the edge speaks
                     // the KA generation -- phase-compatible pairing removes the mixed-phase
                     // early-eof class. An old edge negotiated a legacy id: no marker sent.
-                    let phase_marker = crate::transport::ka_negotiated(&stream)
+                    let phase_marker = (crate::channel::phase_marker_enabled()
+                        && crate::transport::ka_negotiated(&stream))
                         .then_some(crate::channel::PHASE_MARKER_RELAY);
                     let (mut recv, mut send) = tokio::io::split(stream);
                     let local = local.take().expect("local is committed to exactly one rung");
@@ -3059,7 +3060,8 @@ pub async fn present_channel_join_via_ladder(
                     .map_err(ChannelDialError::Failed)?;
                     // #495 slice 2a (v0.4.14): mark the RENDEZVOUS phase on KA-generation
                     // edges (see the relay ladder's twin comment for the why).
-                    let phase_marker = crate::transport::ka_negotiated(&stream)
+                    let phase_marker = (crate::channel::phase_marker_enabled()
+                        && crate::transport::ka_negotiated(&stream))
                         .then_some(crate::channel::PHASE_MARKER_RENDEZVOUS);
                     let (recv, send) = tokio::io::split(stream);
                     // finish_send_after_sig = false (#21 follow-up): on this TCP/TLS leg the

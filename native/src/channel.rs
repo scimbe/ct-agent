@@ -87,6 +87,22 @@ pub(crate) const ADMISSION_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Du
 /// legacy id and receives byte-identical legacy traffic. The magic 0xFF is unambiguous
 /// against the length prefix (it would mean a >=65280-byte join, refused as len-oob by
 /// every edge since the field existed).
+/// #495 measurement isolation (requested by the tester after the 2a series proved
+/// unrunnable with published binaries): `CT_CHANNEL_PHASE_MARKER=off` (or `0`)
+/// suppresses the v0.4.14 phase preamble while keeping everything else identical —
+/// the only way to vary the marker as a SINGLE variable, since every marked release
+/// also carries the #494 ack-reader fix. Default: markers on.
+pub(crate) fn phase_marker_enabled() -> bool {
+    phase_marker_enabled_from(std::env::var("CT_CHANNEL_PHASE_MARKER").ok().as_deref())
+}
+
+/// Pure core of [`phase_marker_enabled`]: only the explicit strings `off`/`0`
+/// disable the marker — unset, empty, or anything else keeps the default (on),
+/// so a typo can never silently drop the marker generation.
+pub(crate) fn phase_marker_enabled_from(v: Option<&str>) -> bool {
+    !matches!(v.map(str::trim), Some("off") | Some("0"))
+}
+
 pub(crate) const PHASE_PREAMBLE_MAGIC: u8 = 0xFF;
 /// Phase byte: rendezvous admission (the parked ack-and-close leg).
 pub(crate) const PHASE_MARKER_RENDEZVOUS: u8 = 0x01;
@@ -426,6 +442,20 @@ mod tests {
 
     fn operator() -> SigningKey {
         SigningKey::from_bytes(&OP_SEED)
+    }
+
+    #[test]
+    fn phase_marker_switch_disables_only_on_explicit_off_or_zero() {
+        // #495 measurement isolation: only the explicit opt-outs disable the marker —
+        // unset/empty/typos keep the default ON, so the marker generation can never be
+        // dropped by accident.
+        assert!(phase_marker_enabled_from(None), "unset -> on");
+        assert!(phase_marker_enabled_from(Some("")), "empty -> on");
+        assert!(phase_marker_enabled_from(Some("on")), "explicit on -> on");
+        assert!(phase_marker_enabled_from(Some("false")), "unknown word -> on (no silent opt-out)");
+        assert!(!phase_marker_enabled_from(Some("off")), "off -> disabled");
+        assert!(!phase_marker_enabled_from(Some("0")), "0 -> disabled");
+        assert!(!phase_marker_enabled_from(Some(" off ")), "trimmed -> disabled");
     }
 
     fn signed_grant(channel: [u8; 32], holder: &SigningKey, dir: Direction) -> SignedChannelGrant {
