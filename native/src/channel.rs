@@ -81,6 +81,18 @@ pub enum ChannelJoinOutcome {
 /// legitimately waiting for the partner on our behalf.
 pub(crate) const ADMISSION_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// #495 slice 2a (v0.4.14): the optional phase preamble a KA-generation client sends
+/// before its length-framed join -- [0xFF, phase]. Only ever sent when the TLS
+/// negotiation selected a KA id (see `transport::ka_negotiated`): an old edge selected a
+/// legacy id and receives byte-identical legacy traffic. The magic 0xFF is unambiguous
+/// against the length prefix (it would mean a >=65280-byte join, refused as len-oob by
+/// every edge since the field existed).
+pub(crate) const PHASE_PREAMBLE_MAGIC: u8 = 0xFF;
+/// Phase byte: rendezvous admission (the parked ack-and-close leg).
+pub(crate) const PHASE_MARKER_RENDEZVOUS: u8 = 0x01;
+/// Phase byte: relay leg (ack then spliced session on the same stream).
+pub(crate) const PHASE_MARKER_RELAY: u8 = 0x02;
+
 pub async fn present_channel_join(
     conn: &Connection,
     request: &ChannelJoinRequest,
@@ -93,7 +105,7 @@ pub async fn present_channel_join(
         .map_err(|_| -> BoxError { "channel join open_bi stalled after connect (#140)".into() })??;
     // finish_send_after_sig = true: on QUIC the post-signature shutdown is quinn's clean
     // per-stream finish() -- connection-scoped state is untouched (unlike a TCP/TLS leg).
-    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT, true).await
+    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT, true, None).await
 }
 
 /// The transport-agnostic core of [`present_channel_join`]: run the channel-join wire
@@ -120,6 +132,7 @@ pub async fn present_channel_join_on_stream<W, R>(
     holder: &SigningKey,
     exchange_timeout: std::time::Duration,
     finish_send_after_sig: bool,
+    phase_marker: Option<u8>,
 ) -> Result<ChannelJoinOutcome, BoxError>
 where
     W: AsyncWrite + Unpin,
@@ -132,6 +145,11 @@ where
     let exchange = async move {
     let bytes = request.encode();
     let len = u16::try_from(bytes.len()).map_err(|_| "channel join request too large")?;
+    if let Some(phase) = phase_marker {
+        // #495 slice 2a: KA-negotiated legs mark their phase so the edge pairs
+        // phase-compatibly (see PHASE_PREAMBLE_MAGIC's doc for the wire safety).
+        send.write_all(&[PHASE_PREAMBLE_MAGIC, phase]).await?;
+    }
     send.write_all(&len.to_be_bytes()).await?;
     send.write_all(&bytes).await?;
     // Flush before awaiting the challenge. On a quinn stream this is a no-op, but this
@@ -287,6 +305,7 @@ pub async fn present_channel_relay_join_on_stream<W, R>(
     recv: &mut R,
     request: &ChannelJoinRequest,
     holder: &SigningKey,
+    phase_marker: Option<u8>,
 ) -> Result<ChannelJoinOutcome, BoxError>
 where
     W: AsyncWrite + Unpin,
@@ -294,6 +313,10 @@ where
 {
     let bytes = request.encode();
     let len = u16::try_from(bytes.len()).map_err(|_| "channel join request too large")?;
+    if let Some(phase) = phase_marker {
+        // #495 slice 2a: see present_channel_join_on_stream -- same preamble, relay leg.
+        send.write_all(&[PHASE_PREAMBLE_MAGIC, phase]).await?;
+    }
     send.write_all(&len.to_be_bytes()).await?;
     send.write_all(&bytes).await?;
     send.flush().await?;
@@ -416,7 +439,7 @@ mod tests {
         let (client_end, _silent_edge) = tokio::io::duplex(4096); // held open, never responds
         let (cli_r, cli_w) = split(client_end);
         let start = std::time::Instant::now();
-        let r = present_channel_join_on_stream(cli_w, cli_r, &request, &holder, std::time::Duration::from_millis(200), false).await;
+        let r = present_channel_join_on_stream(cli_w, cli_r, &request, &holder, std::time::Duration::from_millis(200), false, None).await;
         assert!(r.is_err(), "a stalled admission exchange errors, it does not hang (#140)");
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
@@ -445,7 +468,7 @@ mod tests {
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
             // send = write half, recv = read half — no quinn anywhere.
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
         });
 
         // Minimal "edge": read the framed request, challenge, verify possession, ack OK.
@@ -491,7 +514,7 @@ mod tests {
         let (client_end, edge_end) = tokio::io::duplex(4096);
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
         });
         // "edge": read the framed request, then send a malformed partial (neither 32 bytes
         // nor "NO") and close — a broken stream.
@@ -529,7 +552,7 @@ mod tests {
         let (client_end, edge_end) = tokio::io::duplex(4096);
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
         });
         let (mut er, mut ew) = split(edge_end);
         let mut len_buf = [0u8; 2];
@@ -561,7 +584,7 @@ mod tests {
         let (client_end, edge_end) = tokio::io::duplex(4096);
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
         });
         let (mut er, mut ew) = split(edge_end);
         let mut len_buf = [0u8; 2];
@@ -597,7 +620,7 @@ mod tests {
             let (client_end, edge_end) = tokio::io::duplex(4096);
             let (cli_r, cli_w) = split(client_end);
             let client = tokio::spawn(async move {
-                present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false).await
+                present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
             });
             let (mut er, mut ew) = split(edge_end);
             let mut len_buf = [0u8; 2];
@@ -641,7 +664,7 @@ mod tests {
             sw.write_all(b"OK 198.51.100.7:7007\n").await.unwrap();
             sw.flush().await.unwrap();
         });
-        let outcome = present_channel_relay_join_on_stream(&mut cw, &mut cr, &request, &holder)
+        let outcome = present_channel_relay_join_on_stream(&mut cw, &mut cr, &request, &holder, None)
             .await
             .expect("relay join with leading NULs");
         srv.await.unwrap();
@@ -650,6 +673,50 @@ mod tests {
                 assert_eq!(peer_endpoint, "198.51.100.7:7007", "the ack parses exactly as without NULs");
             }
             other => panic!("NULs+OK line must be Admitted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn phase_marker_prefixes_the_join_and_absent_marker_stays_byte_identical_495a() {
+        // #495 slice 2a client half: with a marker the wire starts [0xFF, phase, len_hi,
+        // len_lo, ...]; without one it starts with the length prefix exactly as every
+        // release before v0.4.14 -- the edge-side compatibility contract in one assert.
+        use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+        for marker in [Some(PHASE_MARKER_RELAY), None] {
+            let channel = [0x14u8; 32];
+            let holder = SigningKey::from_bytes(&[0x41u8; 32]);
+            let request = ChannelJoinRequest {
+                grant: signed_grant(channel, &holder, Direction::Initiate),
+                endpoint: "203.0.113.14:1414".to_string(),
+            };
+            let expected_len = request.encode().len() as u16;
+            let (client, server) = tokio::io::duplex(4096);
+            let (mut cr, mut cw) = split(client);
+            let m = marker;
+            let req = request.clone();
+            let hk = SigningKey::from_bytes(&[0x41u8; 32]);
+            let presenter = tokio::spawn(async move {
+                let _ = present_channel_relay_join_on_stream(&mut cw, &mut cr, &req, &hk, m).await;
+            });
+            let (mut sr, mut sw) = split(server);
+            let mut head = [0u8; 4];
+            sr.read_exact(&mut head).await.expect("wire head");
+            match marker {
+                Some(p) => {
+                    assert_eq!(head[0], PHASE_PREAMBLE_MAGIC, "preamble magic first");
+                    assert_eq!(head[1], p, "phase byte second");
+                    assert_eq!(u16::from_be_bytes([head[2], head[3]]), expected_len, "then the length");
+                }
+                None => {
+                    assert_eq!(
+                        u16::from_be_bytes([head[0], head[1]]),
+                        expected_len,
+                        "no marker: the wire begins with the length prefix, byte-identical to pre-v0.4.14"
+                    );
+                }
+            }
+            let _ = sw.shutdown().await;
+            let _ = presenter.await;
         }
     }
 
@@ -1017,7 +1084,7 @@ mod tests {
 
         let client_tls = tcp_tls_connect(listen_addr, cert).await.expect("tls-tcp connect");
         let (cli_r, cli_w) = split(client_tls);
-        let outcome = present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false)
+        let outcome = present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None)
             .await
             .expect("join drives over the :443 duplex");
         let observed = srv.await.expect("edge task");
@@ -1076,7 +1143,7 @@ mod tests {
             let (_sr, sw) = edge_until_ack(server).await;
             drop(sw); // no OK/NO — the #148 dropped leg
         });
-        let err = present_channel_relay_join_on_stream(&mut cw, &mut cr, &request, &holder)
+        let err = present_channel_relay_join_on_stream(&mut cw, &mut cr, &request, &holder, None)
             .await
             .expect_err("a dropped relay leg after admission must be a distinct error, not Ok(Refused)");
         srv.await.unwrap();
@@ -1095,7 +1162,7 @@ mod tests {
             sw.write_all(b"NO").await.unwrap();
             sw.flush().await.unwrap();
         });
-        let outcome = present_channel_relay_join_on_stream(&mut cw2, &mut cr2, &request, &holder)
+        let outcome = present_channel_relay_join_on_stream(&mut cw2, &mut cr2, &request, &holder, None)
             .await
             .expect("an explicit NO is a clean outcome, not an error");
         srv2.await.unwrap();
@@ -1110,7 +1177,7 @@ mod tests {
             sw.write_all(b"EX").await.unwrap();
             sw.flush().await.unwrap();
         });
-        let outcome = present_channel_relay_join_on_stream(&mut cw3, &mut cr3, &request, &holder)
+        let outcome = present_channel_relay_join_on_stream(&mut cw3, &mut cr3, &request, &holder, None)
             .await
             .expect("the EX token is a clean outcome, not an error");
         srv3.await.unwrap();

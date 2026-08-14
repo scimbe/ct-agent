@@ -1123,9 +1123,14 @@ where
                         rung.kind.label(),
                         rung.endpoint
                     );
+                    // #495 slice 2a (v0.4.14): mark this leg's PHASE when the edge speaks
+                    // the KA generation -- phase-compatible pairing removes the mixed-phase
+                    // early-eof class. An old edge negotiated a legacy id: no marker sent.
+                    let phase_marker = crate::transport::ka_negotiated(&stream)
+                        .then_some(crate::channel::PHASE_MARKER_RELAY);
                     let (mut recv, mut send) = tokio::io::split(stream);
                     let local = local.take().expect("local is committed to exactly one rung");
-                    match present_channel_relay_join_on_stream(&mut send, &mut recv, request, holder).await? {
+                    match present_channel_relay_join_on_stream(&mut send, &mut recv, request, holder, phase_marker).await? {
                         ChannelJoinOutcome::Admitted { .. } => {}
                         ChannelJoinOutcome::Refused => {
                             return Err(AdmissionRefused::boxed("edge relay refused the channel join over the :443 front door"));
@@ -3052,13 +3057,17 @@ pub async fn present_channel_join_via_ladder(
                         _ => crate::transport::tcp_tls_connect_channel(endpoint, edge_cert).await,
                     }
                     .map_err(ChannelDialError::Failed)?;
+                    // #495 slice 2a (v0.4.14): mark the RENDEZVOUS phase on KA-generation
+                    // edges (see the relay ladder's twin comment for the why).
+                    let phase_marker = crate::transport::ka_negotiated(&stream)
+                        .then_some(crate::channel::PHASE_MARKER_RENDEZVOUS);
                     let (recv, send) = tokio::io::split(stream);
                     // finish_send_after_sig = false (#21 follow-up): on this TCP/TLS leg the
                     // old post-signature shutdown was a close_notify+FIN that half-closed the
                     // whole connection -- the parked member then waited out its park as a
                     // closing flow, and the edge's reap teardown RST'd the in-flight EX away
                     // (packet-capture-proven). The edge needs no EOF; keep the leg fully open.
-                    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT, false)
+                    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT, false, phase_marker)
                         .await
                         .map_err(ChannelDialError::Failed)
                 }

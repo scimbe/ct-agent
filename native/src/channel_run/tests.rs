@@ -3280,7 +3280,7 @@ async fn two_443_only_members_learn_each_others_noise_key_and_form_the_tunnel() 
             .await
             .expect("A tls-tcp connect");
         let (mut recv, mut send) = split(stream);
-        let outcome = present_channel_relay_join_on_stream(&mut send, &mut recv, &req_a, &holder_a)
+        let outcome = present_channel_relay_join_on_stream(&mut send, &mut recv, &req_a, &holder_a, None)
             .await
             .expect("A relay join");
         let peer_noise = match outcome {
@@ -3305,7 +3305,7 @@ async fn two_443_only_members_learn_each_others_noise_key_and_form_the_tunnel() 
             .await
             .expect("B tls-tcp connect");
         let (mut recv, mut send) = split(stream);
-        let outcome = present_channel_relay_join_on_stream(&mut send, &mut recv, &req_b, &holder_b)
+        let outcome = present_channel_relay_join_on_stream(&mut send, &mut recv, &req_b, &holder_b, None)
             .await
             .expect("B relay join");
         let peer_noise = match outcome {

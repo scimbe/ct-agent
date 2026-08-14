@@ -654,6 +654,18 @@ pub async fn tcp_tls_connect_channel_boring(
 /// its keepalive API has no TCP_KEEPCNT-equivalent retry-count knob, so it keeps
 /// its own OS-default retry count on top of the tightened time/interval below --
 /// see this function's own `cfg(not(windows))` for why.
+/// #500/#495-2a: whether this channel dial's TLS negotiation selected a KA-generation id
+/// (plain `ct-edge-channel-ka`, or `http/1.1` on the boring leg -- the edge's deliberate
+/// keepalive signal). A KA-generation edge understands the park keepalive AND the
+/// optional `[0xFF, phase]` join preamble; an old edge selected a legacy id and must
+/// receive byte-identical legacy traffic.
+pub fn ka_negotiated(tls: &tokio_rustls::client::TlsStream<TcpStream>) -> bool {
+    matches!(
+        tls.get_ref().1.alpn_protocol(),
+        Some(p) if p == b"ct-edge-channel-ka" || p == b"http/1.1"
+    )
+}
+
 fn apply_tcp_keepalive(stream: &TcpStream) {
     let sock = socket2::SockRef::from(stream);
     let ka = socket2::TcpKeepalive::new()
