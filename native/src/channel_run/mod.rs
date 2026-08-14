@@ -3334,33 +3334,8 @@ async fn serve_admitted_session(
 /// fan-out of handler subprocesses (`claude -p`) a flood of Builds can trigger.
 const DEFAULT_SERVE_CONCURRENCY: usize = 8;
 
-/// #231: ceiling on the exponential backoff a persistent serve loop applies after consecutive
-/// **refused** (not transient) admission attempts — see [`serve_loop_concurrent`].
-const REFUSED_ADMISSION_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// #250 ("flapping peer"): a session that dies within this long of being admitted is treated as
-/// a FAILED pairing, not a completed one — live-diagnosed 2026-08-13 (a Windows accept-side
-/// member and a front-door-only bridge): admission succeeded every single time (grant verified,
-/// both sides acked), but the underlying TLS-TCP connection then died before/during the Noise
-/// handshake, near-instantly, on essentially every attempt — ~98 pair-then-die cycles in 30s
-/// (~300ms apart), matching this loop's UNTHROTTLED re-admit cadence exactly (there was no
-/// backoff at all between a failed session and the next admit). Root cause (Windows-side
-/// AV/firewall DPI killing the connection post-handshake, or a platform-specific transport bug)
-/// is still open -- but regardless of cause, hammering the edge at native RTT speed while it
-/// persists serves nobody: it floods the edge's admission/relay path for no gain (the failure
-/// recurs every time) and produces a wall of noise that hides every other signal. A genuine
-/// session (even a very short, single-call one) legitimately completes well under this: the
-/// sort arena's own measured per-round session lifetime is ~85ms end-to-end including the Noise
-/// handshake -- this threshold is 6x that, so a real, working session is never mistaken for a
-/// flap.
-const FLAPPING_SESSION_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// #250: ceiling on the exponential backoff applied after consecutive flapping (pair-then-
-/// near-instant-death) sessions — same shape as [`REFUSED_ADMISSION_BACKOFF_CAP`], deliberately
-/// shorter: unlike a definitive refusal (which literally cannot resolve without operator
-/// action), a flap's underlying cause (a transient AV heuristic, a flaky corporate firewall
-/// rule) can clear on its own, so this loop should keep checking meaningfully sooner.
-const FLAPPING_SESSION_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Parse `CT_CHANNEL_SERVE_CONCURRENCY` into a concurrency cap: a positive integer overrides the
 /// default; anything absent/blank/zero/malformed falls back to [`DEFAULT_SERVE_CONCURRENCY`]. Pure.
@@ -3472,134 +3447,18 @@ where
     }
 }
 
-/// #250: pure classifier -- did a just-ended session look like a "flap" (pair, then die near-
-/// instantly)? Only an ERRORED session that ended within [`FLAPPING_SESSION_THRESHOLD`]
-/// qualifies; a session that succeeded (even a fast single-call one) or that ran long before
-/// failing is a real session, not a flap, and must reset the counter rather than extend it.
-fn is_flapping_session(elapsed: std::time::Duration, errored: bool) -> bool {
-    errored && elapsed < FLAPPING_SESSION_THRESHOLD
-}
 
-/// #250: exponential backoff after `consecutive_flaps` near-instant session deaths in a row,
-/// same shape as [`admission_retry_backoff`]'s refused-admission path but capped lower (see
-/// [`FLAPPING_SESSION_BACKOFF_CAP`]'s doc for why). Pure.
-fn flapping_session_backoff(
-    retry_backoff: std::time::Duration,
-    consecutive_flaps: u32,
-) -> std::time::Duration {
-    let shift = consecutive_flaps.min(16);
-    retry_backoff
-        .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
-        .min(FLAPPING_SESSION_BACKOFF_CAP)
-}
 
-/// #231: does an admission error mean the presenting holder was **definitively** refused (not a
-/// channel member — see `channel-join NO [not-member]` on the edge) rather than a transient
-/// failure (`edge broker/relay refused the channel join` are the exact strings
-/// [`run_one_admission_session`]'s ladder produces for this case; `channel join admission exchange
-/// stalled (#140)` and any other error are treated as transient/retryable-fast)? Pure string match
-/// on `Display` — the call chain flattens every failure to `BoxError` by the time it reaches
-/// [`serve_loop_concurrent`], so this is the only signal available without a wider error-type
-/// refactor across the admission ladder.
-fn is_definitive_admission_refusal(e: &BoxError) -> bool {
-    // #20 (consolidation): typed classification first -- every in-process creation site now
-    // returns [`AdmissionRefused`], so a future rewording of the operator-facing text can no
-    // longer silently disable the #231 backoff (the failure mode of the old substring-only
-    // check was not an error but a behavioral regression: definitive refusals retried at the
-    // fast cadence, i.e. the exact edge-flood #231 was filed about). The substring fallback
-    // stays for ONE release, documented: it covers errors that crossed a stringifying boundary
-    // (e.g. a subprocess's stderr re-parsed into a fresh error) and is scheduled for removal
-    // once no such path exists.
-    if e.downcast_ref::<AdmissionRefused>().is_some() {
-        return true;
-    }
-    e.to_string().contains("refused the channel join")
-}
 
-/// #20: typed marker for a DEFINITIVE broker/relay refusal -- the peer's wire `NO`. `Display`
-/// emits the exact historical strings (field-visible contract: operators grep these, docs quote
-/// them, the sort bridge's fault attribution matches on them), but in-process classification
-/// ([`is_definitive_admission_refusal`]) is a downcast, not a substring search. The client-side
-/// sibling of the edge's `DefinitiveJoinRefusal` (CADS-Tunnel, same day, same class of fix).
-#[derive(Debug)]
-pub(crate) struct AdmissionRefused(pub(crate) &'static str);
 
-impl std::fmt::Display for AdmissionRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
-    }
-}
 
-impl std::error::Error for AdmissionRefused {}
 
-impl AdmissionRefused {
-    /// The one constructor every refusal site uses -- boxed, ready to return.
-    fn boxed(text: &'static str) -> BoxError {
-        Box::new(AdmissionRefused(text))
-    }
-}
 
-/// #21: typed marker for a park expiry -- the edge reaped this member's park because no partner
-/// arrived within the park TTL, and SAID SO on the wire (the bare `EX` token / the named QUIC
-/// close reason). Deliberately a DISTINCT type from [`AdmissionRefused`]: a park expiry is
-/// neither a refusal (nothing about the grant or holder is wrong -- there was simply nobody to
-/// pair with yet) nor a transport failure (the rung worked end to end). The correct reaction is
-/// to re-park immediately on the same transport; before this type existed the silent reap was
-/// misread as a rung failure, advancing the dial ladder and burning a fresh 0-40s window per
-/// expiry (the tester's measured 271 phantom "rung failures").
-#[derive(Debug)]
-pub(crate) struct ParkExpired(pub(crate) &'static str);
 
-impl std::fmt::Display for ParkExpired {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
-    }
-}
 
-impl std::error::Error for ParkExpired {}
 
-impl ParkExpired {
-    fn boxed(text: &'static str) -> BoxError {
-        Box::new(ParkExpired(text))
-    }
-}
 
-/// #21: is this admission error a park expiry (see [`ParkExpired`])? Typed downcast first; the
-/// string half covers a park-expiry close reason that reached us flattened inside some other
-/// error (e.g. an `open_bi`/write failure racing the edge's ApplicationClose) -- like
-/// [`crate::channel::error_names_park_expiry`], that is wire-token parsing, not an in-process
-/// substring contract.
-fn is_park_expired(e: &BoxError) -> bool {
-    if e.downcast_ref::<ParkExpired>().is_some() {
-        return true;
-    }
-    crate::channel::error_names_park_expiry(e.as_ref())
-}
 
-/// #231: how long to wait before the next admission attempt. A definitive refusal (see
-/// [`is_definitive_admission_refusal`]) will never resolve itself without operator action — a
-/// holder that isn't a channel member stays that way until someone adds it — so retrying at the
-/// same fast `retry_backoff` used for transient errors (200ms in production) does nothing but
-/// flood the edge's admission path with attempts that can never succeed. Live-reproduced: an
-/// orphaned process retrying a not-member holder measured at ~24-47 admission attempts/second
-/// against the production edge, plausibly starving OTHER, genuinely valid joins of admission
-/// capacity (the exact symptom #231 describes). Backs off exponentially
-/// (`retry_backoff * 2^consecutive_refusals`), capped at [`REFUSED_ADMISSION_BACKOFF_CAP`]; a
-/// transient error always gets the fast, unchanged `retry_backoff` so a genuine brief CP/edge
-/// blip (#140) still recovers quickly. Pure — the loop supplies `consecutive_refusals`.
-fn admission_retry_backoff(
-    retry_backoff: std::time::Duration,
-    refused: bool,
-    consecutive_refusals: u32,
-) -> std::time::Duration {
-    if !refused {
-        return retry_backoff;
-    }
-    let shift = consecutive_refusals.min(16); // avoids overflow in 2^shift well before the cap binds
-    retry_backoff
-        .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
-        .min(REFUSED_ADMISSION_BACKOFF_CAP)
-}
 
 /// #179: should `ct-agent channel` stay parked and re-admit successive peers? Only the **accept**
 /// side in **serve** mode (`CT_CHANNEL_SERVE` truthy) — the parking side of a role a pipeline dials
@@ -4437,6 +4296,9 @@ pub async fn run_channel_command(cfg: ChannelRunConfig) -> Result<(), BoxError> 
     }
     Ok(())
 }
+
+mod errors;
+pub(crate) use errors::*;
 
 #[cfg(test)]
 mod tests;
