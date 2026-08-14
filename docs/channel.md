@@ -58,7 +58,8 @@ sequenceDiagram
     participant E as Edge (:443 broker)
     participant I as Initiator
     Note over A,E: Phase 1 — rendezvous admission
-    A->>E: TLS (ALPN ct-edge-channel[-ka] / boring h2) + join request
+    A->>E: TLS (ALPN ct-edge-channel[-ka] / boring h2) + [0xFF,0x01]? + join request
+    Note over A,E: v0.4.14: the 2-byte phase preamble rides only on<br/>KA-negotiated legs (0x01 rendezvous, 0x02 relay) —<br/>the edge then pairs marked parks phase-compatibly<br/>(unmarked = legacy mixed behavior)
     E->>A: 32-byte possession challenge
     A->>E: 64-byte signature — connection stays FULLY OPEN (v0.4.12: no half-close)
     Note over E: A parks (TTL 30 s; pump monitors liveness,<br/>KA-negotiated legs get 1 NUL / 10 s)
@@ -71,7 +72,7 @@ sequenceDiagram
         E->>I: OK + peer identity
     end
     Note over A,I: Phase 2 — relay leg (fresh connections)
-    A->>E: relay join (#121 relay-only fast-path skips the 8 s accept wait)
+    A->>E: [0xFF,0x02]? + relay join (#121 relay-only fast-path skips the 8 s accept wait)
     I->>E: relay join (#121 skips the 5 s direct dial)
     Note over E: pairer splices the two LIVE legs<br/>(#499: corpse parks are skipped, never spliced)
     A-->>I: Noise_IK handshake + session (end-to-end, edge is payload-blind)
@@ -102,9 +103,12 @@ incomplete — fix the picture first.
 - **`early eof`** right after pairing — historically ambiguous; the dominant cause (the splice
   ran against a **corpse park** left by a peer process that died while parked, retried on the
   edge's 10 s sweep grid → the N×10 s first-contact staircase) is fixed edge-side since #499
-  slice B (corpses are live-flagged and never spliced). Remaining causes: a mode/config
-  mismatch such as gate mode without reachable QUIC; [#18] tracks a distinguishable error
-  text.
+  slice B (corpses are live-flagged and never spliced). The second structural cause —
+  **phase-mixed pairing** (a relay leg spliced against a rendezvous park whose client reads
+  the ack and closes) — is fixed by the v0.4.14 phase preamble + the edge's phase-compatible
+  pairing (CADS-Tunnel#495 slice 2a); legacy/unmarked joins keep the historical mixed
+  behavior. Remaining causes: a mode/config mismatch such as gate mode without reachable
+  QUIC; [#18] tracks a distinguishable error text.
 - **Flap backoff (v0.4.10, [#250])**: a session that dies within 500 ms of pairing is a "flap";
   3+ consecutive flaps back off exponentially (cap 10 s) before the next admit — a peer whose
   connection is killed post-handshake (AV/DPI middleboxes are the leading field cause) no longer
