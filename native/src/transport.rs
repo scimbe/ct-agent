@@ -503,9 +503,40 @@ where
     register_tunnel_stream_browser_with_role(stream, token, host, b'L').await
 }
 
-/// Shared body of the `'B'`/`'L'` Browser-Plane registration: both roles have a
-/// byte-identical wire format (`role(1) | token(32) | host_len(2 BE) | host` →
-/// 2-byte `OK`/`NO` ack), so only the role byte varies.
+/// The **framed** Browser-Plane registration (CADS-Tunnel#528): byte-identical to
+/// `'B'`/`'L'` apart from the role byte `'F'`, and it keeps the whole `'L'` park
+/// phase — the Edge PINGs this connection while it sits parked, so the caller
+/// still drives [`await_ping_phase_end`] first. What `'F'` changes is what comes
+/// **after** the `STOP` byte: the relay phase is length-prefix framed in both
+/// directions on the edge↔agent hop (`ct_common::fallback_framing`), instead of
+/// being a raw byte pump. Drive it with [`crate::serve::serve_framed_duplex_to_origin`].
+///
+/// Why: `'L'` only keeps a *parked* connection alive. Once a request is delivered
+/// the framing stops and the connection is transparent again, so a request whose
+/// Origin is silent longer than the middlebox idle timeout — an LLM cold model
+/// load is the case this was found on — has neither relay traffic nor any way to
+/// inject a keepalive, and the middlebox drops the connection mid-request. Framing
+/// the relay phase makes a payload-carrying keepalive interleavable *during* an
+/// in-flight request, the same trick HTTP/2 PING (RFC 7540 §6.7) exists for.
+///
+/// Same fallback shape as `'L'`: an Edge that predates `'F'` treats the unknown
+/// role byte as a hard protocol error and drops the connection without an ack, so
+/// any failure here means redialing and registering `'L'` (then `'B'`) on a fresh
+/// stream — see `serve::tcp_connect_register_serve`.
+pub async fn register_tunnel_stream_browser_framed_capable<S>(
+    stream: &mut S,
+    token: &RoutingToken,
+    host: &str,
+) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    register_tunnel_stream_browser_with_role(stream, token, host, b'F').await
+}
+
+/// Shared body of the `'B'`/`'L'`/`'F'` Browser-Plane registration: all three roles
+/// have a byte-identical wire format (`role(1) | token(32) | host_len(2 BE) | host`
+/// → 2-byte `OK`/`NO` ack), so only the role byte varies.
 async fn register_tunnel_stream_browser_with_role<S>(
     stream: &mut S,
     token: &RoutingToken,
@@ -1219,6 +1250,94 @@ mod tests {
         register_tunnel_stream_browser_ping_capable(&mut agent_side, &token, host)
             .await
             .expect("ping-capable browser-register over a TLS-TCP-style stream");
+        edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn register_tunnel_stream_browser_framed_capable_sends_f_and_an_otherwise_identical_frame()
+    {
+        // #528: 'F' is 'L' with a framed relay phase. The REGISTRATION frame must stay
+        // byte-identical apart from the role byte -- the edge admits all three browser
+        // roles ('B'/'L'/'F') through one shared parser, so any divergence here would
+        // fork that parser for no reason. What differs comes strictly after STOP.
+        let (mut agent_side, mut edge_side) = tokio::io::duplex(1024);
+        let token = RoutingToken([0x4f; 32]);
+        let host = "sort.bunsenbrenner.org";
+
+        let t = token.clone();
+        let edge = tokio::spawn(async move {
+            let mut role = [0u8; 1];
+            edge_side.read_exact(&mut role).await.unwrap();
+            assert_eq!(role[0], b'F', "framed browser role byte");
+            let mut tok = [0u8; 32];
+            edge_side.read_exact(&mut tok).await.unwrap();
+            assert_eq!(&tok, &t.0, "token echoed, exactly as in 'B'/'L'");
+            let mut len = [0u8; 2];
+            edge_side.read_exact(&mut len).await.unwrap();
+            let n = u16::from_be_bytes(len) as usize;
+            let mut host_buf = vec![0u8; n];
+            edge_side.read_exact(&mut host_buf).await.unwrap();
+            assert_eq!(host_buf, host.as_bytes(), "hostname echoed, exactly as in 'B'/'L'");
+            edge_side.write_all(b"OK").await.unwrap();
+            edge_side.flush().await.unwrap();
+        });
+
+        register_tunnel_stream_browser_framed_capable(&mut agent_side, &token, host)
+            .await
+            .expect("framed browser-register over a TLS-TCP-style stream");
+        edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_framed_registration_keeps_the_park_phase_byte_for_byte() {
+        // #528's contract in one test: 'F' changes ONLY what follows the STOP byte.
+        // The park phase (PING/PONG, then a lone 0xFB) is the shared `'L'` one, so a
+        // framed agent must answer pings exactly as before -- and the first byte after
+        // STOP is already relay FRAMING, not raw payload.
+        let (mut agent_side, mut edge_side) = tokio::io::duplex(1024);
+        let token = RoutingToken([0x4e; 32]);
+        let host = "sort.bunsenbrenner.org";
+
+        let edge = tokio::spawn(async move {
+            let mut role = [0u8; 1];
+            edge_side.read_exact(&mut role).await.unwrap();
+            assert_eq!(role[0], b'F');
+            let mut tok = [0u8; 32];
+            edge_side.read_exact(&mut tok).await.unwrap();
+            let mut len = [0u8; 2];
+            edge_side.read_exact(&mut len).await.unwrap();
+            let mut host_buf = vec![0u8; u16::from_be_bytes(len) as usize];
+            edge_side.read_exact(&mut host_buf).await.unwrap();
+            edge_side.write_all(b"OK").await.unwrap();
+            edge_side.flush().await.unwrap();
+
+            let mut ping = [0u8; 9];
+            ping[0] = TCP_PING_MAGIC;
+            ping[1..].copy_from_slice(&7u64.to_be_bytes());
+            edge_side.write_all(&ping).await.unwrap();
+            edge_side.flush().await.unwrap();
+            let mut pong = [0u8; 9];
+            edge_side.read_exact(&mut pong).await.unwrap();
+            assert_eq!(pong[0], TCP_PONG_MAGIC, "a framed agent still PONGs while parked");
+            assert_eq!(&pong[1..], &7u64.to_be_bytes());
+
+            // STOP and the first relay frame in one write: the agent must consume the
+            // single STOP byte and leave the DATA frame's discriminator untouched.
+            let mut after = vec![TCP_PING_STOP];
+            ct_common::fallback_framing::write_data_frame(&mut after, b"hi").await.unwrap();
+            edge_side.write_all(&after).await.unwrap();
+            edge_side.flush().await.unwrap();
+        });
+
+        register_tunnel_stream_browser_framed_capable(&mut agent_side, &token, host)
+            .await
+            .expect("register");
+        await_ping_phase_end(&mut agent_side).await.expect("ping phase ends at STOP");
+        assert_eq!(
+            ct_common::fallback_framing::read_frame(&mut agent_side).await.unwrap(),
+            ct_common::fallback_framing::Frame::Data(b"hi".to_vec()),
+            "the bytes after STOP parse as a relay frame -- no park byte leaked into them"
+        );
         edge.await.unwrap();
     }
 

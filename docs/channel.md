@@ -146,6 +146,21 @@ QUIC every 30 s to upgrade back — previously only the *first* dial ever fell b
 took the tunnel down for its whole duration. `CT_AGENT_REGISTER_TCP_ONLY=1` pins registration to
 TLS-TCP outright (combine with `CT_AGENT_FALLBACK_443=1` for the `:443` front door).
 
+A *parked* TLS-TCP registration is kept alive across middleboxes that ignore ACK-only keepalives
+by real-payload PING/PONG (roles `'K'` mesh / `'L'` browser). That framing stops the moment a
+request is delivered, so a request whose Origin then goes silent longer than the middlebox idle
+timeout — an LLM cold model load — used to have the connection dropped mid-request.
+`CT_AGENT_FRAMED_FALLBACK=1` (Browser Plane only) switches registration to the framed role `'F'`,
+which keeps the identical park phase but length-prefix frames the *relay* phase on the edge↔agent
+hop, so a keepalive can be interleaved during an in-flight request (the HTTP/2 PING model,
+[RFC 7540] §6.7). The Origin side stays raw — only the edge↔agent hop is framed. **Off by
+default**: an Edge that predates `'F'` refuses it, costing one extra dial before the agent
+degrades to `'L'` (and then `'B'`), so enable it only against an Edge that carries the framed
+relay. See [CADS-Tunnel#528].
+
+[RFC 7540]: https://www.rfc-editor.org/rfc/rfc7540#section-6.7
+[CADS-Tunnel#528]: https://github.com/scimbe/CADS-Tunnel/issues/528
+
 ## Environment variables (channel subsystem)
 
 | Variable | Meaning |
