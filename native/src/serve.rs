@@ -2433,6 +2433,230 @@ mod tests {
         let _ = origin.await;
     }
 
+    /// Bring up a REAL edge (`ct_edge::serve::serve_tcp_connection`) on a real
+    /// TLS-TCP listener and a REAL agent (`run_agent_tcp_fallback`, framed opt-in),
+    /// and hand back everything the #528 end-to-end scenarios need: the edge state
+    /// (to deliver a browser into the parked registration and to assert what the
+    /// registration actually bound), the token, and the Origin's address.
+    ///
+    /// Everything here is the production path -- no hand-rolled edge, no stubbed
+    /// registration. That is the point: the stub tests on both sides were green
+    /// while the two `'F'` frames disagreed about their own shape, and only a real
+    /// pairing could see it.
+    async fn framed_e2e_edge_and_agent(
+        origin_addr: SocketAddr,
+        host: &str,
+    ) -> (
+        Arc<ct_edge::state::EdgeState<quinn::Connection>>,
+        RoutingToken,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use ct_common::pow::Challenge;
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use ct_edge::state::EdgeState;
+        use std::net::Ipv4Addr;
+
+        let ca = Ca::new("f-e2e-ca").unwrap();
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let state = Arc::new(EdgeState::<quinn::Connection>::new());
+        let token = RoutingToken([0x46; 32]);
+
+        let st = state.clone();
+        let edge = tokio::spawn(async move {
+            // difficulty 0: the PoW gate is not what this test is about.
+            let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+            loop {
+                let Ok((tcp, _)) = tcp_listener.accept().await else { break };
+                let acc = acceptor.clone();
+                let st = st.clone();
+                let ch = challenge.clone();
+                tokio::spawn(async move {
+                    if let Ok(tls) = acc.accept(tcp).await {
+                        let _ = ct_edge::serve::serve_tcp_connection(tls, &st, &ch, None).await;
+                    }
+                });
+            }
+        });
+
+        let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), &origin_addr.to_string()).unwrap();
+        cfg.browser_forward = true;
+        cfg.hostname = Some(host.to_string());
+        cfg.framed_fallback = true; // the whole point: register 'F'
+        cfg.tcp_fallback_pool_size = 1;
+        let token_a = token.clone();
+        let agent = tokio::spawn(async move {
+            let _ = run_agent_tcp_fallback(&cfg, ca_root, token_a, Arc::new(vec![[0u8; 32]])).await;
+        });
+
+        (state, token, edge, agent)
+    }
+
+    /// Wait until the edge has a parked TCP agent for `token` AND the hostname is
+    /// bound to it. These two are the PROBE assertions from the `'F'`-shape
+    /// investigation, and they belong here permanently: when the two sides
+    /// disagreed about the registration frame, the agent's registration returned
+    /// `Ok(())` while the edge had bound NOTHING -- a silent success that no
+    /// byte-level assertion on either side alone could catch.
+    async fn await_framed_registration(
+        state: &ct_edge::state::EdgeState<quinn::Connection>,
+        token: &RoutingToken,
+        host: &str,
+    ) {
+        for _ in 0..400 {
+            if state.has_tcp_agent(token) && state.route_host(host).as_ref() == Some(token) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!(
+            "the 'F' registration never took effect at the edge: parked={}, host binding={:?} \
+             (an agent that thinks it registered while the edge bound nothing is exactly the \
+             silent failure this assertion exists for)",
+            state.has_tcp_agent(token),
+            state.route_host(host)
+        );
+    }
+
+    /// #528 SCENARIO A, the whole reason the feature exists — real edge, real agent,
+    /// real sockets. A browser request is in flight when the Origin goes silent for
+    /// LONGER than the dead-peer bound (an LLM cold model load). Before #528 the
+    /// relay was a raw byte pump with nothing on the wire, and a middlebox dropped
+    /// the connection; now both sides exchange counted keepalives and ACK them, so
+    /// the silence is survived and the late response still reaches the browser.
+    ///
+    /// Deliberately on the REAL clock, not a paused one: two independent state
+    /// machines (the edge's park/ping/admission timers and the agent's keepalive
+    /// cadence) drive real sockets here, and a virtual clock would auto-advance
+    /// past the edge's 10s admission timeout while a socket read was merely
+    /// pending. The ~30s runtime buys determinism, and it is the only test in this
+    /// file that pays it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn e2e_a_a_silent_origin_past_the_dead_bound_still_answers_the_browser() {
+        const HOST: &str = "framed-e2e.bunsenbrenner.org";
+        // The Origin: takes the request, says nothing for longer than the 24s
+        // dead-peer bound, then answers.
+        let ol = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = ol.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut sock, _) = ol.accept().await.unwrap();
+            let mut buf = [0u8; 128];
+            let n = sock.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"GET /slow HTTP/1.1\r\n\r\n", "the Origin sees raw HTTP, unframed");
+            tokio::time::sleep(KEEPALIVE_DEAD_AFTER + Duration::from_secs(6)).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\n\r\ncold-model-answer").await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+
+        let (state, token, edge, agent) = framed_e2e_edge_and_agent(origin_addr, HOST).await;
+        await_framed_registration(&state, &token, HOST).await;
+
+        // Splice a browser in, exactly as the front door does after SNI routing.
+        // The browser side is RAW: framing lives only on the edge<->agent hop.
+        let (mut browser, edge_side) = tokio::io::duplex(1 << 16);
+        state
+            .deliver_to_tcp_agent_draining(&token, Box::new(edge_side))
+            .map_err(|_| "no parked agent to deliver the browser to")
+            .unwrap();
+
+        browser.write_all(b"GET /slow HTTP/1.1\r\n\r\n").await.unwrap();
+        browser.flush().await.unwrap();
+
+        let mut answer = Vec::new();
+        tokio::time::timeout(
+            KEEPALIVE_DEAD_AFTER + Duration::from_secs(30),
+            browser.read_to_end(&mut answer),
+        )
+        .await
+        .expect("the relay must survive the silence, not stall or be torn down")
+        .unwrap();
+        assert_eq!(
+            answer, b"HTTP/1.1 200 OK\r\n\r\ncold-model-answer",
+            "the late response crosses intact after {}s+ of Origin silence -- unframed, and \
+             with every keepalive discarded rather than forwarded",
+            KEEPALIVE_DEAD_AFTER.as_secs()
+        );
+
+        let _ = origin.await;
+        agent.abort();
+        edge.abort();
+    }
+
+    /// #528 SCENARIO B: clean termination over the real pairing. The Origin answers
+    /// and closes, so the agent sends its in-band FIN; the browser then closes, the
+    /// edge FINs back, and both sides shut the hop down. The assertion is that
+    /// everything ENDS -- a relay that keeps pinging a finished conversation leaks
+    /// a fallback registration and its admission permits, so the timeout is the
+    /// real check here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn e2e_b_a_finished_exchange_terminates_both_sides() {
+        const HOST: &str = "framed-e2e-fin.bunsenbrenner.org";
+        let ol = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = ol.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut sock, _) = ol.accept().await.unwrap();
+            let mut buf = [0u8; 128];
+            let n = sock.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"GET / HTTP/1.1\r\n\r\n");
+            sock.write_all(b"HTTP/1.1 200 OK\r\n\r\ndone").await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+
+        let (state, token, edge, agent) = framed_e2e_edge_and_agent(origin_addr, HOST).await;
+        await_framed_registration(&state, &token, HOST).await;
+
+        let (mut browser, edge_side) = tokio::io::duplex(1 << 16);
+        state
+            .deliver_to_tcp_agent_draining(&token, Box::new(edge_side))
+            .map_err(|_| "no parked agent to deliver the browser to")
+            .unwrap();
+
+        browser.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        browser.flush().await.unwrap();
+
+        // read_to_end returns only once the edge closed the browser leg, which it
+        // may only do after the agent's FIN travelled the framed hop.
+        let mut answer = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), browser.read_to_end(&mut answer))
+            .await
+            .expect("the browser leg must be closed after the Origin finished, not held open")
+            .unwrap();
+        assert_eq!(answer, b"HTTP/1.1 200 OK\r\n\r\ndone");
+
+        // The browser closes, as a real one does once it has its response. Until it
+        // does, the edge is RIGHT to hold the hop open -- it has not sent its own
+        // FIN yet, and the termination rule needs FIN in both directions. (Dropping
+        // this line is how the first version of this test failed: it waited for a
+        // re-registration that the agent was correctly refusing to make.)
+        drop(browser);
+
+        // And the agent re-registers rather than sitting in a finished relay: the
+        // registration is single-use, so a fresh parked slot proves the previous
+        // one was torn down and the worker looped.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if state.has_tcp_agent(&token) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("after a finished exchange the worker must re-register, not linger in the relay");
+
+        let _ = origin.await;
+        agent.abort();
+        edge.abort();
+    }
+
     #[tokio::test]
     async fn tcp_fallback_reconnects_after_a_tunnel_drops() {
         // issue #5 / P1.2b: the TLS-TCP fallback re-registers after each tunnel.
