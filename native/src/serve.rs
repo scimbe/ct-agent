@@ -1761,7 +1761,19 @@ mod tests {
     /// Origin says comes back as a frame; and the Origin itself never sees framing.
     #[tokio::test]
     async fn the_framed_relay_unframes_to_the_origin_and_reframes_the_response() {
-        let (origin_addr, origin) = echo_origin().await;
+        // The Origin asserts the concatenation itself with a read_exact: the relay
+        // forwards each DATA frame as its own write, so a plain single `read` here
+        // would race the second one and make the test flaky rather than wrong.
+        let ol = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = ol.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut sock, _) = ol.accept().await.unwrap();
+            let mut got = [0u8; 14];
+            sock.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"GET / HTTP/1.1", "the Origin sees raw bytes -- no framing reaches it");
+            sock.write_all(b"HTTP/1.1 200 OK").await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
         let (mut edge_side, agent_side) = tokio::io::duplex(1 << 16);
         let relay =
             tokio::spawn(async move { serve_framed_duplex_to_origin(agent_side, origin_addr).await });
@@ -1784,7 +1796,7 @@ mod tests {
                 Err(e) => panic!("relay framing error: {e}"),
             }
         }
-        assert_eq!(got, b"GET / HTTP/1.1", "the Origin saw the concatenated payload, unframed");
+        assert_eq!(got, b"HTTP/1.1 200 OK", "the Origin's raw response comes back framed");
 
         drop(edge_side);
         relay.await.unwrap().expect("the framed relay ends cleanly");
@@ -1797,7 +1809,24 @@ mod tests {
         // before a request, between its chunks, and while a response is in flight --
         // and must never reach the Origin. If a single keepalive byte leaked through,
         // it would corrupt the very request it exists to protect.
-        let (origin_addr, origin) = echo_origin().await;
+        // Same reasoning as above: the Origin itself pins what it received, byte for
+        // byte, instead of echoing whatever happened to arrive in one read.
+        let ol = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = ol.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut sock, _) = ol.accept().await.unwrap();
+            let mut got = [0u8; 4];
+            sock.read_exact(&mut got).await.unwrap();
+            assert_eq!(
+                &got, b"ABCD",
+                "exactly the DATA payloads reached the Origin -- no keepalive leaked into them"
+            );
+            // Nothing else may follow: a leaked trailing keepalive would show up here.
+            let mut extra = [0u8; 1];
+            assert_eq!(sock.read(&mut extra).await.unwrap(), 0, "the Origin sees a clean EOF, not a stray byte");
+            sock.write_all(b"done").await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
         let (mut edge_side, agent_side) = tokio::io::duplex(1 << 16);
         let relay =
             tokio::spawn(async move { serve_framed_duplex_to_origin(agent_side, origin_addr).await });
@@ -1807,7 +1836,9 @@ mod tests {
         fallback_framing::write_keepalive_frame(&mut edge_side).await.unwrap();
         fallback_framing::write_data_frame(&mut edge_side, b"CD").await.unwrap();
         fallback_framing::write_keepalive_frame(&mut edge_side).await.unwrap();
-        edge_side.flush().await.unwrap();
+        // Half-close, so the relay half-closes the Origin in turn and the Origin's
+        // own "nothing else followed" check can complete.
+        edge_side.shutdown().await.unwrap();
 
         let mut got = Vec::new();
         loop {
@@ -1818,10 +1849,7 @@ mod tests {
                 Err(e) => panic!("relay framing error: {e}"),
             }
         }
-        assert_eq!(
-            got, b"ABCD",
-            "exactly the DATA payloads reached the Origin -- no keepalive leaked into the stream"
-        );
+        assert_eq!(got, b"done", "the Origin answered the un-keepalived request");
 
         drop(edge_side);
         relay.await.unwrap().expect("the framed relay ends cleanly");
