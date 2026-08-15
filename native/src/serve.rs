@@ -134,6 +134,55 @@ enum EdgeWrite {
     PeerFin,
 }
 
+/// Apply one [`EdgeWrite`] to the writer-owner's state. Factored out ONLY so the
+/// dead-peer deadline arm can drain the queue through the exact same handling
+/// before it judges (#528 review A2) — two divergent copies of this would be a far
+/// worse bug than the one it fixes.
+async fn apply_edge_write<W>(
+    ev: EdgeWrite,
+    w: &mut fallback_framing::FrameWriter<W>,
+    tracker: &mut fallback_framing::KeepaliveTracker,
+    peer_fin: &mut bool,
+    last_write: &mut tokio::time::Instant,
+) -> Result<(), BoxError>
+where
+    W: AsyncWrite + Unpin,
+{
+    match ev {
+        EdgeWrite::Data { payload, flush } => {
+            w.data(&payload).await?;
+            // #338: flush exactly on the short-read boundary the Origin reader
+            // marked, not per chunk. `data` deliberately does not auto-flush so
+            // bulk chunks can coalesce.
+            if flush {
+                w.flush().await?;
+            }
+            *last_write = tokio::time::Instant::now();
+        }
+        EdgeWrite::Ack(c) => {
+            w.keepalive_ack(c).await?;
+            *last_write = tokio::time::Instant::now();
+        }
+        EdgeWrite::AckReceived(c) => tracker.ack(c),
+        EdgeWrite::Fin => {
+            w.fin().await?;
+            *last_write = tokio::time::Instant::now();
+        }
+        EdgeWrite::PeerFin => {
+            *peer_fin = true;
+            // Stop JUDGING the peer once its data direction is over (#528
+            // contract: inject until both FINs, judge only until the peer's). A
+            // half-closed peer is winding down and may legitimately stop ACKing;
+            // keeping the outstanding set would turn an ordinary clean shutdown
+            // into a dead verdict at 24s -- a spurious error return and a
+            // pointless redial on a connection that was ending correctly. A
+            // genuinely dead peer still surfaces here, as a write error.
+            *tracker = fallback_framing::KeepaliveTracker::new();
+        }
+    }
+    Ok(())
+}
+
 /// Forward a relayed **framed** duplex stream to the Origin (CADS-Tunnel#528) —
 /// the `'F'`-registration counterpart to [`serve_duplex_to_origin`].
 ///
@@ -340,36 +389,9 @@ where
                 });
             tokio::select! {
                 cmd = rx.recv() => match cmd {
-                    Some(EdgeWrite::Data { payload, flush }) => {
-                        w.data(&payload).await?;
-                        // #338: flush exactly on the short-read boundary the Origin
-                        // reader marked, not per chunk. `data` deliberately does not
-                        // auto-flush so bulk chunks can coalesce.
-                        if flush {
-                            w.flush().await?;
-                        }
-                        last_write = tokio::time::Instant::now();
-                    }
-                    Some(EdgeWrite::Ack(c)) => {
-                        w.keepalive_ack(c).await?;
-                        last_write = tokio::time::Instant::now();
-                    }
-                    Some(EdgeWrite::AckReceived(c)) => tracker.ack(c),
-                    Some(EdgeWrite::Fin) => {
-                        w.fin().await?;
-                        last_write = tokio::time::Instant::now();
-                    }
-                    Some(EdgeWrite::PeerFin) => {
-                        peer_fin = true;
-                        // Stop JUDGING the peer once its data direction is over
-                        // (#528 contract: inject until both FINs, judge only until
-                        // the peer's). A half-closed peer is winding down and may
-                        // legitimately stop ACKing; keeping the outstanding set would
-                        // turn an ordinary clean shutdown into a dead verdict at
-                        // 24s -- a spurious error return and a pointless redial on a
-                        // connection that was ending correctly. A genuinely dead peer
-                        // still surfaces here, as a write error.
-                        tracker = fallback_framing::KeepaliveTracker::new();
+                    Some(ev) => {
+                        apply_edge_write(ev, &mut w, &mut tracker, &mut peer_fin, &mut last_write)
+                            .await?
                     }
                     // Both halves are gone and the queue is drained: nothing further
                     // can be written, so close rather than keepalive into the void.
@@ -391,15 +413,26 @@ where
                     }
                     last_write = tokio::time::Instant::now();
                 }
-                // Re-checked rather than trusted: the deadline was computed before the
-                // select, and an ACK may have settled the outstanding set in the very
-                // same wakeup.
                 _ = async {
                     match deadline {
                         Some(d) => tokio::time::sleep_until(d).await,
                         None => std::future::pending::<()>().await,
                     }
                 } => {
+                    // Drain the queue BEFORE judging (#528 review A2). The race is
+                    // real -- an ACK can arrive while this timer is already due --
+                    // but at that moment it sits in the mpsc channel, NOT in the
+                    // tracker, so re-reading the tracker alone would never see it
+                    // and the verdict would be a foregone conclusion (the deadline
+                    // arithmetic guarantees `age == KEEPALIVE_DEAD_AFTER` exactly
+                    // when this fires). Draining through the same handler is what
+                    // gives the peer credit for an ACK it did send in time.
+                    // Deliberately NOT `biased`: that would starve this arm and the
+                    // keepalive timer whenever the channel is busy.
+                    while let Ok(ev) = rx.try_recv() {
+                        apply_edge_write(ev, &mut w, &mut tracker, &mut peer_fin, &mut last_write)
+                            .await?;
+                    }
                     if let Some(age) =
                         tracker.oldest_outstanding_age_ms(now_ms(tokio::time::Instant::now()))
                     {
@@ -2292,6 +2325,59 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(30), scenario)
             .await
             .expect("the relay must terminate on a FIN-without-data, not keepalive forever");
+        assert!(
+            !dialed.load(std::sync::atomic::Ordering::SeqCst),
+            "and the Origin was never dialed for a browser that never spoke"
+        );
+        origin.abort();
+    }
+
+    #[tokio::test]
+    async fn an_empty_browser_connect_that_ends_in_a_clean_eof_terminates_too() {
+        // #528 review A1: the twin of the test above, for the IMPLICIT FIN. The
+        // codec defines a clean EOF at a frame boundary as a FIN, and a conforming
+        // peer may end that way instead of sending 0xFE -- so this path is legal and
+        // must terminate identically. It is also a DIFFERENT code path: the explicit
+        // FIN releases the dial channel inside the frame loop, whereas here the loop
+        // simply ends and the body's locals (the dial channel, the writer queue
+        // sender) are what must be released. Testing only the explicit path would
+        // leave the two fixes that cover this one unexercised.
+        let ol = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = ol.local_addr().unwrap();
+        let dialed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dialed_w = dialed.clone();
+        let origin = tokio::spawn(async move {
+            let _ = ol.accept().await;
+            dialed_w.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let (edge_side, agent_side) = tokio::io::duplex(1 << 16);
+        let relay =
+            tokio::spawn(async move { serve_framed_duplex_to_origin(agent_side, origin_addr).await });
+
+        let scenario = async {
+            let (mut er, mut ew) = edge_peer(edge_side);
+            // No frame at all: just half-close, which the contract reads as a FIN.
+            ew.shutdown().await.unwrap();
+            let mut saw_fin = false;
+            loop {
+                match er.next().await.expect("relay framing stays valid") {
+                    Some(fallback_framing::Frame::Fin) => saw_fin = true,
+                    Some(fallback_framing::Frame::Keepalive { counter, .. }) => {
+                        // The write half is shut; a keepalive here would mean the
+                        // relay failed to notice the EOF at all.
+                        panic!("unexpected keepalive {counter} after a clean EOF")
+                    }
+                    Some(other) => panic!("nothing but a FIN is owed here, got {other:?}"),
+                    None => break,
+                }
+            }
+            assert!(saw_fin, "an implicit FIN is answered with a real one, like the explicit case");
+            relay.await.unwrap().expect("a clean EOF is a clean end, not an error");
+        };
+        tokio::time::timeout(Duration::from_secs(30), scenario)
+            .await
+            .expect("the relay must terminate on a clean EOF, not keepalive forever");
         assert!(
             !dialed.load(std::sync::atomic::Ordering::SeqCst),
             "and the Origin was never dialed for a browser that never spoke"
