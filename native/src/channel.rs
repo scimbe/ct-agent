@@ -369,6 +369,15 @@ where
     Ok(parse_channel_ack(&ack))
 }
 
+/// The substring the edge's QUIC park-expiry ApplicationClose reason always carries — the
+/// colon-less stem of CADS-Tunnel's `QUIC_PARK_EXPIRED_REASON_PREFIX` (`"park-expired:"`), so
+/// it matches the prefix and any honest human-readable suffix. This is the cross-repo wire
+/// contract [`error_names_park_expiry`] classifies on; reword it on either side and a benign
+/// park reap silently reads as a refusal (rung-ladder advance + refusal backoff instead of
+/// re-park). Both repos pin it with a test — here `error_names_park_expiry_walks_the_source_chain_21`,
+/// on the edge `quic_park_expiry_reasons_carry_the_wire_prefix` (CADS-Tunnel#526).
+const QUIC_PARK_EXPIRED_MARKER: &str = "park-expired";
+
 /// #21: does this error (anywhere in its source chain) carry the edge's named QUIC park-expiry
 /// close reason? The edge reaps an idle QUIC park by closing the connection with the
 /// ApplicationClose reason `park-expired: no partner within the park TTL` — quinn flattens that
@@ -378,7 +387,7 @@ where
 pub(crate) fn error_names_park_expiry(e: &(dyn std::error::Error + 'static)) -> bool {
     let mut cur: Option<&dyn std::error::Error> = Some(e);
     while let Some(err) = cur {
-        if err.to_string().contains("park-expired") {
+        if err.to_string().contains(QUIC_PARK_EXPIRED_MARKER) {
             return true;
         }
         cur = err.source();
@@ -1084,6 +1093,13 @@ mod tests {
         // #21 QUIC half: quinn buries the ApplicationClose reason at a nesting depth that
         // depends on which call observed the close — the classifier must find the wire token
         // at any level of the source chain, and must not fire on unrelated errors.
+        // CADS-Tunnel#526 cross-repo contract: the marker must be a substring of the edge's
+        // ACTUAL close reasons, so this pins our stem against a copy of what the edge emits.
+        assert!(
+            "park-expired: no partner within the park TTL".contains(QUIC_PARK_EXPIRED_MARKER)
+                && "park-expired: superseded by a newer join from the same holder".contains(QUIC_PARK_EXPIRED_MARKER),
+            "the client marker must match every edge QUIC park-expiry reason"
+        );
         let inner = std::io::Error::other("connection lost: closed by peer: 0: park-expired: no partner within the park TTL");
         let outer = std::io::Error::other(inner);
         assert!(error_names_park_expiry(&outer), "the nested close reason is recognized");
