@@ -550,6 +550,18 @@ pub(crate) fn run_service_handler(
     run_service_handler_with_timeout(cmd, service, input, SERVICE_HANDLER_TIMEOUT)
 }
 
+/// #19 (v0.5.0 default flip): whether `--call-service` holds ONE session and multiplexes
+/// NDJSON-framed calls over it (`true`, the default) or runs the legacy one-shot
+/// bare-output call (`false`). Only an explicit `0`/`false`/`no` opts out — unset,
+/// empty, or anything else keeps the session mode, so a typo can never silently
+/// reintroduce the one-pairing-per-call cost this flip removes.
+pub(crate) fn call_persistent_enabled_from(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(str::trim),
+        Some(s) if s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("no")
+    )
+}
+
 /// Build the channel session's local app duplex from the environment (#135 L2.x). `CT_CHANNEL_CALL=<method>`
 /// → one-shot MCP **client** (invoke a peer's tool, print the reply, exit). `CT_CHANNEL_SERVE=1` → the
 /// persistent MCP **service** (JSON-RPC `tools/list`/`tools/call` via the tool registry). Neither → the
@@ -561,18 +573,17 @@ pub(crate) fn channel_local() -> ChannelLocal {
     if let Ok(slug) = std::env::var("CT_CHANNEL_CALL_SERVICE") {
         let slug = slug.trim().to_string();
         // #19: persistent call mode -- hold ONE session and multiplex line-framed calls over it
-        // until stdin EOF, instead of one pairing per call. Checked before the one-shot path so
-        // the flag simply upgrades an existing CT_CHANNEL_CALL_SERVICE deployment. Deliberately
-        // NOT combined with the DCUtR retry modes yet (their per-attempt channel_local() re-entry
-        // would contend for the single stdin feed -- the same class of trap #248 documents below);
-        // the arena/front-door path this exists for calls channel_local() exactly once.
-        let persistent = std::env::var("CT_CHANNEL_CALL_PERSISTENT")
-            .map(|v| {
-                let v = v.trim();
-                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
-            })
-            .unwrap_or(false);
-        if persistent {
+        // until stdin EOF, instead of one pairing per call. THE DEFAULT since v0.5.0 (the
+        // operator-staged flip: opt-in through v0.4.x, default once the reference bridges
+        // migrated to the NDJSON envelope -- sort runs it in the field at 85-92 ms/round,
+        // faults 0). `CT_CHANNEL_CALL_PERSISTENT=0` opts a deliberate one-shot caller back
+        // into the old contract (ONE bare-output call, then exit); only an explicit off
+        // value disables, so a typo can never silently drop the session mode (same posture
+        // as `phase_marker_enabled_from`). Deliberately NOT combined with the DCUtR retry
+        // modes (their per-attempt channel_local() re-entry would contend for the single
+        // stdin feed -- the #248 trap class below); the arena/front-door path this exists
+        // for calls channel_local() exactly once.
+        if call_persistent_enabled_from(std::env::var("CT_CHANNEL_CALL_PERSISTENT").ok().as_deref()) {
             eprintln!(
                 "ct-agent channel: --call-service {slug} (persistent: one held session, NDJSON calls over stdio until EOF, #19)"
             );

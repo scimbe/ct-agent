@@ -185,6 +185,21 @@ async fn dial_relay_preferring_direct_with_no_direct_address_dials_the_fallback_
     assert!(fallback_hit.await.unwrap());
 }
 
+/// #19 (v0.5.0 flip): persistent call mode is the DEFAULT; only an explicit off
+/// value opts a deliberate one-shot caller out — unset/empty/typos keep the
+/// session mode, mirroring `phase_marker_enabled_from`'s fail-safe posture.
+#[test]
+fn call_persistent_defaults_on_and_disables_only_on_explicit_off() {
+    use super::service_calls::call_persistent_enabled_from;
+    assert!(call_persistent_enabled_from(None), "unset: persistent (the v0.5.0 default)");
+    assert!(call_persistent_enabled_from(Some("1")), "explicit on stays on");
+    assert!(call_persistent_enabled_from(Some("")), "empty is not an opt-out");
+    assert!(call_persistent_enabled_from(Some("ture")), "a typo never silently drops the session mode");
+    assert!(!call_persistent_enabled_from(Some("0")), "0 opts out");
+    assert!(!call_persistent_enabled_from(Some("false")), "false opts out");
+    assert!(!call_persistent_enabled_from(Some(" No ")), "no (trimmed, any case) opts out");
+}
+
 /// #24 test helpers: one result per admission-outcome class.
 fn dcutr_ok() -> Result<(), BoxError> {
     Ok(())
