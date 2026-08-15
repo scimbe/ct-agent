@@ -3122,13 +3122,19 @@ pub async fn present_channel_join_via_ladder(
                     // #495 slice 2a (v0.4.14): mark the RENDEZVOUS phase on KA-generation
                     // edges (see the relay ladder's twin comment for the why).
                     let phase_marker = crate::channel::phase_marker_for(&stream, crate::channel::PHASE_MARKER_RENDEZVOUS);
+                    // #506: a KA-negotiated leg waits for its pairing on the TICK contract
+                    // (the edge's 10 s NUL keepalives prove the park alive), so the park may
+                    // outlive the fixed 45 s exchange bound once the edge runs a long TTL.
+                    // Deliberately gated on the ALPN alone — the v0.4.17 marker switch must
+                    // not disable liveness-based waiting.
+                    let ka_tick_wait = crate::transport::ka_negotiated(&stream);
                     let (recv, send) = tokio::io::split(stream);
                     // finish_send_after_sig = false (#21 follow-up): on this TCP/TLS leg the
                     // old post-signature shutdown was a close_notify+FIN that half-closed the
                     // whole connection -- the parked member then waited out its park as a
                     // closing flow, and the edge's reap teardown RST'd the in-flight EX away
                     // (packet-capture-proven). The edge needs no EOF; keep the leg fully open.
-                    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT, false, phase_marker)
+                    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT, false, phase_marker, ka_tick_wait)
                         .await
                         .map_err(ChannelDialError::Failed)
                 }

@@ -184,7 +184,7 @@ pub async fn present_channel_join(
         .map_err(|_| -> BoxError { "channel join open_bi stalled after connect (#140)".into() })??;
     // finish_send_after_sig = true: on QUIC the post-signature shutdown is quinn's clean
     // per-stream finish() -- connection-scoped state is untouched (unlike a TCP/TLS leg).
-    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT, true, None).await
+    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT, true, None, false).await
 }
 
 /// The transport-agnostic core of [`present_channel_join`]: run the channel-join wire
@@ -204,6 +204,14 @@ pub async fn present_channel_join(
 /// beats) the in-flight `EX` record out of the receive buffer, and every stateful
 /// middlebox on the path sees a closing flow where a live park is meant to be. The edge
 /// never needed the EOF (every read on its side is exact-length).
+/// #506: how long a KA leg's parked wait may go without a single byte (NUL tick or
+/// ack) before the park is presumed dead. The edge ticks every parked KA leg every
+/// 10 s (#500 K2), so 35 s = 3.5 missed ticks — far above jitter, far below the
+/// old fixed bound's worst case. This is what lets a KA park outlive the 45 s
+/// exchange bound: liveness is per-tick, not per-total (the edge's park TTL for KA
+/// legs becomes an operator knob, CT_EDGE_KA_PARK_TTL_SECS).
+pub(crate) const KA_PARK_INACTIVITY_BOUND: std::time::Duration = std::time::Duration::from_secs(35);
+
 pub async fn present_channel_join_on_stream<W, R>(
     mut send: W,
     mut recv: R,
@@ -212,16 +220,23 @@ pub async fn present_channel_join_on_stream<W, R>(
     exchange_timeout: std::time::Duration,
     finish_send_after_sig: bool,
     phase_marker: Option<u8>,
+    ka_tick_wait: bool,
 ) -> Result<ChannelJoinOutcome, BoxError>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    // #140: bound the whole admission exchange so a transport-alive-but-stalled admission (broker not
-    // responding, half-open connection, early packet loss on this exchange) fails fast instead of
-    // hanging forever — the same bound-the-stall discipline as #139/#126. `exchange_timeout` is a
-    // parameter so tests drive it deterministically without waiting the production bound.
-    let exchange = async move {
+    // #140: bound the stall — a transport-alive-but-stalled admission (broker not
+    // responding, half-open connection, early packet loss) fails fast instead of hanging
+    // forever, same discipline as #139/#126. Since #506 the bound is TWO-PHASE: the
+    // pre-ack phases (request, challenge, possession) always run under the whole
+    // `exchange_timeout`; the ACK WAIT is bounded per-read — for a legacy leg by the
+    // remaining total budget (exactly the old whole-exchange behavior), for a KA leg
+    // (`ka_tick_wait`) by tick INACTIVITY: the edge ticks a parked KA leg every 10 s, so
+    // the park is provably alive however long the edge's park TTL runs, and only 35 s of
+    // SILENCE (dead park / wedged edge) fails the wait.
+    let deadline = tokio::time::Instant::now() + exchange_timeout;
+    let pre = async {
     let bytes = request.encode();
     let len = u16::try_from(bytes.len()).map_err(|_| "channel join request too large")?;
     if let Some(phase) = phase_marker {
@@ -256,7 +271,8 @@ where
     if resp.len() != 32 {
         let text = String::from_utf8_lossy(&resp);
         if resp.is_empty() || text.starts_with("NO") {
-            return Ok(ChannelJoinOutcome::Refused); // explicit NO, or an ambiguous empty (raced-NO/closed)
+            // explicit NO, or an ambiguous empty (raced-NO/closed)
+            return Ok(Some(ChannelJoinOutcome::Refused));
         }
         return Err(format!(
             "channel join: the edge sent a malformed {}-byte response before the possession \
@@ -274,6 +290,14 @@ where
         // already have closed. See the doc comment for why a stream leg must NOT do this.
         let _ = send.shutdown().await;
     }
+    Ok::<Option<ChannelJoinOutcome>, BoxError>(None)
+    };
+    match tokio::time::timeout_at(deadline, pre).await {
+        Ok(Ok(None)) => {} // possession complete — proceed to the ack wait
+        Ok(Ok(Some(early))) => return Ok(early),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err("channel join admission exchange stalled (#140)".into()),
+    }
 
     // This reader implements the module header's ack contract (#23). The #494 history
     // of why it is byte-wise: the old `take(512).read_to_end` completed only at EOF (or
@@ -285,7 +309,28 @@ where
     let mut ack = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        match recv.read(&mut byte).await {
+        // #506: bound each read. A KA leg is bounded by tick INACTIVITY — every #500
+        // NUL keepalive (or ack byte) restarts the window, so a long-TTL park waits as
+        // long as it provably lives. A legacy leg is bounded by the remaining total
+        // budget: byte-for-byte the old whole-exchange #140 behavior.
+        let bound = if ka_tick_wait {
+            KA_PARK_INACTIVITY_BOUND
+        } else {
+            deadline.saturating_duration_since(tokio::time::Instant::now())
+        };
+        let read = match tokio::time::timeout(bound, recv.read(&mut byte)).await {
+            Ok(r) => r,
+            Err(_) if ka_tick_wait => {
+                return Err(format!(
+                    "KA park went silent — no keepalive tick or ack for {}s: dead park or \
+                     wedged edge, not a refusal; retry (#506)",
+                    KA_PARK_INACTIVITY_BOUND.as_secs()
+                )
+                .into())
+            }
+            Err(_) => return Err("channel join admission exchange stalled (#140)".into()),
+        };
+        match read {
             // EOF: QUIC finish, a NO/EX teardown — or a leg dropped before any ack
             // byte, classified as [`DroppedLegBeforeAck`] below the loop (#23).
             Ok(0) => break,
@@ -322,11 +367,6 @@ where
     }
     let ack = String::from_utf8_lossy(&ack);
     Ok(parse_channel_ack(&ack))
-    };
-    match tokio::time::timeout(exchange_timeout, exchange).await {
-        Ok(result) => result,
-        Err(_) => Err("channel join admission exchange stalled (#140)".into()),
-    }
 }
 
 /// #21: does this error (anywhere in its source chain) carry the edge's named QUIC park-expiry
@@ -552,7 +592,7 @@ mod tests {
         let (client_end, _silent_edge) = tokio::io::duplex(4096); // held open, never responds
         let (cli_r, cli_w) = split(client_end);
         let start = std::time::Instant::now();
-        let r = present_channel_join_on_stream(cli_w, cli_r, &request, &holder, std::time::Duration::from_millis(200), false, None).await;
+        let r = present_channel_join_on_stream(cli_w, cli_r, &request, &holder, std::time::Duration::from_millis(200), false, None, false).await;
         assert!(r.is_err(), "a stalled admission exchange errors, it does not hang (#140)");
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
@@ -581,7 +621,7 @@ mod tests {
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
             // send = write half, recv = read half — no quinn anywhere.
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None, false).await
         });
 
         // Minimal "edge": read the framed request, challenge, verify possession, ack OK.
@@ -631,7 +671,7 @@ mod tests {
         let (client_end, edge_end) = tokio::io::duplex(4096);
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None, false).await
         });
 
         let (mut er, mut ew) = split(edge_end);
@@ -672,6 +712,65 @@ mod tests {
         drop(er);
     }
 
+    /// #506 (tick-based wait contract): a KA leg's parked wait is bounded by tick
+    /// INACTIVITY, not by the total exchange bound — the edge's 10 s NUL keepalives
+    /// prove the park alive, so a long-TTL park (CT_EDGE_KA_PARK_TTL_SECS) must be
+    /// waitable past the 45 s #140 bound. Driven here with a deliberately TINY
+    /// exchange_timeout (500 ms) and a park that ticks well past it before acking:
+    /// the ticking park must complete Admitted where the old total bound fired #140.
+    #[tokio::test]
+    async fn a_ticking_ka_park_outlives_the_exchange_bound_506() {
+        use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+
+        let channel = [0x66u8; 32];
+        let holder = SigningKey::from_bytes(&[0x2Bu8; 32]);
+        let grant = signed_grant(channel, &holder, Direction::Accept);
+        let request = ChannelJoinRequest { grant, endpoint: "203.0.113.7:7007".to_string() };
+
+        let (client_end, edge_end) = tokio::io::duplex(4096);
+        let (cli_r, cli_w) = split(client_end);
+        let exchange_timeout = std::time::Duration::from_millis(500);
+        let client = tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let r = present_channel_join_on_stream(
+                cli_w, cli_r, &request, &holder, exchange_timeout, false, None, true,
+            )
+            .await;
+            (r, start.elapsed())
+        });
+
+        let (mut er, mut ew) = split(edge_end);
+        let mut len_buf = [0u8; 2];
+        er.read_exact(&mut len_buf).await.expect("len");
+        let mut body = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+        er.read_exact(&mut body).await.expect("request");
+        ew.write_all(&[0xAu8; 32]).await.expect("challenge");
+        let mut sig = [0u8; 64];
+        er.read_exact(&mut sig).await.expect("sig");
+        // The park ticks every 150 ms for 1.2 s — far past the 500 ms exchange bound —
+        // then the partner arrives and the ack lands.
+        for _ in 0..8 {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            ew.write_all(&[0u8]).await.expect("tick");
+        }
+        ew.write_all(b"OK 198.51.100.9:9009\n").await.expect("ack");
+
+        let (outcome, elapsed) = tokio::time::timeout(std::time::Duration::from_secs(5), client)
+            .await
+            .expect("completes")
+            .expect("client task");
+        assert!(
+            elapsed > exchange_timeout,
+            "the test only proves something if the wait genuinely outlived the bound"
+        );
+        match outcome.expect("a ticking park must not time out (#506)") {
+            ChannelJoinOutcome::Admitted { peer_endpoint, .. } => {
+                assert_eq!(peer_endpoint, "198.51.100.9:9009");
+            }
+            other => panic!("expected Admitted after the ticking wait, got {other:?}"),
+        }
+    }
+
     /// #23 (ack contract): a leg that closes with ZERO ack bytes after the possession
     /// handshake completed is a dropped leg / handoff race — the typed, retryable
     /// [`DroppedLegBeforeAck`] — and must NOT classify as `Refused`, which the ladder
@@ -690,7 +789,7 @@ mod tests {
         let (client_end, edge_end) = tokio::io::duplex(4096);
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None, false).await
         });
 
         let (mut er, mut ew) = split(edge_end);
@@ -732,7 +831,7 @@ mod tests {
         let (client_end, edge_end) = tokio::io::duplex(4096);
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None, false).await
         });
 
         let (mut er, mut ew) = split(edge_end);
@@ -774,7 +873,7 @@ mod tests {
         let (client_end, edge_end) = tokio::io::duplex(4096);
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None, false).await
         });
         // "edge": read the framed request, then send a malformed partial (neither 32 bytes
         // nor "NO") and close — a broken stream.
@@ -812,7 +911,7 @@ mod tests {
         let (client_end, edge_end) = tokio::io::duplex(4096);
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None, false).await
         });
         let (mut er, mut ew) = split(edge_end);
         let mut len_buf = [0u8; 2];
@@ -844,7 +943,7 @@ mod tests {
         let (client_end, edge_end) = tokio::io::duplex(4096);
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None, false).await
         });
         let (mut er, mut ew) = split(edge_end);
         let mut len_buf = [0u8; 2];
@@ -880,7 +979,7 @@ mod tests {
             let (client_end, edge_end) = tokio::io::duplex(4096);
             let (cli_r, cli_w) = split(client_end);
             let client = tokio::spawn(async move {
-                present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None).await
+                present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None, false).await
             });
             let (mut er, mut ew) = split(edge_end);
             let mut len_buf = [0u8; 2];
@@ -1344,7 +1443,7 @@ mod tests {
 
         let client_tls = tcp_tls_connect(listen_addr, cert).await.expect("tls-tcp connect");
         let (cli_r, cli_w) = split(client_tls);
-        let outcome = present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None)
+        let outcome = present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None, false)
             .await
             .expect("join drives over the :443 duplex");
         let observed = srv.await.expect("edge task");
