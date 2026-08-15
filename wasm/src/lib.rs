@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn build_channel_join_request_produces_bytes_the_real_ct_common_decoder_accepts_and_verifies() {
-        use ct_common::channel::{verify, ChannelJoinRequest, CHANNEL_ENDPOINT_RELAY_ONLY};
+        use ct_common::channel::{verify_stateless, ChannelJoinRequest, CHANNEL_ENDPOINT_RELAY_ONLY};
         use ed25519_dalek::SigningKey;
 
         let operator_sk = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -634,7 +634,7 @@ mod tests {
         assert_eq!(decoded.grant, signed);
         assert_eq!(decoded.endpoint, CHANNEL_ENDPOINT_RELAY_ONLY);
         assert!(decoded.is_relay_only());
-        assert!(verify(&operator_sk.verifying_key().to_bytes(), &decoded.grant, 0).is_ok());
+        assert!(verify_stateless(&operator_sk.verifying_key().to_bytes(), &decoded.grant, 0).is_ok());
 
         // frame_message wraps it exactly the way it goes on the wire (a u16 BE
         // length prefix that read_channel_join_on_stream's `len_buf` reads).
