@@ -446,7 +446,14 @@ where
             }
             (peer_endpoint, noise, observed_reflexive)
         }
-        ChannelJoinOutcome::Refused => return Err(AdmissionRefused::boxed("edge broker refused the channel join")),
+        ChannelJoinOutcome::Refused { category } => {
+            // #524: the frozen base string stays the prefix; the category (when the
+            // edge sent one) appends the actionable class of failure.
+            return Err(AdmissionRefused::boxed_with_category(
+                "edge broker refused the channel join",
+                category.as_deref(),
+            ));
+        }
         // #21: unreachable in practice (admit_one_peer converts a ParkExpired before spawning a
         // session), kept as the typed error so a future caller can never misread it as refused.
         ChannelJoinOutcome::ParkExpired => {
@@ -545,7 +552,13 @@ where
 {
     match present_channel_join(relay_conn, request, holder).await? {
         ChannelJoinOutcome::Admitted { .. } => {}
-        ChannelJoinOutcome::Refused => return Err(AdmissionRefused::boxed("edge relay refused the channel join")),
+        ChannelJoinOutcome::Refused { category } => {
+            // #524: base string frozen, category appended when present.
+            return Err(AdmissionRefused::boxed_with_category(
+                "edge relay refused the channel join",
+                category.as_deref(),
+            ));
+        }
         // #21: the relay park was reaped before a partner arrived -- retryable, not a refusal.
         ChannelJoinOutcome::ParkExpired => {
             return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
@@ -596,7 +609,13 @@ where
         ChannelJoinOutcome::Admitted { .. } => {
             return Err("DCUtR relay join needs the peer's relayed Noise key (register the member's key, #101)".into())
         }
-        ChannelJoinOutcome::Refused => return Err(AdmissionRefused::boxed("edge relay refused the channel join")),
+        ChannelJoinOutcome::Refused { category } => {
+            // #524: base string frozen, category appended when present.
+            return Err(AdmissionRefused::boxed_with_category(
+                "edge relay refused the channel join",
+                category.as_deref(),
+            ));
+        }
         // #21: the relay park was reaped before a partner arrived -- retryable, not a refusal.
         ChannelJoinOutcome::ParkExpired => {
             return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
@@ -667,11 +686,25 @@ pub async fn dial_relay_gate_over_443(
         .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate read ack failed after {:?}: {e}", t2.elapsed()); } e })?;
     if &ack != b"OK" {
         if dbg { eprintln!("ct-agent channel: debug relay-gate pre-auth refused, ack={ack:?}"); }
+        // #524: on a refusal the edge follows the `NO` sentinel with a length-framed
+        // category token and shuts the stream down — opportunistically read it (bounded;
+        // an old edge yields EOF at once → None → the generic message below, unchanged).
+        let category = if &ack == b"NO" {
+            let mut tail = Vec::new();
+            let mut bounded = (&mut stream).take(crate::channel::REFUSAL_CATEGORY_MAX_LEN as u64 + 1);
+            match tokio::time::timeout(std::time::Duration::from_secs(2), bounded.read_to_end(&mut tail)).await {
+                Ok(Ok(_)) => crate::channel::decode_refusal_category(&tail),
+                _ => None,
+            }
+        } else {
+            None
+        };
         // #24: typed -- this is the relay-gate's wire `NO`, a DEFINITIVE refusal the
         // retry policy must back off on (it was a bare string before, invisible to
         // `is_definitive_admission_refusal`, so the serve loop hot-looped on it).
-        return Err(AdmissionRefused::boxed(
+        return Err(AdmissionRefused::boxed_with_category(
             "relay-gate: pre-auth refused (grant not authorized -- see the edge's own log)",
+            category.as_deref(),
         ));
     }
     if dbg { eprintln!("ct-agent channel: debug relay-gate pre-auth ok (ack=OK) in {:?} total", t0.elapsed()); }
@@ -768,7 +801,13 @@ where
         ChannelJoinOutcome::Admitted { .. } => {
             return Err("DCUtR relay-gate join needs the peer's relayed Noise key (register the member's key, #101)".into())
         }
-        ChannelJoinOutcome::Refused => return Err(AdmissionRefused::boxed("edge relay refused the channel join")),
+        ChannelJoinOutcome::Refused { category } => {
+            // #524: base string frozen, category appended when present.
+            return Err(AdmissionRefused::boxed_with_category(
+                "edge relay refused the channel join",
+                category.as_deref(),
+            ));
+        }
         // #21: the relay park was reaped before a partner arrived -- retryable, not a refusal.
         ChannelJoinOutcome::ParkExpired => {
             return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
@@ -1160,8 +1199,12 @@ where
                     let local = local.take().expect("local is committed to exactly one rung");
                     match present_channel_relay_join_on_stream(&mut send, &mut recv, request, holder, phase_marker).await? {
                         ChannelJoinOutcome::Admitted { .. } => {}
-                        ChannelJoinOutcome::Refused => {
-                            return Err(AdmissionRefused::boxed("edge relay refused the channel join over the :443 front door"));
+                        ChannelJoinOutcome::Refused { category } => {
+                            // #524: base string frozen, category appended when present.
+                            return Err(AdmissionRefused::boxed_with_category(
+                                "edge relay refused the channel join over the :443 front door",
+                                category.as_deref(),
+                            ));
                         }
                         // #21: the relay park was reaped before a partner arrived -- return the
                         // typed error immediately (no further rungs: the rung WORKED, there was
@@ -2645,7 +2688,13 @@ async fn admit_one_peer(ctx: &ServeSessionCtx) -> Result<ChannelJoinOutcome, Box
 /// matters (#248).
 fn reject_refused_outcome(outcome: ChannelJoinOutcome) -> Result<ChannelJoinOutcome, BoxError> {
     match outcome {
-        ChannelJoinOutcome::Refused => Err(AdmissionRefused::boxed("edge broker refused the channel join")),
+        ChannelJoinOutcome::Refused { ref category } => {
+            // #524: base string frozen, category appended when present.
+            Err(AdmissionRefused::boxed_with_category(
+                "edge broker refused the channel join",
+                category.as_deref(),
+            ))
+        }
         // #21: a park expiry becomes the DISTINCT typed error so [`serve_loop_concurrent`]
         // routes it through its immediate-re-park path (no refusal backoff, no ladder advance)
         // instead of spawning it as a session or backing off as if refused.

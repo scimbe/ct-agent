@@ -90,21 +90,80 @@ pub(crate) fn is_definitive_admission_refusal(e: &BoxError) -> bool {
 /// ([`is_definitive_admission_refusal`]) is a downcast, not a substring search. The client-side
 /// sibling of the edge's `DefinitiveJoinRefusal` (CADS-Tunnel, same day, same class of fix).
 #[derive(Debug)]
-pub(crate) struct AdmissionRefused(pub(crate) &'static str);
+pub(crate) struct AdmissionRefused(pub(crate) std::borrow::Cow<'static, str>);
 
 impl std::fmt::Display for AdmissionRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
+        f.write_str(&self.0)
     }
 }
 
 impl std::error::Error for AdmissionRefused {}
 
 impl AdmissionRefused {
-    /// The one constructor every refusal site uses -- boxed, ready to return.
+    /// The category-less constructor -- boxed, ready to return. Emits the exact
+    /// historical string, for the sites (and old edges) with no category to add.
     pub(crate) fn boxed(text: &'static str) -> BoxError {
-        Box::new(AdmissionRefused(text))
+        Box::new(AdmissionRefused(text.into()))
     }
+
+    /// #524: the category-aware constructor every wire-refusal site uses. `base` is the
+    /// site's exact historical string (frozen: operators grep it, the substring half of
+    /// [`is_definitive_admission_refusal`] matches on it — it must stay a PREFIX of
+    /// whatever this renders); `category` is the edge's closed-vocabulary refusal token
+    /// when the wire carried one. Known categories get an actionable self-diagnosis
+    /// hint; unknown tokens (a newer edge's future vocabulary) surface raw with a
+    /// generic pointer; `None` (an old edge / raced token) renders `base` unchanged.
+    pub(crate) fn boxed_with_category(base: &'static str, category: Option<&str>) -> BoxError {
+        let Some(cat) = category else {
+            return Self::boxed(base); // old edge / raced token: byte-identical message
+        };
+        let text = match refusal_category_hint(cat) {
+            Some(hint) => format!("{base} [{cat}]: {hint}"),
+            None => format!(
+                "{base} [{cat}] (unrecognized refusal category — likely a newer edge; \
+                 the edge's own log has the detail)"
+            ),
+        };
+        Box::new(AdmissionRefused(text.into()))
+    }
+}
+
+/// #524: map a known refusal-category token (the edge's closed vocabulary — the
+/// `[<tag>]` of its `channel-join NO` log line, now also on the wire) to an actionable
+/// operator hint. The DETAILED reason deliberately stays server-side; these hints only
+/// explain what the CLASS of failure means for this agent and what to check. Unknown
+/// tokens return `None` and are surfaced raw by [`AdmissionRefused::boxed_with_category`].
+pub(crate) fn refusal_category_hint(category: &str) -> Option<&'static str> {
+    Some(match category {
+        "possession" => {
+            "the holder-possession proof failed — this agent's holder PRIVATE key does not \
+             match the grant's holder. Usually a run under the wrong claimed identity, or a \
+             grant minted for a different holder key; re-check which identity/holder key \
+             this block runs as"
+        }
+        "grant-verify" => {
+            "the grant failed signature/validity verification — expired, or not signed by \
+             this channel's operator key; fetch a fresh grant"
+        }
+        "not-member" => {
+            "the channel is unknown to this edge, or the holder is not currently a member — \
+             check the channel id and whether this member was removed"
+        }
+        "endpoint" => {
+            "the advertised endpoint was rejected as unsafe/undialable — advertise a public \
+             address or the relay-only sentinel"
+        }
+        "malformed" | "len-oob" => {
+            "the edge could not read the join request off the wire — likely an agent/edge \
+             version skew"
+        }
+        "pairing" => {
+            "admission succeeded but pairing the two members was refused — the problem is \
+             with the PAIR (e.g. the partner's authorization), not this grant"
+        }
+        _ => return None,
+    })
 }
 
 /// #21: typed marker for a park expiry -- the edge reaped this member's park because no partner

@@ -462,8 +462,13 @@ pub fn holder_sign(holder_private_hex: &str, message: &[u8]) -> Result<Vec<u8>, 
 /// 1. send `frame_message(build_channel_join_request(grant, "relay-only"))`
 ///    as one WebSocket binary message (the length prefix is already inside
 ///    those framed bytes -- message boundaries don't need to line up)
-/// 2. read the next 32 bytes that arrive -- a `b"NO"` (2 bytes) means
-///    refused; otherwise it's a 32-byte single-use possession challenge
+/// 2. read the next 32 bytes that arrive -- a response STARTING with `b"NO"`
+///    means refused (CADS-Tunnel#524: since refusal categories, the `NO` may be
+///    followed by one length-framed short ASCII reason token -- `len(1) | token`
+///    -- and the whole refusal stays strictly UNDER 32 bytes, so "exactly 32
+///    bytes" is still unambiguously the challenge; check the first 2 bytes and
+///    treat the optional tail as a diagnosis aid); otherwise it's the 32-byte
+///    single-use possession challenge
 /// 3. send `holderSign(holderPrivateHex, challenge)` (64 raw bytes, no
 ///    framing) as the next WebSocket binary message
 /// 4. from here on the socket is a raw relay splice: nothing further

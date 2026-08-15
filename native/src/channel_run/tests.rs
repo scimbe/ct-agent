@@ -1454,7 +1454,7 @@ fn park_expired_is_neither_a_refusal_nor_a_generic_error_21() {
     let transport: BoxError = "connection reset by peer".into();
     assert!(!is_park_expired(&transport));
     // Refusals stay refusals: the two classifiers are disjoint.
-    let refused = reject_refused_outcome(ChannelJoinOutcome::Refused).expect_err("refused");
+    let refused = reject_refused_outcome(ChannelJoinOutcome::Refused { category: None }).expect_err("refused");
     assert!(is_definitive_admission_refusal(&refused) && !is_park_expired(&refused));
 }
 
@@ -2037,6 +2037,47 @@ fn admission_refusal_classification_is_typed_and_survives_rewording_20() {
 }
 
 #[test]
+fn refusal_category_messages_stay_definitive_and_keep_the_frozen_prefix_524() {
+    // #524: the category makes the operator text more helpful, but the refusal contract
+    // must not move: every rendering stays a typed AdmissionRefused (downcast-first
+    // classification) AND keeps the exact historical string as its PREFIX (the substring
+    // fallback + operator greps + the sort bridge's fault attribution all match on it).
+    const BASE: &str = "edge broker refused the channel join";
+
+    // No category (old edge / raced token): byte-identical to the pre-#524 message.
+    let plain = AdmissionRefused::boxed_with_category(BASE, None);
+    assert!(is_definitive_admission_refusal(&plain));
+    assert_eq!(plain.to_string(), BASE);
+
+    // Known category: actionable hint, e.g. the #524 live incident's [possession].
+    let possession = AdmissionRefused::boxed_with_category(BASE, Some("possession"));
+    assert!(is_definitive_admission_refusal(&possession));
+    let msg = possession.to_string();
+    assert!(msg.starts_with(BASE), "frozen prefix, got: {msg}");
+    assert!(msg.contains("[possession]"), "names the category: {msg}");
+    assert!(
+        msg.contains("holder") && msg.contains("key"),
+        "the possession hint points at the holder-key mismatch: {msg}"
+    );
+
+    // Every closed-vocabulary token the edge can currently send has a real hint.
+    for cat in ["possession", "grant-verify", "not-member", "endpoint", "malformed", "len-oob", "pairing"] {
+        assert!(
+            refusal_category_hint(cat).is_some(),
+            "closed-vocabulary token {cat:?} must map to an actionable hint"
+        );
+    }
+
+    // Unknown token (a newer edge's future vocabulary): surfaced RAW with a generic
+    // pointer -- never dropped, never a panic, still definitive.
+    let future = AdmissionRefused::boxed_with_category(BASE, Some("quota-exceeded"));
+    assert!(is_definitive_admission_refusal(&future));
+    let msg = future.to_string();
+    assert!(msg.starts_with(BASE), "frozen prefix, got: {msg}");
+    assert!(msg.contains("[quota-exceeded]") && msg.contains("unrecognized"), "raw token + generic pointer: {msg}");
+}
+
+#[test]
 fn is_definitive_admission_refusal_matches_only_the_refused_strings() {
     // #231 + #20: the substring FALLBACK (kept one release for errors that crossed a
     // stringifying boundary) still recognizes exactly the historical strings -- everything
@@ -2162,7 +2203,7 @@ fn reject_refused_outcome_converts_refused_to_the_err_string_is_definitive_admis
     // backoff never engaged, hot-looping at near-zero backoff exactly as #231 first fixed for the
     // transport-level case. This proves the translation: a Refused outcome becomes an Err whose
     // string `is_definitive_admission_refusal` recognizes as a definitive refusal.
-    let err = reject_refused_outcome(ChannelJoinOutcome::Refused).expect_err("Refused must become an Err");
+    let err = reject_refused_outcome(ChannelJoinOutcome::Refused { category: None }).expect_err("Refused must become an Err");
     assert!(
         is_definitive_admission_refusal(&err),
         "the translated error must be recognized as a definitive refusal so #231's backoff engages, got: {err}"
@@ -2193,7 +2234,7 @@ async fn serve_loop_never_spawns_a_refused_outcome_as_a_session() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     let spawned = Arc::new(AtomicUsize::new(0));
-    let admit = move || async move { reject_refused_outcome(ChannelJoinOutcome::Refused) };
+    let admit = move || async move { reject_refused_outcome(ChannelJoinOutcome::Refused { category: None }) };
     let s = spawned.clone();
     let serve = move |_w: ChannelJoinOutcome| {
         let s = s.clone();
