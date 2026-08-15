@@ -650,31 +650,6 @@ pub async fn tcp_tls_connect_channel_boring(
     .await
 }
 
-/// Enable TCP keepalive on `stream` (#229): a parked TLS-TCP fallback
-/// registration is otherwise a plain, silent TCP connection with nothing to
-/// refresh it over however long it sits waiting for a Client -- over a real,
-/// geographically distant network, any NAT/firewall between the Agent and
-/// the Edge can drop an idle mapping without either endpoint noticing, so a
-/// Client later delivered onto that "parked" connection gets nothing back
-/// (found live: reproduced on hugging's real UDP-blocked network, never on a
-/// same-host hermetic/loopback test, exactly what an idle-NAT-drop
-/// hypothesis predicts). Best-effort: unsupported platforms or an
-/// already-broken socket just don't get the option, same as today.
-///
-/// `time`/`interval` were originally 20s/20s with the OS-default retry count
-/// (typically 9 on Linux), so a genuinely dead connection could take up to
-/// ~200s (20 + 9*20) to surface as an error -- long enough that a parked
-/// registration sits silently broken for minutes before either side
-/// notices. A matching investigation on the Edge side (issue #15, live flap
-/// monitoring) tightened the Edge's own accept-side keepalive to 10s/10s
-/// with an explicit `with_retries(3)` bound (CADS-Tunnel, `crates/edge/src/
-/// transport.rs`, commit `5e3dd3c`); mirrored here for symmetry on this end
-/// of the same connection, since only one side keepaliving doesn't help
-/// this side's own idle-NAT-drop detection. Worst case is now 10 + 3*10 =
-/// 40s, roughly a 5x cut to the detection blind spot, while keeping probe
-/// traffic light (one 0-byte ACK-only segment every 10s while idle --
-/// negligible bandwidth/battery cost, still well above what would
-/// meaningfully drain a mobile client sitting parked). Windows is the one exception:
 /// #500/#495-2a: whether this channel dial's TLS negotiation selected a KA-generation id
 /// (plain `ct-edge-channel-ka`, or `http/1.1` on the boring leg -- the edge's deliberate
 /// keepalive signal). A KA-generation edge understands the park keepalive AND the
@@ -694,22 +669,39 @@ pub fn ka_negotiated(tls: &tokio_rustls::client::TlsStream<TcpStream>) -> bool {
 /// the Edge can drop an idle mapping without either endpoint noticing, so a
 /// Client later delivered onto that "parked" connection gets nothing back.
 /// Best-effort: unsupported platforms or an already-broken socket just
-/// don't get the option. 10s/10s + `with_retries(3)` mirrors the edge's
-/// accept-side keepalive (CADS-Tunnel #15, commit `5e3dd3c`) -- worst-case
-/// dead-connection detection 40s; Windows has no TCP_KEEPCNT knob and keeps
-/// its OS-default retry count (see the `cfg(not(windows))` below).
+/// don't get the option.
+///
+/// **20s/20s with the OS-default retry count** (~200s worst-case dead-connection
+/// detection on Linux). These were briefly 10s/10s + `with_retries(3)` (~40s) to
+/// mirror an edge-side tightening (CADS-Tunnel #15, `5e3dd3c`) -- but the edge
+/// REVERTED that a day later (`58864ae`) and the agent side was never pulled back
+/// with it, so this end kept claiming to mirror an edge setting that no longer
+/// exists. The revert's two reasons apply verbatim here:
+///
+/// * It didn't fix what it targeted. The parked-registration flapping continued at
+///   exactly the same rate after the tightening (measured next day on the same
+///   deployment: 5s request spacing -> 4/4 OK, 20s -> 1/4). The cause is a middlebox
+///   that ignores ACK-only segments entirely, so no keepalive *timing* can help --
+///   which is why the real-payload `'K'`/`'L'` park roles, and now #528's framed
+///   relay keepalive, exist instead.
+/// * Its blast radius was wider than intended, in the exact direction #528 is about:
+///   this runs on EVERY TLS-TCP dial, not just parked registrations, so a 5x tighter
+///   window also cut how long a legitimately quiet *in-flight* connection may stay
+///   quiet. On the edge that produced a live regression (an LLM call going quiet for
+///   15-20s), and an agent-side kill during the same silence is the same user-visible
+///   failure seen from the other end of the wire.
+///
+/// So dead-connection detection here is deliberately slow; liveness during a relay is
+/// the framed keepalive's job (`serve::serve_framed_duplex_to_origin`, ~24s verdict),
+/// not TCP's.
 fn apply_tcp_keepalive(stream: &TcpStream) {
     let sock = socket2::SockRef::from(stream);
+    // No `with_retries`: an explicit TCP_KEEPCNT bound is what made the reverted
+    // tightening kill quiet in-flight connections early. The OS default (~9 on Linux)
+    // is the value the edge went back to, and this side matches it again.
     let ka = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(10))
-        .with_interval(Duration::from_secs(10));
-    // `with_retries` sets TCP_KEEPCNT, which Windows' keepalive API (WSAIoctl
-    // SIO_KEEPALIVE_VALS) has no equivalent knob for -- socket2 only exposes it on
-    // platforms with a real TCP_KEEPCNT (see socket2::TcpKeepalive::with_retries'
-    // own cfg list, which excludes windows). Windows keeps its own default retry
-    // count; still gets the tightened 10s/10s time/interval above.
-    #[cfg(not(windows))]
-    let ka = ka.with_retries(3);
+        .with_time(Duration::from_secs(20))
+        .with_interval(Duration::from_secs(20));
     let _ = sock.set_tcp_keepalive(&ka);
 }
 
@@ -800,14 +792,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_tcp_keepalive_uses_the_tightened_10s_10s_3_retry_parameters() {
-        // issue #15 flap investigation: the parked TLS-TCP fallback connection was still
-        // flapping under the old 20s/20s + OS-default-retries (~9) keepalive, whose
-        // worst-case dead-connection-detection time was ~200s (20 + 9*20). This proves the
-        // tightened values actually land on the wire (not just that apply_tcp_keepalive
-        // compiles): SO_KEEPALIVE on, TCP_KEEPIDLE=10s, TCP_KEEPINTVL=10s, TCP_KEEPCNT=3 --
-        // worst case now 10 + 3*10 = 40s. Mirrors CADS-Tunnel's matching edge-side test
-        // (crates/edge/src/transport.rs, commit 5e3dd3c).
+    async fn apply_tcp_keepalive_stays_at_20s_20s_with_no_explicit_retry_bound() {
+        // The values, and the fact that they land on the wire at all (not just that
+        // apply_tcp_keepalive compiles). They were briefly 10s/10s + TCP_KEEPCNT=3 to
+        // mirror an edge tightening; the EDGE reverted that a day later (CADS-Tunnel
+        // 58864ae) because it didn't reduce the flapping it targeted -- the middlebox
+        // ignores ACK-only segments, so no timing helps -- and because it killed quiet
+        // in-flight connections early (a 15-20s silent LLM call), which is a
+        // user-visible failure. This side kept the tightened values and a doc claiming
+        // to "mirror the edge" until #528. Pin the reverted values so the two ends of
+        // the same connection cannot silently drift apart again.
         let bind = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = bind.local_addr().unwrap();
         let accept = tokio::spawn(async move { bind.accept().await.unwrap().0 });
@@ -819,18 +813,18 @@ mod tests {
         assert!(sock.keepalive().unwrap_or(false), "SO_KEEPALIVE must be enabled");
         assert_eq!(
             sock.keepalive_time().unwrap(),
-            Duration::from_secs(10),
-            "TCP_KEEPIDLE must be tightened to 10s (was 20s)"
+            Duration::from_secs(20),
+            "TCP_KEEPIDLE stays at 20s -- matching the edge after its revert"
         );
         assert_eq!(
             sock.keepalive_interval().unwrap(),
-            Duration::from_secs(10),
-            "TCP_KEEPINTVL must be tightened to 10s (was 20s)"
+            Duration::from_secs(20),
+            "TCP_KEEPINTVL stays at 20s -- matching the edge after its revert"
         );
-        assert_eq!(
-            sock.keepalive_retries().unwrap(),
-            3,
-            "TCP_KEEPCNT must be explicitly bounded to 3 (was the OS default, ~9 on Linux)"
+        assert!(
+            sock.keepalive_retries().unwrap() > 3,
+            "TCP_KEEPCNT must be left at the OS default (~9 on Linux), NOT bounded to 3: \
+             an explicit low bound is what killed quiet in-flight connections early"
         );
     }
 
