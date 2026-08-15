@@ -150,7 +150,10 @@ enum EdgeWrite {
 ///   send silence the writer emits a counter-carrying keepalive and records it in
 ///   the [`fallback_framing::KeepaliveTracker`]; inbound keepalives are ACKed iff
 ///   the reader's bounded-ACK verdict says so, and an unacknowledged keepalive
-///   older than [`FRAMED_DEAD_AFTER_MS`] ends the connection (the worker redials).
+///   older than [`KEEPALIVE_DEAD_AFTER`] ends the connection (the worker redials).
+///   The verdict runs only until the PEER's FIN: a half-closed peer is winding down
+///   and may stop ACKing, and judging it then would turn a clean shutdown into a
+///   spurious error. Injection continues until FIN has passed BOTH ways.
 /// * **In-band FIN.** Origin EOF sends `FIN`, not a TCP shutdown, so keepalives
 ///   can keep flowing while the other direction is still in flight; a received
 ///   `FIN` (or a clean EOF, which the contract defines as an implicit FIN)
@@ -180,6 +183,15 @@ where
     // ---- Edge → Origin: unframe, forward, and drive the frame-level protocol.
     let tx_up = tx.clone();
     let up = async move {
+        // Rebound as a body local ON PURPOSE (#528 review I2): a variable captured
+        // by an async block lives in the generator's environment and is dropped only
+        // when the FUTURE is dropped -- and this future stays pinned and alive while
+        // the writer half is awaited below. As an upvar the sender would therefore
+        // never be released, `rx.recv()` could never observe a closed channel, and
+        // the writer's "both halves are gone" arm would be unreachable code. As a
+        // body local it is dropped the moment this body returns, which is what makes
+        // that arm real.
+        let tx_up = tx_up;
         let mut reader = fallback_framing::FrameReader::new(edge_r);
         let mut origin_w: Option<tokio::net::tcp::OwnedWriteHalf> = None;
         let mut origin_r_tx = Some(origin_r_tx);
@@ -228,6 +240,13 @@ where
                     if let Some(mut w) = origin_w.take() {
                         let _ = w.shutdown().await;
                     }
+                    // Nothing was ever dialed and nothing ever will be: DATA after
+                    // the peer's FIN is a protocol error the codec rejects, so no
+                    // first byte can still arrive. Dropping the dial channel tells
+                    // the origin→edge half that at once; leaving it alive would park
+                    // that half on a dial that can never happen, and with it the FIN
+                    // it owes the peer (#528 review I2).
+                    drop(origin_r_tx.take());
                     if tx_up.send(EdgeWrite::PeerFin).await.is_err() {
                         break;
                     }
@@ -247,9 +266,18 @@ where
 
     // ---- Origin → Edge: read the Origin, hand frames to the writer-owner.
     let down = async move {
+        let tx = tx; // body-local, for the reason spelled out on `up` above
         let Ok(mut origin_r) = origin_r_rx.await else {
-            // The edge→origin half ended before any Client byte arrived: nothing
-            // was ever relayed, so there is nothing to answer.
+            // No Origin will ever be dialed for this relay: either the peer FINed
+            // before any non-empty DATA (a browser that connects and closes without
+            // speaking -- a TLS probe or health check), or the edge half ended.
+            // Either way OUR data direction is finished and the peer is owed an
+            // explicit FIN. Without it `fin_sent` stays false forever, the both-FIN
+            // termination can never fire, and the dead verdict cannot save us either
+            // (a healthy peer keeps ACKing), so both sides hang until something
+            // external kills them -- leaking a fallback registration and its
+            // admission permits per incident (#528 review I2).
+            let _ = tx.send(EdgeWrite::Fin).await;
             return Ok::<(), BoxError>(());
         };
         let mut buf = vec![0u8; FRAMED_CHUNK];
@@ -297,6 +325,19 @@ where
                 w.shutdown().await?;
                 return Ok::<(), BoxError>(());
             }
+            // The dead-peer deadline as an EXPLICIT wakeup, not a side effect of the
+            // next keepalive: checking only after the select would let the verdict
+            // land anywhere up to one cadence late (24-32s instead of 24s), since
+            // nothing else is scheduled to wake us in between (#528 review I5).
+            // `None` = nothing outstanding, so there is no verdict pending and the
+            // branch must never fire — a plain `pending()` future is exactly that.
+            let deadline = tracker
+                .oldest_outstanding_age_ms(now_ms(tokio::time::Instant::now()))
+                .map(|age| {
+                    tokio::time::Instant::now() + KEEPALIVE_DEAD_AFTER.saturating_sub(
+                        Duration::from_millis(age),
+                    )
+                });
             tokio::select! {
                 cmd = rx.recv() => match cmd {
                     Some(EdgeWrite::Data { payload, flush }) => {
@@ -318,7 +359,18 @@ where
                         w.fin().await?;
                         last_write = tokio::time::Instant::now();
                     }
-                    Some(EdgeWrite::PeerFin) => peer_fin = true,
+                    Some(EdgeWrite::PeerFin) => {
+                        peer_fin = true;
+                        // Stop JUDGING the peer once its data direction is over
+                        // (#528 contract: inject until both FINs, judge only until
+                        // the peer's). A half-closed peer is winding down and may
+                        // legitimately stop ACKing; keeping the outstanding set would
+                        // turn an ordinary clean shutdown into a dead verdict at
+                        // 24s -- a spurious error return and a pointless redial on a
+                        // connection that was ending correctly. A genuinely dead peer
+                        // still surfaces here, as a write error.
+                        tracker = fallback_framing::KeepaliveTracker::new();
+                    }
                     // Both halves are gone and the queue is drained: nothing further
                     // can be written, so close rather than keepalive into the void.
                     None => {
@@ -331,19 +383,35 @@ where
                 _ = tokio::time::sleep_until(last_write + KEEPALIVE_INTERVAL) => {
                     counter += 1;
                     w.keepalive(counter).await?;
-                    tracker.sent(counter, now_ms(tokio::time::Instant::now()));
+                    // Injected but deliberately NOT tracked once the peer has FINed:
+                    // it is middlebox food for the direction still in flight, not a
+                    // probe we may hang a verdict on. See the PeerFin arm.
+                    if !peer_fin {
+                        tracker.sent(counter, now_ms(tokio::time::Instant::now()));
+                    }
                     last_write = tokio::time::Instant::now();
                 }
-            }
-            if let Some(age) = tracker.oldest_outstanding_age_ms(now_ms(tokio::time::Instant::now()))
-            {
-                if age > KEEPALIVE_DEAD_AFTER.as_millis() as u64 {
-                    return Err(format!(
-                        "framed relay: peer did not answer a keepalive for {age}ms (> {}ms) \
-                         — treating the connection as dead",
-                        KEEPALIVE_DEAD_AFTER.as_millis()
-                    )
-                    .into());
+                // Re-checked rather than trusted: the deadline was computed before the
+                // select, and an ACK may have settled the outstanding set in the very
+                // same wakeup.
+                _ = async {
+                    match deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    if let Some(age) =
+                        tracker.oldest_outstanding_age_ms(now_ms(tokio::time::Instant::now()))
+                    {
+                        if age >= KEEPALIVE_DEAD_AFTER.as_millis() as u64 {
+                            return Err(format!(
+                                "framed relay: peer did not answer a keepalive for {age}ms \
+                                 (>= {}ms) — treating the connection as dead",
+                                KEEPALIVE_DEAD_AFTER.as_millis()
+                            )
+                            .into());
+                        }
+                    }
                 }
             }
         }
@@ -2170,6 +2238,122 @@ mod tests {
         let _ = origin.await;
     }
 
+
+    #[tokio::test]
+    async fn an_empty_browser_connect_terminates_both_sides_instead_of_hanging() {
+        // #528 review I2. A browser that connects and immediately closes without
+        // speaking -- a TLS probe, an uptime check, a user hitting Escape -- gives
+        // the relay a peer FIN and NO non-empty DATA, so the Origin is never dialed.
+        // The relay must still finish: our data direction is over, so the peer is
+        // owed a FIN, and once FIN has passed both ways the hop closes.
+        //
+        // The bound below is the real assertion, and it has to wrap the WHOLE
+        // scenario rather than each read: the broken version is not slow, it is
+        // non-terminating, and it stays lively while it hangs -- the agent keeps
+        // injecting keepalives every 8s and this side keeps ACKing them, so a
+        // per-read timeout never fires and the test would hang until something
+        // external killed it (verified: it did exactly that). A correct relay
+        // finishes this in milliseconds, so the bound is only ever paid on a
+        // regression.
+        let ol = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = ol.local_addr().unwrap();
+        let dialed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dialed_w = dialed.clone();
+        let origin = tokio::spawn(async move {
+            let _ = ol.accept().await;
+            dialed_w.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let (edge_side, agent_side) = tokio::io::duplex(1 << 16);
+        let relay =
+            tokio::spawn(async move { serve_framed_duplex_to_origin(agent_side, origin_addr).await });
+
+        let scenario = async {
+            let (mut er, mut ew) = edge_peer(edge_side);
+            // The browser said nothing at all: straight to FIN.
+            ew.fin().await.unwrap();
+            let mut saw_fin = false;
+            loop {
+                match er.next().await.expect("relay framing stays valid") {
+                    Some(fallback_framing::Frame::Fin) => saw_fin = true,
+                    Some(fallback_framing::Frame::Keepalive { counter, .. }) => {
+                        ew.keepalive_ack(counter).await.unwrap()
+                    }
+                    Some(other) => panic!("nothing but a FIN is owed here, got {other:?}"),
+                    None => break, // the agent shut the hop down: both FINs are through
+                }
+            }
+            assert!(saw_fin, "the agent owes an explicit FIN even when it never dialed the Origin");
+            relay
+                .await
+                .unwrap()
+                .expect("an empty browser connect is a clean end, not an error");
+        };
+        tokio::time::timeout(Duration::from_secs(30), scenario)
+            .await
+            .expect("the relay must terminate on a FIN-without-data, not keepalive forever");
+        assert!(
+            !dialed.load(std::sync::atomic::Ordering::SeqCst),
+            "and the Origin was never dialed for a browser that never spoke"
+        );
+        origin.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_fin_with_a_keepalive_still_outstanding_is_a_clean_end_not_a_dead_verdict() {
+        // #528 contract: inject until BOTH FINs, but judge only until the PEER's FIN.
+        // A half-closed peer is winding down and may legitimately stop ACKing; if the
+        // outstanding set survived its FIN, an ordinary shutdown would trip the 24s
+        // dead verdict and return an error -- a spurious failure plus a pointless
+        // redial on a connection that ended correctly. Set that up exactly: leave a
+        // keepalive unanswered, FIN, and then stay silent well past the verdict.
+        let ol = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = ol.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut sock, _) = ol.accept().await.unwrap();
+            let mut b = [0u8; 64];
+            let _ = sock.read(&mut b).await.unwrap();
+            // Far longer than KEEPALIVE_DEAD_AFTER, so a surviving verdict would fire.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            sock.write_all(b"late answer").await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+
+        let (edge_side, agent_side) = tokio::io::duplex(1 << 16);
+        let relay =
+            tokio::spawn(async move { serve_framed_duplex_to_origin(agent_side, origin_addr).await });
+        let (mut er, mut ew) = edge_peer(edge_side);
+        ew.data(b"request").await.unwrap();
+
+        // Take exactly one keepalive and DON'T ack it -- that is the outstanding
+        // counter -- then half-close and go quiet.
+        loop {
+            match er.next().await.unwrap() {
+                Some(fallback_framing::Frame::Keepalive { .. }) => break,
+                Some(_) => {}
+                None => panic!("the hop closed before the first keepalive"),
+            }
+        }
+        ew.fin().await.unwrap();
+
+        // Everything after the peer's FIN must still work: no verdict, and the late
+        // response still crosses.
+        let mut answer = Vec::new();
+        loop {
+            match er.next().await.expect("no dead verdict may fire after the peer's FIN") {
+                Some(fallback_framing::Frame::Data(d)) => answer.extend_from_slice(&d),
+                Some(fallback_framing::Frame::Keepalive { .. }) => {} // still injected, still unacked
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert_eq!(answer, b"late answer", "the in-flight direction still completes");
+        relay
+            .await
+            .unwrap()
+            .expect("a peer FIN with an outstanding keepalive is a clean end, not a dead verdict");
+        let _ = origin.await;
+    }
 
     /// #528 acceptance for the `'F'` rung through the real
     /// `tcp_connect_register_serve`: an Edge that does not know `'F'` drops the
