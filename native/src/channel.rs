@@ -415,9 +415,21 @@ fn parse_channel_ack(ack: &str) -> ChannelJoinOutcome {
             let mut observed_reflexive = None;
             let mut fields: Vec<&str> = Vec::new();
             for tok in rest.split_whitespace() {
-                match tok.strip_prefix("r=") {
-                    Some(addr) => observed_reflexive = addr.parse().ok(),
-                    None => fields.push(tok),
+                if let Some(addr) = tok.strip_prefix("r=") {
+                    observed_reflexive = addr.parse().ok();
+                } else if tok.contains('=') {
+                    // Any OTHER tagged `key=value` token (`sp=`, or a future additive
+                    // tag) is NOT a positional field. Grammar-true parse per the normative
+                    // ack grammar (CADS-Tunnel ADR-0020 4a): bare tokens are positional,
+                    // `key=value` tokens are read by name and unknown ones ignored — so
+                    // positional decoding stays immune to tag additions/reordering. Before
+                    // this, only `r=` was separated and `sp=` leaked into `fields`, harmless
+                    // solely by luck (it failed hex-decode / fell off after 4 takes); a
+                    // future tag could have misparsed — the exact positional-fragility class
+                    // that broke the webconference JS ack parser on the U1 `r=`/`sp=`
+                    // addition (2026-08-15 outage).
+                } else {
+                    fields.push(tok);
                 }
             }
             let mut parts = fields.into_iter();
@@ -934,6 +946,56 @@ mod tests {
         match client.await.expect("client task").expect("an explicit NO is a clean Refused, not an error") {
             ChannelJoinOutcome::Refused => {}
             other => panic!("an explicit NO must be Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_channel_ack_is_grammar_true_and_immune_to_tag_additions() {
+        // Positional decoding must be immune to every `key=value` tag (present `r=`/`sp=`
+        // and any future one), and `r=` still read by name — the grammar-true invariant that
+        // the webconference JS parser lacked when it broke on the U1 `r=`/`sp=` addition.
+        let noise = "aa".repeat(32);
+        let holder = "bb".repeat(32);
+        let attest = "cc".repeat(64);
+
+        // Full ack + r= + sp= + a synthetic FUTURE tag: positional fields unaffected.
+        let ack = format!("OK relay-only {noise} {holder} {attest} r=203.0.113.9:41000 sp=1 futuretag=whatever");
+        match parse_channel_ack(&ack) {
+            ChannelJoinOutcome::Admitted {
+                peer_endpoint,
+                peer_noise_pubkey,
+                peer_holder,
+                peer_attestation,
+                observed_reflexive,
+            } => {
+                assert_eq!(peer_endpoint, "relay-only");
+                assert_eq!(peer_noise_pubkey, decode_hex_32(&noise));
+                assert_eq!(peer_holder, decode_hex_32(&holder));
+                assert_eq!(peer_attestation, decode_hex_64(&attest));
+                assert_eq!(observed_reflexive, Some("203.0.113.9:41000".parse().unwrap()));
+            }
+            other => panic!("expected Admitted, got {other:?}"),
+        }
+
+        // Tags interleaved BEFORE positional fields must not shift positions (true grammar
+        // parse, not "tags happen to be last").
+        let reordered = format!("OK sp=1 relay-only {noise} r=203.0.113.9:41000 {holder} {attest}");
+        match parse_channel_ack(&reordered) {
+            ChannelJoinOutcome::Admitted { peer_endpoint, peer_noise_pubkey, observed_reflexive, .. } => {
+                assert_eq!(peer_endpoint, "relay-only");
+                assert_eq!(peer_noise_pubkey, decode_hex_32(&noise));
+                assert_eq!(observed_reflexive, Some("203.0.113.9:41000".parse().unwrap()));
+            }
+            other => panic!("expected Admitted, got {other:?}"),
+        }
+
+        // No triple (registry lacks the peer's noise key): endpoint only, genuinely no key.
+        match parse_channel_ack("OK relay-only r=0.0.0.0:0 sp=1") {
+            ChannelJoinOutcome::Admitted { peer_endpoint, peer_noise_pubkey, .. } => {
+                assert_eq!(peer_endpoint, "relay-only");
+                assert_eq!(peer_noise_pubkey, None, "no triple -> genuinely no peer noise key, not a parse artifact");
+            }
+            other => panic!("expected Admitted, got {other:?}"),
         }
     }
 
