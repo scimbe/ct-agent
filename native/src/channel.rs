@@ -1429,14 +1429,15 @@ mod tests {
         let client2 = build_client_endpoint(cert2).expect("client");
         let conn2 = client2.connect(addr2, "localhost").expect("cfg").await.expect("conn");
         let outcome2 = present_channel_join(&conn2, &request, &thief).await.expect("join drives");
-        // Note (#524): the dev-dependency edge is pinned to CADS-Tunnel v0.4.14, which
-        // predates refusal categories — so this doubles as the old-edge interop check:
-        // a bare `NO` still classifies as Refused with NO category. When the pin moves
-        // past CADS-Tunnel#524 this becomes `Some("possession")`.
+        // #524: the dev-dependency edge is pinned to CADS-Tunnel v0.4.15, the first
+        // tag that FRAMES the refusal category — so this is now the real-edge proof
+        // that the token the agent parses is the one the edge actually writes, not a
+        // fixture agreeing with itself. The old-edge interop (a bare `NO` staying
+        // category-less) keeps its own wire-level tests above.
         assert_eq!(
             outcome2,
-            ChannelJoinOutcome::Refused { category: None },
-            "a wrong possession key is refused",
+            ChannelJoinOutcome::Refused { category: Some("possession".to_string()) },
+            "a wrong possession key is refused, with the edge's own category",
         );
         let _ = srv2.await;
     }

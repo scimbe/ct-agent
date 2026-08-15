@@ -138,12 +138,18 @@ enum EdgeWrite {
 /// dead-peer deadline arm can drain the queue through the exact same handling
 /// before it judges (#528 review A2) — two divergent copies of this would be a far
 /// worse bug than the one it fixes.
+///
+/// `last_data` is the post-peer-FIN progress clock (#528 review N2, mirrored from
+/// CADS-Tunnel's edge relay): the moment of the last DATA write, distinct from
+/// `last_write` on purpose — keepalives and ACKs refresh the middlebox, but only
+/// DATA is progress.
 async fn apply_edge_write<W>(
     ev: EdgeWrite,
     w: &mut fallback_framing::FrameWriter<W>,
     tracker: &mut fallback_framing::KeepaliveTracker,
     peer_fin: &mut bool,
     last_write: &mut tokio::time::Instant,
+    last_data: &mut tokio::time::Instant,
 ) -> Result<(), BoxError>
 where
     W: AsyncWrite + Unpin,
@@ -158,6 +164,7 @@ where
                 w.flush().await?;
             }
             *last_write = tokio::time::Instant::now();
+            *last_data = *last_write;
         }
         EdgeWrite::Ack(c) => {
             w.keepalive_ack(c).await?;
@@ -169,6 +176,13 @@ where
             *last_write = tokio::time::Instant::now();
         }
         EdgeWrite::PeerFin => {
+            // N2: the idle bound measures from the START of the post-peer-FIN
+            // phase (or the last DATA within it) -- guarded so the duplicate
+            // PeerFin the edge reader sends (explicit FIN, then again when its
+            // loop ends) cannot extend the phase.
+            if !*peer_fin {
+                *last_data = tokio::time::Instant::now();
+            }
             *peer_fin = true;
             // Stop JUDGING the peer once its data direction is over (#528
             // contract: inject until both FINs, judge only until the peer's). A
@@ -202,7 +216,16 @@ where
 ///   older than [`KEEPALIVE_DEAD_AFTER`] ends the connection (the worker redials).
 ///   The verdict runs only until the PEER's FIN: a half-closed peer is winding down
 ///   and may stop ACKing, and judging it then would turn a clean shutdown into a
-///   spurious error. Injection continues until FIN has passed BOTH ways.
+///   spurious error. Injection continues until FIN has passed BOTH ways, and the
+///   post-peer-FIN phase is therefore bounded by
+///   [`fallback_framing::POST_PEER_FIN_IDLE_BOUND`] (#528 review N2, CADS-Tunnel#529):
+///   once no Origin DATA has been written for that long after the peer's FIN, this
+///   side FINs its own direction and the both-FINs rule terminates the relay.
+///   Without it the untracked injection would hold a data-idle half-closed relay
+///   open forever — the keepalives reset the TCP idle timer and a live peer host
+///   keeps ACKing them, so neither the kernel keepalive nor retransmit escalation
+///   ever fires. DATA progress resets the clock, so a slow-but-alive Origin
+///   streaming past an early-FINning browser is never cut.
 /// * **In-band FIN.** Origin EOF sends `FIN`, not a TCP shutdown, so keepalives
 ///   can keep flowing while the other direction is still in flight; a received
 ///   `FIN` (or a clean EOF, which the contract defines as an implicit FIN)
@@ -364,13 +387,21 @@ where
         let start = tokio::time::Instant::now();
         let now_ms = |t: tokio::time::Instant| t.duration_since(start).as_millis() as u64;
         let mut last_write = tokio::time::Instant::now();
+        // The post-peer-FIN progress clock (#528 review N2): the moment of the last
+        // Origin DATA write, re-based to "now" when the peer's FIN lands, so the
+        // bound measures idleness WITHIN the post-peer-FIN phase. See
+        // `apply_edge_write`, which owns both updates.
+        let mut last_data = tokio::time::Instant::now();
         loop {
+            // Snapshot before the select so the N2 arm's precondition does not
+            // borrow `w` while the branch handlers write through it.
+            let own_fin = w.fin_sent();
             // Termination is the caller's duty: the writer knows `fin_sent`, the
             // reader knows `peer_fin`, and only here do both meet. Once FIN has
             // passed in both directions, close promptly instead of keepaliving a
             // finished relay forever — the registration is single-use and the pool
             // worker re-registers.
-            if w.fin_sent() && peer_fin {
+            if own_fin && peer_fin {
                 w.shutdown().await?;
                 return Ok::<(), BoxError>(());
             }
@@ -390,8 +421,15 @@ where
             tokio::select! {
                 cmd = rx.recv() => match cmd {
                     Some(ev) => {
-                        apply_edge_write(ev, &mut w, &mut tracker, &mut peer_fin, &mut last_write)
-                            .await?
+                        apply_edge_write(
+                            ev,
+                            &mut w,
+                            &mut tracker,
+                            &mut peer_fin,
+                            &mut last_write,
+                            &mut last_data,
+                        )
+                        .await?
                     }
                     // Both halves are gone and the queue is drained: nothing further
                     // can be written, so close rather than keepalive into the void.
@@ -413,6 +451,30 @@ where
                     }
                     last_write = tokio::time::Instant::now();
                 }
+                _ = tokio::time::sleep_until(last_data + fallback_framing::POST_PEER_FIN_IDLE_BOUND),
+                    if peer_fin && !own_fin =>
+                {
+                    // #528 review N2 / CADS-Tunnel#529: the post-peer-FIN
+                    // progress-idle bound, the exact mirror of the edge relay's.
+                    // The peer has FINed and the Origin direction has written no
+                    // DATA for the whole bound -- only the untracked keepalives
+                    // above have kept the hop alive, and they would keep it alive
+                    // FOREVER (they reset the TCP idle timer and keep earning
+                    // transport ACKs, so neither the kernel keepalive nor
+                    // retransmit escalation ever fires). End cleanly: own FIN
+                    // now, then the loop-top both-FINs rule shuts the hop down.
+                    // No A2-style drain before THIS verdict, deliberately: every
+                    // input (peer_fin -- monotone and already true per the guard
+                    // -- plus last_data and own_fin, both owned by this task) is
+                    // unfalsifiable by a queued event, so a drain would document
+                    // a safeguard that does not exist. A queued DATA losing this
+                    // arm's race in the unbiased select does not falsify it
+                    // either: at firing time "no DATA written for the whole
+                    // bound" is a fact, and the queued frame belongs to a relay
+                    // that is ending -- the pool worker re-registers.
+                    w.fin().await?;
+                    last_write = tokio::time::Instant::now();
+                }
                 _ = async {
                     match deadline {
                         Some(d) => tokio::time::sleep_until(d).await,
@@ -430,8 +492,15 @@ where
                     // Deliberately NOT `biased`: that would starve this arm and the
                     // keepalive timer whenever the channel is busy.
                     while let Ok(ev) = rx.try_recv() {
-                        apply_edge_write(ev, &mut w, &mut tracker, &mut peer_fin, &mut last_write)
-                            .await?;
+                        apply_edge_write(
+                            ev,
+                            &mut w,
+                            &mut tracker,
+                            &mut peer_fin,
+                            &mut last_write,
+                            &mut last_data,
+                        )
+                        .await?;
                     }
                     if let Some(age) =
                         tracker.oldest_outstanding_age_ms(now_ms(tokio::time::Instant::now()))
@@ -2439,6 +2508,205 @@ mod tests {
             .unwrap()
             .expect("a peer FIN with an outstanding keepalive is a clean end, not a dead verdict");
         let _ = origin.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_framed_relay_ends_the_data_idle_post_peer_fin_phase_at_the_n2_bound() {
+        // #528 review N2 / CADS-Tunnel#529, the agent side of the edge's bound.
+        // After the peer's FIN the dead verdict is over (the test above), injection
+        // continues -- and a data-idle Origin direction would then be held open
+        // FOREVER by our own untracked keepalives: they reset the TCP idle timer, and
+        // a live peer host keeps ACKing the segments, so neither the kernel keepalive
+        // nor retransmit escalation ever fires. After POST_PEER_FIN_IDLE_BOUND with
+        // no DATA written the relay must FIN its own direction and end cleanly.
+        let ol = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = ol.local_addr().unwrap();
+        let hung_origin = tokio::spawn(async move {
+            let (mut sock, _) = ol.accept().await.unwrap();
+            let mut b = [0u8; 64];
+            let n = sock.read(&mut b).await.unwrap();
+            assert_eq!(&b[..n], b"request");
+            assert_eq!(sock.read(&mut [0u8; 1]).await.unwrap(), 0, "the peer's FIN half-closed us");
+            // ...and then it never answers and never closes: the hazard shape.
+            std::future::pending::<()>().await;
+        });
+
+        let (edge_side, agent_side) = tokio::io::duplex(1 << 16);
+        let relay =
+            tokio::spawn(async move { serve_framed_duplex_to_origin(agent_side, origin_addr).await });
+        let (mut er, mut ew) = edge_peer(edge_side);
+
+        let start = tokio::time::Instant::now();
+        ew.data(b"request").await.unwrap();
+        ew.fin().await.unwrap();
+
+        // The hop stays middlebox-protected for the whole idle window (untracked
+        // keepalives, which this side deliberately does not ack), then ends.
+        let mut keepalives = 0u32;
+        loop {
+            match er.next().await.expect("relay framing stays valid") {
+                // The cap is the real regression assertion: without the bound this
+                // relay does not END, and under a paused clock it would keepalive
+                // through virtual time forever -- the test would hang instead of
+                // failing (the same trap the FIN-without-data test documents).
+                // 60 cadences = 480s, far past the 180s bound.
+                Some(fallback_framing::Frame::Keepalive { .. }) if keepalives < 60 => {
+                    keepalives += 1
+                }
+                Some(fallback_framing::Frame::Keepalive { .. }) => {
+                    panic!("the data-idle post-peer-FIN phase was never bounded: still keepaliving")
+                }
+                Some(fallback_framing::Frame::Fin) => break,
+                other => panic!("expected keepalives then the N2 FIN, got {other:?}"),
+            }
+        }
+        assert!(
+            keepalives >= 20,
+            "the idle window stays keepalived until the bound (got {keepalives} keepalives)"
+        );
+        assert_eq!(
+            er.next().await.unwrap(),
+            None,
+            "the FIN is followed by the both-FINs shutdown of the hop"
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= fallback_framing::POST_PEER_FIN_IDLE_BOUND,
+            "the relay must not end before the bound (ended after {elapsed:?})"
+        );
+        assert!(
+            elapsed < fallback_framing::POST_PEER_FIN_IDLE_BOUND + KEEPALIVE_INTERVAL,
+            "the relay must end promptly AT the bound (ended after {elapsed:?})"
+        );
+        relay.await.unwrap().expect("the N2 ending is a clean return, not an error");
+        hung_origin.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_framed_relay_keeps_a_progressing_origin_alive_past_the_n2_bound() {
+        // #528 review N2, the reason the bound gates PROGRESS instead of wall time:
+        // an Origin may HTTP-legally keep streaming long after the browser has
+        // finished its request and FINed (a download, an SSE stream, an LLM emitting
+        // tokens). Chunks spaced inside the bound but totalling far beyond it must
+        // keep the relay alive -- every DATA write resets the clock.
+        let ol = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = ol.local_addr().unwrap();
+        let streaming_origin = tokio::spawn(async move {
+            let (mut sock, _) = ol.accept().await.unwrap();
+            let mut b = [0u8; 64];
+            let n = sock.read(&mut b).await.unwrap();
+            assert_eq!(&b[..n], b"request");
+            assert_eq!(sock.read(&mut [0u8; 1]).await.unwrap(), 0, "the peer's FIN half-closed us");
+            // Three chunks, each 2/3 of the bound apart: 360s inside the
+            // post-peer-FIN phase, twice the bound, never 180s idle.
+            for _ in 0..3u32 {
+                tokio::time::sleep(2 * fallback_framing::POST_PEER_FIN_IDLE_BOUND / 3).await;
+                sock.write_all(b"chunk").await.unwrap();
+            }
+            sock.shutdown().await.unwrap();
+        });
+
+        let (edge_side, agent_side) = tokio::io::duplex(1 << 16);
+        let relay =
+            tokio::spawn(async move { serve_framed_duplex_to_origin(agent_side, origin_addr).await });
+        let (mut er, mut ew) = edge_peer(edge_side);
+
+        let start = tokio::time::Instant::now();
+        ew.data(b"request").await.unwrap();
+        ew.fin().await.unwrap();
+
+        let mut got = Vec::new();
+        let mut saw_fin = false;
+        loop {
+            match er.next().await.expect("relay framing stays valid") {
+                Some(fallback_framing::Frame::Data(d)) => got.extend_from_slice(&d),
+                Some(fallback_framing::Frame::Keepalive { .. }) => {}
+                Some(fallback_framing::Frame::Fin) => saw_fin = true,
+                Some(other) => panic!("unexpected frame during the stream: {other:?}"),
+                None => break,
+            }
+        }
+        assert_eq!(got, b"chunkchunkchunk", "every chunk crossed, none was cut by the bound");
+        assert!(saw_fin, "the stream's own end is what FINs this direction");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= 2 * fallback_framing::POST_PEER_FIN_IDLE_BOUND,
+            "the relay must outlive twice the bound while it makes progress (lived {elapsed:?})"
+        );
+        relay.await.unwrap().expect("a progressing stream ends cleanly at its own EOF");
+        let _ = streaming_origin.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_n2_bound_leaves_the_own_fin_only_phase_alone() {
+        // The mirror phase -- own FIN sent (the Origin answered early and closed),
+        // peer NOT FINed -- is governed by the keepalive dead verdict, not by the N2
+        // bound: a browser may legitimately keep uploading far longer than the bound
+        // after such an early reply, and that upload is exactly what the post-FIN
+        // injection exists to protect. Judging it by the N2 clock would cut it.
+        let ol = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = ol.local_addr().unwrap();
+        let early_origin = tokio::spawn(async move {
+            let (mut sock, _) = ol.accept().await.unwrap();
+            let mut head = [0u8; 4];
+            sock.read_exact(&mut head).await.unwrap();
+            assert_eq!(&head, b"head");
+            // Reply and half-close at once: our data direction is over, the
+            // browser's is not.
+            sock.write_all(b"early reply").await.unwrap();
+            sock.shutdown().await.unwrap();
+            let mut rest = Vec::new();
+            sock.read_to_end(&mut rest).await.unwrap();
+            assert_eq!(rest, b"late upload", "the upload still reaches the Origin");
+        });
+
+        let (edge_side, agent_side) = tokio::io::duplex(1 << 16);
+        let relay =
+            tokio::spawn(async move { serve_framed_duplex_to_origin(agent_side, origin_addr).await });
+        let (mut er, mut ew) = edge_peer(edge_side);
+
+        let start = tokio::time::Instant::now();
+        ew.data(b"head").await.unwrap();
+
+        // The early reply, its FIN, and then 40 acked keepalive cadences (320s, well
+        // past the 180s bound) in which this side sends no DATA at all.
+        let mut early = Vec::new();
+        let mut saw_fin = false;
+        let mut acked = 0u32;
+        while acked < 40 {
+            match er.next().await.expect("relay framing stays valid") {
+                Some(fallback_framing::Frame::Keepalive { counter, should_ack }) => {
+                    assert!(should_ack, "injected counters rise strictly");
+                    // Acking matters: the verdict DOES run in this phase (the peer
+                    // has not FINed), and 320s unanswered would trip it at 24s.
+                    ew.keepalive_ack(counter).await.unwrap();
+                    acked += 1;
+                }
+                Some(fallback_framing::Frame::Data(d)) => early.extend_from_slice(&d),
+                Some(fallback_framing::Frame::Fin) => saw_fin = true,
+                other => panic!("expected the early reply, its FIN and keepalives, got {other:?}"),
+            }
+        }
+        assert_eq!(early, b"early reply");
+        assert!(saw_fin, "the Origin's EOF is the own-FIN half of this phase");
+
+        // ...and the upload still goes through afterwards: the bound never fired.
+        ew.data(b"late upload").await.unwrap();
+        ew.fin().await.unwrap();
+        loop {
+            match er.next().await.expect("relay framing stays valid") {
+                Some(fallback_framing::Frame::Keepalive { .. }) => {}
+                Some(other) => panic!("nothing is owed after both FINs, got {other:?}"),
+                None => break,
+            }
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed > fallback_framing::POST_PEER_FIN_IDLE_BOUND,
+            "the own-FIN-only phase must survive past the bound (lived {elapsed:?})"
+        );
+        relay.await.unwrap().expect("the late upload's own FIN is the clean end");
+        let _ = early_origin.await;
     }
 
     /// #528 acceptance for the `'F'` rung through the real
