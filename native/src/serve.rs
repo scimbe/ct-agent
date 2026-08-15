@@ -987,7 +987,8 @@ mod tests {
                 let (acc, st, ch) = (acceptor.clone(), state_e.clone(), challenge.clone());
                 tokio::spawn(async move {
                     if let Ok(tls) = acc.accept(tcp).await {
-                        let _ = serve_tcp_connection(tls, &st, &ch).await;
+                        // The trailing None is ct-edge's per-connection cap (no cap in this test).
+                        let _ = serve_tcp_connection(tls, &st, &ch, None).await;
                     }
                 });
             }

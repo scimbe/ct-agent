@@ -57,7 +57,8 @@
 use std::time::Duration;
 
 use ct_common::channel::{
-    verify, verify_holder_possession, ChannelId, GrantError, SignedChannelGrant, UnixSeconds,
+    verify_holder_possession, verify_stateless, ChannelId, GrantError, SignedChannelGrant,
+    UnixSeconds,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use libp2p::core::transport::MemoryTransport;
@@ -1890,12 +1891,13 @@ pub fn authorize_relay_circuit(
     now: UnixSeconds,
 ) -> Result<(), RelayCircuitError> {
     // 1–2. The relay must itself hold an authentic grant FOR THIS channel (invariant #3).
-    verify(operator_pubkey, relay_grant, now).map_err(RelayCircuitError::RelayGrantInvalid)?;
+    verify_stateless(operator_pubkey, relay_grant, now)
+        .map_err(RelayCircuitError::RelayGrantInvalid)?;
     if relay_grant.grant.channel != *circuit_channel {
         return Err(RelayCircuitError::RelayNotMember);
     }
     // 3–4. The requester must prove co-membership on the same channel.
-    verify(operator_pubkey, requester_grant, now)
+    verify_stateless(operator_pubkey, requester_grant, now)
         .map_err(RelayCircuitError::RequesterGrantInvalid)?;
     if requester_grant.grant.channel != *circuit_channel {
         return Err(RelayCircuitError::RequesterChannelMismatch);
@@ -2515,15 +2517,20 @@ mod tests {
                 .expect("two DCUtR-enabled peers connect through the relay");
             let a = generate_static_keypair();
             let b = generate_static_keypair();
-            // The dialer (initiator) pins the peer's `b_pub`; the responder needs no peer key.
-            let (a_priv, b_priv, b_pub) = (a.private, b.private, b.public);
+            // #416: BOTH roles pin their peer now -- the responder's `peer_noise_public`
+            // used to be discarded, so this test handed it a `[0u8; 32]` placeholder. It is
+            // enforced today (a2a_respond_verified), and the placeholder is exactly the
+            // "genuine handshake from an unexpected peer" the pin exists to reject. The
+            // production callers (p2p.rs's DCUtR closures, channel_run's upgrade closures)
+            // always passed the real peer key, so only this test's placeholder was stale.
+            let (a_priv, a_pub, b_priv, b_pub) = (a.private, a.public, b.private, b.public);
 
             // The dialer opened the substream (writes first), so it is the direct-Noise INITIATOR.
             let dialer_task = tokio::spawn(async move {
                 establish_direct_over_duplex(dialer_stream, true, &a_priv, &b_pub).await
             });
             let (mut lts, mut lr, mut lw) =
-                establish_direct_over_duplex(listener_stream, false, &b_priv, &[0u8; 32])
+                establish_direct_over_duplex(listener_stream, false, &b_priv, &a_pub)
                     .await
                     .expect("listener establishes the direct session over DCUtR");
             let (mut dts, mut dr, mut dw) = dialer_task

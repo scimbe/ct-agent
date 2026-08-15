@@ -9,4 +9,21 @@ members = ["native", "wasm"]
 # drifting pins. Bump deliberately, in lockstep with native/Cargo.lock's own
 # ct-edge/ct-client dev-dependency pins (kept at the same tag by convention).
 [workspace.dependencies]
-ct-common = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.13" }
+# DEV-ONLY, TEMPORARY (CADS-Tunnel#528) -- normally this is `tag = "v0.4.13"`.
+# The framed TLS-TCP relay in native/src/transport.rs is built on ct-common's
+# fallback-relay frame codec (`ct_common::fallback_framing`, CADS-Tunnel commit
+# e7ec736), which is not in any tag yet, so this points at the branch instead.
+#
+# Why the whole pin moves and not just a `[patch]` entry: cargo rejects a patch
+# whose replacement comes from the same repository URL ("patches must point to
+# different sources"), and every other CADS-Tunnel crate below (control-plane,
+# dns, edge, client) carries ct-common along as a workspace-path dependency of
+# its own checkout -- leaving them on the tag while ct-common moved would put
+# TWO ct-commons in the graph and make ct_common types from ct-agent and from
+# ct-edge mutually incompatible in the cross-crate tests. All CADS-Tunnel pins
+# therefore move together; Cargo.lock nails the branch to one concrete rev, so
+# the build stays reproducible while the branch moves.
+#
+# REVERT ALL OF THEM to `tag = "vX.Y.Z"` as soon as CADS-Tunnel cuts a tag that
+# contains e7ec736 -- a branch pin silently follows other people's work.
+ct-common = { git = "https://github.com/scimbe/CADS-Tunnel", branch = "feat/528-fallback-framing" }

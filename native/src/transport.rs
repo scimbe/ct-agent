@@ -915,7 +915,8 @@ mod tests {
         let edge = tokio::spawn(async move {
             let (tcp, _) = tcp_listener.accept().await.unwrap();
             let tls = acceptor.accept(tcp).await.unwrap();
-            let _ = serve_tcp_connection(tls, &state_e, &challenge).await;
+            // The trailing None is ct-edge's per-connection cap (no cap in this test).
+            let _ = serve_tcp_connection(tls, &state_e, &challenge, None).await;
         });
 
         // Agent: connect over TLS-TCP (trusting the CA root) and register.
@@ -975,7 +976,8 @@ mod tests {
             let (tcp, _) = tcp_listener.accept().await.unwrap();
             let proxies: std::collections::HashMap<String, ct_edge::serve::ProxyTarget> =
                 std::collections::HashMap::new();
-            let _ = serve_front_door(tcp, &state_e, &acceptor, &proxies, None, &challenge, None, None, None, None, None).await;
+            // The two trailing Nones are ct-edge's per-connection cap and admission permit.
+            let _ = serve_front_door(tcp, &state_e, &acceptor, &proxies, None, &challenge, None, None, None, None, None, None, None).await;
         });
 
         // Agent: TLS-TCP connect (ALPN=ct-edge set in tcp_tls_connect) + register.
