@@ -560,7 +560,7 @@ dependencies = [
 [[package]]
 name = "ct-client"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?branch=feat%2F528-fallback-framing#e7ec736f2f888cb425ace8f87f20ae29404aebfb"
+source = "git+https://github.com/scimbe/CADS-Tunnel?branch=feat%2F528-fallback-framing#db4c4460d4feb4314187b842c5f8c913cdef57bf"
 dependencies = [
  "ct-common",
  "futures-util",
@@ -573,7 +573,7 @@ dependencies = [
 [[package]]
 name = "ct-common"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?branch=feat%2F528-fallback-framing#e7ec736f2f888cb425ace8f87f20ae29404aebfb"
+source = "git+https://github.com/scimbe/CADS-Tunnel?branch=feat%2F528-fallback-framing#db4c4460d4feb4314187b842c5f8c913cdef57bf"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
@@ -590,7 +590,7 @@ dependencies = [
 [[package]]
 name = "ct-control-plane"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?branch=feat%2F528-fallback-framing#e7ec736f2f888cb425ace8f87f20ae29404aebfb"
+source = "git+https://github.com/scimbe/CADS-Tunnel?branch=feat%2F528-fallback-framing#db4c4460d4feb4314187b842c5f8c913cdef57bf"
 dependencies = [
  "axum",
  "base64",
@@ -614,7 +614,7 @@ dependencies = [
 [[package]]
 name = "ct-dns"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?branch=feat%2F528-fallback-framing#e7ec736f2f888cb425ace8f87f20ae29404aebfb"
+source = "git+https://github.com/scimbe/CADS-Tunnel?branch=feat%2F528-fallback-framing#db4c4460d4feb4314187b842c5f8c913cdef57bf"
 dependencies = [
  "axum",
  "hickory-resolver 0.26.1",
@@ -626,7 +626,7 @@ dependencies = [
 [[package]]
 name = "ct-edge"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?branch=feat%2F528-fallback-framing#e7ec736f2f888cb425ace8f87f20ae29404aebfb"
+source = "git+https://github.com/scimbe/CADS-Tunnel?branch=feat%2F528-fallback-framing#db4c4460d4feb4314187b842c5f8c913cdef57bf"
 dependencies = [
  "axum",
  "ct-common",

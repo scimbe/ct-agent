@@ -27,8 +27,18 @@ use crate::transport::{
     tcp_tls_connect,
 };
 // #528: the relay-phase frame codec. Imported as a module, not by item, because
-// this file already has its own `read_frame` (the 2-byte Noise framing).
+// this file already has its own `read_frame` (the 2-byte Noise framing) -- except
+// for the two timing constants, which are pulled in by name precisely because they
+// must NOT be local choices: the keepalive cadence (8s of own send silence) and the
+// dead-peer bound (24s, 3x the cadence) have one definition shared by both
+// endpoints, which is the whole reason they cannot drift apart. The cadence is the
+// park phase's measured interval, calibrated against a real middlebox that kills an
+// idle flow in ~10-15s (5s request spacing -> 4/4 OK, 20s -> 1/4 on the deployment
+// this was found on); the dead bound tolerates two lost keepalives and still fires
+// long before this socket's own TCP keepalive would (~200s, see
+// `transport::apply_tcp_keepalive`).
 use ct_common::fallback_framing;
+use ct_common::fallback_framing::{KEEPALIVE_DEAD_AFTER, KEEPALIVE_INTERVAL};
 use ct_common::metrics::{Metered, TunnelMetrics};
 use ct_common::noise::{frame, noise_pump, origin_handshake, origin_handshake_any};
 use ct_common::RoutingToken;
@@ -88,147 +98,268 @@ where
     Ok(())
 }
 
-/// How long this side may stay silent on the edge↔agent hop before it injects a
-/// [`fallback_framing::FRAME_KEEPALIVE`]. Matches the park phase's PING cadence
-/// (`park_and_ping`, 10s) for the same measured reason: on the deployment where
-/// this was found a silent fallback connection dies after ~10-15s (5s request
-/// spacing → 4/4 OK, 20s spacing → 1/4), so the keepalive has to be comfortably
-/// inside that window, and the keepalive is one byte on an already-open TLS
-/// connection — the cost of being early is nil.
-const FRAMED_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
 
 /// Chunk size for Origin→Edge [`fallback_framing::FRAME_DATA`] frames. Well under
-/// [`fallback_framing::MAX_FRAME_PAYLOAD`] (256 KiB) so a chunk can never be
-/// rejected by the far side's cap, and around a max TLS record so a typical
-/// response body needs no artificial re-chunking.
+/// `MAX_FRAME_PAYLOAD` (256 KiB), so a chunk can never be rejected by the far
+/// side's cap, and around a max TLS record so a typical response body needs no
+/// artificial re-chunking. Also the buffer whose "short read" drives the #338
+/// flush heuristic below.
 const FRAMED_CHUNK: usize = 16 * 1024;
+
+/// Depth of the queue into the single edge-writer owner. Bounded on purpose: it is
+/// the backpressure that stops a fast Origin from buffering an unbounded response
+/// in memory while the edge↔agent hop is slow. 16 × [`FRAMED_CHUNK`] = 256 KiB in
+/// flight, the same order as one `MAX_FRAME_PAYLOAD`.
+const FRAMED_WRITE_QUEUE: usize = 16;
+
+/// One unit of work for the edge direction's single writer-owner. Everything that
+/// wants to put bytes on the edge↔agent hop — relayed Origin data, keepalive ACKs,
+/// the FIN — goes through this queue rather than touching the stream, because the
+/// #528 contract requires exactly one writer per direction: `write_all` is not
+/// atomic against concurrent writers (it loops over `poll_write` and can yield
+/// under backpressure, and a split `WriteHalf` locks per `poll_write`, not per
+/// call), so two writers would interleave and desynchronise the framing.
+enum EdgeWrite {
+    /// Relayed Origin bytes. `flush` carries the #338 short-read verdict.
+    Data { payload: Vec<u8>, flush: bool },
+    /// ACK a keepalive the reader decided is ack-worthy (`should_ack`).
+    Ack(u64),
+    /// An ACK the peer sent us — bookkeeping only, nothing goes on the wire.
+    AckReceived(u64),
+    /// The Origin is done: send the in-band half-close.
+    Fin,
+    /// The peer is done sending data (explicit FIN or a clean EOF) — bookkeeping
+    /// only, but it is half of the termination condition, which only the writer
+    /// sees in full (it knows `fin_sent`, the reader knows `peer_fin`).
+    PeerFin,
+}
 
 /// Forward a relayed **framed** duplex stream to the Origin (CADS-Tunnel#528) —
 /// the `'F'`-registration counterpart to [`serve_duplex_to_origin`].
 ///
-/// Only the edge↔agent hop is framed; the Origin side stays raw, so this
-/// unframes on the way in (`FRAME_DATA` → Origin, `FRAME_KEEPALIVE` → discard)
-/// and frames on the way out (Origin bytes → `FRAME_DATA`), injecting a
-/// `FRAME_KEEPALIVE` whenever *this* side has been silent for
-/// [`FRAMED_KEEPALIVE_IDLE`]. That keepalive is the entire point: it is the one
-/// thing the raw pump cannot do, because in a raw pump every byte on the wire
-/// belongs to the browser↔Origin conversation and there is no way to say
-/// "still here" during a silent in-flight request.
+/// Only the edge↔agent hop is framed; the Origin side stays raw, so this unframes
+/// on the way in and frames on the way out. The point of the framing is the one
+/// thing a raw pump cannot do: inject a keepalive *during* an in-flight request,
+/// because in a raw pump every byte on the wire belongs to the browser↔Origin
+/// conversation and there is no way to say "still here" while the Origin is quiet.
 ///
-/// Dials the Origin lazily on the first non-empty `FRAME_DATA`, for exactly the
-/// reason spelled out on [`serve_duplex_to_origin`].
+/// Shape (all four rules are the #528 contract, not local choices):
+/// * **One writer-owner.** All edge-bound frames are funnelled through one task
+///   holding the [`fallback_framing::FrameWriter`] — see [`EdgeWrite`].
+/// * **Bidirectional keepalive.** After [`KEEPALIVE_INTERVAL`] of *our own*
+///   send silence the writer emits a counter-carrying keepalive and records it in
+///   the [`fallback_framing::KeepaliveTracker`]; inbound keepalives are ACKed iff
+///   the reader's bounded-ACK verdict says so, and an unacknowledged keepalive
+///   older than [`FRAMED_DEAD_AFTER_MS`] ends the connection (the worker redials).
+/// * **In-band FIN.** Origin EOF sends `FIN`, not a TCP shutdown, so keepalives
+///   can keep flowing while the other direction is still in flight; a received
+///   `FIN` (or a clean EOF, which the contract defines as an implicit FIN)
+///   half-closes the Origin. Once FIN has passed both ways the writer shuts the
+///   stream down promptly — two mutually-FINed sides must not ping forever.
+/// * **Lazy Origin dial on the first non-empty `DATA`.** A keepalive or an empty
+///   DATA frame must NOT count as "the client spoke" (#528 finding 16): dialling
+///   on one would re-open the eagerly-dialled-Origin bug (#229 follow-up) that
+///   [`serve_duplex_to_origin`] documents, since the Origin connection would then
+///   sit idle from the moment the hop was merely kept alive.
 ///
-/// Structure note — why two one-way tasks rather than one `select!` loop over
-/// both directions: [`fallback_framing::read_frame`] performs several
-/// `read_exact` calls per frame and is therefore **not cancel-safe**; dropping it
-/// mid-frame in a `select!` branch would silently desynchronise the relay stream.
-/// So the reader half owns the edge read side and is never raced against
-/// anything, while the keepalive timer is raced only against the Origin read
-/// (`AsyncReadExt::read`, which is cancel-safe) on the writer half.
+/// Cancel-safety note: [`fallback_framing::FrameReader::next`] performs several
+/// `read_exact` calls per frame and is NOT cancel-safe, so it is never raced
+/// against anything — the edge reader owns it and blocks on it alone. The only
+/// `select!` on the read side is the writer's, over its (cancel-safe) queue and a
+/// timer; the Origin reader likewise races nothing.
 pub async fn serve_framed_duplex_to_origin<T>(edge: T, origin: SocketAddr) -> Result<(), BoxError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut edge_r, mut edge_w) = split(edge);
+    let (edge_r, edge_w) = split(edge);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<EdgeWrite>(FRAMED_WRITE_QUEUE);
     // The Origin is dialed by the edge→origin half (it sees the first DATA); its
     // read half is handed to the origin→edge half over this oneshot.
-    let (origin_r_tx, mut origin_r_rx) = tokio::sync::oneshot::channel();
+    let (origin_r_tx, origin_r_rx) = tokio::sync::oneshot::channel();
 
-    // Edge → Origin: unframe and forward.
+    // ---- Edge → Origin: unframe, forward, and drive the frame-level protocol.
+    let tx_up = tx.clone();
     let up = async move {
+        let mut reader = fallback_framing::FrameReader::new(edge_r);
         let mut origin_w: Option<tokio::net::tcp::OwnedWriteHalf> = None;
         let mut origin_r_tx = Some(origin_r_tx);
         loop {
-            let frame = match fallback_framing::read_frame(&mut edge_r).await {
-                Ok(f) => f,
-                // EOF at (or inside) a frame boundary: the Edge closed this
-                // single-use relay. That is the ordinary end of a browser
-                // connection, not a failure — the pool worker re-registers.
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(BoxError::from(e)),
+            let frame = match reader.next().await? {
+                Some(f) => f,
+                // Clean EOF at a frame boundary. The contract calls this an
+                // implicit FIN, so it takes exactly the explicit FIN's path.
+                None => break,
             };
-            let data = match frame {
-                fallback_framing::Frame::Keepalive => continue,
-                fallback_framing::Frame::Data(d) if d.is_empty() => continue,
-                fallback_framing::Frame::Data(d) => d,
-            };
-            let w = match origin_w.as_mut() {
-                Some(w) => w,
-                None => {
-                    let (r, w) = TcpStream::connect(origin).await?.into_split();
-                    // The receiver is only dropped if the writer half already
-                    // returned, in which case this relay is over anyway.
-                    let _ = origin_r_tx.take().expect("dial happens once").send(r);
-                    origin_w.insert(w)
+            match frame {
+                fallback_framing::Frame::Data(d) => {
+                    // Empty DATA is a legal no-op and never an EOF — in particular
+                    // it must not trigger the lazy dial (#528 finding 16).
+                    if d.is_empty() {
+                        continue;
+                    }
+                    let w = match origin_w.as_mut() {
+                        Some(w) => w,
+                        None => {
+                            let (r, w) = TcpStream::connect(origin).await?.into_split();
+                            // A send error means the writer half already ended, so
+                            // this relay is over regardless.
+                            let _ = origin_r_tx.take().expect("dial happens once").send(r);
+                            origin_w.insert(w)
+                        }
+                    };
+                    w.write_all(&d).await?;
                 }
-            };
-            w.write_all(&data).await?;
+                fallback_framing::Frame::Keepalive { counter, should_ack } => {
+                    // The bounded-ACK verdict is the reader's, not ours: a flood
+                    // with a constant or regressing counter earns no reply.
+                    if should_ack && tx_up.send(EdgeWrite::Ack(counter)).await.is_err() {
+                        break;
+                    }
+                }
+                fallback_framing::Frame::KeepaliveAck { counter } => {
+                    if tx_up.send(EdgeWrite::AckReceived(counter)).await.is_err() {
+                        break;
+                    }
+                }
+                fallback_framing::Frame::Fin => {
+                    // Data-EOF of the edge direction: half-close the Origin so it
+                    // sees the request end. Keep reading — keepalives and ACKs are
+                    // still legal (and still needed) after the peer's FIN.
+                    if let Some(mut w) = origin_w.take() {
+                        let _ = w.shutdown().await;
+                    }
+                    if tx_up.send(EdgeWrite::PeerFin).await.is_err() {
+                        break;
+                    }
+                }
+            }
         }
-        // Half-close the Origin so it sees the request end and can answer/finish
-        // — and, crucially, so the origin→edge half below is not left waiting on
-        // a response that will never come. Dropping `origin_w` implicitly would
-        // not be enough: this future stays alive (pinned in the `select!` below)
-        // while the other half is awaited.
+        // Reached on a clean EOF (implicit FIN) or a closed writer queue. Half-close
+        // the Origin if the peer never sent an explicit FIN; doing it here rather
+        // than by dropping matters, because this future stays alive (pinned below)
+        // while the other halves are awaited.
         if let Some(mut w) = origin_w.take() {
             let _ = w.shutdown().await;
         }
+        let _ = tx_up.send(EdgeWrite::PeerFin).await;
         Ok::<(), BoxError>(())
     };
 
-    // Origin → Edge: frame, plus keepalive injection during our own silence.
+    // ---- Origin → Edge: read the Origin, hand frames to the writer-owner.
     let down = async move {
-        // Keepalive while waiting for the Client's first bytes to arrive and the
-        // Origin to be dialed, too: the Edge writes STOP as soon as it splices a
-        // Client in, so this gap is normally sub-RTT, but a slow Client must not
-        // be able to starve the keepalive.
-        let mut origin_r = loop {
-            tokio::select! {
-                r = &mut origin_r_rx => match r {
-                    Ok(r) => break r,
-                    // The edge→origin half ended before any Client byte arrived:
-                    // nothing was ever relayed, so there is nothing to answer.
-                    Err(_) => return Ok(()),
-                },
-                _ = tokio::time::sleep(FRAMED_KEEPALIVE_IDLE) => {
-                    fallback_framing::write_keepalive_frame(&mut edge_w).await?;
-                    edge_w.flush().await?;
-                }
-            }
+        let Ok(mut origin_r) = origin_r_rx.await else {
+            // The edge→origin half ended before any Client byte arrived: nothing
+            // was ever relayed, so there is nothing to answer.
+            return Ok::<(), BoxError>(());
         };
         let mut buf = vec![0u8; FRAMED_CHUNK];
         loop {
-            // Each iteration ends in a write, and the sleep is created fresh
-            // here, so it measures exactly "silence since our last frame".
+            let n = origin_r.read(&mut buf).await?;
+            if n == 0 {
+                let _ = tx.send(EdgeWrite::Fin).await;
+                return Ok(());
+            }
+            // #338 short-read heuristic (the house rule, cf. ct-edge's
+            // `relay_streams`): a read that returned fewer bytes than the buffer
+            // holds marks a likely message boundary the far side is waiting on, so
+            // that frame is flushed. Flushing every chunk instead would trade the
+            // pipelining away; flushing none strands response bytes in a buffer
+            // while the browser waits.
+            let flush = n < buf.len();
+            if tx
+                .send(EdgeWrite::Data { payload: buf[..n].to_vec(), flush })
+                .await
+                .is_err()
+            {
+                return Ok(()); // writer gone: the connection is ending anyway
+            }
+        }
+    };
+
+    // ---- The single writer-owner for the edge direction.
+    let writer = async move {
+        let mut w = fallback_framing::FrameWriter::new(edge_w);
+        let mut tracker = fallback_framing::KeepaliveTracker::new();
+        let mut counter: u64 = 0;
+        let mut peer_fin = false;
+        // tokio's Instant, not std's, so a `start_paused` test's virtual clock is
+        // the same clock the cadence and the dead-verdict are measured on.
+        let start = tokio::time::Instant::now();
+        let now_ms = |t: tokio::time::Instant| t.duration_since(start).as_millis() as u64;
+        let mut last_write = tokio::time::Instant::now();
+        loop {
+            // Termination is the caller's duty: the writer knows `fin_sent`, the
+            // reader knows `peer_fin`, and only here do both meet. Once FIN has
+            // passed in both directions, close promptly instead of keepaliving a
+            // finished relay forever — the registration is single-use and the pool
+            // worker re-registers.
+            if w.fin_sent() && peer_fin {
+                w.shutdown().await?;
+                return Ok::<(), BoxError>(());
+            }
             tokio::select! {
-                n = origin_r.read(&mut buf) => {
-                    let n = n?;
-                    if n == 0 {
-                        // Origin closed: half-close the hop so the Edge can end
-                        // the browser connection. Under the raw pump this is the
-                        // FIN propagating; here it is ours to send.
-                        edge_w.shutdown().await?;
+                cmd = rx.recv() => match cmd {
+                    Some(EdgeWrite::Data { payload, flush }) => {
+                        w.data(&payload).await?;
+                        // #338: flush exactly on the short-read boundary the Origin
+                        // reader marked, not per chunk. `data` deliberately does not
+                        // auto-flush so bulk chunks can coalesce.
+                        if flush {
+                            w.flush().await?;
+                        }
+                        last_write = tokio::time::Instant::now();
+                    }
+                    Some(EdgeWrite::Ack(c)) => {
+                        w.keepalive_ack(c).await?;
+                        last_write = tokio::time::Instant::now();
+                    }
+                    Some(EdgeWrite::AckReceived(c)) => tracker.ack(c),
+                    Some(EdgeWrite::Fin) => {
+                        w.fin().await?;
+                        last_write = tokio::time::Instant::now();
+                    }
+                    Some(EdgeWrite::PeerFin) => peer_fin = true,
+                    // Both halves are gone and the queue is drained: nothing further
+                    // can be written, so close rather than keepalive into the void.
+                    None => {
+                        w.shutdown().await?;
                         return Ok(());
                     }
-                    fallback_framing::write_data_frame(&mut edge_w, &buf[..n]).await?;
-                    edge_w.flush().await?;
+                },
+                // Our own send silence, measured from the last frame WE wrote —
+                // receiving an ACK is not a reason to postpone a keepalive.
+                _ = tokio::time::sleep_until(last_write + KEEPALIVE_INTERVAL) => {
+                    counter += 1;
+                    w.keepalive(counter).await?;
+                    tracker.sent(counter, now_ms(tokio::time::Instant::now()));
+                    last_write = tokio::time::Instant::now();
                 }
-                _ = tokio::time::sleep(FRAMED_KEEPALIVE_IDLE) => {
-                    fallback_framing::write_keepalive_frame(&mut edge_w).await?;
-                    edge_w.flush().await?;
+            }
+            if let Some(age) = tracker.oldest_outstanding_age_ms(now_ms(tokio::time::Instant::now()))
+            {
+                if age > KEEPALIVE_DEAD_AFTER.as_millis() as u64 {
+                    return Err(format!(
+                        "framed relay: peer did not answer a keepalive for {age}ms (> {}ms) \
+                         — treating the connection as dead",
+                        KEEPALIVE_DEAD_AFTER.as_millis()
+                    )
+                    .into());
                 }
             }
         }
     };
 
-    // Whichever direction ends first, drain the other: an ended edge→origin half
-    // has half-closed the Origin (so the response still arrives), and an ended
-    // origin→edge half has half-closed the hop (so the Edge closes and the read
-    // half sees EOF). An *error* on either side ends the relay immediately —
-    // dropping the other future is safe because the stream is unusable anyway.
-    tokio::pin!(up, down);
+    // The writer decides when the relay is over (it owns the termination
+    // condition); the two readers feed it. An error anywhere ends the relay at
+    // once — dropping the other futures is safe, the stream is unusable anyway.
+    let readers = async { tokio::try_join!(up, down).map(|_| ()) };
+    tokio::pin!(readers, writer);
     tokio::select! {
-        r = &mut up => { r?; down.await }
-        r = &mut down => { r?; up.await }
+        r = &mut writer => r,
+        r = &mut readers => {
+            r?;
+            writer.await
+        }
     }
 }
 
@@ -1756,9 +1887,24 @@ mod tests {
         let _ = origin.await;
     }
 
+    /// A test-side Edge peer for the framed relay: the two halves of the duplex,
+    /// each wrapped in the very codec the real Edge uses. One owner for the write
+    /// half, exactly as the #528 contract demands of both endpoints.
+    fn edge_peer(
+        s: tokio::io::DuplexStream,
+    ) -> (
+        fallback_framing::FrameReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        fallback_framing::FrameWriter<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
+    ) {
+        let (r, w) = split(s);
+        (fallback_framing::FrameReader::new(r), fallback_framing::FrameWriter::new(w))
+    }
+
     /// #528: the framed relay's round trip, driven from the Edge side with the very
     /// codec the Edge uses. Everything the Edge writes is a frame; everything the
     /// Origin says comes back as a frame; and the Origin itself never sees framing.
+    /// Also pins the termination contract: once FIN has passed BOTH ways the agent
+    /// closes the hop instead of keepaliving a finished relay forever.
     #[tokio::test]
     async fn the_framed_relay_unframes_to_the_origin_and_reframes_the_response() {
         // The Origin asserts the concatenation itself with a read_exact: the relay
@@ -1771,87 +1917,91 @@ mod tests {
             let mut got = [0u8; 14];
             sock.read_exact(&mut got).await.unwrap();
             assert_eq!(&got, b"GET / HTTP/1.1", "the Origin sees raw bytes -- no framing reaches it");
+            // The agent must have half-closed us on the peer's FIN, so this is EOF.
+            assert_eq!(sock.read(&mut [0u8; 1]).await.unwrap(), 0, "a received FIN half-closes the Origin");
             sock.write_all(b"HTTP/1.1 200 OK").await.unwrap();
             sock.shutdown().await.unwrap();
         });
-        let (mut edge_side, agent_side) = tokio::io::duplex(1 << 16);
+        let (edge_side, agent_side) = tokio::io::duplex(1 << 16);
         let relay =
             tokio::spawn(async move { serve_framed_duplex_to_origin(agent_side, origin_addr).await });
+        let (mut er, mut ew) = edge_peer(edge_side);
 
-        // Two DATA frames: the Origin must receive their concatenation, unframed --
-        // relay chunking is not request structure.
-        fallback_framing::write_data_frame(&mut edge_side, b"GET / ").await.unwrap();
-        fallback_framing::write_data_frame(&mut edge_side, b"HTTP/1.1").await.unwrap();
-        edge_side.flush().await.unwrap();
+        // Two DATA frames, then the in-band half-close: the Origin must receive the
+        // concatenation, unframed -- relay chunking is not request structure.
+        ew.data(b"GET / ").await.unwrap();
+        ew.data(b"HTTP/1.1").await.unwrap();
+        ew.fin().await.unwrap();
 
-        // The echo origin answers once it has read, then closes; the response comes
-        // back framed. It may arrive as one DATA frame or several, so collect until
-        // the hop is half-closed (the framed relay's end-of-response signal).
         let mut got = Vec::new();
+        let mut saw_fin = false;
         loop {
-            match fallback_framing::read_frame(&mut edge_side).await {
-                Ok(fallback_framing::Frame::Data(d)) => got.extend_from_slice(&d),
-                Ok(fallback_framing::Frame::Keepalive) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => panic!("relay framing error: {e}"),
+            match er.next().await.expect("relay framing stays valid") {
+                Some(fallback_framing::Frame::Data(d)) => got.extend_from_slice(&d),
+                Some(fallback_framing::Frame::Keepalive { counter, .. }) => {
+                    ew.keepalive_ack(counter).await.unwrap()
+                }
+                Some(fallback_framing::Frame::KeepaliveAck { .. }) => {}
+                Some(fallback_framing::Frame::Fin) => saw_fin = true,
+                // The agent closed the hop -- which it may only do once BOTH sides
+                // have FINed, so reaching this proves the termination rule.
+                None => break,
             }
         }
         assert_eq!(got, b"HTTP/1.1 200 OK", "the Origin's raw response comes back framed");
+        assert!(saw_fin, "Origin EOF is signalled in-band with FIN, not by tearing down TCP");
 
-        drop(edge_side);
         relay.await.unwrap().expect("the framed relay ends cleanly");
         let _ = origin.await;
     }
 
     #[tokio::test]
-    async fn the_framed_relay_discards_keepalives_instead_of_forwarding_them() {
-        // The whole point of KEEPALIVE: it is injectable at ANY frame boundary --
-        // before a request, between its chunks, and while a response is in flight --
-        // and must never reach the Origin. If a single keepalive byte leaked through,
-        // it would corrupt the very request it exists to protect.
-        // Same reasoning as above: the Origin itself pins what it received, byte for
-        // byte, instead of echoing whatever happened to arrive in one read.
+    async fn the_framed_relay_acks_keepalives_and_never_forwards_them_to_the_origin() {
+        // Two rules at once. (a) A keepalive is injectable at ANY frame boundary --
+        // before a request, between its chunks, after it -- and must never reach the
+        // Origin; a single leaked byte would corrupt the very request the keepalive
+        // exists to protect. (b) The ACK is bounded (PING-flood class, cf.
+        // CVE-2019-9512): only a counter strictly greater than the last one acked
+        // earns a reply, so a flood with a constant counter earns nothing.
         let ol = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin_addr = ol.local_addr().unwrap();
         let origin = tokio::spawn(async move {
             let (mut sock, _) = ol.accept().await.unwrap();
             let mut got = [0u8; 4];
             sock.read_exact(&mut got).await.unwrap();
-            assert_eq!(
-                &got, b"ABCD",
-                "exactly the DATA payloads reached the Origin -- no keepalive leaked into them"
-            );
-            // Nothing else may follow: a leaked trailing keepalive would show up here.
-            let mut extra = [0u8; 1];
-            assert_eq!(sock.read(&mut extra).await.unwrap(), 0, "the Origin sees a clean EOF, not a stray byte");
+            assert_eq!(&got, b"ABCD", "exactly the DATA payloads reached the Origin");
+            assert_eq!(sock.read(&mut [0u8; 1]).await.unwrap(), 0, "no keepalive leaked in behind them");
             sock.write_all(b"done").await.unwrap();
             sock.shutdown().await.unwrap();
         });
-        let (mut edge_side, agent_side) = tokio::io::duplex(1 << 16);
+        let (edge_side, agent_side) = tokio::io::duplex(1 << 16);
         let relay =
             tokio::spawn(async move { serve_framed_duplex_to_origin(agent_side, origin_addr).await });
+        let (mut er, mut ew) = edge_peer(edge_side);
 
-        fallback_framing::write_keepalive_frame(&mut edge_side).await.unwrap();
-        fallback_framing::write_data_frame(&mut edge_side, b"AB").await.unwrap();
-        fallback_framing::write_keepalive_frame(&mut edge_side).await.unwrap();
-        fallback_framing::write_data_frame(&mut edge_side, b"CD").await.unwrap();
-        fallback_framing::write_keepalive_frame(&mut edge_side).await.unwrap();
-        // Half-close, so the relay half-closes the Origin in turn and the Origin's
-        // own "nothing else followed" check can complete.
-        edge_side.shutdown().await.unwrap();
+        ew.keepalive(1).await.unwrap();
+        ew.data(b"AB").await.unwrap();
+        ew.keepalive(1).await.unwrap(); // repeat -- must NOT be acked
+        ew.data(b"CD").await.unwrap();
+        ew.keepalive(2).await.unwrap();
+        ew.fin().await.unwrap();
 
+        let mut acks = Vec::new();
         let mut got = Vec::new();
         loop {
-            match fallback_framing::read_frame(&mut edge_side).await {
-                Ok(fallback_framing::Frame::Data(d)) => got.extend_from_slice(&d),
-                Ok(fallback_framing::Frame::Keepalive) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => panic!("relay framing error: {e}"),
+            match er.next().await.expect("relay framing stays valid") {
+                Some(fallback_framing::Frame::KeepaliveAck { counter }) => acks.push(counter),
+                Some(fallback_framing::Frame::Data(d)) => got.extend_from_slice(&d),
+                Some(fallback_framing::Frame::Keepalive { counter, .. }) => {
+                    ew.keepalive_ack(counter).await.unwrap()
+                }
+                Some(fallback_framing::Frame::Fin) => {}
+                None => break,
             }
         }
+        assert_eq!(acks, vec![1, 2], "every ack-worthy keepalive is acked, the repeat is not");
         assert_eq!(got, b"done", "the Origin answered the un-keepalived request");
 
-        drop(edge_side);
         relay.await.unwrap().expect("the framed relay ends cleanly");
         let _ = origin.await;
     }
@@ -1862,7 +2012,8 @@ mod tests {
         // whose Origin says nothing for a long time -- an LLM cold model load -- used
         // to leave the hop completely silent, and the middlebox dropped it. Under a
         // paused clock, prove the agent puts real payload on the wire during exactly
-        // that silence, at the ~10s cadence, WITHOUT touching the Origin's answer.
+        // that silence, at the 8s cadence and with monotonic counters, WITHOUT
+        // touching the Origin's answer.
         let ol = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin_addr = ol.local_addr().unwrap();
         let slow_origin = tokio::spawn(async move {
@@ -1876,33 +2027,149 @@ mod tests {
             sock.shutdown().await.unwrap();
         });
 
-        let (mut edge_side, agent_side) = tokio::io::duplex(1 << 16);
+        let (edge_side, agent_side) = tokio::io::duplex(1 << 16);
         let relay =
             tokio::spawn(async move { serve_framed_duplex_to_origin(agent_side, origin_addr).await });
-        fallback_framing::write_data_frame(&mut edge_side, b"prompt").await.unwrap();
-        edge_side.flush().await.unwrap();
+        let (mut er, mut ew) = edge_peer(edge_side);
+        ew.data(b"prompt").await.unwrap();
 
-        let mut keepalives = 0usize;
+        let mut counters = Vec::new();
         let mut answer = Vec::new();
         loop {
-            match fallback_framing::read_frame(&mut edge_side).await {
-                Ok(fallback_framing::Frame::Keepalive) => keepalives += 1,
-                Ok(fallback_framing::Frame::Data(d)) => answer.extend_from_slice(&d),
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => panic!("relay framing error: {e}"),
+            match er.next().await.expect("relay framing stays valid") {
+                Some(fallback_framing::Frame::Keepalive { counter, should_ack }) => {
+                    assert!(should_ack, "a monotonically rising counter is always ack-worthy");
+                    counters.push(counter);
+                    // Answering matters: an unanswered keepalive is what the 24s
+                    // dead-verdict is for, and 45s of silence would trip it.
+                    ew.keepalive_ack(counter).await.unwrap();
+                }
+                Some(fallback_framing::Frame::Data(d)) => answer.extend_from_slice(&d),
+                Some(fallback_framing::Frame::Fin) => ew.fin().await.unwrap(),
+                Some(fallback_framing::Frame::KeepaliveAck { .. }) => {}
+                None => break,
             }
         }
         assert_eq!(answer, b"answer", "the response still arrives intact");
         assert!(
-            keepalives >= 3,
-            "45s of Origin silence must produce keepalives at the {}s cadence, got {keepalives}",
-            FRAMED_KEEPALIVE_IDLE.as_secs()
+            counters.len() >= 4,
+            "45s of Origin silence must produce keepalives at the {}s cadence, got {}",
+            KEEPALIVE_INTERVAL.as_secs(),
+            counters.len()
+        );
+        let mut sorted = counters.clone();
+        sorted.dedup();
+        assert!(
+            counters.windows(2).all(|w| w[1] > w[0]) && sorted == counters,
+            "keepalive counters must rise strictly, or the peer's bounded ACK would drop them: {counters:?}"
         );
 
-        drop(edge_side);
         relay.await.unwrap().expect("the framed relay ends cleanly");
         let _ = slow_origin.await;
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_framed_relay_declares_a_peer_that_never_acks_dead() {
+        // The other half of the bidirectional keepalive: it is not just middlebox
+        // food, it is this side's liveness probe. A peer that has silently gone away
+        // (or a path that black-holes) leaves our keepalives unanswered, and the
+        // relay must give up on its own -- TCP's keepalive on this socket would take
+        // ~200s to notice, by which time the browser is long gone. Nothing else here
+        // ever ends: the Origin never answers and the Edge never closes.
+        let ol = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = ol.local_addr().unwrap();
+        let mute_origin = tokio::spawn(async move {
+            let (mut sock, _) = ol.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let _ = sock.read(&mut buf).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let (edge_side, agent_side) = tokio::io::duplex(1 << 16);
+        let relay =
+            tokio::spawn(async move { serve_framed_duplex_to_origin(agent_side, origin_addr).await });
+        let (_er, mut ew) = edge_peer(edge_side);
+        ew.data(b"prompt").await.unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(120), relay)
+            .await
+            .expect("the relay must give up on its own, not hang")
+            .unwrap()
+            .expect_err("an unanswered keepalive past the dead-verdict must end the relay");
+        assert!(
+            err.to_string().contains("dead"),
+            "the error must name the liveness verdict, got: {err}"
+        );
+        mute_origin.abort();
+    }
+
+    #[tokio::test]
+    async fn the_framed_relay_dials_the_origin_only_on_the_first_non_empty_data_frame() {
+        // #528 finding 16. The lazy dial exists because a fallback registration can
+        // sit parked arbitrarily long before a real Client shows up, and an Origin
+        // connection opened early enough can idle past the Origin's own keep-alive
+        // timeout, so the FIRST real request lands on an already-dead connection
+        // (the #229 follow-up documented on serve_duplex_to_origin). Framing adds two
+        // new ways to trip that trigger prematurely -- a keepalive, and an empty DATA
+        // frame, which the codec defines as a no-op and never an EOF. Neither may
+        // count as "the client spoke".
+        let ol = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = ol.local_addr().unwrap();
+        let dialed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dialed_w = dialed.clone();
+        let origin = tokio::spawn(async move {
+            let (mut sock, _) = ol.accept().await.unwrap();
+            dialed_w.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut b = [0u8; 64];
+            let n = sock.read(&mut b).await.unwrap();
+            assert_eq!(&b[..n], b"real request");
+            sock.write_all(b"ok").await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+
+        let (edge_side, agent_side) = tokio::io::duplex(1 << 16);
+        let relay =
+            tokio::spawn(async move { serve_framed_duplex_to_origin(agent_side, origin_addr).await });
+        let (mut er, mut ew) = edge_peer(edge_side);
+
+        // Everything that is NOT a client speaking.
+        ew.keepalive(1).await.unwrap();
+        ew.data(b"").await.unwrap();
+        ew.keepalive(2).await.unwrap();
+        // Drain the two ACKs, which also proves the frames were processed and not
+        // merely sitting unread in the buffer while we assert below.
+        for _ in 0..2 {
+            match er.next().await.unwrap() {
+                Some(fallback_framing::Frame::KeepaliveAck { .. }) => {}
+                other => panic!("expected a keepalive ack, got {other:?}"),
+            }
+        }
+        assert!(
+            !dialed.load(std::sync::atomic::Ordering::SeqCst),
+            "neither a keepalive nor an empty DATA frame may dial the Origin"
+        );
+
+        // Now a client actually speaks.
+        ew.data(b"real request").await.unwrap();
+        ew.fin().await.unwrap();
+        let mut got = Vec::new();
+        loop {
+            match er.next().await.expect("relay framing stays valid") {
+                Some(fallback_framing::Frame::Data(d)) => got.extend_from_slice(&d),
+                Some(fallback_framing::Frame::Keepalive { counter, .. }) => {
+                    ew.keepalive_ack(counter).await.unwrap()
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(dialed.load(std::sync::atomic::Ordering::SeqCst), "a non-empty DATA frame dials it");
+        assert_eq!(got, b"ok");
+
+        relay.await.unwrap().expect("the framed relay ends cleanly");
+        let _ = origin.await;
+    }
+
 
     /// #528 acceptance for the `'F'` rung through the real
     /// `tcp_connect_register_serve`: an Edge that does not know `'F'` drops the

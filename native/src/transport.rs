@@ -1318,7 +1318,10 @@ mod tests {
             // STOP and the first relay frame in one write: the agent must consume the
             // single STOP byte and leave the DATA frame's discriminator untouched.
             let mut after = vec![TCP_PING_STOP];
-            ct_common::fallback_framing::write_data_frame(&mut after, b"hi").await.unwrap();
+            ct_common::fallback_framing::FrameWriter::new(&mut after)
+                .data(b"hi")
+                .await
+                .unwrap();
             edge_side.write_all(&after).await.unwrap();
             edge_side.flush().await.unwrap();
         });
@@ -1328,8 +1331,8 @@ mod tests {
             .expect("register");
         await_ping_phase_end(&mut agent_side).await.expect("ping phase ends at STOP");
         assert_eq!(
-            ct_common::fallback_framing::read_frame(&mut agent_side).await.unwrap(),
-            ct_common::fallback_framing::Frame::Data(b"hi".to_vec()),
+            ct_common::fallback_framing::FrameReader::new(&mut agent_side).next().await.unwrap(),
+            Some(ct_common::fallback_framing::Frame::Data(b"hi".to_vec())),
             "the bytes after STOP parse as a relay frame -- no park byte leaked into them"
         );
         edge.await.unwrap();
