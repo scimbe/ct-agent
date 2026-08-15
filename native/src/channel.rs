@@ -24,6 +24,24 @@
 //! (Pre-challenge is different: there an empty response stays `Refused`, because
 //! over QUIC an explicit `NO` can race the teardown and arrive empty — see the
 //! pre-challenge read in [`present_channel_join_on_stream`].)
+//!
+//! ### `OK`-line field grammar (normative — parse by grammar, never by count)
+//!
+//! ```text
+//! OK <endpoint-or-mode> [<peer_noise_hex64> <peer_holder_hex64> <peer_attest_hex128>] [<key>=<value> ...]
+//! ```
+//!
+//! - The `<noise> <holder> <attest>` triple is **optional and all-or-nothing** — present
+//!   only when the edge relayed the peer's attested Noise key (#101); absent otherwise
+//!   (then "no peer Noise key" is a real registration state, not a parse artifact).
+//! - `<key>=<value>` tokens (`r=` reflexive #121, `sp=` same-public-IP #276, and any
+//!   FUTURE tag) are **tagged, order-independent, and additively appended** — the line is
+//!   deliberately extensible. `parse_channel_ack` therefore takes **bare** tokens as the
+//!   positional fields and reads `key=value` tokens **by name**, ignoring unknown ones; it
+//!   MUST NOT assume a fixed field count. A consumer that hard-checked the count broke on
+//!   the U1 `r=`/`sp=` addition (webconference-demo outage, 2026-08-15); ct-agent#28
+//!   hardened this reader to the grammar above. The authoritative producer + the same
+//!   grammar live in CADS-Tunnel `channel_broker.rs` (`write_member_ack`) and ADR-0020 §4a.
 
 use ct_common::channel::ChannelJoinRequest;
 use ed25519_dalek::{Signer, SigningKey};
