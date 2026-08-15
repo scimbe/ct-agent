@@ -66,6 +66,18 @@ pub struct AgentConfig {
     /// (`wait_for_tcp_agent`) rather than failing outright. Only used in
     /// TLS-TCP fallback mode; QUIC already multiplexes and needs no pool.
     pub tcp_fallback_pool_size: usize,
+    /// CADS-Tunnel#528: when true, the Browser-Plane TLS-TCP fallback prefers the
+    /// **framed** `'F'` registration, whose relay phase is length-prefix framed on
+    /// the edge↔agent hop so a keepalive can be interleaved *during* an in-flight
+    /// request (an Origin that is silent for an LLM cold model load no longer has
+    /// its connection dropped by a middlebox). `CT_AGENT_FRAMED_FALLBACK`.
+    ///
+    /// Default `false` **until the Edge side of #528 is deployed everywhere**: an
+    /// Edge that does not know `'F'` refuses it, which costs one extra dial per
+    /// registration before the `'L'` fallback takes over. That is harmless but
+    /// pointless, so this stays opt-in rather than being paid on every edge in the
+    /// fleet. Flip the default once the framed Edge is the deployed baseline.
+    pub framed_fallback: bool,
     /// #16 operational escape hatch: when true, the Agent registers over the
     /// TLS-TCP fallback **exclusively** -- no QUIC dial at all, ever. For
     /// deployments whose UDP path to the edge is known-flaky ("UDP flapping"):
@@ -103,6 +115,7 @@ impl AgentConfig {
             hostname: None,
             fallback_443: false,
             tcp_fallback_pool_size: DEFAULT_TCP_FALLBACK_POOL_SIZE,
+            framed_fallback: false,
             register_tcp_only: false,
         })
     }
@@ -150,19 +163,12 @@ impl AgentConfig {
             .map(|h| h.trim().to_string())
             .filter(|h| !h.is_empty());
         // Firewall-fallback (#46): CT_AGENT_FALLBACK_443 truthy -> also try :443.
-        cfg.fallback_443 = get("CT_AGENT_FALLBACK_443")
-            .map(|v| {
-                let v = v.trim();
-                !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
-            })
-            == Some(true);
+        cfg.fallback_443 = truthy(&get, "CT_AGENT_FALLBACK_443");
         // #16: CT_AGENT_REGISTER_TCP_ONLY truthy -> never dial QUIC, TLS-TCP only.
-        cfg.register_tcp_only = get("CT_AGENT_REGISTER_TCP_ONLY")
-            .map(|v| {
-                let v = v.trim();
-                !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
-            })
-            == Some(true);
+        cfg.register_tcp_only = truthy(&get, "CT_AGENT_REGISTER_TCP_ONLY");
+        // #528: CT_AGENT_FRAMED_FALLBACK truthy -> prefer the framed 'F' browser
+        // registration over 'L'. Off by default, see the field's doc comment.
+        cfg.framed_fallback = truthy(&get, "CT_AGENT_FRAMED_FALLBACK");
         cfg.tcp_fallback_pool_size = match get("CT_AGENT_TCP_FALLBACK_POOL_SIZE") {
             Some(s) if !s.trim().is_empty() => s
                 .trim()
@@ -179,6 +185,18 @@ impl AgentConfig {
         };
         Ok(cfg)
     }
+}
+
+/// Read a boolean env flag: set and not `""`/`0`/`false` (case-insensitive,
+/// trimmed) means on. The one shared reading of "truthy" across every boolean
+/// `CT_AGENT_*` flag, so `=0` reliably means off everywhere instead of per-flag.
+fn truthy(get: &impl Fn(&str) -> Option<String>, key: &str) -> bool {
+    get(key)
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
 }
 
 /// See [`AgentConfig::tcp_fallback_pool_size`].
@@ -228,6 +246,30 @@ mod tests {
             .fallback_443
         };
         assert!(!base(None), "default off");
+        assert!(!base(Some("0")), "0 -> off");
+        assert!(!base(Some("false")), "false -> off");
+        assert!(!base(Some("")), "empty -> off");
+        assert!(base(Some("1")), "1 -> on");
+        assert!(base(Some("true")), "true -> on");
+    }
+
+    #[test]
+    fn framed_fallback_is_off_until_explicitly_enabled() {
+        // #528: the framed 'F' browser registration must stay OPT-IN while Edges
+        // that don't know 'F' are still deployed -- every such Edge refuses it and
+        // costs the agent an extra dial before 'L' takes over. Default-on would
+        // impose that on the whole fleet for no gain, so pin the default here.
+        let base = |v: Option<&str>| {
+            AgentConfig::from_env_with(|k| match k {
+                "CT_AGENT_EDGE" => Some("127.0.0.1:4433".into()),
+                "CT_AGENT_ORIGIN" => Some("127.0.0.1:8080".into()),
+                "CT_AGENT_FRAMED_FALLBACK" => v.map(str::to_string),
+                _ => None,
+            })
+            .unwrap()
+            .framed_fallback
+        };
+        assert!(!base(None), "default off -- opt-in until the framed Edge is the baseline");
         assert!(!base(Some("0")), "0 -> off");
         assert!(!base(Some("false")), "false -> off");
         assert!(!base(Some("")), "empty -> off");

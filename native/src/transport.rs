@@ -503,9 +503,40 @@ where
     register_tunnel_stream_browser_with_role(stream, token, host, b'L').await
 }
 
-/// Shared body of the `'B'`/`'L'` Browser-Plane registration: both roles have a
-/// byte-identical wire format (`role(1) | token(32) | host_len(2 BE) | host` →
-/// 2-byte `OK`/`NO` ack), so only the role byte varies.
+/// The **framed** Browser-Plane registration (CADS-Tunnel#528): byte-identical to
+/// `'B'`/`'L'` apart from the role byte `'F'`, and it keeps the whole `'L'` park
+/// phase — the Edge PINGs this connection while it sits parked, so the caller
+/// still drives [`await_ping_phase_end`] first. What `'F'` changes is what comes
+/// **after** the `STOP` byte: the relay phase is length-prefix framed in both
+/// directions on the edge↔agent hop (`ct_common::fallback_framing`), instead of
+/// being a raw byte pump. Drive it with [`crate::serve::serve_framed_duplex_to_origin`].
+///
+/// Why: `'L'` only keeps a *parked* connection alive. Once a request is delivered
+/// the framing stops and the connection is transparent again, so a request whose
+/// Origin is silent longer than the middlebox idle timeout — an LLM cold model
+/// load is the case this was found on — has neither relay traffic nor any way to
+/// inject a keepalive, and the middlebox drops the connection mid-request. Framing
+/// the relay phase makes a payload-carrying keepalive interleavable *during* an
+/// in-flight request, the same trick HTTP/2 PING (RFC 7540 §6.7) exists for.
+///
+/// Same fallback shape as `'L'`: an Edge that predates `'F'` treats the unknown
+/// role byte as a hard protocol error and drops the connection without an ack, so
+/// any failure here means redialing and registering `'L'` (then `'B'`) on a fresh
+/// stream — see `serve::tcp_connect_register_serve`.
+pub async fn register_tunnel_stream_browser_framed_capable<S>(
+    stream: &mut S,
+    token: &RoutingToken,
+    host: &str,
+) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    register_tunnel_stream_browser_with_role(stream, token, host, b'F').await
+}
+
+/// Shared body of the `'B'`/`'L'`/`'F'` Browser-Plane registration: all three roles
+/// have a byte-identical wire format (`role(1) | token(32) | host_len(2 BE) | host`
+/// → 2-byte `OK`/`NO` ack), so only the role byte varies.
 async fn register_tunnel_stream_browser_with_role<S>(
     stream: &mut S,
     token: &RoutingToken,
@@ -619,31 +650,6 @@ pub async fn tcp_tls_connect_channel_boring(
     .await
 }
 
-/// Enable TCP keepalive on `stream` (#229): a parked TLS-TCP fallback
-/// registration is otherwise a plain, silent TCP connection with nothing to
-/// refresh it over however long it sits waiting for a Client -- over a real,
-/// geographically distant network, any NAT/firewall between the Agent and
-/// the Edge can drop an idle mapping without either endpoint noticing, so a
-/// Client later delivered onto that "parked" connection gets nothing back
-/// (found live: reproduced on hugging's real UDP-blocked network, never on a
-/// same-host hermetic/loopback test, exactly what an idle-NAT-drop
-/// hypothesis predicts). Best-effort: unsupported platforms or an
-/// already-broken socket just don't get the option, same as today.
-///
-/// `time`/`interval` were originally 20s/20s with the OS-default retry count
-/// (typically 9 on Linux), so a genuinely dead connection could take up to
-/// ~200s (20 + 9*20) to surface as an error -- long enough that a parked
-/// registration sits silently broken for minutes before either side
-/// notices. A matching investigation on the Edge side (issue #15, live flap
-/// monitoring) tightened the Edge's own accept-side keepalive to 10s/10s
-/// with an explicit `with_retries(3)` bound (CADS-Tunnel, `crates/edge/src/
-/// transport.rs`, commit `5e3dd3c`); mirrored here for symmetry on this end
-/// of the same connection, since only one side keepaliving doesn't help
-/// this side's own idle-NAT-drop detection. Worst case is now 10 + 3*10 =
-/// 40s, roughly a 5x cut to the detection blind spot, while keeping probe
-/// traffic light (one 0-byte ACK-only segment every 10s while idle --
-/// negligible bandwidth/battery cost, still well above what would
-/// meaningfully drain a mobile client sitting parked). Windows is the one exception:
 /// #500/#495-2a: whether this channel dial's TLS negotiation selected a KA-generation id
 /// (plain `ct-edge-channel-ka`, or `http/1.1` on the boring leg -- the edge's deliberate
 /// keepalive signal). A KA-generation edge understands the park keepalive AND the
@@ -663,22 +669,39 @@ pub fn ka_negotiated(tls: &tokio_rustls::client::TlsStream<TcpStream>) -> bool {
 /// the Edge can drop an idle mapping without either endpoint noticing, so a
 /// Client later delivered onto that "parked" connection gets nothing back.
 /// Best-effort: unsupported platforms or an already-broken socket just
-/// don't get the option. 10s/10s + `with_retries(3)` mirrors the edge's
-/// accept-side keepalive (CADS-Tunnel #15, commit `5e3dd3c`) -- worst-case
-/// dead-connection detection 40s; Windows has no TCP_KEEPCNT knob and keeps
-/// its OS-default retry count (see the `cfg(not(windows))` below).
+/// don't get the option.
+///
+/// **20s/20s with the OS-default retry count** (~200s worst-case dead-connection
+/// detection on Linux). These were briefly 10s/10s + `with_retries(3)` (~40s) to
+/// mirror an edge-side tightening (CADS-Tunnel #15, `5e3dd3c`) -- but the edge
+/// REVERTED that a day later (`58864ae`) and the agent side was never pulled back
+/// with it, so this end kept claiming to mirror an edge setting that no longer
+/// exists. The revert's two reasons apply verbatim here:
+///
+/// * It didn't fix what it targeted. The parked-registration flapping continued at
+///   exactly the same rate after the tightening (measured next day on the same
+///   deployment: 5s request spacing -> 4/4 OK, 20s -> 1/4). The cause is a middlebox
+///   that ignores ACK-only segments entirely, so no keepalive *timing* can help --
+///   which is why the real-payload `'K'`/`'L'` park roles, and now #528's framed
+///   relay keepalive, exist instead.
+/// * Its blast radius was wider than intended, in the exact direction #528 is about:
+///   this runs on EVERY TLS-TCP dial, not just parked registrations, so a 5x tighter
+///   window also cut how long a legitimately quiet *in-flight* connection may stay
+///   quiet. On the edge that produced a live regression (an LLM call going quiet for
+///   15-20s), and an agent-side kill during the same silence is the same user-visible
+///   failure seen from the other end of the wire.
+///
+/// So dead-connection detection here is deliberately slow; liveness during a relay is
+/// the framed keepalive's job (`serve::serve_framed_duplex_to_origin`, ~24s verdict),
+/// not TCP's.
 fn apply_tcp_keepalive(stream: &TcpStream) {
     let sock = socket2::SockRef::from(stream);
+    // No `with_retries`: an explicit TCP_KEEPCNT bound is what made the reverted
+    // tightening kill quiet in-flight connections early. The OS default (~9 on Linux)
+    // is the value the edge went back to, and this side matches it again.
     let ka = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(10))
-        .with_interval(Duration::from_secs(10));
-    // `with_retries` sets TCP_KEEPCNT, which Windows' keepalive API (WSAIoctl
-    // SIO_KEEPALIVE_VALS) has no equivalent knob for -- socket2 only exposes it on
-    // platforms with a real TCP_KEEPCNT (see socket2::TcpKeepalive::with_retries'
-    // own cfg list, which excludes windows). Windows keeps its own default retry
-    // count; still gets the tightened 10s/10s time/interval above.
-    #[cfg(not(windows))]
-    let ka = ka.with_retries(3);
+        .with_time(Duration::from_secs(20))
+        .with_interval(Duration::from_secs(20));
     let _ = sock.set_tcp_keepalive(&ka);
 }
 
@@ -769,14 +792,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_tcp_keepalive_uses_the_tightened_10s_10s_3_retry_parameters() {
-        // issue #15 flap investigation: the parked TLS-TCP fallback connection was still
-        // flapping under the old 20s/20s + OS-default-retries (~9) keepalive, whose
-        // worst-case dead-connection-detection time was ~200s (20 + 9*20). This proves the
-        // tightened values actually land on the wire (not just that apply_tcp_keepalive
-        // compiles): SO_KEEPALIVE on, TCP_KEEPIDLE=10s, TCP_KEEPINTVL=10s, TCP_KEEPCNT=3 --
-        // worst case now 10 + 3*10 = 40s. Mirrors CADS-Tunnel's matching edge-side test
-        // (crates/edge/src/transport.rs, commit 5e3dd3c).
+    async fn apply_tcp_keepalive_stays_at_20s_20s_with_no_explicit_retry_bound() {
+        // The values, and the fact that they land on the wire at all (not just that
+        // apply_tcp_keepalive compiles). They were briefly 10s/10s + TCP_KEEPCNT=3 to
+        // mirror an edge tightening; the EDGE reverted that a day later (CADS-Tunnel
+        // 58864ae) because it didn't reduce the flapping it targeted -- the middlebox
+        // ignores ACK-only segments, so no timing helps -- and because it killed quiet
+        // in-flight connections early (a 15-20s silent LLM call), which is a
+        // user-visible failure. This side kept the tightened values and a doc claiming
+        // to "mirror the edge" until #528. Pin the reverted values so the two ends of
+        // the same connection cannot silently drift apart again.
         let bind = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = bind.local_addr().unwrap();
         let accept = tokio::spawn(async move { bind.accept().await.unwrap().0 });
@@ -788,18 +813,18 @@ mod tests {
         assert!(sock.keepalive().unwrap_or(false), "SO_KEEPALIVE must be enabled");
         assert_eq!(
             sock.keepalive_time().unwrap(),
-            Duration::from_secs(10),
-            "TCP_KEEPIDLE must be tightened to 10s (was 20s)"
+            Duration::from_secs(20),
+            "TCP_KEEPIDLE stays at 20s -- matching the edge after its revert"
         );
         assert_eq!(
             sock.keepalive_interval().unwrap(),
-            Duration::from_secs(10),
-            "TCP_KEEPINTVL must be tightened to 10s (was 20s)"
+            Duration::from_secs(20),
+            "TCP_KEEPINTVL stays at 20s -- matching the edge after its revert"
         );
-        assert_eq!(
-            sock.keepalive_retries().unwrap(),
-            3,
-            "TCP_KEEPCNT must be explicitly bounded to 3 (was the OS default, ~9 on Linux)"
+        assert!(
+            sock.keepalive_retries().unwrap() > 3,
+            "TCP_KEEPCNT must be left at the OS default (~9 on Linux), NOT bounded to 3: \
+             an explicit low bound is what killed quiet in-flight connections early"
         );
     }
 
@@ -915,7 +940,8 @@ mod tests {
         let edge = tokio::spawn(async move {
             let (tcp, _) = tcp_listener.accept().await.unwrap();
             let tls = acceptor.accept(tcp).await.unwrap();
-            let _ = serve_tcp_connection(tls, &state_e, &challenge).await;
+            // The trailing None is ct-edge's per-connection cap (no cap in this test).
+            let _ = serve_tcp_connection(tls, &state_e, &challenge, None).await;
         });
 
         // Agent: connect over TLS-TCP (trusting the CA root) and register.
@@ -975,7 +1001,8 @@ mod tests {
             let (tcp, _) = tcp_listener.accept().await.unwrap();
             let proxies: std::collections::HashMap<String, ct_edge::serve::ProxyTarget> =
                 std::collections::HashMap::new();
-            let _ = serve_front_door(tcp, &state_e, &acceptor, &proxies, None, &challenge, None, None, None, None, None).await;
+            // The two trailing Nones are ct-edge's per-connection cap and admission permit.
+            let _ = serve_front_door(tcp, &state_e, &acceptor, &proxies, None, &challenge, None, None, None, None, None, None, None).await;
         });
 
         // Agent: TLS-TCP connect (ALPN=ct-edge set in tcp_tls_connect) + register.
@@ -1217,6 +1244,97 @@ mod tests {
         register_tunnel_stream_browser_ping_capable(&mut agent_side, &token, host)
             .await
             .expect("ping-capable browser-register over a TLS-TCP-style stream");
+        edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn register_tunnel_stream_browser_framed_capable_sends_f_and_an_otherwise_identical_frame()
+    {
+        // #528: 'F' is 'L' with a framed relay phase. The REGISTRATION frame must stay
+        // byte-identical apart from the role byte -- the edge admits all three browser
+        // roles ('B'/'L'/'F') through one shared parser, so any divergence here would
+        // fork that parser for no reason. What differs comes strictly after STOP.
+        let (mut agent_side, mut edge_side) = tokio::io::duplex(1024);
+        let token = RoutingToken([0x4f; 32]);
+        let host = "sort.bunsenbrenner.org";
+
+        let t = token.clone();
+        let edge = tokio::spawn(async move {
+            let mut role = [0u8; 1];
+            edge_side.read_exact(&mut role).await.unwrap();
+            assert_eq!(role[0], b'F', "framed browser role byte");
+            let mut tok = [0u8; 32];
+            edge_side.read_exact(&mut tok).await.unwrap();
+            assert_eq!(&tok, &t.0, "token echoed, exactly as in 'B'/'L'");
+            let mut len = [0u8; 2];
+            edge_side.read_exact(&mut len).await.unwrap();
+            let n = u16::from_be_bytes(len) as usize;
+            let mut host_buf = vec![0u8; n];
+            edge_side.read_exact(&mut host_buf).await.unwrap();
+            assert_eq!(host_buf, host.as_bytes(), "hostname echoed, exactly as in 'B'/'L'");
+            edge_side.write_all(b"OK").await.unwrap();
+            edge_side.flush().await.unwrap();
+        });
+
+        register_tunnel_stream_browser_framed_capable(&mut agent_side, &token, host)
+            .await
+            .expect("framed browser-register over a TLS-TCP-style stream");
+        edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_framed_registration_keeps_the_park_phase_byte_for_byte() {
+        // #528's contract in one test: 'F' changes ONLY what follows the STOP byte.
+        // The park phase (PING/PONG, then a lone 0xFB) is the shared `'L'` one, so a
+        // framed agent must answer pings exactly as before -- and the first byte after
+        // STOP is already relay FRAMING, not raw payload.
+        let (mut agent_side, mut edge_side) = tokio::io::duplex(1024);
+        let token = RoutingToken([0x4e; 32]);
+        let host = "sort.bunsenbrenner.org";
+
+        let edge = tokio::spawn(async move {
+            let mut role = [0u8; 1];
+            edge_side.read_exact(&mut role).await.unwrap();
+            assert_eq!(role[0], b'F');
+            let mut tok = [0u8; 32];
+            edge_side.read_exact(&mut tok).await.unwrap();
+            let mut len = [0u8; 2];
+            edge_side.read_exact(&mut len).await.unwrap();
+            let mut host_buf = vec![0u8; u16::from_be_bytes(len) as usize];
+            edge_side.read_exact(&mut host_buf).await.unwrap();
+            edge_side.write_all(b"OK").await.unwrap();
+            edge_side.flush().await.unwrap();
+
+            let mut ping = [0u8; 9];
+            ping[0] = TCP_PING_MAGIC;
+            ping[1..].copy_from_slice(&7u64.to_be_bytes());
+            edge_side.write_all(&ping).await.unwrap();
+            edge_side.flush().await.unwrap();
+            let mut pong = [0u8; 9];
+            edge_side.read_exact(&mut pong).await.unwrap();
+            assert_eq!(pong[0], TCP_PONG_MAGIC, "a framed agent still PONGs while parked");
+            assert_eq!(&pong[1..], &7u64.to_be_bytes());
+
+            // STOP and the first relay frame in one write: the agent must consume the
+            // single STOP byte and leave the DATA frame's discriminator untouched.
+            let mut after = vec![TCP_PING_STOP];
+            ct_common::fallback_framing::FrameWriter::new(&mut after)
+                .data(b"hi")
+                .await
+                .unwrap();
+            edge_side.write_all(&after).await.unwrap();
+            edge_side.flush().await.unwrap();
+        });
+
+        register_tunnel_stream_browser_framed_capable(&mut agent_side, &token, host)
+            .await
+            .expect("register");
+        await_ping_phase_end(&mut agent_side).await.expect("ping phase ends at STOP");
+        assert_eq!(
+            ct_common::fallback_framing::FrameReader::new(&mut agent_side).next().await.unwrap(),
+            Some(ct_common::fallback_framing::Frame::Data(b"hi".to_vec())),
+            "the bytes after STOP parse as a relay frame -- no park byte leaked into them"
+        );
         edge.await.unwrap();
     }
 

@@ -629,7 +629,7 @@ fn operator_issues_a_grant_the_edge_verifies_and_the_member_cli_accepts() {
     let signed = SignedChannelGrant::decode(&hex_bytes(&grant_hex).expect("grant hex")).expect("decode");
     let op_pub = op.key.verifying_key().to_bytes();
     assert!(
-        ct_common::channel::verify(&op_pub, &signed, 500).is_ok(),
+        ct_common::channel::verify_stateless(&op_pub, &signed, 500).is_ok(),
         "the edge verifies the operator-issued grant under the operator key"
     );
     assert_eq!(signed.grant.holder, holder_pub, "grant binds the member's holder pubkey");
@@ -707,7 +707,7 @@ fn operator_compiles_an_overlay_plan_into_verifiable_per_link_grants() {
     // the operator key, bind distinct holders + the same channel, and split
     // Initiate/Accept — exactly what the broker's admission pairing expects. An
     // unmapped node id fails the whole compile (can't wire a link without both keys).
-    use ct_common::channel::{channel_id_for_link, verify, Direction};
+    use ct_common::channel::{channel_id_for_link, verify_stateless, Direction};
     use ct_common::overlay::OverlayPlan;
 
     let op = OperatorIdentity::generate();
@@ -740,8 +740,8 @@ fn operator_compiles_an_overlay_plan_into_verifiable_per_link_grants() {
         channel_id_for_link(&op_pub, &[0xa1u8; 32], &[0xb2u8; 32]),
         "the link's channel is the deterministic per-link derivation"
     );
-    assert!(verify(&op_pub, &ab.initiator_grant, 1_000).is_ok(), "initiator grant verifies");
-    assert!(verify(&op_pub, &ab.acceptor_grant, 1_000).is_ok(), "acceptor grant verifies");
+    assert!(verify_stateless(&op_pub, &ab.initiator_grant, 1_000).is_ok(), "initiator grant verifies");
+    assert!(verify_stateless(&op_pub, &ab.acceptor_grant, 1_000).is_ok(), "acceptor grant verifies");
     assert_eq!(ab.initiator_grant.grant.channel, ab.channel, "initiator grant is for this channel");
     assert_eq!(ab.acceptor_grant.grant.channel, ab.channel, "acceptor grant is for this channel");
     assert_eq!(ab.initiator_grant.grant.holder, [0xa1u8; 32]);
@@ -891,7 +891,7 @@ fn operator_grant_request_parses_env_and_issues_a_verifiable_grant() {
     // The issued grant verifies under the operator key and binds the member.
     let signed = SignedChannelGrant::decode(&hex_bytes(&req.issue()).expect("hex")).expect("decode");
     assert!(
-        ct_common::channel::verify(&op.key.verifying_key().to_bytes(), &signed, 500).is_ok(),
+        ct_common::channel::verify_stateless(&op.key.verifying_key().to_bytes(), &signed, 500).is_ok(),
         "the issued grant verifies under the operator key"
     );
     assert_eq!(signed.grant.holder, member_holder);
@@ -971,7 +971,7 @@ fn operator_invite_request_parses_env_and_issues_a_verifiable_invitation() {
     if let Some(bytes) = hex_bytes(&req.issue()) {
         if let Ok(as_grant) = SignedChannelGrant::decode(&bytes) {
             assert!(
-                ct_common::channel::verify(&op.key.verifying_key().to_bytes(), &as_grant, 500).is_err(),
+                ct_common::channel::verify_stateless(&op.key.verifying_key().to_bytes(), &as_grant, 500).is_err(),
                 "an invitation's signature must not verify as a grant's"
             );
         }
@@ -3165,6 +3165,7 @@ async fn join_via_relay_ladder_falls_back_to_the_443_front_door_and_forms_the_no
                 &authorize,
                 10_000u64, // parked-member deadline (never reached in this test)
                 &pairer,
+                None, // no admission permit to hand over in this test
             )
             .await
             .expect("admit + pair the :443 member")
@@ -3345,6 +3346,7 @@ async fn two_443_only_members_learn_each_others_noise_key_and_form_the_tunnel() 
                 &authorize,
                 10_000u64,
                 &pairer,
+                None, // no admission permit to hand over in this test
             )
             .await
             .expect("admit + pair the :443 member")

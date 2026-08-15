@@ -560,9 +560,10 @@ dependencies = [
 [[package]]
 name = "ct-client"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.13#ce262516c07ba23d6f2f3c3541a0e21ed8249ac5"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.14#5872d7cc3ea118fd4524e59f98be983ef0a9f60f"
 dependencies = [
  "ct-common",
+ "futures-util",
  "quinn",
  "rustls",
  "tokio",
@@ -572,29 +573,35 @@ dependencies = [
 [[package]]
 name = "ct-common"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.13#ce262516c07ba23d6f2f3c3541a0e21ed8249ac5"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.14#5872d7cc3ea118fd4524e59f98be983ef0a9f60f"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
+ "rand 0.8.7",
  "serde",
  "serde_json",
  "sha2",
  "snow",
  "tokio",
+ "x25519-dalek",
  "zeroize",
 ]
 
 [[package]]
 name = "ct-control-plane"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.13#ce262516c07ba23d6f2f3c3541a0e21ed8249ac5"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.14#5872d7cc3ea118fd4524e59f98be983ef0a9f60f"
 dependencies = [
  "axum",
+ "base64",
  "ct-common",
  "ct-dns",
  "ed25519-dalek",
+ "futures",
  "hmac",
  "jsonwebtoken",
+ "r2d2",
+ "r2d2_sqlite",
  "rand 0.8.7",
  "reqwest",
  "rusqlite",
@@ -607,7 +614,7 @@ dependencies = [
 [[package]]
 name = "ct-dns"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.13#ce262516c07ba23d6f2f3c3541a0e21ed8249ac5"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.14#5872d7cc3ea118fd4524e59f98be983ef0a9f60f"
 dependencies = [
  "axum",
  "hickory-resolver 0.26.1",
@@ -619,7 +626,7 @@ dependencies = [
 [[package]]
 name = "ct-edge"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.13#ce262516c07ba23d6f2f3c3541a0e21ed8249ac5"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.14#5872d7cc3ea118fd4524e59f98be983ef0a9f60f"
 dependencies = [
  "axum",
  "ct-common",
@@ -634,6 +641,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "socket2 0.5.10",
+ "time",
  "tokio",
  "tokio-rustls",
  "zeroize",
@@ -2746,6 +2754,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "r2d2"
+version = "0.8.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51de85fb3fb6524929c8a2eb85e6b6d363de4e8c48f9e2c2eac4944abc181c93"
+dependencies = [
+ "log",
+ "parking_lot",
+ "scheduled-thread-pool",
+]
+
+[[package]]
+name = "r2d2_sqlite"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a982edf65c129796dba72f8775b292ef482b40d035e827a9825b3bc07ccc5f2"
+dependencies = [
+ "r2d2",
+ "rusqlite",
+ "uuid",
+]
+
+[[package]]
 name = "rand"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3063,6 +3093,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "scheduled-thread-pool"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3cbc66816425a074528352f5789333ecff06ca41b36b0b0efdfbb29edc391a19"
+dependencies = [
+ "parking_lot",
 ]
 
 [[package]]
@@ -3774,6 +3813,7 @@ checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "rand 0.10.2",
  "wasm-bindgen",
 ]
 
