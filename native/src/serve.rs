@@ -821,7 +821,8 @@ pub async fn run_agent(
         );
         return run_agent_tcp_fallback(config, edge_cert, token, origin_keys).await;
     }
-    let mut backoff = Backoff::new(RECONNECT_BASE, RECONNECT_MAX, reconnect_max_attempts());
+    let (reconnect_base, reconnect_max) = reconnect_backoff_bounds();
+    let mut backoff = Backoff::new(reconnect_base, reconnect_max, reconnect_max_attempts());
     loop {
         let conn = match dial_quic_or_blocked_error(config.edge, edge_cert.clone(), Duration::from_secs(5))
             .await
@@ -954,9 +955,70 @@ async fn bind_hostname_with_retry(
     }
 }
 
-/// Reconnect backoff parameters (issue #5 / P1.2b).
+/// Reconnect backoff parameters (issue #5 / P1.2b), used when
+/// `CT_AGENT_RECONNECT_BASE_MS` / `CT_AGENT_RECONNECT_MAX_MS` are unset. The
+/// defaults are deliberately unchanged from the constants they replace: they suit
+/// a fleet sharing one edge, where a slow first retry is the cheap side of the
+/// trade-off.
+///
+/// They are overridable because that trade-off is not universal. A path reset on
+/// the llm route (2026-08-16) took 15-20s end to end, of which ~7.5s was pure
+/// backoff sleep — the peer had already been reachable for seconds. For a single
+/// agent on a campus link (HAW), dialing the base down converts most of that wait
+/// into recovered service; for a large fleet it would not, which is why this is a
+/// knob and not a new default.
+///
+/// Scope: the two *tunnel* reconnect loops only — the QUIC one and the TLS-TCP
+/// fallback worker. The channel-side backoffs (#231/#250) answer to a different
+/// peer and stay on their own constants.
 const RECONNECT_BASE: Duration = Duration::from_millis(500);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+
+/// Floor for the configured reconnect base delay.
+///
+/// A base below this turns the first seconds after an edge restart into a retry
+/// flood: every agent that lost the same edge re-dials in near-lockstep (the
+/// jitter in [`Backoff::next_delay_jittered`] halves the spread at best), so the
+/// edge is hit hardest exactly while it is least able to answer. The same
+/// thundering-herd reasoning bounds the channel-side backoffs (#231/#250). 100ms
+/// still cuts the dominant part of the observed reconnect wait while keeping the
+/// first retry off the edge's recovery path; values below it are clamped up
+/// rather than rejected, so a too-eager setting degrades to "fast" instead of
+/// failing the agent's start.
+const RECONNECT_BASE_FLOOR: Duration = Duration::from_millis(100);
+
+/// The reconnect backoff's `(base, max)` from the environment. See
+/// [`RECONNECT_BASE`] for why these are configurable and
+/// [`RECONNECT_BASE_FLOOR`] for the lower bound on the base.
+fn reconnect_backoff_bounds() -> (Duration, Duration) {
+    parse_reconnect_backoff_bounds(
+        std::env::var("CT_AGENT_RECONNECT_BASE_MS").ok(),
+        std::env::var("CT_AGENT_RECONNECT_MAX_MS").ok(),
+    )
+}
+
+/// Pure core of [`reconnect_backoff_bounds`]: each value is a millisecond count,
+/// with unset/empty/garbage falling back to the default (as with
+/// [`parse_reconnect_max_attempts`] — a typo must not change the timing silently
+/// in some third way). A base below [`RECONNECT_BASE_FLOOR`] is raised to it, and
+/// a max below the resulting base is raised to that base, so the pair can never
+/// describe an inverted backoff where the cap sits under the first delay.
+fn parse_reconnect_backoff_bounds(
+    base_raw: Option<String>,
+    max_raw: Option<String>,
+) -> (Duration, Duration) {
+    let base = parse_millis(base_raw)
+        .map(|d| d.max(RECONNECT_BASE_FLOOR))
+        .unwrap_or(RECONNECT_BASE);
+    let max = parse_millis(max_raw).unwrap_or(RECONNECT_MAX).max(base);
+    (base, max)
+}
+
+/// A millisecond count from an env value, or `None` if unset/empty/unparsable.
+fn parse_millis(raw: Option<String>) -> Option<Duration> {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
 /// Reconnect attempts before giving up, when `CT_AGENT_RECONNECT_MAX_ATTEMPTS` is
 /// unset. **Unbounded by default** — an onboarded agent IS the tunnel, so exiting
 /// takes the service down permanently rather than failing over to anything.
@@ -1149,8 +1211,12 @@ async fn run_agent_tcp_fallback_worker(
 ) -> Result<(), BoxError> {
     let metrics = Arc::new(TunnelMetrics::new());
     // Reconnect loop (issue #5 / P1.2b): re-register and serve again after each
-    // single tunnel ends or the connection drops, with backoff on failure.
-    let mut backoff = Backoff::new(RECONNECT_BASE, RECONNECT_MAX, reconnect_max_attempts());
+    // single tunnel ends or the connection drops, with backoff on failure. Reads
+    // the same env-configured bounds as the QUIC loop: the fallback is the
+    // degraded path an operator most wants to shorten, so a knob that stopped
+    // applying the moment UDP broke would go quiet exactly when it matters.
+    let (reconnect_base, reconnect_max) = reconnect_backoff_bounds();
+    let mut backoff = Backoff::new(reconnect_base, reconnect_max, reconnect_max_attempts());
     // #46 FB-c: the TCP-fallback rungs to try in order — the configured edge port,
     // then the unified :443 front door when CT_AGENT_FALLBACK_443 is set. The first
     // rung that connects+registers serves the client; if all fail, back off.
@@ -1333,6 +1399,95 @@ mod tests {
         assert_eq!(parse_reconnect_max_attempts(Some("not-a-number".into())), RECONNECT_MAX_ATTEMPTS);
         assert_eq!(parse_reconnect_max_attempts(Some("0".into())), u32::MAX, "0 -> retry forever");
         assert_eq!(parse_reconnect_max_attempts(Some(" 7 ".into())), 7);
+    }
+
+    #[test]
+    fn unset_or_unparsable_reconnect_bounds_keep_todays_timing() {
+        // The knob must be invisible to everyone who doesn't set it: a typo'd or
+        // empty value falls back to the shipped defaults rather than inventing a
+        // third timing that nobody chose.
+        for raw in [None, Some("".into()), Some("   ".into()), Some("soon".into()), Some("-1".into())] {
+            assert_eq!(
+                parse_reconnect_backoff_bounds(raw.clone(), raw),
+                (RECONNECT_BASE, RECONNECT_MAX),
+                "unset/garbage must keep the defaults"
+            );
+        }
+        assert_eq!(RECONNECT_BASE, Duration::from_millis(500));
+        assert_eq!(RECONNECT_MAX, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn configured_reconnect_bounds_are_taken_as_milliseconds() {
+        assert_eq!(
+            parse_reconnect_backoff_bounds(Some("150".into()), Some("5000".into())),
+            (Duration::from_millis(150), Duration::from_secs(5))
+        );
+        // Each side falls back independently, so an operator can shorten the first
+        // retry without also restating the cap.
+        assert_eq!(
+            parse_reconnect_backoff_bounds(Some(" 200 ".into()), None),
+            (Duration::from_millis(200), RECONNECT_MAX)
+        );
+        assert_eq!(
+            parse_reconnect_backoff_bounds(None, Some("10000".into())),
+            (RECONNECT_BASE, Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn a_base_below_the_floor_is_clamped_up_to_protect_the_edge() {
+        // Thundering herd (#231/#250 reasoning): agents that lost the same edge
+        // re-dial together, so a sub-100ms first retry hits the edge hardest while
+        // it is least able to answer. Too-eager settings degrade to "fast", they
+        // don't fail the agent's start.
+        assert_eq!(
+            parse_reconnect_backoff_bounds(Some("50".into()), None).0,
+            RECONNECT_BASE_FLOOR
+        );
+        assert_eq!(parse_reconnect_backoff_bounds(Some("0".into()), None).0, RECONNECT_BASE_FLOOR);
+        assert_eq!(RECONNECT_BASE_FLOOR, Duration::from_millis(100));
+        // At and above the floor the operator's value stands unchanged.
+        assert_eq!(
+            parse_reconnect_backoff_bounds(Some("100".into()), None).0,
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn a_max_below_the_base_is_clamped_up_so_the_backoff_is_never_inverted() {
+        // A cap under the first delay would make `max` shrink the very delay it is
+        // supposed to bound. Clamping degenerates to a constant delay instead.
+        let (base, max) = parse_reconnect_backoff_bounds(Some("2000".into()), Some("500".into()));
+        assert_eq!((base, max), (Duration::from_millis(2000), Duration::from_millis(2000)));
+        // Also when the base only reaches its value via the floor.
+        let (base, max) = parse_reconnect_backoff_bounds(Some("10".into()), Some("20".into()));
+        assert_eq!((base, max), (RECONNECT_BASE_FLOOR, RECONNECT_BASE_FLOOR));
+        // And when a lowered cap meets the default base.
+        let (base, max) = parse_reconnect_backoff_bounds(None, Some("100".into()));
+        assert_eq!((base, max), (RECONNECT_BASE, RECONNECT_BASE));
+    }
+
+    #[test]
+    fn clamped_bounds_still_drive_a_monotonic_capped_backoff() {
+        // The clamping must hand `Backoff` a usable pair: delays never decrease and
+        // never exceed the cap, whichever rule did the clamping.
+        for (base_raw, max_raw) in [
+            (Some("50".into()), Some("400".into())),   // base floored
+            (Some("2000".into()), Some("500".into())), // max raised to base
+            (Some("150".into()), Some("5000".into())), // both as configured
+        ] {
+            let (base, max) = parse_reconnect_backoff_bounds(base_raw, max_raw);
+            assert!(base >= RECONNECT_BASE_FLOOR && max >= base);
+            let mut b = Backoff::new(base, max, 12);
+            let mut prev = Duration::ZERO;
+            while let Some(d) = b.next_delay() {
+                assert!(d >= prev, "backoff went backwards: {prev:?} -> {d:?}");
+                assert!(d >= base && d <= max, "delay {d:?} outside [{base:?}, {max:?}]");
+                prev = d;
+            }
+            assert_eq!(prev, max, "a long enough outage must reach the cap");
+        }
     }
 
     #[test]
