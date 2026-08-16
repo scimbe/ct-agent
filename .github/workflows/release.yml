@@ -24,7 +24,29 @@ permissions:
   contents: write   # create the release and attach assets
 
 jobs:
+  version-matches-tag:
+    # The crate version drifted from the release tags for three releases (v0.5.0,
+    # v0.5.1, v0.5.2 all shipped binaries whose `--version` said 0.5.0, ct-agent#29):
+    # nothing checked it, so nobody noticed until a user tried to VERIFY which build
+    # they had. Fail the release instead of publishing another mislabelled binary.
+    # ct-agent-wasm is versioned independently and ships no release asset -- not covered.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: crate version == tag
+        run: |
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' native/Cargo.toml | head -1)"
+          tag="${RELEASE_TAG#v}"
+          echo "crate=$crate tag=$tag"
+          if [ "$crate" != "$tag" ]; then
+            echo "::error::native/Cargo.toml says $crate but the tag is $tag -- bump the crate version before tagging (ct-agent#29)"
+            exit 1
+          fi
+
   create-release:
+    needs: version-matches-tag
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
