@@ -1525,7 +1525,8 @@ where
     P: AsyncRead + AsyncWrite + Unpin,
 {
     use ct_common::upgrade::{
-        run_upgradable_session_initiator, run_upgradable_session_responder, Role, UpgradeCoordinator,
+        run_upgradable_session_initiator, run_upgradable_session_responder_verified, Role,
+        UpgradeCoordinator,
     };
     // The relay handshake borrows these; the direct-establishment closures need owned copies.
     let (relay_priv, relay_peer) = (*own_noise_private, *peer_noise_public);
@@ -1560,23 +1561,36 @@ where
         }
         crate::channel_run::ChannelRole::Accept => {
             let coord = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
-            run_upgradable_session_responder(
+            // ct-agent#11 (follow-up to CADS-Tunnel#416): the VERIFIED responder. The
+            // unverified one accepts a session from any peer that completes a valid
+            // Noise_IK handshake -- a real, unregistered peer, not merely an impostor
+            // guessing a key. The initiator half a few lines up has always passed the
+            // attested peer key; the responder was the asymmetric half. `relay_peer` is
+            // the key the edge attested for this member, so the session is now bound to
+            // the peer we were paired with rather than to whoever answers.
+            run_upgradable_session_responder_verified(
                 relay_send,
                 relay_recv,
                 local,
                 &relay_priv,
+                &relay_peer,
                 coord,
                 1,
                 {
                     let trusted = circuit_relay.clone();
                     move |ep: String| async move { dcutr_upgrade_target(&ep, &trusted).is_some() }
                 },
-                move |ep: String| async move {
+                // ct-agent#11: the verified responder hands the ATTESTED key down to the
+                // direct leg as well, so the upgraded path is pinned to the same peer as
+                // the relay leg. Using it (rather than the captured `direct_peer`) keeps
+                // one source of truth: if the two ever diverged, the direct session would
+                // silently be bound to a different identity than the verified relay one.
+                move |ep: String, expected_peer: [u8; 32]| async move {
                     // Relay-pin the peer-conveyed circuit address, then dial the target through it.
                     let target = dcutr_upgrade_target(&ep, &circuit_relay)?;
                     let addr: Multiaddr = ep.parse().ok()?;
                     let stream = dcutr_dial_via_relay(client, addr, target).await.ok()?;
-                    ct_common::a2a::establish_direct_over_duplex(stream, true, &direct_priv, &direct_peer)
+                    ct_common::a2a::establish_direct_over_duplex(stream, true, &direct_priv, &expected_peer)
                         .await
                         .ok()
                 },
