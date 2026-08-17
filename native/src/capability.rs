@@ -126,13 +126,13 @@ fn resolve_primary_identity(
         let origin_key = OriginKey::generate();
         let cap = mint(origin_key.origin_identity());
         write_owner_only(kp, &origin_key.private_bytes())?;
-        std::fs::write(cap_path, cap.encode())?;
+        write_owner_only(cap_path, &cap.encode())?;
         return Ok((cap, origin_key.private_bytes()));
     }
     // Default: a fresh, unique single-agent identity.
     let origin_key = OriginKey::generate();
     let cap = mint(origin_key.origin_identity());
-    std::fs::write(cap_path, cap.encode())?;
+    write_owner_only(cap_path, &cap.encode())?;
     Ok((cap, origin_key.private_bytes()))
 }
 
@@ -195,7 +195,7 @@ pub fn rotate_origin_key(
     write_owner_only(&retired.to_string_lossy(), &old_key)?;
     // Promote the new key + capability.
     write_owner_only(key_path, &new_key.private_bytes())?;
-    std::fs::write(cap_path, new_cap.encode())?;
+    write_owner_only(cap_path, &new_cap.encode())?;
     Ok(new_cap)
 }
 
@@ -203,8 +203,21 @@ fn hex8(bytes: &[u8]) -> String {
     bytes.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
-/// Write `bytes` to `path`, restricting to owner read/write (0600) on Unix — a
-/// persisted Origin private key must never be world-readable.
+/// Write `bytes` to `path`, restricting to owner read/write (0600) on Unix.
+///
+/// Applies to every **bearer** artifact this module persists, not just key material —
+/// #31. The capability is the sufficient secret, not the lesser one: CADS-Tunnel#540
+/// established that agent registration takes `role='A'(1) | token(32)` and nothing else,
+/// that every edge TLS context is `with_no_client_auth()`, and that a capability carries
+/// `{token, origin, edge_addr}`. So whoever reads a capability can register as the
+/// tunnel's agent, and since `EdgeState::route` hands back `v.last()` they receive ALL of
+/// its traffic. The origin private key — already protected here — is not needed for that
+/// at all, which is why writing the key 0600 and the capability 0644 protected the wrong
+/// file of the two.
+///
+/// This adds no constraint that sharing an identity did not already impose: `key_path` in
+/// the shared-identity branch has always been written 0600, so peer agents that share an
+/// identity already had to run as the same user.
 fn write_owner_only(path: &str, bytes: &[u8]) -> Result<(), BoxError> {
     std::fs::write(path, bytes)?;
     #[cfg(unix)]
@@ -224,6 +237,58 @@ mod tests {
             .join(format!("ct-{}-{}", std::process::id(), name))
             .to_string_lossy()
             .into_owned()
+    }
+
+    /// #31: the capability file must be owner-only, on every path that writes one.
+    ///
+    /// It is not a lesser secret than the origin key beside it — it is the *sufficient*
+    /// one. CADS-Tunnel#540: agent registration takes `role='A'(1) | token(32)` and
+    /// nothing more, every edge TLS context is `with_no_client_auth()`, and a capability
+    /// carries `{token, origin, edge_addr}`. Whoever can read this file can register as an
+    /// agent for the tunnel, and `EdgeState::route` returns `v.last()` — so they take ALL
+    /// of its traffic, not a share. The private key is not needed for any of that.
+    #[cfg(unix)]
+    #[test]
+    fn a_written_capability_is_not_world_readable_31() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let check = |path: &str, what: &str| {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o600,
+                "{what} is mode {mode:o}; anyone who can read it can register as this \
+                 tunnel's agent and take all of its traffic (CADS-Tunnel#540)"
+            );
+        };
+
+        // Path 1: fresh single-agent identity (no shared key path).
+        let cap1 = tmp("perm-fresh-cap.bin");
+        let _ = std::fs::remove_file(&cap1);
+        let _ = resolve_serving_identity_with_token(None, &cap1, "edge:443", None, None).unwrap();
+        check(&cap1, "a freshly minted capability");
+
+        // Path 2: shared identity — key and capability persisted side by side. This is the
+        // one where the asymmetry was visible in a single directory listing.
+        let cap2 = tmp("perm-shared-cap.bin");
+        let key2 = tmp("perm-shared.key");
+        let _ = std::fs::remove_file(&cap2);
+        let _ = std::fs::remove_file(&key2);
+        let _ =
+            resolve_serving_identity_with_token(Some(&key2), &cap2, "edge:443", None, None).unwrap();
+        check(&key2, "the origin key");
+        check(&cap2, "the capability written alongside that key");
+
+        // Path 3: rotation promotes a new capability over the old one.
+        let dir = tmp("perm-retired-dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = rotate_origin_key(&key2, &cap2, &dir).unwrap();
+        check(&cap2, "the capability promoted by a key rotation");
+
+        for p in [&cap1, &cap2, &key2] {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

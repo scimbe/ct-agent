@@ -233,7 +233,11 @@ fn load_or_generate_account_key(path: &Path) -> Result<AccountKey, BoxError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, key.pkcs8_der())?;
+    // #31: the ACME ACCOUNT key, not just the certificate key. It authenticates this agent
+    // to the CA — whoever reads it can issue and revoke certificates for the hostnames this
+    // account is authorized for. `write_private` was already sitting in this file and this
+    // one call was simply missing it.
+    write_private(path, &key.pkcs8_der())?;
     Ok(key)
 }
 
@@ -332,9 +336,19 @@ pub async fn obtain_or_renew(config: &AcmeCertConfig) -> Result<bool, BoxError> 
 
 #[cfg(unix)]
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-    std::fs::write(path, bytes)
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    // #31: `mode()` applies only when the file is CREATED. The previous version opened
+    // with 0600, dropped the handle, and then wrote through a second `fs::write` — so a
+    // file that already existed at 0644 (an older agent's key, a restored backup, an
+    // operator's `touch`) kept those permissions and the fresh key was written straight
+    // into it. Write through the handle we opened, then set the mode explicitly so the
+    // pre-existing case is corrected too.
+    let mut f =
+        std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 #[cfg(not(unix))]
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -449,6 +463,40 @@ mod tests {
             vec!["https://dns.google/resolve".to_string(), "https://dns.quad9.net/dns-query".to_string()]
         );
         assert_eq!(cfg.dns01_propagation_timeout, Duration::from_secs(30));
+    }
+
+    /// #31: `write_private` must also FIX a file that already exists world-readable.
+    ///
+    /// `OpenOptions::mode()` applies at creation only, so the previous version silently
+    /// left an existing 0644 file at 0644 and wrote the new private key into it. That is
+    /// the realistic case, not the exotic one: key files are rewritten on every renewal.
+    #[cfg(unix)]
+    #[test]
+    fn write_private_hardens_a_file_that_already_exists_world_readable_31() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ct-acme-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("account.der");
+
+        // A key file left behind at 0644 by an older agent, a restore, or a `touch`.
+        std::fs::write(&path, b"stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_private(&path, b"fresh-private-key-material").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "an existing world-readable key file must be tightened, not written into as-is \
+             (mode {mode:o})"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"fresh-private-key-material",
+            "and the contents must actually be replaced"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
