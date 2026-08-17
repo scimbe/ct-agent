@@ -1577,9 +1577,22 @@ impl ChannelJoinCliConfig {
         // independent of `front_door` (a set-but-malformed value is an error — a typo
         // shouldn't silently drop the fallback); absent ⇒ direct-QUIC-only admission.
         let front_door_cert = match f("CT_CHANNEL_FRONT_DOOR_CERT") {
-            Some(s) if !s.trim().is_empty() => Some(CertificateDer::from(
-                hex_bytes(s.trim()).ok_or("CT_CHANNEL_FRONT_DOOR_CERT must be hex DER")?,
-            )),
+            Some(s) if !s.trim().is_empty() => {
+                let raw = s.trim();
+                let der = hex_bytes(raw).ok_or_else(|| {
+                    format!(
+                        "CT_CHANNEL_FRONT_DOOR_CERT must be hex DER -- got {} character(s), \
+                         {}",
+                        raw.len(),
+                        if raw.len() % 2 != 0 { "an odd count (one nibble lost?)" } else { "with a non-hex character in it" }
+                    )
+                })?;
+                // ct-agent#26: fail HERE, naming the damage, instead of letting a truncated
+                // value become a generic TLS error minutes later on a different machine.
+                der_certificate_shape(&der)
+                    .map_err(|why| format!("invalid CT_CHANNEL_FRONT_DOOR_CERT: {why}"))?;
+                Some(CertificateDer::from(der))
+            }
             _ => None,
         };
         // Auto-detect relay-only when not forced: a non-globally-routable ADVERTISED address
@@ -2603,6 +2616,66 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// ct-agent#26: is `der` structurally a DER certificate?
+///
+/// `CT_CHANNEL_FRONT_DOOR_CERT` is a ~740-character unbroken hex string that a human copies
+/// out of a join page. The reported failure was one byte lost at a terminal line-wrap — the
+/// leading `0x30` (SEQUENCE) of the SubjectPublicKeyInfo. The result is still valid hex of
+/// even length, so `hex_bytes` accepted it happily and the corruption only surfaced much
+/// later as a generic TLS/connection error, i.e. indistinguishable from the DPI/firewall
+/// mysteries this thread had already been chasing for weeks.
+///
+/// The check is deliberately structural rather than a full X.509 parse: outer tag must be
+/// SEQUENCE, the definite length must be well-formed, and the declared length must match the
+/// bytes actually present. That is exactly enough to catch a truncated, over-long or
+/// wrong-start value — the transcription damage this exists for — and it does not pretend to
+/// judge whether the certificate is valid, current or the right one. Saying which of the two
+/// it proves matters: a check that quietly implied "this is a good certificate" would be a
+/// worse lie than no check.
+///
+/// Returns `Err(reason)` naming what was wrong and where, so the message can be acted on.
+pub(crate) fn der_certificate_shape(der: &[u8]) -> Result<(), String> {
+    let n = der.len();
+    if n < 2 {
+        return Err(format!("only {n} byte(s) -- far too short for a certificate"));
+    }
+    if der[0] != 0x30 {
+        return Err(format!(
+            "starts with 0x{:02x}, expected 0x30 (ASN.1 SEQUENCE) -- the usual cause is a \
+             byte lost at the start, e.g. at a line wrap while copying",
+            der[0]
+        ));
+    }
+    // Definite length: short form (<=0x7f) or long form (0x80 | count-of-length-bytes).
+    let first = der[1] as usize;
+    let (declared, header) = if first < 0x80 {
+        (first, 2usize)
+    } else {
+        let count = first & 0x7f;
+        if count == 0 || count > 4 {
+            return Err(format!("length header byte 0x{first:02x} is not a usable definite length"));
+        }
+        if n < 2 + count {
+            return Err(format!("truncated inside the length header ({n} bytes total)"));
+        }
+        let mut v = 0usize;
+        for b in &der[2..2 + count] {
+            v = (v << 8) | *b as usize;
+        }
+        (v, 2 + count)
+    };
+    let expected = header + declared;
+    if expected != n {
+        return Err(format!(
+            "declares {declared} content byte(s) (total {expected}) but {n} byte(s) were given \
+             -- {} byte(s) {}",
+            expected.abs_diff(n),
+            if expected > n { "missing" } else { "too many" }
+        ));
+    }
+    Ok(())
 }
 
 fn hex_bytes(s: &str) -> Option<Vec<u8>> {

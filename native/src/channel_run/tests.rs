@@ -567,7 +567,12 @@ fn front_door_only_drops_the_direct_quic_rung_and_requires_a_front_door_16() {
     // With both front-door values present the flag parses and the ladders obey it.
     let mut full = base.clone();
     full.push(("CT_CHANNEL_FRONT_DOOR", "203.0.113.5:443".into()));
-    full.push(("CT_CHANNEL_FRONT_DOOR_CERT", "aa".into())); // any hex DER parses here
+    // ct-agent#26: this used to be "aa" with the note "any hex DER parses here". That is no
+    // longer true, deliberately -- a single stray byte is exactly the transcription damage
+    // the shape check now rejects. The fixture is a minimal well-formed DER SEQUENCE
+    // (0x30, length 3, three content bytes); the test's point is that a USABLE front door
+    // satisfies the guard, not that any hex string does.
+    full.push(("CT_CHANNEL_FRONT_DOOR_CERT", "3003010203".into()));
     let cfg = lookup(&full).expect("a usable front door satisfies the guard");
     assert!(cfg.front_door_only);
     assert!(
@@ -4481,4 +4486,35 @@ async fn direct_upgrade_opt_in_still_completes_over_the_relay_when_the_candidate
     a.abort();
     b.abort();
     relay_task.abort();
+}
+
+#[test]
+fn der_certificate_shape_catches_the_transcription_damage_agent26() {
+    use crate::channel_run::der_certificate_shape;
+
+    // A well-formed short-form SEQUENCE: 0x30, length 3, three content bytes.
+    assert!(der_certificate_shape(&[0x30, 0x03, 0x01, 0x02, 0x03]).is_ok());
+    // Long form: 0x82 = two length bytes, 0x0100 = 256 content bytes.
+    let mut long = vec![0x30, 0x82, 0x01, 0x00];
+    long.extend(std::iter::repeat(0x00).take(256));
+    assert!(der_certificate_shape(&long).is_ok(), "long-form length is normal for a real cert");
+
+    // THE reported case (ct-agent#26): the leading 0x30 lost at a line wrap. Still valid
+    // hex, still even length -- which is exactly why hex decoding alone waved it through.
+    let why = der_certificate_shape(&[0x03, 0x01, 0x02, 0x03]).expect_err("missing SEQUENCE tag");
+    assert!(why.contains("0x30"), "the message must name what was expected: {why}");
+    assert!(why.contains("line wrap"), "and point at the likely cause: {why}");
+
+    // Truncated tail: the declared length outlives the bytes present.
+    let why = der_certificate_shape(&[0x30, 0x05, 0x01, 0x02]).expect_err("truncated");
+    assert!(why.contains("missing"), "says which direction the mismatch goes: {why}");
+    // Trailing junk is equally wrong, and must not be reported as 'missing'.
+    let why = der_certificate_shape(&[0x30, 0x01, 0x01, 0x99]).expect_err("over-long");
+    assert!(why.contains("too many"), "{why}");
+
+    // Degenerate inputs must not panic -- this runs on operator-supplied input.
+    assert!(der_certificate_shape(&[]).is_err());
+    assert!(der_certificate_shape(&[0x30]).is_err());
+    assert!(der_certificate_shape(&[0x30, 0x80]).is_err(), "indefinite length is not DER");
+    assert!(der_certificate_shape(&[0x30, 0x85, 0, 0, 0, 0, 0]).is_err(), "absurd length count");
 }
