@@ -417,13 +417,21 @@ where
 }
 
 /// The substring the edge's QUIC park-expiry ApplicationClose reason always carries — the
-/// colon-less stem of CADS-Tunnel's `QUIC_PARK_EXPIRED_REASON_PREFIX` (`"park-expired:"`), so
-/// it matches the prefix and any honest human-readable suffix. This is the cross-repo wire
-/// contract [`error_names_park_expiry`] classifies on; reword it on either side and a benign
-/// park reap silently reads as a refusal (rung-ladder advance + refusal backoff instead of
-/// re-park). Both repos pin it with a test — here `error_names_park_expiry_walks_the_source_chain_21`,
-/// on the edge `quic_park_expiry_reasons_carry_the_wire_prefix` (CADS-Tunnel#526).
-const QUIC_PARK_EXPIRED_MARKER: &str = "park-expired";
+/// colon-less stem of the prefix the edge writes, so it matches that prefix and any honest
+/// human-readable suffix. This is the cross-repo wire contract [`error_names_park_expiry`]
+/// classifies on; get it wrong and a benign park reap silently reads as a refusal
+/// (rung-ladder advance + refusal backoff instead of re-park).
+///
+/// **CADS-Tunnel#557: derived, no longer a second copy.** This used to be its own literal,
+/// pinned here by one test while the edge pinned its own literal by another. Two tests that
+/// each agree with themselves cannot notice the two literals coming apart — a reword on one
+/// side updates that side's test and stays green. Both repos now read
+/// [`ct_common::channel::PARK_EXPIRED_REASON_PREFIX`], so a reword arrives here through the
+/// shared crate instead of having to be copied by hand.
+fn quic_park_expired_marker() -> &'static str {
+    let prefix = ct_common::channel::PARK_EXPIRED_REASON_PREFIX;
+    prefix.strip_suffix(':').unwrap_or(prefix)
+}
 
 /// #21: does this error (anywhere in its source chain) carry the edge's named QUIC park-expiry
 /// close reason? The edge reaps an idle QUIC park by closing the connection with the
@@ -434,7 +442,7 @@ const QUIC_PARK_EXPIRED_MARKER: &str = "park-expired";
 pub(crate) fn error_names_park_expiry(e: &(dyn std::error::Error + 'static)) -> bool {
     let mut cur: Option<&dyn std::error::Error> = Some(e);
     while let Some(err) = cur {
-        if err.to_string().contains(QUIC_PARK_EXPIRED_MARKER) {
+        if err.to_string().contains(quic_park_expired_marker()) {
             return true;
         }
         cur = err.source();
@@ -509,8 +517,11 @@ async fn read_refusal_tail_token<R: AsyncRead + Unpin>(recv: &mut R) -> Option<S
 fn parse_channel_ack(ack: &str) -> ChannelJoinOutcome {
     // #21: the edge's park-expiry token (a reaped park announcing itself) — checked before
     // the OK/Refused fallthrough so it can never be mistaken for a refusal. Wire contract:
-    // the bare token, nothing else (CADS-Tunnel's PARK_EXPIRED_TOKEN).
-    if ack.trim() == "EX" {
+    // the bare token, nothing else.
+    //
+    // CADS-Tunnel#557: this was a bare `"EX"` literal whose only tie to the edge was the
+    // comment naming its constant. It now IS that constant, shared through `ct_common`.
+    if ack.trim().as_bytes() == ct_common::channel::PARK_EXPIRED_TOKEN {
         return ChannelJoinOutcome::ParkExpired;
     }
     match ack.strip_prefix("OK") {
@@ -1364,6 +1375,34 @@ mod tests {
         }
     }
 
+    /// CADS-Tunnel#557: the marker is DERIVED from the shared prefix, not copied beside it.
+    ///
+    /// This replaced an arrangement where this repo held its own literal and pinned it with
+    /// its own test while the edge did the same on its side — two tests that each agreed
+    /// with themselves and could not notice the two literals coming apart. A reword on the
+    /// edge now arrives here through `ct_common`, so the only thing left to check is that
+    /// the derivation itself stays sane.
+    #[test]
+    fn the_park_expiry_marker_is_derived_from_the_shared_prefix_557() {
+        let prefix = ct_common::channel::PARK_EXPIRED_REASON_PREFIX;
+        let marker = quic_park_expired_marker();
+
+        assert!(!marker.is_empty(), "an empty marker would match EVERY error, not just park expiries");
+        assert!(
+            prefix.starts_with(marker),
+            "the marker must be the stem of the shared prefix: {marker:?} vs {prefix:?}"
+        );
+        assert!(
+            !marker.ends_with(':'),
+            "the colon is stripped on purpose -- a close reason is the prefix PLUS a suffix, so \
+             matching the colon-terminated form would fail on the very reasons this must catch"
+        );
+
+        // The round trip that actually matters: a reason built the way the edge builds it.
+        let real_reason = format!("{prefix} no partner within the park TTL");
+        assert!(real_reason.contains(marker), "must match a real edge close reason");
+    }
+
     #[test]
     fn error_names_park_expiry_walks_the_source_chain_21() {
         // #21 QUIC half: quinn buries the ApplicationClose reason at a nesting depth that
@@ -1372,8 +1411,8 @@ mod tests {
         // CADS-Tunnel#526 cross-repo contract: the marker must be a substring of the edge's
         // ACTUAL close reasons, so this pins our stem against a copy of what the edge emits.
         assert!(
-            "park-expired: no partner within the park TTL".contains(QUIC_PARK_EXPIRED_MARKER)
-                && "park-expired: superseded by a newer join from the same holder".contains(QUIC_PARK_EXPIRED_MARKER),
+            "park-expired: no partner within the park TTL".contains(quic_park_expired_marker())
+                && "park-expired: superseded by a newer join from the same holder".contains(quic_park_expired_marker()),
             "the client marker must match every edge QUIC park-expiry reason"
         );
         let inner = std::io::Error::other("connection lost: closed by peer: 0: park-expired: no partner within the park TTL");
