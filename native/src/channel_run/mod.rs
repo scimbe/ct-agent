@@ -501,6 +501,22 @@ where
                 join_via_relay_fallback(relay, request, holder, ChannelRole::Accept, own_noise_private, &peer_noise, local, upgrade).await?;
             }
             Some(ep) => {
+                // ct-agent#22: do not spend the accept window on a connection that cannot
+                // arrive. The edge just told this member which address it is seen on; if
+                // that contradicts what it advertises, inbound is not going to happen and
+                // the 8 s is pure latency on every single first contact.
+                if !own_endpoint_looks_reachable(&request.endpoint, observed_reflexive) {
+                    eprintln!(
+                        "ct-agent channel: advertised {} but the edge observes this member on {} \
+                         -- inbound cannot reach the advertised address, going straight to the \
+                         edge relay instead of waiting {accept_timeout:?} (#22). Set \
+                         CT_CHANNEL_RELAY_ONLY=1 to make this explicit.",
+                        request.endpoint,
+                        observed_reflexive.map(|a| a.to_string()).unwrap_or_else(|| "-".into()),
+                    );
+                    join_via_relay_fallback(relay, request, holder, ChannelRole::Accept, own_noise_private, &peer_noise, local, upgrade).await?;
+                    return Ok(());
+                }
                 let accept_started = std::time::Instant::now();
                 match tokio::time::timeout(accept_timeout, ep.accept()).await {
                     Ok(Some(incoming)) => {
@@ -1410,6 +1426,50 @@ pub struct ChannelDialRung {
 /// [`ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY`] sentinel, participating purely via the
 /// edge relay + the #106 `:443` fallback (outbound-only). Pure — it decides from the address
 /// alone, so it is unit-testable without touching real network interfaces.
+/// ct-agent#22: can this member plausibly be reached inbound on what it advertised?
+///
+/// The measured symptom was a **constant** ~11 s first contact (11017/10865/11177 ms across
+/// three samples — a spread under 320 ms means a timer, not luck). The acceptor waits
+/// `CHANNEL_ACCEPT_TIMEOUT` (8 s) for a direct connection that can never arrive, while the
+/// initiator burns `DIRECT_DIAL_TIMEOUT` (5 s) dialing the same unreachable address; the two
+/// run in parallel and the relay leg follows.
+///
+/// The existing auto-detection (`relay_only_mode`) catches an address that is *structurally*
+/// undialable — private, loopback, CGNAT. It cannot catch a **public but firewalled** one,
+/// which is exactly the reported shape: the advertised endpoint passes the edge's
+/// global-unicast filter and still nothing can connect to it.
+///
+/// The missing fact is already in hand by then: the edge echoes each member's own observed
+/// source address in the ack (`r=`). If the edge sees this member on a *different* global
+/// address of the same family than it advertises, it is behind a NAT that is not
+/// port-forwarding the advertised address, and waiting the full window buys nothing.
+///
+/// Deliberately silent (returns `true`, "keep waiting") in every case where the observation
+/// says nothing:
+/// * no `r=` in the ack (older edge) — no information;
+/// * observed address not global (edge co-located / behind the same NAT) — meaningless to
+///   compare, the same reasoning as CADS-Tunnel#546's `Unobservable`;
+/// * different address family — ordinary dual-stack, not evidence of unreachability;
+/// * advertised value unparseable or the relay-only sentinel — not this check's business.
+///
+/// Same IP with a different port is **corroborated**: that is what a port-forward looks like.
+pub(crate) fn own_endpoint_looks_reachable(
+    advertised: &str,
+    observed: Option<std::net::SocketAddr>,
+) -> bool {
+    let Some(obs) = observed else { return true };
+    if !ct_common::channel::is_global_unicast(obs) {
+        return true;
+    }
+    let Ok(adv) = advertised.parse::<std::net::SocketAddr>() else {
+        return true;
+    };
+    if adv.ip().is_ipv4() != obs.ip().is_ipv4() {
+        return true;
+    }
+    adv.ip() == obs.ip()
+}
+
 pub fn relay_only_mode(explicit: bool, listen_addr: SocketAddr) -> bool {
     explicit || !is_globally_routable(listen_addr.ip())
 }

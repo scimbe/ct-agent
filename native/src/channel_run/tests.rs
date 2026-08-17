@@ -4518,3 +4518,32 @@ fn der_certificate_shape_catches_the_transcription_damage_agent26() {
     assert!(der_certificate_shape(&[0x30, 0x80]).is_err(), "indefinite length is not DER");
     assert!(der_certificate_shape(&[0x30, 0x85, 0, 0, 0, 0, 0]).is_err(), "absurd length count");
 }
+
+#[test]
+fn own_endpoint_looks_reachable_only_gives_up_on_real_evidence_agent22() {
+    use crate::channel_run::own_endpoint_looks_reachable;
+    let g: std::net::SocketAddr = "203.0.113.7:9000".parse().unwrap();
+
+    // The reported shape: a public, firewalled address. The edge sees this member somewhere
+    // else entirely, so the 8s accept window can only ever expire.
+    assert!(!own_endpoint_looks_reachable("198.51.100.9:7001", Some(g)));
+
+    // A port-forward looks like this and MUST keep waiting: same address, different port is
+    // exactly what an inbound mapping produces.
+    assert!(own_endpoint_looks_reachable("203.0.113.7:7001", Some(g)));
+
+    // Every case where the observation says nothing must keep the old behaviour. Skipping
+    // the wait on a guess would trade a measured 8s for an unmeasured loss of the direct
+    // path -- the check may only fire on evidence.
+    assert!(own_endpoint_looks_reachable("198.51.100.9:7001", None), "older edge sends no r=");
+    assert!(
+        own_endpoint_looks_reachable("198.51.100.9:7001", Some("172.18.0.1:5000".parse().unwrap())),
+        "edge co-located / behind the same NAT -- comparing says nothing"
+    );
+    assert!(
+        own_endpoint_looks_reachable("[2001:db8::7]:7001", Some(g)),
+        "dual-stack is ordinary, not evidence of unreachability"
+    );
+    assert!(own_endpoint_looks_reachable("relay-only", Some(g)), "the sentinel is not an address");
+    assert!(own_endpoint_looks_reachable("not-an-address", Some(g)));
+}
