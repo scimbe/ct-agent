@@ -54,6 +54,30 @@ OS/arch itself, so there's no separate manual-download path to keep in sync. If
 you're contributing to `ct-agent` itself, `cargo build --release` (Rust 1.85+) works
 as usual from a clone of this repo.
 
+## `ct-agent-supervisor` (#331)
+
+A second binary ships beside `ct-agent`: a thin external wrapper that spawns the real agent
+as a child, classifies **why** it exited, restarts it with backoff on a crash loop, and keeps
+a short crash history. `ct-agent` itself is unchanged by it.
+
+Usage is identical to `ct-agent` — `ct-agent-supervisor <subcommand> [args...]`, same
+environment — so it drops in wherever the agent is invoked today (a systemd unit, a launch
+script). Two variables are its own:
+
+| variable | default | meaning |
+|---|---|---|
+| `CT_AGENT_SUPERVISOR_BIN` | `ct-agent` (resolved via `PATH`) | the binary to supervise |
+| `CT_AGENT_SUPERVISOR_STATUS_LISTEN` | unset | `host:port` serving `GET /crashes`, the crash history as JSON, for live debugging |
+
+It observes only what a parent process can see from outside: a panic printed by Rust's
+default hook, an explicit `exit(1)` after whatever was logged, and an OS-level kill (OOM,
+`docker stop`, `kill -9`) as a signal on the child's wait status.
+
+**What it cannot repair:** an agent that exits after exhausting its reconnect budget. The
+single-use join token is already spent by then, so restarting the same process just fails to
+re-onboard. That is why `CT_AGENT_RECONNECT_MAX_ATTEMPTS` defaults to retry-forever — the
+supervisor handles crashes, not give-ups.
+
 ## Versioning
 
 `ct-agent`'s dependency on CADS-Tunnel's shared crates (`ct-common`, `ct-control-plane`,
