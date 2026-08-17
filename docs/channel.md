@@ -183,7 +183,7 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_CHANNEL_DIRECT_UPGRADE=1` | opt-in in-band relay→direct upgrade (#104) |
 | `CT_AGENT_SERVICE_HANDLER_CMD` / `CT_AGENT_SERVICES` | the handler command + offered service slugs on the serve side |
 | `CT_CHANNEL_REFLEXIVE_EDGE` | `host:port` of the edge's QUIC "whoami" listener (its `'W'` reflexive-address echo, #248/#238). Defaults to the relay-gate host on port `4433`; override only when the edge's QUIC listener is somewhere else. |
-| `CT_CHANNEL_SUPER_PEER_LISTEN` / `_UPSTREAM` | LAN super-peer mode (both required): `_LISTEN` is the `host:port` that LAN-local members point their own `CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY` at **instead of the real edge**; `_UPSTREAM` is this super-peer's real edge. One WAN hop plus N−1 local ones. |
+| `CT_CHANNEL_SUPER_PEER_LISTEN` / `CT_CHANNEL_SUPER_PEER_UPSTREAM` | LAN super-peer mode (both required): `CT_CHANNEL_SUPER_PEER_LISTEN` is the `host:port` that LAN-local members point their own `CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY` at **instead of the real edge**; `CT_CHANNEL_SUPER_PEER_UPSTREAM` is this super-peer's real edge. One WAN hop plus N−1 local ones. |
 
 **`CT_CHANNEL_PHASE_MARKER=off` (or `0`) is a measurement tool, not a tuning knob.** It
 suppresses the v0.4.14 phase preamble while keeping everything else identical — the only way
