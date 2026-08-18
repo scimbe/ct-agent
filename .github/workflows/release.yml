@@ -110,3 +110,15 @@ jobs:
           [ -f "$bin.exe" ] && bin="$bin.exe"
           cp "$bin" "${{ matrix.asset }}"
           gh release upload "$RELEASE_TAG" "${{ matrix.asset }}" --clobber
+
+          # `-p ct-agent` builds BOTH binaries of this package. Until now only the first
+          # was uploaded, so `ct-agent-supervisor` (#331) was compiled for all eight
+          # targets on every release and then thrown away -- which is why no image could
+          # install it and no deployment could use it. It is a drop-in wrapper
+          # (`ct-agent-supervisor <subcommand>`, same env), so shipping the binary is what
+          # makes "supervise it" an operator decision instead of a rebuild.
+          sup="target/${{ matrix.target }}/release/ct-agent-supervisor"
+          [ -f "$sup.exe" ] && sup="$sup.exe"
+          sup_asset="$(printf '%s' "${{ matrix.asset }}" | sed 's/^ct-agent/ct-agent-supervisor/')"
+          cp "$sup" "$sup_asset"
+          gh release upload "$RELEASE_TAG" "$sup_asset" --clobber
