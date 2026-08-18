@@ -1408,8 +1408,24 @@ pub(crate) fn dcutr_upgrade_target(offered: &str, trusted_circuit: &Multiaddr) -
 /// RESPONDER; the **responder** validates the offered address against its own `circuit_relay`
 /// ([`dcutr_upgrade_target`], the #137-analog relay pin), dials it via [`dcutr_dial_via_relay`], and
 /// establishes as the direct-Noise INITIATOR. Hole-punch failure stays on the relay; the relay leg is
-/// end-to-end throughout. The live cross-NAT punch is proven on the deploy (#136 N136.4); this over an
-/// in-process relay on loopback.
+/// end-to-end throughout. This test runs over an in-process relay on loopback, where the punch is
+/// trivial.
+///
+/// **The live cross-NAT punch is NOT proven.** This comment used to say it was ("proven on the
+/// deploy, #136 N136.4"), and two independent records say otherwise: ct-agent#6 (open) reports that
+/// every DCUtR direct-dial against a real cross-NAT peer fails — QUIC `HandshakeTimedOut`, TCP
+/// `Timeout` — cross-confirmed by two testers in both directions; and CADS-Tunnel's own
+/// `docs/product/comparison.md` states "NAT-to-NAT direct punch is emulation-proven, not
+/// live-confirmed". What carries traffic between two NAT'd agents today is the relay fallback.
+///
+/// The direction of that error is why it is worth this paragraph: a comment claiming a capability
+/// the field says fails invites someone to build on it, or to stop investigating #6.
+///
+/// What IS proven, and by what: the loopback composition here (every gate run), and the two-NAT
+/// emulation in CADS-Tunnel's `scripts/nat-lab.sh` (netns + iptables MASQUERADE, run by hand — it
+/// needs NET_ADMIN). Note what that lab does not cover: MASQUERADE keeps the source port where it
+/// can, so it does not exhibit the per-destination remapping that defines symmetric NAT, and CGNAT
+/// is not modelled at all — precisely the classes a hole-punch fails on.
 /// Build the **initiator's/responder's** `:443`-relay-gate `Swarm<DcutrRelayClientBehaviour>`
 /// plus its circuit `Multiaddr` from an already-pre-authed relay-gate `stream` and the
 /// relay-node's `relay_peer` id (learned from the gate's own ack — see
@@ -2521,8 +2537,9 @@ mod tests {
         // DCUtR-hole-punched stream and yields the pump-ready `(TransportState, read, write)` — the
         // EXACT op the NAT-to-NAT wire-in (N136.3) injects in place of the plain-QUIC
         // `dial_peer_direct`. Distinct from the full-session test above: this exercises the handshake
-        // adapter that feeds the multiplexed pump's late-bind one-shot. Loopback (punch trivial); the
-        // live cross-NAT punch is N136.4. Bounded so a stall fails fast instead of wedging the gate.
+        // adapter that feeds the multiplexed pump's late-bind one-shot. Loopback (punch trivial);
+        // the live cross-NAT punch is NOT proven — see the note on `run_upgradable_dcutr_session`
+        // and ct-agent#6. Bounded so a stall fails fast instead of wedging the gate.
         use ct_common::a2a::{a2a_recv, a2a_send, establish_direct_over_duplex};
         use ct_common::noise::generate_static_keypair;
         tokio::time::timeout(Duration::from_secs(15), async move {
