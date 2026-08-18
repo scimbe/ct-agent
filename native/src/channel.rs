@@ -236,6 +236,15 @@ pub async fn present_channel_join(
 /// legs becomes an operator knob, CT_EDGE_KA_PARK_TTL_SECS).
 pub(crate) const KA_PARK_INACTIVITY_BOUND: std::time::Duration = std::time::Duration::from_secs(35);
 
+/// Length of the edge's possession challenge, and therefore the length that separates
+/// "proceed" from "this was a refusal" in the pre-challenge read.
+///
+/// Named because it is the reason [`REFUSAL_CATEGORY_MAX_LEN`] has the value it has: a
+/// refusal frame of exactly this length would be indistinguishable from a challenge. It
+/// used to be a bare `32` in three places, which left that dependency unstatable — and so
+/// unenforced. See `refusal_frame_can_never_be_mistaken_for_a_possession_challenge`.
+pub(crate) const POSSESSION_CHALLENGE_LEN: usize = 32;
+
 pub async fn present_channel_join_on_stream<W, R>(
     mut send: W,
     mut recv: R,
@@ -291,8 +300,11 @@ where
     // server-side reason logs (#124-#128) are the authoritative diagnostic. Only a partial
     // response that is neither a full challenge nor `NO` is *unambiguously* a broken stream.
     let mut resp = Vec::new();
-    let _ = (&mut recv).take(32).read_to_end(&mut resp).await;
-    if resp.len() != 32 {
+    let _ = (&mut recv)
+        .take(POSSESSION_CHALLENGE_LEN as u64)
+        .read_to_end(&mut resp)
+        .await;
+    if resp.len() != POSSESSION_CHALLENGE_LEN {
         let text = String::from_utf8_lossy(&resp);
         if resp.is_empty() || text.starts_with("NO") {
             // Explicit NO, or an ambiguous empty (raced-NO/closed). #524: a new edge
@@ -310,7 +322,8 @@ where
         )
         .into());
     }
-    let challenge: [u8; 32] = resp.try_into().expect("length checked == 32");
+    let challenge: [u8; POSSESSION_CHALLENGE_LEN] =
+        resp.try_into().expect("length checked above");
     let sig = holder.sign(&challenge).to_bytes();
     send.write_all(&sig).await?;
     send.flush().await?;
@@ -458,13 +471,18 @@ pub(crate) fn error_names_park_expiry(e: &(dyn std::error::Error + 'static)) -> 
 /// member's OWN edge-observed reflexive address as a tagged `r=<addr>` token. The `r=` token
 /// is pulled out first (it is self-addressed, not peer material, and order-independent); a
 /// missing field yields `None` — backward-additive. Anything else is a refusal.
-/// #524: upper bound on a refusal-category token's length — mirrors CADS-Tunnel's
-/// `CHANNEL_REFUSAL_CATEGORY_MAX_LEN` (the edge caps tokens at 24 so the whole
-/// `NO | len | token` frame stays strictly under the 32 bytes this client's
-/// pre-challenge `take(32)` would mistake for a possession challenge). Duplicated here
-/// because this crate pins ct-common to a tag that predates the constant; the wire
-/// contract (and both values) are pinned by tests on both sides.
-pub(crate) const REFUSAL_CATEGORY_MAX_LEN: usize = 24;
+/// #524: upper bound on a refusal-category token's length — the edge caps tokens here so
+/// the whole `NO | len | token` frame stays strictly under [`POSSESSION_CHALLENGE_LEN`],
+/// which this client's pre-challenge read would otherwise mistake for a challenge.
+///
+/// **Derived, not copied.** This used to be a bare `24` with two claims attached: that the
+/// pinned ct-common predated the constant, and that both values were held by tests on both
+/// sides. Neither was true any more — the pinned tag carries
+/// `CHANNEL_REFUSAL_CATEGORY_MAX_LEN`, and this side had no test naming the value at all.
+/// A hand-copied number whose justification has expired is exactly the shape CADS-Tunnel#557
+/// removed for the park-expiry strings: two sides that each agree with themselves cannot
+/// notice their values coming apart.
+pub(crate) const REFUSAL_CATEGORY_MAX_LEN: usize = ct_common::channel::CHANNEL_REFUSAL_CATEGORY_MAX_LEN;
 
 /// #524: how long the opportunistic tail read in [`read_refusal_tail_token`] may wait.
 /// Deliberately short — the category is a diagnosis aid, never worth stalling a rung
@@ -700,6 +718,31 @@ mod tests {
     use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
     use ct_edge::channel_broker::{broker_channel_rendezvous, resolve_channel_join};
     use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+
+    /// #524/#557: a refusal frame must never be as long as a possession challenge.
+    ///
+    /// This is the invariant the category cap exists for, and until now it was asserted
+    /// only in CADS-Tunnel — on the side that WRITES the token. The side that reads it,
+    /// and that owns the `take(POSSESSION_CHALLENGE_LEN)` this bound protects, asserted
+    /// nothing: the value lived here as a hand-copied `24` with a stale comment claiming
+    /// tests on both sides. A cap that only the writer checks is no cap for the reader.
+    ///
+    /// `<` and not `<=`: a frame of exactly the challenge length would be consumed as a
+    /// challenge, which is the failure this bound prevents.
+    #[test]
+    fn refusal_frame_can_never_be_mistaken_for_a_possession_challenge() {
+        // `NO` sentinel + the length byte + the longest token the edge may send.
+        let longest_frame = 2 + 1 + REFUSAL_CATEGORY_MAX_LEN;
+        assert!(
+            longest_frame < POSSESSION_CHALLENGE_LEN,
+            "a {longest_frame}-byte refusal frame would be read as a {POSSESSION_CHALLENGE_LEN}-byte challenge"
+        );
+        // Deliberately NOT asserted here: that the cap equals
+        // `ct_common::channel::CHANNEL_REFUSAL_CATEGORY_MAX_LEN`. It is now defined as that
+        // constant, so the comparison would be a value against itself — and it would pass
+        // just as happily against a re-introduced literal `24`. The derivation is enforced
+        // by the definition; a test restating it would only look like protection.
+    }
 
     const OP_SEED: [u8; 32] = [7u8; 32];
 
