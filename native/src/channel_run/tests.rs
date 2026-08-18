@@ -2117,6 +2117,77 @@ fn admission_retry_backoff_is_flat_for_transient_and_exponential_for_refused() {
 }
 
 #[test]
+fn is_transport_handshake_eof_matches_the_field_captured_wording_40() {
+    // #40 (CADS-Tunnel#335): the exact production log line the field incident captured
+    // (`ct-agent channel: debug relay-gate tcp+tls connect to ... failed after ~35ms: tls
+    // handshake eof`) must be recognized -- and a definitive refusal or an ordinary transient
+    // error must NOT be, so this classifier stays disjoint from
+    // `is_definitive_admission_refusal`.
+    assert!(is_transport_handshake_eof(
+        &"tcp+tls connect to 57.131.133.91:443 failed after 35.2ms: tls handshake eof".into()
+    ));
+    assert!(is_transport_handshake_eof(&"tls handshake eof".into()));
+    assert!(
+        !is_transport_handshake_eof(&"edge broker refused the channel join".into()),
+        "a definitive refusal is not a handshake EOF"
+    );
+    assert!(
+        !is_transport_handshake_eof(&"channel join admission exchange stalled (#140)".into()),
+        "an ordinary transient stall is not a handshake EOF"
+    );
+}
+
+#[test]
+fn handshake_eof_backoff_is_exponential_and_capped_between_transient_and_refusal_40() {
+    let base = std::time::Duration::from_millis(200);
+    assert_eq!(handshake_eof_backoff(base, 0), base, "zero EOFs -> the unchanged fast retry");
+    assert_eq!(handshake_eof_backoff(base, 1), base * 2);
+    assert_eq!(handshake_eof_backoff(base, 2), base * 4);
+    assert_eq!(handshake_eof_backoff(base, 100), HANDSHAKE_EOF_BACKOFF_CAP, "clamped, never overflows");
+    assert!(
+        HANDSHAKE_EOF_BACKOFF_CAP < REFUSED_ADMISSION_BACKOFF_CAP,
+        "a saturated connection cap clears on its own (unlike a definitive refusal) -- keep checking sooner"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn serve_loop_concurrent_backs_off_after_repeated_handshake_eofs_without_touching_the_refusal_streak_40() {
+    // #40 (CADS-Tunnel#335) end-to-end: the field incident was two peers hammering a
+    // (plausibly) saturated edge connection cap at the fast retry cadence for ~2 hours
+    // straight, because a TLS-handshake-EOF admission failure fell into the same bucket as
+    // any other transient error and never escalated. Proves: (a) repeated handshake-EOF
+    // failures DO grow the gap between admits, (b) a later admission that fails for a
+    // DIFFERENT (refused) reason is NOT affected by the EOF streak -- the two counters are
+    // independent, matching `is_definitive_admission_refusal`'s own disjoint classification.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let attempt = std::sync::Arc::new(AtomicUsize::new(0));
+    let attempt2 = attempt.clone();
+    let admit = move || {
+        let n = attempt2.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if n < 3 {
+                Err::<(), BoxError>("tls handshake eof".into())
+            } else {
+                // The 4th attempt is a DEFINITIVE refusal, not another EOF -- if the two
+                // streaks were conflated, this would inherit 3 "refusals" worth of backoff
+                // instead of starting its own streak at 1.
+                Err::<(), BoxError>("edge broker refused the channel join".into())
+            }
+        }
+    };
+    let serve = |_: ()| async { Ok::<(), BoxError>(()) };
+    let driver = tokio::spawn(serve_loop_concurrent(1, std::time::Duration::from_millis(50), admit, serve));
+
+    for _ in 0..20 {
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+    }
+
+    assert!(attempt.load(Ordering::SeqCst) >= 4, "the loop kept making progress through both failure classes");
+    driver.abort();
+}
+
+#[test]
 fn is_flapping_session_only_flags_a_short_errored_session_250() {
     // #250: the classifier's whole job is telling "pair, then die near-instantly" (flap)
     // apart from every other outcome -- success, a fast-but-real session, or a slow failure.

@@ -1076,6 +1076,11 @@ where
 {
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max.max(1)));
     let mut consecutive_refusals: u32 = 0;
+    // #40 (CADS-Tunnel#335): independent from `consecutive_refusals` -- a TLS-handshake-EOF
+    // admission failure (a saturated edge connection cap shedding pre-handshake) has a
+    // different cause and a different natural resolution time than a definitive refusal, so
+    // its own streak must not affect, or be affected by, the refusal streak.
+    let mut consecutive_handshake_eofs: u32 = 0;
     // #250: shared across spawned sessions (all admissions on this loop are for the SAME
     // channel/holder -- an accept-side member has exactly one fixed remote grant, so there is
     // no "other peer" a global backoff could unfairly delay). Incremented by a session that
@@ -1108,6 +1113,7 @@ where
         match admit().await {
             Ok(work) => {
                 consecutive_refusals = 0;
+                consecutive_handshake_eofs = 0;
                 let fut = serve(work);
                 let flap_counter = consecutive_flaps.clone();
                 tokio::spawn(async move {
@@ -1138,10 +1144,30 @@ where
                 // that reaps instantly; a healthy edge parks for the full TTL between expiries.
                 if is_park_expired(&e) {
                     consecutive_refusals = 0;
+                    consecutive_handshake_eofs = 0;
                     eprintln!("ct-agent channel: {e}");
                     tokio::time::sleep(retry_backoff).await;
                     continue;
                 }
+                // #40 (CADS-Tunnel#335): checked before refusal classification -- a
+                // TLS-handshake-EOF is not a refusal (nothing about the grant or holder was
+                // even reached), so it must not feed or reset `consecutive_refusals` either.
+                // Escalates on its own streak instead of retrying at native speed against a
+                // saturated cap (CADS-Tunnel#335's field-observed failure mode).
+                if is_transport_handshake_eof(&e) {
+                    consecutive_refusals = 0;
+                    consecutive_handshake_eofs = consecutive_handshake_eofs.saturating_add(1);
+                    let backoff = handshake_eof_backoff(retry_backoff, consecutive_handshake_eofs);
+                    eprintln!(
+                        "ct-agent channel: {consecutive_handshake_eofs} consecutive TLS-handshake-EOF \
+                         admission attempt(s) (#40/CADS-Tunnel#335) -- backing off {backoff:?} before \
+                         the next admit (a saturated edge connection cap is the leading known cause; \
+                         it clears on its own once load drops)"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                consecutive_handshake_eofs = 0;
                 let refused = is_definitive_admission_refusal(&e);
                 consecutive_refusals = if refused { consecutive_refusals.saturating_add(1) } else { 0 };
                 let backoff = admission_retry_backoff(retry_backoff, refused, consecutive_refusals);

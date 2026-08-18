@@ -166,6 +166,45 @@ pub(crate) fn refusal_category_hint(category: &str) -> Option<&'static str> {
     })
 }
 
+/// #40 (CADS-Tunnel#335): ceiling on the exponential backoff after consecutive TLS-handshake-EOF
+/// admission failures (see [`is_transport_handshake_eof`]) -- deliberately BETWEEN the fast
+/// `retry_backoff` and [`REFUSED_ADMISSION_BACKOFF_CAP`]'s 30s, same reasoning as
+/// [`FLAPPING_SESSION_BACKOFF_CAP`]: unlike a definitive refusal, a saturated edge connection
+/// cap clears on its own once load drops, so this loop should keep checking meaningfully
+/// sooner than a refusal would justify -- while no longer hammering it at native retry speed
+/// (CADS-Tunnel#335's field observation: two peers did exactly that for ~2 hours straight,
+/// plausibly a real contributor to their own outage).
+pub(crate) const HANDSHAKE_EOF_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// #40 (CADS-Tunnel#335): does this admission error mean the connection died with a clean
+/// TLS-handshake EOF -- no application byte exchanged on either side -- rather than a genuine
+/// refusal or a park expiry? CADS-Tunnel#335's traced root cause: the edge's `:443` connection
+/// cap sheds an accepted TCP socket by dropping it BEFORE the TLS handshake when full, which
+/// surfaces to the dialer as exactly this. String-matched, not typed: this crosses the TLS
+/// library's own error boundary (tokio-rustls), the exact wording CADS-Tunnel#335's field log
+/// captured (`ct-agent channel: debug relay-gate tcp+tls connect to ... failed after ~35ms: tls
+/// handshake eof`). Extend the substring list here if another TLS backend (the "boring" ALPN
+/// dialer, [`crate::transport::tcp_tls_connect_channel_boring`]) is ever observed to word this
+/// differently -- not assumed identical without a field sample.
+pub(crate) fn is_transport_handshake_eof(e: &BoxError) -> bool {
+    e.to_string().contains("tls handshake eof")
+}
+
+/// #40: exponential backoff after `consecutive_handshake_eofs` TLS-handshake-EOF admission
+/// failures in a row -- same shape as [`flapping_session_backoff`], deliberately an
+/// INDEPENDENT counter from [`admission_retry_backoff`]'s `consecutive_refusals`: the two
+/// failure modes have different causes and different natural resolution times, so one
+/// streak escalating must not affect the other's classification or reset the other's count.
+pub(crate) fn handshake_eof_backoff(
+    retry_backoff: std::time::Duration,
+    consecutive_eofs: u32,
+) -> std::time::Duration {
+    let shift = consecutive_eofs.min(16);
+    retry_backoff
+        .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
+        .min(HANDSHAKE_EOF_BACKOFF_CAP)
+}
+
 /// #21: typed marker for a park expiry -- the edge reaped this member's park because no partner
 /// arrived within the park TTL, and SAID SO on the wire (the bare `EX` token / the named QUIC
 /// close reason). Deliberately a DISTINCT type from [`AdmissionRefused`]: a park expiry is
