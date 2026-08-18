@@ -15,6 +15,7 @@ linked — those threads carry the full evidence.
 | One-shot raw MCP call | `CT_CHANNEL_CALL=<method>` (+ `CT_CHANNEL_CALL_PARAMS`) | One JSON-RPC request/response, prints the whole envelope, exits. |
 | Persistent serve | `CT_CHANNEL_ROLE=accept` + `CT_CHANNEL_SERVE=1` | Parks at the broker, serves each paired peer's session **concurrently** (up to `CT_CHANNEL_SERVE_CONCURRENCY`, default 8, [#200]) — a JSON-RPC request loop per session, any number of calls per session. `CT_AGENT_SERVICE_HANDLER_CMD` spawns a fresh handler per request (the handler stays stateless even under a held session). |
 | Raw pipe | neither | stdin/stdout spliced over the channel. |
+| **Direct address (no broker at all)** | `CT_CHANNEL_ADDR` + `CT_CHANNEL_PEER_NOISE_KEY` (+ `CT_CHANNEL_PEER_CERT` when initiating) | Dials the peer **directly**; the edge is not involved in pairing. This is the `first-channel` tutorial's path. Every other row in this table goes through the broker — this one is the reason not to read "channel" as "always via the edge". |
 
 ## Transport selection (the dial ladders)
 
@@ -88,6 +89,22 @@ class). When a symptom doesn't map to an arrow here, the picture is incomplete �
 picture first.
 
 ## Failure semantics and timers (what an error actually means)
+
+- **A clean, fast `early eof`** — the most misleading error this subsystem produces, because
+  it names a symptom and not a cause. Three different things look identical from the caller's
+  side, and the code has been bitten by each:
+  - the responder's **service handler blocked the connection's own read/write pump**, so its
+    reply never reached the initiator (fixed by dispatching handlers on the blocking pool —
+    on a 2-CPU host this also stalled *unrelated* channels' admissions for the full #140
+    window);
+  - a **relay-gate step failed** — six sequential steps (TCP, TLS, ALPN, pre-auth, circuit,
+    upgrade) all surfaced as one generic message. `CT_DEBUG_A2A_TIMING=1` names which step;
+  - an **old edge** negotiated a legacy id and sent no marker, so a newer client's expectation
+    of a marked stream ended at the first read.
+
+  The rule of thumb: `early eof` on a service call points at the **responder's handler**;
+  `early eof` during a join points at the **ladder**, and the timing switch is what tells the
+  two apart. Do not read it as "the peer went away" — that is the one thing it rarely means.
 
 - **`channel join admission exchange stalled (#140)`** — the 45 s admission-exchange bound
   expired. It is 45 s (not the pre-v0.4.8 15 s) because the edge only acks a pairing-path join
@@ -179,6 +196,10 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_CHANNEL_FRONT_DOOR` / `_CERT` / `_ONLY` | `:443` TLS-TCP fallback rungs; `_ONLY=1` skips direct QUIC (v0.4.8) |
 | `CT_CHANNEL_RELAY_GATE` / `_CERT` | #330 Circuit-Relay gate (admission still needs QUIC — see above) |
 | `CT_CHANNEL_CALL_SERVICE` / `CT_CHANNEL_CALL_PERSISTENT` | service-call modes (see table above) |
+| `CT_CHANNEL_ADDR` | direct-address mode: the peer's `host:port`. Selects the no-broker path above |
+| `CT_CHANNEL_PEER_NOISE_KEY` / `CT_CHANNEL_PEER_CERT` | the peer's Noise public key (64 hex) and, for the initiator, its transport cert (hex DER) — direct-address mode only |
+| `CT_CHANNEL_CIRCUIT_RELAY` | libp2p Circuit-Relay v2 multiaddr for the DCUtR upgrade path (#136). Absent: no hole-punch is attempted at all |
+| `CT_CHANNEL_RELAY_DIRECT` | dial the relay at this `host:port` instead of the one the grant names — an operator override, not a fallback |
 | `CT_CHANNEL_SERVE` / `CT_CHANNEL_SERVE_CONCURRENCY` | accept-side persistent serve, session cap (default 8) |
 | `CT_CHANNEL_DIRECT_UPGRADE=1` | opt-in in-band relay→direct upgrade (#104) |
 | `CT_AGENT_SERVICE_HANDLER_CMD` / `CT_AGENT_SERVICES` | the handler command + offered service slugs on the serve side |
