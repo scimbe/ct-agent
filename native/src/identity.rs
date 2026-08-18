@@ -28,13 +28,13 @@ impl AgentIdentity {
     /// redeemed the single-use join token is reloaded on restart instead of
     /// re-redeeming a spent token.
     pub fn save_secret_to(&self, path: &Path) -> io::Result<()> {
-        std::fs::write(path, self.signing.to_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
+        // #36: was `fs::write` + `set_permissions`, i.e. created under the umask (commonly
+        // 0644) and narrowed only AFTERWARDS -- the 32 secret bytes were readable by anyone
+        // until the second call landed, and a crash in between left them that way for good.
+        // `write_private` (from #31, previously private to the ACME path) creates WITH the
+        // mode, so the fresh-file case has no window at all; the two copies of this rule had
+        // simply drifted apart. See `crate::secret_file` for why it is not `create_new`.
+        crate::secret_file::write_private(path, &self.signing.to_bytes())
     }
 
     /// Reload an identity previously written by [`save_secret_to`]. Rejects any

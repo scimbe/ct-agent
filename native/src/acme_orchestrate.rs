@@ -334,26 +334,10 @@ pub async fn obtain_or_renew(config: &AcmeCertConfig) -> Result<bool, BoxError> 
     Ok(true)
 }
 
-#[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    // #31: `mode()` applies only when the file is CREATED. The previous version opened
-    // with 0600, dropped the handle, and then wrote through a second `fs::write` — so a
-    // file that already existed at 0644 (an older agent's key, a restored backup, an
-    // operator's `touch`) kept those permissions and the fresh key was written straight
-    // into it. Write through the handle we opened, then set the mode explicitly so the
-    // pre-existing case is corrected too.
-    let mut f =
-        std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-}
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, bytes)
-}
+// #36: beide Varianten leben jetzt in `crate::secret_file` -- dieselbe Regel stand hier
+// und in `Identity::save_secret_to`, und die zweite Kopie hatte die Lehre aus #31 nie
+// mitbekommen (sie schrieb unter der umask und verengte erst danach).
+use crate::secret_file::write_private;
 
 /// Run [`obtain_or_renew`] once immediately, then keep checking forever — the
 /// entry point `ct-agent certificate` runs. A failed attempt is logged, not

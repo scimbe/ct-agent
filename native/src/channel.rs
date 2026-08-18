@@ -324,6 +324,17 @@ where
     }
     let challenge: [u8; POSSESSION_CHALLENGE_LEN] =
         resp.try_into().expect("length checked above");
+    // #36: `holder.sign` here has no domain-separation prefix, unlike this same key's
+    // other signing sites (Noise attestations, DHT coordinate records), which are longer
+    // and domain-prefixed. Safe today because the edge's challenge generators (verified
+    // in CADS-Tunnel: channel_broker.rs, relay_gate.rs) draw 32 fresh CSPRNG bytes per
+    // call -- never predictable, never reused -- so a raw 32-byte challenge cannot
+    // collide with anything else this key signs. That property lives entirely on the
+    // OTHER side of the wire and this code cannot verify it; a domain-separated `H(ctx ‖
+    // challenge)` signature would remove the dependency, but changing it here alone
+    // would break interop with every edge still verifying the raw challenge -- a
+    // protocol-version rollout, not a local hardening change (see #575's KA-fleet floor
+    // for why a one-sided flip like this is worse than the risk it fixes).
     let sig = holder.sign(&challenge).to_bytes();
     send.write_all(&sig).await?;
     send.flush().await?;
@@ -689,25 +700,37 @@ where
 
 /// Decode 64 lowercase-hex chars into 32 bytes (the peer Noise key / holder the
 /// broker relays), or `None` if malformed.
+///
+/// #36: was `s.len()` (byte length, correctly) guarding a **string-slice** index
+/// `&s[2*i..2*i+2]` — `str` slicing panics when a byte offset falls inside a multi-byte
+/// UTF-8 char rather than on a boundary, and `s.len() == 64` says nothing about where the
+/// boundaries are. `U+FFFD` (3 bytes) + 61 ASCII = 64 bytes passes the length guard and
+/// then panics on the very first slice. These tokens arrive via
+/// `String::from_utf8_lossy` over broker-relayed wire bytes, which is exactly what
+/// produces `U+FFFD` from a malformed or malicious peer — under `panic=abort` that is a
+/// process DoS. `p2p.rs`'s `relay_node_key_seed` already has the safe shape for the same
+/// job: chunk the raw BYTES and `from_utf8` each chunk, so a boundary that splits a
+/// multi-byte char fails the chunk's own UTF-8 check instead of ever being sliced.
 fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
     }
     let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
     }
     Some(out)
 }
 
-/// Decode 128 lowercase-hex chars into the 64-byte attestation, or `None`.
+/// Decode 128 lowercase-hex chars into the 64-byte attestation, or `None`. Same fix as
+/// [`decode_hex_32`], same reason (#36).
 fn decode_hex_64(s: &str) -> Option<[u8; 64]> {
     if s.len() != 128 {
         return None;
     }
     let mut out = [0u8; 64];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
     }
     Some(out)
 }
@@ -718,6 +741,32 @@ mod tests {
     use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
     use ct_edge::channel_broker::{broker_channel_rendezvous, resolve_channel_join};
     use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+
+    /// #36: a byte-length-correct but char-boundary-crossing token does not panic.
+    ///
+    /// `U+FFFD` (3 bytes, the exact replacement character `String::from_utf8_lossy`
+    /// produces from malformed wire bytes) + 61 ASCII bytes = 64 bytes: passes the length
+    /// guard, and a plain `&s[2*i..2*i+2]` string slice panics on it (byte offset 2 falls
+    /// inside the 3-byte char). Under `panic=abort` that is a process DoS reachable from
+    /// broker-relayed peer input. The fix decodes bytes, not `str` slices, so a boundary
+    /// mismatch fails the chunk's own UTF-8 check and returns `None` instead of panicking.
+    #[test]
+    fn a_token_with_a_multi_byte_char_at_the_right_byte_length_does_not_panic_36() {
+        let replacement = "\u{FFFD}"; // 3 bytes
+        let ascii_32 = "a".repeat(61); // 61 bytes: 3 + 61 = 64
+        let token_32 = format!("{replacement}{ascii_32}");
+        assert_eq!(token_32.len(), 64, "must actually hit the length guard, not undershoot it");
+        assert_eq!(
+            decode_hex_32(&token_32),
+            None,
+            "malformed content -- rejected, not panicked"
+        );
+
+        let ascii_64 = "a".repeat(125); // 3 + 125 = 128
+        let token_64 = format!("{replacement}{ascii_64}");
+        assert_eq!(token_64.len(), 128);
+        assert_eq!(decode_hex_64(&token_64), None);
+    }
 
     /// #524/#557: a refusal frame must never be as long as a possession challenge.
     ///

@@ -19,6 +19,7 @@ pub mod onboard;
 pub mod origin;
 pub mod p2p;
 pub mod reconnect;
+pub mod secret_file;
 pub mod serve;
 pub mod super_peer;
 pub mod transport;
