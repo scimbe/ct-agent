@@ -46,6 +46,25 @@ jobs:
           # cargo-audit scans Cargo.lock's package list without feature-awareness, so it
           # flags this regardless -- a documented class of cargo-audit false positive.
           # Ignored here for that reason; revisit if libp2p ever makes this reachable.
+          #
+          # #37: "revisit if libp2p ever makes this reachable" is a request, not a check --
+          # nothing would notice. The 0119 ignore rests on ONE mechanical claim, so that
+          # claim is now verified on every run instead of trusted: if hickory-proto 0.25.2
+          # ever becomes compiled (someone enables libp2p's "mdns" feature, or a new
+          # dependency pulls it in), the ignore silently turns a real exposure into
+          # silence. `cargo tree -i` prints the dependents when there are any and warns
+          # "nothing to print" when there are none, so the absence of that warning IS the
+          # signal. Checked BEFORE the audit, so a stale ignore fails loudly rather than
+          # being masked by a green audit.
+          if ! cargo tree -i hickory-proto@0.25.2 2>&1 | grep -q "nothing to print"; then
+            echo "::error::Die Begruendung fuer --ignore RUSTSEC-2026-0119 gilt nicht mehr:" \
+                 "hickory-proto 0.25.2 wird jetzt kompiliert. Entweder die Abhaengigkeit" \
+                 "aufloesen oder die Ausnahme streichen -- sie deckt ab jetzt eine echte" \
+                 "Verwundbarkeit zu (#37)."
+            cargo tree -i hickory-proto@0.25.2 2>&1 | head -20
+            exit 1
+          fi
+          echo "0119-Ausnahme weiterhin gedeckt: hickory-proto 0.25.2 ist nicht erreichbar."
           cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
 
   wasm:
