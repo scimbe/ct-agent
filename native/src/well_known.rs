@@ -32,11 +32,21 @@ pub fn agent_card_response(card: &AgentCard) -> Response {
 }
 
 /// An axum [`Router`](axum::Router) that serves the agent's holder-signed card at
-/// [`AGENT_CARD_WELL_KNOWN_PATH`] (and 404s any other path). Direction-agnostic: the origin
-/// helper — or `ct-agent onboard --mode browser` — mounts it and binds it to a TLS listener on
-/// the agent's subdomain. The card is served **at the origin** because browser mode is raw TLS
-/// passthrough (the agent forwards opaque bytes and never sees the request path); binding + the
-/// subdomain cert are the onboard integration follow.
+/// [`AGENT_CARD_WELL_KNOWN_PATH`] (and 404s any other path). The card is served **at the
+/// origin** because browser mode is raw TLS passthrough (the agent forwards opaque bytes and
+/// never sees the request path).
+///
+/// **Nothing in this binary mounts it, and by design nothing will.** An earlier version of this
+/// comment said `ct-agent onboard --mode browser` mounts it and binds it to a TLS listener —
+/// that is the opposite of the decision recorded two functions below, where #144 chose central's
+/// option (ii): *emit a runnable helper, don't bake an HTTP server into ct-agent*. What
+/// `onboard --mode browser` actually does is call [`write_agent_card_for_origin`], which drops
+/// the card as a file under the operator's existing origin.
+///
+/// So this router is a convenience for an EMBEDDER that already runs axum, not a description of
+/// what this agent does. Left in place as public API for exactly that use; the wrong half was
+/// the sentence claiming a wiring that the design explicitly rejected. Found by a reachability
+/// survey (CADS-Tunnel#565): unmounted here, and no consumer mounts it either.
 pub fn agent_card_router(card: AgentCard) -> axum::Router {
     axum::Router::new().route(
         AGENT_CARD_WELL_KNOWN_PATH,
