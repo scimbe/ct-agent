@@ -30,41 +30,52 @@ jobs:
       - name: Dependency audit
         run: |
           cargo install cargo-audit --locked || true
-          # RUSTSEC-2026-0118 (hickory-proto NSEC3 unbounded-loop advisory) has no fixed
-          # upgrade available as of this writing -- ignored explicitly rather than left to
-          # silently block every CI run. Revisit (drop the --ignore) once hickory-dns ships
-          # a fix.
+          # RUSTSEC-2026-0118 (hickory-proto NSEC3 unbounded-loop) and RUSTSEC-2026-0119
+          # (hickory-proto CPU exhaustion) both resolve to the SAME unreachable dependency
+          # instance: Cargo.lock carries hickory-proto@0.25.2 only as an optional
+          # transitive dependency of libp2p (libp2p-mdns, local-network mDNS peer
+          # discovery) -- unrelated to the ACME/DNS-01 path that uses the direct,
+          # already-fixed hickory-resolver 0.26.1 dependency. `cargo tree -i
+          # hickory-proto@0.25.2` shows it as unreachable ("nothing to print"): resolved
+          # into Cargo.lock but never actually compiled, since ct-agent doesn't enable
+          # libp2p's "mdns" feature. cargo-audit scans Cargo.lock's package list without
+          # feature-awareness, so it flags both regardless -- a documented class of
+          # cargo-audit false positive.
           #
-          # RUSTSEC-2026-0119 (the other hickory-proto advisory, CPU exhaustion) IS fixed
-          # for ct-agent's own direct hickory-resolver dependency (bumped to 0.26.1) -- but
-          # Cargo.lock still carries a SECOND copy at the vulnerable 0.25.2, pulled in
-          # transitively as an optional dependency of libp2p (libp2p-mdns -> hickory-proto
-          # 0.25.2, local-network mDNS peer discovery, unrelated to the ACME/DNS-01 path the
-          # 0.26.1 bump addresses). `cargo tree -i hickory-proto@0.25.2` shows it as
-          # unreachable ("nothing to print") -- it is resolved into Cargo.lock but never
-          # actually compiled, since ct-agent doesn't enable libp2p's "mdns" feature.
-          # cargo-audit scans Cargo.lock's package list without feature-awareness, so it
-          # flags this regardless -- a documented class of cargo-audit false positive.
-          # Ignored here for that reason; revisit if libp2p ever makes this reachable.
-          #
-          # #37: "revisit if libp2p ever makes this reachable" is a request, not a check --
-          # nothing would notice. The 0119 ignore rests on ONE mechanical claim, so that
-          # claim is now verified on every run instead of trusted: if hickory-proto 0.25.2
-          # ever becomes compiled (someone enables libp2p's "mdns" feature, or a new
-          # dependency pulls it in), the ignore silently turns a real exposure into
-          # silence. `cargo tree -i` prints the dependents when there are any and warns
-          # "nothing to print" when there are none, so the absence of that warning IS the
-          # signal. Checked BEFORE the audit, so a stale ignore fails loudly rather than
-          # being masked by a green audit.
+          # #37 added the check below for 0119's reachability claim; #39 found it silently
+          # already covers 0118's SAME reachability premise too (confirmed 2026-08-18:
+          # `cargo audit`'s own report for 0118 names `Version: 0.25.2`, the exact instance
+          # this checks), even though the code comment for 0118 up to #39 named a DIFFERENT
+          # reason ("no fixed upgrade available") and never mentioned reachability at all.
           if ! cargo tree -i hickory-proto@0.25.2 2>&1 | grep -q "nothing to print"; then
-            echo "::error::Die Begruendung fuer --ignore RUSTSEC-2026-0119 gilt nicht mehr:" \
-                 "hickory-proto 0.25.2 wird jetzt kompiliert. Entweder die Abhaengigkeit" \
-                 "aufloesen oder die Ausnahme streichen -- sie deckt ab jetzt eine echte" \
-                 "Verwundbarkeit zu (#37)."
+            echo "::error::Die Erreichbarkeits-Begruendung fuer --ignore RUSTSEC-2026-0118" \
+                 "UND --ignore RUSTSEC-2026-0119 gilt nicht mehr: hickory-proto 0.25.2 wird" \
+                 "jetzt kompiliert. Entweder die Abhaengigkeit aufloesen oder die Ausnahmen" \
+                 "streichen -- sie decken ab jetzt eine echte Verwundbarkeit zu (#37, #39)."
             cargo tree -i hickory-proto@0.25.2 2>&1 | head -20
             exit 1
           fi
-          echo "0119-Ausnahme weiterhin gedeckt: hickory-proto 0.25.2 ist nicht erreichbar."
+          echo "0118/0119-Erreichbarkeits-Begruendung weiterhin gedeckt: hickory-proto 0.25.2 ist nicht erreichbar."
+          # #39: RUSTSEC-2026-0118's OWN stated justification ("no fixed upgrade available",
+          # independent of the reachability check above) had no enforcer at all -- a prose
+          # "revisit once hickory-dns ships a fix" comment, exactly the "request, not a
+          # check" #37 already called out for 0119. Checked here instead of trusted: run
+          # the audit without EITHER ignore, capture its verdict for 0118 specifically, and
+          # fail loudly if the "no fixed upgrade" line is gone (a real fix shipped, or the
+          # advisory changed shape) instead of the ignore silently continuing to suppress
+          # a now-fixable vulnerability forever.
+          set +e
+          unignored_0118="$(cargo audit --ignore RUSTSEC-2026-0119 2>&1)"
+          set -e
+          if ! echo "$unignored_0118" | grep -A3 "RUSTSEC-2026-0118" | grep -q "No fixed upgrade is available"; then
+            echo "::error::Die Begruendung fuer --ignore RUSTSEC-2026-0118 gilt moeglicherweise" \
+                 "nicht mehr: cargo audit nennt keine 'No fixed upgrade is available'-Zeile" \
+                 "mehr fuer diese Advisory (neuer Fix, oder die Advisory hat sich veraendert)." \
+                 "Pruefen und die Ausnahme ggf. streichen (#39)."
+            echo "$unignored_0118" | grep -B2 -A6 "RUSTSEC-2026-0118" || echo "$unignored_0118"
+            exit 1
+          fi
+          echo "0118-Fix-Verfuegbarkeits-Begruendung weiterhin gedeckt: kein Fix verfuegbar."
           cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
 
   wasm:
