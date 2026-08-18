@@ -606,8 +606,11 @@ where
 /// configured libp2p Circuit-Relay v2 `circuit_relay` and cuts the stream over — offloading the
 /// edge. Hole-punch failure stays on the relay; the relay leg is end-to-end throughout. The
 /// peer's Noise key is learned from the relayed admission (no out-of-band exchange). The actual
-/// cross-NAT punch is proven in the Docker 2-NAT lab (N-rig-2) / the live plane (N-rig-3); on
-/// loopback it degrades to the relay.
+/// cross-NAT punch is proven in the Docker 2-NAT lab (N-rig-2); on loopback it degrades to the
+/// relay. **Not on the live plane** — the "/ the live plane (N-rig-3)" this line used to carry
+/// is the same overclaim corrected at [`run_channel_session_upgradable`] and
+/// [`crate::p2p::run_upgradable_dcutr_session`]: ct-agent#6 (open) measures every real cross-NAT
+/// direct dial failing. The lab half of the sentence is accurate and stays.
 pub async fn join_via_relay_dcutr<P>(
     relay_conn: &Connection,
     request: &ChannelJoinRequest,
@@ -905,8 +908,18 @@ where
 /// direct Noise session. The direct-Noise role is tied to who-dials (the dialer is the Noise
 /// initiator) so `a2a_initiate`/`a2a_respond` never block each other. If the hole-punch fails, the
 /// session stays on the relay. An initiator with no listener to offer (a relay-only member) runs a
-/// plain [`run_channel_session_on_stream`]. The relay leg stays end-to-end either way; the live
-/// cross-NAT hole-punch is proven on the deploy (#104 H4), this over loopback.
+/// plain [`run_channel_session_on_stream`]. The relay leg stays end-to-end either way; this test
+/// runs over loopback.
+///
+/// **The live cross-NAT hole-punch is NOT proven** — this said "proven on the deploy (#104 H4)".
+/// See the note on [`crate::p2p::run_upgradable_dcutr_session`] for the two records that say
+/// otherwise (ct-agent#6, open, measures every real cross-NAT direct dial failing; and
+/// CADS-Tunnel's `docs/product/comparison.md`). The relay fallback is what carries traffic
+/// between two NAT'd agents today.
+///
+/// Noted here as well as there because the claim existed in BOTH places under different issue
+/// tags (#104 H4 here, #136 N136.4 there), and correcting only the one that turned up first
+/// would have left the other reading as a live proof.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_channel_session_upgradable<P>(
     relay_conn: &Connection,
