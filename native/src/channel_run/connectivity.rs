@@ -566,7 +566,7 @@ where
                     .await;
                 }
                 Err(ChannelDialError::Unreachable) => last = Some(ChannelDialError::Unreachable.into()),
-                Err(ChannelDialError::Failed(e)) => last = Some(e),
+                Err(ChannelDialError::Failed(e) | ChannelDialError::ConnectFailed(e)) => last = Some(e),
             }
         }
     }

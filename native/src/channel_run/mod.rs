@@ -499,7 +499,7 @@ where
                     );
                     join_via_relay_fallback(relay, request, holder, ChannelRole::Initiate, own_noise_private, &peer_noise, local, upgrade).await?;
                 }
-                Err(ChannelDialError::Failed(e)) => return Err(e),
+                Err(ChannelDialError::Failed(e) | ChannelDialError::ConnectFailed(e)) => return Err(e),
             }
         }
         ChannelRole::Accept => match listener {

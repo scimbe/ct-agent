@@ -2279,6 +2279,43 @@ fn is_transport_handshake_eof_matches_the_field_captured_wording_40() {
 }
 
 #[test]
+fn is_transport_handshake_eof_recognizes_the_typed_connect_failure_regardless_of_wording() {
+    // Consolidation program (typed-errors-first pass): a real `ChannelDialError::ConnectFailed`
+    // boxing an `io::Error` of kind `UnexpectedEof` must be recognized WITHOUT relying on the
+    // exact "tls handshake eof" wording -- proving the typed path, not just the substring
+    // fallback the tests above already cover. A rustls/tokio-rustls dependency bump that
+    // reworded this message (kept the same `ErrorKind`, changed the text) would have silently
+    // defeated the OLD substring-only classifier, reverting straight into the CADS-Tunnel#335
+    // fast-retry flood -- this is exactly the regression that fix closes.
+    let inner = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "some future rustls wording");
+    let dial_err: BoxError = Box::new(ChannelDialError::ConnectFailed(Box::new(inner)));
+    assert!(
+        is_transport_handshake_eof(&dial_err),
+        "a ConnectFailed(UnexpectedEof) must be recognized via its typed io::ErrorKind, \
+         independent of message wording"
+    );
+}
+
+#[test]
+fn is_transport_handshake_eof_does_not_misclassify_a_post_handshake_exchange_eof() {
+    // Consolidation program: an admission-EXCHANGE-phase failure (`ChannelDialError::Failed`,
+    // e.g. the peer closing mid-exchange after a successful TLS handshake -- CADS-Tunnel#533's
+    // class) can surface the SAME `io::ErrorKind::UnexpectedEof` as a genuine handshake EOF for
+    // a completely different reason. It must NOT feed the #40 handshake-EOF backoff counter --
+    // that would misclassify an ordinary exchange failure as a connection-cap-saturation signal
+    // and apply the wrong backoff policy. This is exactly why `ConnectFailed` had to be a
+    // distinct variant from `Failed` rather than reusing one and walking the source chain
+    // generically.
+    let inner = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "peer closed mid-exchange");
+    let dial_err: BoxError = Box::new(ChannelDialError::Failed(Box::new(inner)));
+    assert!(
+        !is_transport_handshake_eof(&dial_err),
+        "an exchange-phase UnexpectedEof (ChannelDialError::Failed) must not be classified as a \
+         handshake EOF -- only ConnectFailed's typed path may"
+    );
+}
+
+#[test]
 fn handshake_eof_backoff_is_exponential_and_capped_between_transient_and_refusal_40() {
     let base = std::time::Duration::from_millis(200);
     assert_eq!(handshake_eof_backoff(base, 0), base, "zero EOFs -> the unchanged fast retry");

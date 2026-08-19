@@ -145,7 +145,19 @@ pub enum ChannelDialError {
     /// **direct** path. This is the signal to fall back to the edge relay, not an error
     /// to surface to the user.
     Unreachable,
-    /// The dial failed for another reason (bad address, endpoint setup, connect error).
+    /// The **front-door TLS-TCP `:443` connect step itself** failed (consolidation program,
+    /// typed-errors-first pass, split out of the former single `Failed` variant): TCP
+    /// connect, or the TLS handshake up to `connector.connect()` returning. Kept distinct
+    /// from [`Self::Failed`] so [`crate::channel_run::errors::is_transport_handshake_eof`]
+    /// can downcast to the boxed `std::io::Error` and check `kind()` structurally — a
+    /// post-handshake admission-exchange EOF (a totally different failure with a totally
+    /// different meaning) can surface with the SAME `io::ErrorKind::UnexpectedEof`, so the
+    /// two phases must stay in different variants or that classifier could not tell them
+    /// apart without also risking misreading a normal exchange failure as the CADS-Tunnel#335
+    /// connection-cap-saturation signal.
+    ConnectFailed(BoxError),
+    /// The dial failed for another reason (bad address, endpoint setup, connect error, or
+    /// the admission exchange itself after a successful connect).
     Failed(BoxError),
 }
 
@@ -153,12 +165,20 @@ impl std::fmt::Display for ChannelDialError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ChannelDialError::Unreachable => write!(f, "peer unreachable on the direct path"),
+            ChannelDialError::ConnectFailed(e) => write!(f, "front-door TLS connect failed: {e}"),
             ChannelDialError::Failed(e) => write!(f, "direct dial failed: {e}"),
         }
     }
 }
 
-impl std::error::Error for ChannelDialError {}
+impl std::error::Error for ChannelDialError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ChannelDialError::Unreachable => None,
+            ChannelDialError::ConnectFailed(e) | ChannelDialError::Failed(e) => Some(e.as_ref()),
+        }
+    }
+}
 
 /// Dial a paired peer's advertised endpoint directly over QUIC (accept-any transport —
 /// Noise_IK is the real auth), bounded by `timeout`. A timeout is classified as
@@ -254,7 +274,7 @@ pub async fn present_channel_join_via_ladder(
                         }
                         _ => crate::transport::tcp_tls_connect_channel(endpoint, edge_cert).await,
                     }
-                    .map_err(ChannelDialError::Failed)?;
+                    .map_err(ChannelDialError::ConnectFailed)?;
                     // #495 slice 2a (v0.4.14): mark the RENDEZVOUS phase on KA-generation
                     // edges (see the relay ladder's twin comment for the why).
                     let phase_marker = crate::channel::phase_marker_for(&stream, crate::channel::PHASE_MARKER_RENDEZVOUS);

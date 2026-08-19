@@ -180,13 +180,36 @@ pub(crate) const HANDSHAKE_EOF_BACKOFF_CAP: std::time::Duration = std::time::Dur
 /// TLS-handshake EOF -- no application byte exchanged on either side -- rather than a genuine
 /// refusal or a park expiry? CADS-Tunnel#335's traced root cause: the edge's `:443` connection
 /// cap sheds an accepted TCP socket by dropping it BEFORE the TLS handshake when full, which
-/// surfaces to the dialer as exactly this. String-matched, not typed: this crosses the TLS
-/// library's own error boundary (tokio-rustls), the exact wording CADS-Tunnel#335's field log
-/// captured (`ct-agent channel: debug relay-gate tcp+tls connect to ... failed after ~35ms: tls
-/// handshake eof`). Extend the substring list here if another TLS backend (the "boring" ALPN
-/// dialer, [`crate::transport::tcp_tls_connect_channel_boring`]) is ever observed to word this
+/// surfaces to the dialer as exactly this.
+///
+/// Typed first (consolidation program, typed-errors-first pass): the front-door TLS connect
+/// step boxes its `std::io::Error` directly into
+/// [`super::dialing::ChannelDialError::ConnectFailed`] (`?` preserves the concrete type), and
+/// rustls/tokio-rustls surface a peer closing before the handshake completes as
+/// `io::ErrorKind::UnexpectedEof` -- that call site does nothing else that could produce that
+/// kind, so `kind()` alone is unambiguous THERE. It must stay scoped to `ConnectFailed`
+/// specifically, not walked across the whole error generically: a post-handshake admission-
+/// exchange failure (`ChannelDialError::Failed`) can surface the SAME `UnexpectedEof` kind for
+/// a completely different reason (the peer closing mid-exchange, CADS-Tunnel#533's class), and
+/// conflating the two would misfeed this backoff counter from the wrong signal.
+///
+/// The substring fallback below is kept for whatever still crosses a stringifying boundary
+/// (mirrors [`is_definitive_admission_refusal`]'s typed-first-then-substring shape) -- the exact
+/// wording CADS-Tunnel#335's field log captured (`ct-agent channel: debug relay-gate tcp+tls
+/// connect to ... failed after ~35ms: tls handshake eof`). Extend the substring list here if
+/// another TLS backend (the "boring" ALPN dialer,
+/// [`crate::transport::tcp_tls_connect_channel_boring`]) is ever observed to word this
 /// differently -- not assumed identical without a field sample.
 pub(crate) fn is_transport_handshake_eof(e: &BoxError) -> bool {
+    if let Some(super::dialing::ChannelDialError::ConnectFailed(inner)) =
+        e.downcast_ref::<super::dialing::ChannelDialError>()
+    {
+        if let Some(io_err) = inner.downcast_ref::<std::io::Error>() {
+            if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
+                return true;
+            }
+        }
+    }
     e.to_string().contains("tls handshake eof")
 }
 
