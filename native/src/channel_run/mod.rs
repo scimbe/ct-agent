@@ -42,7 +42,7 @@ use crate::channel::{
     present_channel_join, present_channel_join_on_stream, present_channel_relay_join_on_stream,
     ChannelJoinOutcome, ADMISSION_EXCHANGE_TIMEOUT,
 };
-use ct_common::a2a::{a2a_initiate, a2a_respond};
+use ct_common::a2a::{a2a_initiate, a2a_respond_verified};
 use ct_common::noise::noise_pump;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -310,7 +310,14 @@ where
             ChannelRole::Initiate => {
                 a2a_initiate(&mut send, &mut recv, own_noise_private, peer_noise_public).await
             }
-            ChannelRole::Accept => a2a_respond(&mut send, &mut recv, own_noise_private).await,
+            // ct-agent#35: was the plain, unverified `a2a_respond` -- the caller had already
+            // attestation-verified `peer_noise_public` (run_channel_join_with_admission,
+            // #101 SEC101c-ii) and simply never used it here, so the responder authenticated
+            // nothing about who it was talking to at the Noise layer. `a2a_respond_verified`
+            // refuses the session if the live peer's static key doesn't match.
+            ChannelRole::Accept => {
+                a2a_respond_verified(&mut send, &mut recv, own_noise_private, peer_noise_public).await
+            }
         }
     };
     let session = tokio::time::timeout(A2A_HANDSHAKE_TIMEOUT, handshake)

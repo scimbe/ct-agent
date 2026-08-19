@@ -214,7 +214,7 @@ where
 {
     use ct_common::a2a::establish_direct_session;
     use ct_common::upgrade::{
-        run_upgradable_session_initiator, run_upgradable_session_responder, Role, UpgradeCoordinator,
+        run_upgradable_session_initiator, run_upgradable_session_responder_verified, Role, UpgradeCoordinator,
     };
 
     let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::other(e.to_string());
@@ -297,11 +297,12 @@ where
         }
         ChannelRole::Accept => {
             let coord = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
-            run_upgradable_session_responder(
+            run_upgradable_session_responder_verified(
                 relay_send,
                 relay_recv,
                 local,
                 &relay_priv,
+                &relay_peer,
                 coord,
                 1,
                 // #137 SSRF guard (reflexive candidate) / #276 same-subnet guard (local
@@ -320,7 +321,13 @@ where
                     );
                     chosen.is_some()
                 },
-                move |ep: String| async move {
+                // ct-agent#35: was the plain (non-`_verified`) responder, so this closure never
+                // saw an attested key at all -- `establish_direct_session` pinned whatever
+                // `peer_noise_public` this function was called with, unchecked against the live
+                // peer. `_verified` hands the ATTESTED key down as `expected_peer` (same pattern
+                // ct-agent#11 already established for the DCUtR path, p2p.rs): using it here
+                // instead of the captured `direct_peer` keeps one source of truth.
+                move |ep: String, expected_peer: [u8; 32]| async move {
                     // Dial the selected candidate (SSRF/same-subnet-guarded, #137/#276) and
                     // handshake as the direct-Noise INITIATOR. No dialable candidate → stay on relay.
                     let addr = match select_upgrade_candidate(&ep) {
@@ -341,7 +348,7 @@ where
                             return None;
                         }
                     };
-                    match establish_direct_session(s, r, true, &direct_priv, &direct_peer).await {
+                    match establish_direct_session(s, r, true, &direct_priv, &expected_peer).await {
                         Ok(session) => {
                             eprintln!("ct-agent channel: #104 upgrade — direct Noise session established with {addr}, cutting over from relay");
                             Some(session)

@@ -1544,6 +1544,55 @@ async fn run_channel_session_on_stream_forms_the_noise_tunnel_over_a_plain_duple
 }
 
 #[tokio::test]
+async fn accept_role_refuses_a_peer_whose_live_key_does_not_match_the_expected_one_35() {
+    // ct-agent#35: before this fix, the Accept role's handshake (`a2a_respond`, no verification
+    // parameter at all) accepted a session from ANY peer that completed a valid Noise_IK
+    // handshake -- a real, unregistered peer, not merely an impostor guessing a key -- because
+    // `peer_noise_public` (the caller's already attestation-verified value, #101) was simply
+    // never consulted. C completes a genuine handshake with A, but A's accept side is told to
+    // expect member B's key, not C's: the session must now be refused, not silently accepted
+    // under B's identity.
+    use ct_common::noise::generate_static_keypair;
+    use tokio::io::{duplex, split};
+
+    let a = generate_static_keypair();
+    let b = generate_static_keypair(); // the key A's accept side is (wrongly) told to expect
+    let c = generate_static_keypair(); // the real, live initiator -- NOT b
+    let (a_priv, _a_pub) = (a.private, a.public);
+    let (c_priv, _c_pub) = (c.private, c.public);
+    let (_b_priv, b_pub) = (b.private, b.public);
+
+    let (a_transport, c_transport) = duplex(16 * 1024);
+    let (_a_app, a_local) = duplex(16 * 1024);
+    let (_c_app, c_local) = duplex(16 * 1024);
+
+    let a_task = tokio::spawn(async move {
+        let (ar, aw) = split(a_transport);
+        // A expects B's key, but the live initiator below is C.
+        run_channel_session_on_stream(aw, ar, ChannelRole::Accept, &a_priv, &b_pub, a_local).await
+    });
+    let c_task = tokio::spawn(async move {
+        let (cr, cw) = split(c_transport);
+        run_channel_session_on_stream(cw, cr, ChannelRole::Initiate, &c_priv, &a.public, c_local).await
+    });
+
+    // Only A's (Accept/verifying side) outcome is under test. C completed a real Noise_IK
+    // handshake from its own point of view (Noise_IK's initiator has no way to learn that the
+    // responder rejected the SESSION post-handshake, only that the transport later went away) and
+    // its pump loop has no reason to exit on its own here -- abort it once A has answered rather
+    // than waiting on a task this test never expects to finish.
+    let a_result = tokio::time::timeout(std::time::Duration::from_secs(5), a_task)
+        .await
+        .expect("A must resolve well within the #126 handshake timeout, not hang")
+        .expect("a's task did not panic");
+    c_task.abort();
+    assert!(
+        a_result.is_err(),
+        "the accept side must refuse a live peer that doesn't match the expected (attested) key"
+    );
+}
+
+#[tokio::test]
 async fn graceful_stream_drain_returns_when_the_peer_closes() {
     // #150 (frozen): the drain FINs our write half and reads the peer to EOF — so once the peer
     // closes it returns promptly, having kept us alive just long enough to flush our tail (the
@@ -2818,6 +2867,7 @@ async fn runner_pipes_local_data_over_the_a2a_tunnel() {
     let responder = generate_static_keypair();
     let resp_priv = responder.private;
     let init_priv = initiator.private;
+    let init_pub = initiator.public;
     let resp_pub = responder.public;
 
     let (server, cert) = build_server_endpoint_with_cert().expect("server");
@@ -2827,7 +2877,9 @@ async fn runner_pipes_local_data_over_the_a2a_tunnel() {
     let (mut resp_local_test, resp_local_run) = tokio::io::duplex(8192);
     let resp_task = tokio::spawn(async move {
         let conn = server.accept().await.expect("incoming").await.expect("conn");
-        run_channel_session(&conn, ChannelRole::Accept, &resp_priv, &[0u8; 32], resp_local_run)
+        // ct-agent#35: expect the real initiator's key, not a dead placeholder --
+        // now enforced (a2a_respond_verified), not merely accepted-and-ignored.
+        run_channel_session(&conn, ChannelRole::Accept, &resp_priv, &init_pub, resp_local_run)
             .await
             .expect("responder session");
     });
@@ -2904,6 +2956,11 @@ async fn channel_join_initiator_uses_the_rendezvous_peer_and_pipes_data() {
     use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
     use ed25519_dalek::Signer;
 
+    // ct-agent#35: generated before the responder task so its public key (now enforced,
+    // not a placeholder) can be given to the Accept side below.
+    let initiator_noise = generate_static_keypair();
+    let inpub = initiator_noise.public;
+
     // Responder: a real direct listener running the Accept side of the session.
     let responder_noise = generate_static_keypair();
     let (resp_listener, _c) = crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("listener");
@@ -2912,7 +2969,7 @@ async fn channel_join_initiator_uses_the_rendezvous_peer_and_pipes_data() {
     let rnp = responder_noise.private;
     let resp_task = tokio::spawn(async move {
         let conn = resp_listener.accept().await.expect("incoming").await.expect("conn");
-        run_channel_session(&conn, ChannelRole::Accept, &rnp, &[0u8; 32], resp_local_run)
+        run_channel_session(&conn, ChannelRole::Accept, &rnp, &inpub, resp_local_run)
             .await
             .expect("responder session");
     });
@@ -2933,7 +2990,6 @@ async fn channel_join_initiator_uses_the_rendezvous_peer_and_pipes_data() {
     });
 
     // Initiator: run_channel_join over a connection to the (stub) broker.
-    let initiator_noise = generate_static_keypair();
     let op = SigningKey::from_bytes(&[7u8; 32]);
     let holder = SigningKey::from_bytes(&[0x11u8; 32]);
     let g = ChannelGrant {
@@ -3001,6 +3057,11 @@ async fn run_channel_join_with_admission_runs_the_direct_session_from_a_443_ladd
 
     let channel = [0x6Au8; 32];
 
+    // ct-agent#35: generated before the responder task so its public key (now enforced,
+    // not a placeholder) can be given to the Accept side below.
+    let initiator_noise = generate_static_keypair();
+    let inpub = initiator_noise.public;
+
     // Responder: a real direct listener running the Accept side of the session.
     let responder_noise = generate_static_keypair();
     let (resp_listener, _c) =
@@ -3010,7 +3071,7 @@ async fn run_channel_join_with_admission_runs_the_direct_session_from_a_443_ladd
     let rnp = responder_noise.private;
     let resp_task = tokio::spawn(async move {
         let conn = resp_listener.accept().await.expect("incoming").await.expect("conn");
-        run_channel_session(&conn, ChannelRole::Accept, &rnp, &[0u8; 32], resp_local_run)
+        run_channel_session(&conn, ChannelRole::Accept, &rnp, &inpub, resp_local_run)
             .await
             .expect("responder session");
     });
@@ -3105,7 +3166,6 @@ async fn run_channel_join_with_admission_runs_the_direct_session_from_a_443_ladd
     let unused_relay = sc.connect(scratch_addr, "localhost").expect("cfg").await.expect("scratch conn");
 
     // The outcome-driven data path dials the responder directly and pumps bytes.
-    let initiator_noise = generate_static_keypair();
     let (mut a_local_test, a_local_run) = tokio::io::duplex(8192);
     let inp = initiator_noise.private;
     let a_task = tokio::spawn(async move {
@@ -3863,6 +3923,7 @@ async fn initiator_dials_without_a_pre_shared_cert_noise_authenticates() {
     let responder = generate_static_keypair();
     let resp_priv = responder.private;
     let init_priv = initiator.private;
+    let init_pub = initiator.public;
     let resp_pub = responder.public;
 
     let (server, _cert) = build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("listener");
@@ -3871,7 +3932,8 @@ async fn initiator_dials_without_a_pre_shared_cert_noise_authenticates() {
     let (mut resp_local_test, resp_local_run) = tokio::io::duplex(8192);
     let resp_task = tokio::spawn(async move {
         let conn = server.accept().await.expect("incoming").await.expect("conn");
-        run_channel_session(&conn, ChannelRole::Accept, &resp_priv, &[0u8; 32], resp_local_run)
+        // ct-agent#35: expect the real initiator's key (now enforced), not a placeholder.
+        run_channel_session(&conn, ChannelRole::Accept, &resp_priv, &init_pub, resp_local_run)
             .await
             .expect("responder session");
     });
@@ -3913,7 +3975,8 @@ async fn large_transfer_is_not_truncated_when_the_sender_tears_down_after_the_se
 
     let initiator = generate_static_keypair();
     let responder = generate_static_keypair();
-    let (init_priv, resp_priv, resp_pub) = (initiator.private, responder.private, responder.public);
+    let (init_priv, init_pub, resp_priv, resp_pub) =
+        (initiator.private, initiator.public, responder.private, responder.public);
 
     // ~1 MiB — well past the ~144 KiB first-flight/window where the truncation was observed.
     let payload: Vec<u8> = (0..(1024u32 * 1024)).map(|i| (i % 251) as u8).collect();
@@ -3933,7 +3996,8 @@ async fn large_transfer_is_not_truncated_when_the_sender_tears_down_after_the_se
         let (mut resp_test_r, resp_test_w) = tokio::io::split(resp_test);
         drop(resp_test_w); // responder→initiator app source EOF
         let _sess = tokio::spawn(async move {
-            let _ = run_channel_session(&conn, ChannelRole::Accept, &resp_priv, &[0u8; 32], resp_run).await;
+            // ct-agent#35: expect the real initiator's key (now enforced), not a placeholder.
+            let _ = run_channel_session(&conn, ChannelRole::Accept, &resp_priv, &init_pub, resp_run).await;
             // keep `conn` alive for the session's lifetime, then drop
             drop(conn);
         });
