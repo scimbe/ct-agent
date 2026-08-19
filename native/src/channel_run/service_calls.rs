@@ -8,6 +8,9 @@
 //! service-handler subprocess runner with its #200 timeout.
 
 use super::*;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::ReadBuf;
 
 /// The channel session's local application duplex (#135 L2.1-cli). **Pipe** mode (default) is the
 /// CLI's stdin/stdout — the historical one-shot behaviour (stdin-EOF tears the session down).
