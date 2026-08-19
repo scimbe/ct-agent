@@ -279,7 +279,9 @@ pub async fn present_channel_join_via_ladder(
                 // Direct: QUIC to the channel port. Unreachable falls through to :443.
                 async {
                     let conn = dial_peer_direct(endpoint, direct_timeout).await?;
-                    present_channel_join(&conn, request, holder)
+                    // CADS-Tunnel#495 U2 (a'): this rung's twin :443 leg above marks
+                    // PHASE_MARKER_RENDEZVOUS (admission-only, same as this direct-QUIC rung).
+                    present_channel_join_marked(&conn, request, holder, PHASE_MARKER_RENDEZVOUS)
                         .await
                         .map_err(ChannelDialError::Failed)
                 }

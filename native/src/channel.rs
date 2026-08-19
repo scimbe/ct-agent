@@ -113,16 +113,19 @@ pub enum ChannelJoinOutcome {
 pub(crate) const ADMISSION_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// #495 slice 2a (v0.4.14): the optional phase preamble a KA-generation client sends
-/// before its length-framed join -- [0xFF, phase]. Only ever sent when the TLS
-/// negotiation selected a KA id (see `transport::ka_negotiated`): an old edge selected a
-/// legacy id and receives byte-identical legacy traffic. The magic 0xFF is unambiguous
-/// against the length prefix (it would mean a >=65280-byte join, refused as len-oob by
-/// every edge since the field existed).
+/// before its length-framed join -- [0xFF, phase]. On a `:443` TLS-TCP leg, only ever
+/// sent when the TLS negotiation selected a KA id (see `transport::ka_negotiated`): an
+/// old edge selected a legacy id and receives byte-identical legacy traffic. On QUIC
+/// (CADS-Tunnel#495 U2 (a'), [`present_channel_join_marked`]) there is no ALPN to gate
+/// on at all -- safety instead rests entirely on the length-prefix property below,
+/// which holds on every transport equally. The magic 0xFF is unambiguous against the
+/// length prefix (it would mean a >=65280-byte join, refused as len-oob by every edge
+/// since the field existed).
 /// #495 measurement isolation (requested by the tester after the 2a series proved
 /// unrunnable with published binaries): `CT_CHANNEL_PHASE_MARKER=off` (or `0`)
-/// suppresses the v0.4.14 phase preamble while keeping everything else identical —
-/// the only way to vary the marker as a SINGLE variable, since every marked release
-/// also carries the #494 ack-reader fix. Default: markers on.
+/// suppresses the phase preamble on EVERY transport while keeping everything else
+/// identical — the only way to vary the marker as a SINGLE variable, since every marked
+/// release also carries the #494 ack-reader fix. Default: markers on.
 pub(crate) fn phase_marker_enabled() -> bool {
     phase_marker_enabled_from(std::env::var("CT_CHANNEL_PHASE_MARKER").ok().as_deref())
 }
@@ -201,6 +204,44 @@ pub async fn present_channel_join(
     request: &ChannelJoinRequest,
     holder: &SigningKey,
 ) -> Result<ChannelJoinOutcome, BoxError> {
+    present_channel_join_quic(conn, request, holder, None).await
+}
+
+/// CADS-Tunnel#495 U2 (a'): the QUIC analog of [`present_channel_join`] that also sends the
+/// `[0xFF, phase]` phase preamble -- previously every QUIC join hardcoded `None` here
+/// regardless of the operator switch, which is exactly the gap #495's own status table
+/// tracked as "(a') ct-agent sendet den Marker -- offen, braucht ein Release": the edge's
+/// QUIC-side tolerance for the marker ((b'), CADS-Tunnel#495 slice U2) has been live and
+/// field-verified since 2026-08-19, but was inert because no released ct-agent ever sent
+/// one on this transport.
+///
+/// Gated ONLY on [`phase_marker_enabled`] -- unlike [`phase_marker_for`]'s `:443` twin,
+/// this is deliberately NOT also gated on a negotiated-ALPN check: QUIC has no ALPN
+/// concept at all, and the edge's own wire-safety argument for tolerating an unexpected
+/// marker rests entirely on the length-prefix property (`[0xFF, phase]` reads as a
+/// declared length of >= 65280 bytes to any edge without the #495(b') peek -- a clean
+/// len-oob refusal, never a hang), not on ALPN-negotiated detection.
+///
+/// `phase` should be [`PHASE_MARKER_RENDEZVOUS`] for a pure admission connection (the
+/// peer is learned here but the actual session runs elsewhere -- e.g. a `broker_conn`)
+/// and [`PHASE_MARKER_RELAY`] for a connection the spliced/relayed session itself runs
+/// over afterward (e.g. a `relay_conn`) -- mirroring the `:443` front-door callers'
+/// existing [`phase_marker_for`] convention so the two transports cannot drift apart.
+pub(crate) async fn present_channel_join_marked(
+    conn: &Connection,
+    request: &ChannelJoinRequest,
+    holder: &SigningKey,
+    phase: u8,
+) -> Result<ChannelJoinOutcome, BoxError> {
+    present_channel_join_quic(conn, request, holder, phase_marker_enabled().then_some(phase)).await
+}
+
+async fn present_channel_join_quic(
+    conn: &Connection,
+    request: &ChannelJoinRequest,
+    holder: &SigningKey,
+    phase_marker: Option<u8>,
+) -> Result<ChannelJoinOutcome, BoxError> {
     // #140: bound `open_bi` too — it is the QUIC-path analog of the unbounded exchange below and
     // was equally unbounded past dial_peer_direct's connect timeout.
     let (send, recv) = tokio::time::timeout(ADMISSION_EXCHANGE_TIMEOUT, conn.open_bi())
@@ -208,7 +249,7 @@ pub async fn present_channel_join(
         .map_err(|_| -> BoxError { "channel join open_bi stalled after connect (#140)".into() })??;
     // finish_send_after_sig = true: on QUIC the post-signature shutdown is quinn's clean
     // per-stream finish() -- connection-scoped state is untouched (unlike a TCP/TLS leg).
-    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT, true, None, false).await
+    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT, true, phase_marker, false).await
 }
 
 /// The transport-agnostic core of [`present_channel_join`]: run the channel-join wire
@@ -1465,6 +1506,47 @@ mod tests {
             let _ = sw.shutdown().await;
             let _ = presenter.await;
         }
+    }
+
+    /// CADS-Tunnel#495 U2 (a'): `present_channel_join_marked` actually puts the `[0xFF,
+    /// phase]` preamble on the QUIC wire -- the exact gap #495's own status table named
+    /// ("(a') ct-agent sendet den Marker -- offen"). Drives a REAL quinn connection (not
+    /// a bare duplex, unlike the relay-leg twin above) so the assertion covers the whole
+    /// `present_channel_join_marked` -> `open_bi` -> `present_channel_join_on_stream`
+    /// path, not just the wire-writing core.
+    #[tokio::test]
+    async fn present_channel_join_marked_prefixes_the_quic_join_495_u2() {
+        let channel = [0x15u8; 32];
+        let holder = SigningKey::from_bytes(&[0x42u8; 32]);
+        let request = ChannelJoinRequest {
+            grant: signed_grant(channel, &holder, Direction::Initiate),
+            endpoint: "203.0.113.15:1515".to_string(),
+        };
+        let expected_len = request.encode().len() as u16;
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.expect("incoming").await.expect("conn");
+            let (_s, mut r) = conn.accept_bi().await.expect("accept_bi");
+            let mut head = [0u8; 4];
+            r.read_exact(&mut head).await.expect("wire head");
+            head
+        });
+
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let req = request.clone();
+        let hk = SigningKey::from_bytes(&[0x42u8; 32]);
+        let presenter = tokio::spawn(async move {
+            let _ = present_channel_join_marked(&conn, &req, &hk, PHASE_MARKER_RENDEZVOUS).await;
+        });
+
+        let head = srv.await.expect("server task");
+        assert_eq!(head[0], PHASE_PREAMBLE_MAGIC, "preamble magic first on the real QUIC wire");
+        assert_eq!(head[1], PHASE_MARKER_RENDEZVOUS, "phase byte second");
+        assert_eq!(u16::from_be_bytes([head[2], head[3]]), expected_len, "then the length, unmoved");
+        let _ = presenter.await;
     }
 
     /// CADS-Tunnel#557: the marker is DERIVED from the shared prefix, not copied beside it.

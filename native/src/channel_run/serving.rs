@@ -62,7 +62,8 @@ pub(crate) async fn admit_one_peer(ctx: &ServeSessionCtx) -> Result<ChannelJoinO
             let broker_conn = crate::transport::build_channel_dialer()?
                 .connect(ctx.broker_addr, "localhost")?
                 .await?;
-            present_channel_join(&broker_conn, &ctx.request, &ctx.holder).await?
+            // CADS-Tunnel#495 U2 (a'): broker_conn is admission-only -- PHASE_MARKER_RENDEZVOUS.
+            present_channel_join_marked(&broker_conn, &ctx.request, &ctx.holder, PHASE_MARKER_RENDEZVOUS).await?
         }
     };
     reject_refused_outcome(outcome)
@@ -299,7 +300,8 @@ pub(crate) async fn run_one_admission_session(
             let broker_conn = crate::transport::build_channel_dialer()?
                 .connect(cfg.broker_addr, "localhost")?
                 .await?;
-            present_channel_join(&broker_conn, request, &cfg.holder).await?
+            // CADS-Tunnel#495 U2 (a'): broker_conn is admission-only -- PHASE_MARKER_RENDEZVOUS.
+            present_channel_join_marked(&broker_conn, request, &cfg.holder, PHASE_MARKER_RENDEZVOUS).await?
         }
     };
     // The relay data leg mirrors the broker leg (#106 relay-leg-443): with a `:443` front-door cert

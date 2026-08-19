@@ -93,7 +93,11 @@ where
 {
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
-    let (peer_noise, own_observed_reflexive) = match present_channel_join(relay_conn, request, holder).await? {
+    // CADS-Tunnel#495 U2 (a'): relay_conn's actual (post-admission) bi-stream carries the
+    // relay-gate leg's data below -- PHASE_MARKER_RELAY, mirroring the :443 relay ladder's
+    // own phase_marker_for(&stream, PHASE_MARKER_RELAY) call.
+    let (peer_noise, own_observed_reflexive) =
+        match present_channel_join_marked(relay_conn, request, holder, PHASE_MARKER_RELAY).await? {
         ChannelJoinOutcome::Admitted {
             peer_noise_pubkey: Some(noise),
             peer_holder,

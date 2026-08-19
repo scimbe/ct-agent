@@ -3017,8 +3017,23 @@ async fn stub_broker_admit(
 ) {
     let conn = server.accept().await.expect("incoming").await.expect("conn");
     let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
-    let mut len = [0u8; 2];
-    recv.read_exact(&mut len).await.expect("len");
+    // CADS-Tunnel#495 U2 (a'): run_channel_join's broker_conn leg now optionally sends a
+    // `[0xFF, phase]` preamble ahead of the length prefix (present_channel_join_marked).
+    // This hand-rolled stub predates that -- without tolerating it, the first two bytes
+    // (0xFF plus a phase byte) get misread as a length of >= 65280, and the stub hangs
+    // forever in read_exact waiting for a request body that large that never arrives
+    // (found live: channel_join_initiator_uses_the_rendezvous_peer_and_pipes_data hung
+    // for real once run_channel_join started marking). Peek-and-tolerate exactly like the
+    // real edge's own preamble handling (crates/edge/src/channel_broker.rs).
+    let mut head = [0u8; 2];
+    recv.read_exact(&mut head).await.expect("head");
+    let len = if head[0] == crate::channel::PHASE_PREAMBLE_MAGIC {
+        let mut real_len = [0u8; 2];
+        recv.read_exact(&mut real_len).await.expect("len after preamble");
+        real_len
+    } else {
+        head
+    };
     let mut buf = vec![0u8; u16::from_be_bytes(len) as usize];
     recv.read_exact(&mut buf).await.expect("req");
     send.write_all(&[0u8; 32]).await.expect("challenge"); // possession challenge

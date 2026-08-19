@@ -14,10 +14,10 @@ repository = "https://github.com/scimbe/ct-agent"
 # native-only (never needed by the wasm build) so they keep their own explicit
 # pins here, bumped in lockstep with the shared one by convention.
 ct-common.workspace = true
-ct-control-plane = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.16" }
+ct-control-plane = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.17" }
 # ACME (ADR-0003): Dns01Provider (SelfHosted ct-dns / deSEC) publishes the
 # _acme-challenge TXT record the DNS-01 validation reads.
-ct-dns = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.16" }
+ct-dns = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.17" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 # #248-follow: opt-in only (see main.rs -- initialized only when RUST_LOG is set, same
 # off-by-default pattern as CT_DEBUG_A2A_TIMING). quinn/libp2p already emit their own
@@ -90,5 +90,5 @@ http-body-util = "0.1"
 # Cross-crate integration tests (channel.rs, transport.rs, serve.rs, channel_run.rs) drive
 # a real ct-edge relay / ct-client dialer end-to-end. Same pinned-tag git dependency as the
 # runtime deps above -- these are dev-only, never shipped in a release binary.
-ct-edge = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.16" }
-ct-client = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.16" }
+ct-edge = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.17" }
+ct-client = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.17" }

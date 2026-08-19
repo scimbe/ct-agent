@@ -39,8 +39,8 @@ use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::channel::{
-    present_channel_join, present_channel_join_on_stream, present_channel_relay_join_on_stream,
-    ChannelJoinOutcome, ADMISSION_EXCHANGE_TIMEOUT,
+    present_channel_join_marked, present_channel_join_on_stream, present_channel_relay_join_on_stream,
+    ChannelJoinOutcome, ADMISSION_EXCHANGE_TIMEOUT, PHASE_MARKER_RELAY, PHASE_MARKER_RENDEZVOUS,
 };
 use ct_common::a2a::{a2a_initiate, a2a_respond_verified};
 use ct_common::noise::noise_pump;
@@ -384,7 +384,9 @@ where
     // outcome-driven data path. The plane CLI instead admits over the broker *ladder*
     // (direct QUIC → the `:443` front door) and calls [`run_channel_join_with_admission`]
     // directly — same data path, but the broker leg reachable when the ports are blocked.
-    let admission = present_channel_join(broker_conn, request, holder).await?;
+    // CADS-Tunnel#495 U2 (a'): broker_conn is admission-only -- the actual session runs
+    // over the separately-passed relay_conn/direct connection below -- PHASE_MARKER_RENDEZVOUS.
+    let admission = present_channel_join_marked(broker_conn, request, holder, PHASE_MARKER_RENDEZVOUS).await?;
     run_channel_join_with_admission(
         admission,
         RelayFallback::Quic(relay_conn),
@@ -573,7 +575,10 @@ pub async fn join_via_relay<P>(
 where
     P: AsyncRead + AsyncWrite + Unpin,
 {
-    match present_channel_join(relay_conn, request, holder).await? {
+    // CADS-Tunnel#495 U2 (a'): relay_conn's own bi-stream carries the session below --
+    // PHASE_MARKER_RELAY, mirroring the :443 relay ladder's phase_marker_for(&stream,
+    // PHASE_MARKER_RELAY) call.
+    match present_channel_join_marked(relay_conn, request, holder, PHASE_MARKER_RELAY).await? {
         ChannelJoinOutcome::Admitted { .. } => {}
         ChannelJoinOutcome::Refused { category } => {
             // #524: base string frozen, category appended when present.
@@ -663,7 +668,9 @@ pub async fn join_via_relay_dcutr<P>(
 where
     P: AsyncRead + AsyncWrite + Unpin,
 {
-    let peer_noise = match present_channel_join(relay_conn, request, holder).await? {
+    // CADS-Tunnel#495 U2 (a'): relay_conn's own bi-stream carries the DCUtR base leg
+    // below -- PHASE_MARKER_RELAY.
+    let peer_noise = match present_channel_join_marked(relay_conn, request, holder, PHASE_MARKER_RELAY).await? {
         ChannelJoinOutcome::Admitted { peer_noise_pubkey: Some(noise), peer_holder, peer_attestation, .. } => {
             verify_relayed_dcutr_peer(request, noise, peer_holder, peer_attestation)?
         }
