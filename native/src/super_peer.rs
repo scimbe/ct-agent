@@ -67,12 +67,33 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// against an oversized read filling the stack buffer.
 const MAX_DATAGRAM: usize = 65536;
 
+/// Max distinct local-client mappings (and therefore dedicated upstream sockets + forwarder
+/// tasks) held concurrently. This relay is deliberately protocol-unaware (module doc) — it
+/// never authenticates a sender before opening a real OS socket and spawning a task on their
+/// behalf, so without a ceiling, anyone who can reach `listen` (this module's LAN-local trust
+/// is a convention, not something enforced here) can grow `clients` without bound simply by
+/// sending datagrams from a rotating set of source addresses/ports faster than
+/// `IDLE_TIMEOUT` evicts them — exhausting the process's ephemeral-port range and/or file
+/// descriptors, which can starve this same process's OTHER sockets (its real edge/tunnel
+/// connections). Matches this codebase's existing per-listener connection-cap convention
+/// (`MAX_TCP_CONNECTIONS` in `crates/dns/src/server.rs`, CADS-Tunnel) rather than leaving
+/// this the one unbounded accept loop in the fleet. A legitimate LAN group this relay is
+/// meant for (#276: "3+ members sharing a reflexive address") is nowhere near this ceiling;
+/// hitting it is itself a signal worth logging, not a plausible legitimate-traffic shape.
+const MAX_SUPER_PEER_CLIENTS: usize = 256;
+
 /// Run the super-peer relay forever: bind `listen` (what LAN-local clients dial instead of
 /// the real edge) and transparently forward every datagram to/from `upstream` (the real edge
 /// address this super-peer's own `CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY` already points at).
 /// Returns only on a fatal bind/listen error; per-client forwarding errors are logged and
 /// that one client's mapping is torn down, never the whole relay.
 pub async fn run(listen: SocketAddr, upstream: SocketAddr) -> Result<(), BoxError> {
+    run_with_cap(listen, upstream, MAX_SUPER_PEER_CLIENTS).await
+}
+
+/// [`run`]'s actual implementation, taking the client-count ceiling as a parameter so tests
+/// can exercise it hitting a small cap without opening hundreds of real sockets.
+async fn run_with_cap(listen: SocketAddr, upstream: SocketAddr, max_clients: usize) -> Result<(), BoxError> {
     let front = Arc::new(UdpSocket::bind(listen).await?);
     eprintln!("ct-agent super-peer: relaying {listen} -> {upstream}");
     let clients: Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -84,6 +105,17 @@ pub async fn run(listen: SocketAddr, upstream: SocketAddr) -> Result<(), BoxErro
             let mut locked = clients.lock().await;
             if let Some(sock) = locked.get(&from) {
                 sock.clone()
+            } else if locked.len() >= max_clients {
+                // #46: at the ceiling -- refuse to bind yet another real OS socket on this
+                // unauthenticated sender's behalf. Checked in the SAME critical section as
+                // the insert below, so two new addresses racing in concurrently can't both
+                // slip past a stale count. The client's next datagram (if it's ever going to
+                // be a real, distinct LAN client rather than the flood) is retried the same
+                // way once the map has room.
+                eprintln!(
+                    "ct-agent super-peer: at the client cap ({max_clients}), refusing new client {from}"
+                );
+                continue;
             } else {
                 // First datagram from this local client: open its dedicated upstream socket
                 // and spawn the upstream->local return-path forwarder for it.
@@ -223,6 +255,62 @@ mod tests {
         let port_a = reply_a.rsplit('|').next().unwrap();
         let port_b = reply_b.rsplit('|').next().unwrap();
         assert_ne!(port_a, port_b, "each LAN client is relayed through its own dedicated upstream socket");
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_new_source_addresses_is_capped_not_unbounded_46() {
+        // #46: an unauthenticated sender flooding the relay from many distinct source
+        // addresses must NOT grow `clients` (and its real OS sockets + spawned tasks)
+        // without bound -- prior to this cap, every single one of these would have opened
+        // a fresh upstream UdpSocket and spawned a forwarder task, forever.
+        let edge = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let edge_addr = edge.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            loop {
+                let Ok((n, from)) = edge.recv_from(&mut buf).await else { return };
+                let _ = edge.send_to(&buf[..n], from).await;
+            }
+        });
+
+        let relay_bind = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_bind.local_addr().unwrap();
+        drop(relay_bind);
+        const CAP: usize = 2;
+        tokio::spawn(run_with_cap(relay_addr, edge_addr, CAP));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Two distinct "clients" fill the cap -- both must be served normally.
+        let mut admitted = Vec::new();
+        for i in 0..CAP {
+            let client = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+            client.send_to(format!("client-{i}").as_bytes(), relay_addr).await.unwrap();
+            let mut buf = [0u8; 64];
+            let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+                .await
+                .expect("an admitted client within the cap gets served")
+                .unwrap();
+            assert_eq!(&buf[..n], format!("client-{i}").as_bytes());
+            admitted.push(client);
+        }
+
+        // A THIRD distinct source address arrives once the cap is already full -- must be
+        // refused (no reply), not silently admitted as an unbounded 3rd mapping.
+        let overflow_client = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        overflow_client.send_to(b"overflow", relay_addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        let refused = tokio::time::timeout(Duration::from_millis(300), overflow_client.recv_from(&mut buf)).await;
+        assert!(refused.is_err(), "a new source address beyond the cap must get no reply, not a fresh mapping");
+
+        // The two already-admitted clients are still served -- the cap doesn't disrupt
+        // existing mappings, only refuses NEW ones once full.
+        admitted[0].send_to(b"still-alive", relay_addr).await.unwrap();
+        let mut buf2 = [0u8; 64];
+        let (n2, _) = tokio::time::timeout(Duration::from_secs(2), admitted[0].recv_from(&mut buf2))
+            .await
+            .expect("an already-admitted client keeps working once the cap is full")
+            .unwrap();
+        assert_eq!(&buf2[..n2], b"still-alive");
     }
 
     #[tokio::test]
