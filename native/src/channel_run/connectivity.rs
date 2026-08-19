@@ -94,7 +94,17 @@ where
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
     let (peer_noise, own_observed_reflexive) = match present_channel_join(relay_conn, request, holder).await? {
-        ChannelJoinOutcome::Admitted { peer_noise_pubkey: Some(k), observed_reflexive, .. } => (k, observed_reflexive),
+        ChannelJoinOutcome::Admitted {
+            peer_noise_pubkey: Some(noise),
+            peer_holder,
+            peer_attestation,
+            observed_reflexive,
+            ..
+        } => {
+            // ct-agent#41 (#35 "Path A"): see verify_relayed_dcutr_peer's own doc comment.
+            let noise = verify_relayed_dcutr_peer(request, noise, peer_holder, peer_attestation)?;
+            (noise, observed_reflexive)
+        }
         ChannelJoinOutcome::Admitted { .. } => {
             return Err("DCUtR relay-gate join needs the peer's relayed Noise key (register the member's key, #101)".into())
         }

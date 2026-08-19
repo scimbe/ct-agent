@@ -500,6 +500,98 @@ fn channel_identity_generates_self_service_keys_the_cli_accepts() {
     assert_ne!(id.noise.private, id2.noise.private, "Noise keys are unique per mint");
 }
 
+/// Shared setup for the `verify_relayed_dcutr_peer` tests (ct-agent#41): a `ChannelJoinRequest`
+/// for a fixed channel, and the real holder-signed attestation over a given Noise key --
+/// exactly the triple the edge relays in a real DCUtR admission.
+fn dcutr_attestation_fixture(
+    channel: [u8; 32],
+    signer: &SigningKey,
+    noise_pubkey: [u8; 32],
+) -> (ChannelJoinRequest, [u8; 32], [u8; 64]) {
+    use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+    use ed25519_dalek::Signer as _;
+
+    let holder_pub = signer.verifying_key().to_bytes();
+    let attestation = signer
+        .sign(&ct_common::channel::member_noise_attest_bytes(&ChannelId(channel), &holder_pub, &noise_pubkey))
+        .to_bytes();
+    let op = SigningKey::from_bytes(&[0x99u8; 32]);
+    let g = ChannelGrant {
+        channel: ChannelId(channel),
+        holder: holder_pub,
+        direction: Direction::Accept,
+        rights: Rights::ReadWrite,
+        delegable: false,
+        expires_at: 1_000,
+    };
+    let request = ChannelJoinRequest {
+        grant: SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() },
+        endpoint: "203.0.113.9:9000".to_string(),
+    };
+    (request, holder_pub, attestation)
+}
+
+#[test]
+fn verify_relayed_dcutr_peer_accepts_a_genuinely_attested_key_41() {
+    let channel = [0x7Au8; 32];
+    let signer = SigningKey::from_bytes(&[0x44u8; 32]);
+    let noise = [0x55u8; 32];
+    let (request, holder_pub, attestation) = dcutr_attestation_fixture(channel, &signer, noise);
+
+    let result = verify_relayed_dcutr_peer(&request, noise, Some(holder_pub), Some(attestation));
+    assert_eq!(result.unwrap(), noise, "a genuinely attested key is accepted and returned unchanged");
+}
+
+#[test]
+fn verify_relayed_dcutr_peer_refuses_a_substituted_key_41() {
+    // ct-agent#41 (#35 "Path A"): the exact threat this closes -- a malicious/compromised edge
+    // relays a DIFFERENT Noise key than the one the attestation actually covers (e.g. its own,
+    // for a MITM). The attestation is genuine, just for the WRONG key.
+    let channel = [0x7Au8; 32];
+    let signer = SigningKey::from_bytes(&[0x44u8; 32]);
+    let attested_noise = [0x55u8; 32];
+    let substituted_noise = [0x66u8; 32]; // the edge's own key, say
+    let (request, holder_pub, attestation) = dcutr_attestation_fixture(channel, &signer, attested_noise);
+
+    let result = verify_relayed_dcutr_peer(&request, substituted_noise, Some(holder_pub), Some(attestation));
+    assert!(result.is_err(), "a key that doesn't match its own attestation must be refused, not pinned");
+}
+
+#[test]
+fn verify_relayed_dcutr_peer_refuses_an_attestation_for_the_wrong_channel_41() {
+    // A real signature, over the right holder and the right key -- but for a DIFFERENT
+    // channel than the one this join is for (an attestation minted for another channel,
+    // replayed here). `member_noise_attest_bytes` binds the channel into the signed bytes
+    // specifically so this cannot be reused across channels.
+    let signer = SigningKey::from_bytes(&[0x44u8; 32]);
+    let noise = [0x55u8; 32];
+    let (_other_request, holder_pub, attestation) = dcutr_attestation_fixture([0x7Au8; 32], &signer, noise);
+    let (this_request, _hp2, _att2) = dcutr_attestation_fixture([0x7Bu8; 32], &signer, noise);
+
+    let result = verify_relayed_dcutr_peer(&this_request, noise, Some(holder_pub), Some(attestation));
+    assert!(result.is_err(), "an attestation minted for a different channel must be refused, not replayed here");
+}
+
+#[test]
+fn verify_relayed_dcutr_peer_refuses_a_missing_holder_or_attestation_41() {
+    // ct-agent#41: before this fix, join_via_relay_dcutr/join_via_relay_gate_dcutr discarded
+    // these fields entirely (`..`) and pinned the key unconditionally -- proving the OLD
+    // behavior would have accepted exactly this case (present key, absent holder/attestation).
+    let channel = [0x7Au8; 32];
+    let signer = SigningKey::from_bytes(&[0x44u8; 32]);
+    let noise = [0x55u8; 32];
+    let (request, holder_pub, attestation) = dcutr_attestation_fixture(channel, &signer, noise);
+
+    assert!(
+        verify_relayed_dcutr_peer(&request, noise, None, Some(attestation)).is_err(),
+        "missing peer_holder must be refused, not silently accepted"
+    );
+    assert!(
+        verify_relayed_dcutr_peer(&request, noise, Some(holder_pub), None).is_err(),
+        "missing peer_attestation must be refused, not silently accepted"
+    );
+}
+
 #[test]
 fn front_door_only_drops_the_direct_quic_rung_and_requires_a_front_door_16() {
     // #16 ("UDP flapping"): CT_CHANNEL_FRONT_DOOR_ONLY pins the dial ladders to the

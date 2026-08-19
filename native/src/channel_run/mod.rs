@@ -618,6 +618,39 @@ where
 /// is the same overclaim corrected at [`run_channel_session_upgradable`] and
 /// [`crate::p2p::run_upgradable_dcutr_session`]: ct-agent#6 (open) measures every real cross-NAT
 /// direct dial failing. The lab half of the sentence is accurate and stays.
+/// ct-agent#41 (#35 "Path A"): verify a relay-admitted DCUtR peer's Noise key is attested by
+/// its grant-authenticated holder before pinning it -- the same check
+/// `run_channel_join_with_admission` already does for the main path (mod.rs, #101 SEC101c-ii).
+/// Shared by [`join_via_relay_dcutr`] and [`join_via_relay_gate_dcutr`], the two joins that do
+/// their OWN [`present_channel_join`] call rather than going through
+/// `run_channel_join_with_admission`, so neither had this check at all before.
+///
+/// Without it, a malicious/compromised edge could substitute its own key in the admission
+/// response; the DCUtR "verified" responder downstream (`p2p.rs`, ct-agent#11) only checks the
+/// LIVE peer against whatever key this function hands it, so a consistent substitution at both
+/// points would defeat that check too. Only the independently-signed attestation (which the
+/// edge cannot forge) closes it. Pure (no I/O), so unit-testable without a live relay.
+pub(crate) fn verify_relayed_dcutr_peer(
+    request: &ChannelJoinRequest,
+    noise: [u8; 32],
+    peer_holder: Option<[u8; 32]>,
+    peer_attestation: Option<[u8; 64]>,
+) -> Result<[u8; 32], BoxError> {
+    let peer_holder =
+        peer_holder.ok_or("relay admitted the DCUtR join but relayed no peer holder -- cannot verify (#101)")?;
+    let attestation =
+        peer_attestation.ok_or("relay admitted the DCUtR join but relayed no attestation (#101)")?;
+    if !ct_common::channel::verify_member_noise_attestation(
+        &request.grant.grant.channel,
+        &peer_holder,
+        &noise,
+        &attestation,
+    ) {
+        return Err("peer Noise-key attestation failed -- refusing to pin a possibly-substituted key (#101)".into());
+    }
+    Ok(noise)
+}
+
 pub async fn join_via_relay_dcutr<P>(
     relay_conn: &Connection,
     request: &ChannelJoinRequest,
@@ -631,7 +664,9 @@ where
     P: AsyncRead + AsyncWrite + Unpin,
 {
     let peer_noise = match present_channel_join(relay_conn, request, holder).await? {
-        ChannelJoinOutcome::Admitted { peer_noise_pubkey: Some(k), .. } => k,
+        ChannelJoinOutcome::Admitted { peer_noise_pubkey: Some(noise), peer_holder, peer_attestation, .. } => {
+            verify_relayed_dcutr_peer(request, noise, peer_holder, peer_attestation)?
+        }
         ChannelJoinOutcome::Admitted { .. } => {
             return Err("DCUtR relay join needs the peer's relayed Noise key (register the member's key, #101)".into())
         }
