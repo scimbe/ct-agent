@@ -131,10 +131,26 @@ fn resolve_primary_identity(
             }
         }
         // First agent: generate the identity and persist both for peers to share.
+        // Staged the same way as `rotate_origin_key` (#51), for the same reason: a
+        // crash between the two writes would leave `kp` holding a key with no
+        // matching `cap_path` -- self-healing IS possible here (the load branch
+        // above falls through to regenerate when either file is missing, since
+        // nothing external has trusted the partial state yet on a genuine first
+        // boot), but a peer sharing these paths (#8 R4) that starts up in that
+        // exact window would ALSO see "cap_path missing" and race to generate its
+        // OWN fresh identity, silently discarding the first agent's key instead of
+        // sharing it. Staging removes the window instead of relying on retry luck.
         let origin_key = OriginKey::generate();
         let cap = mint(origin_key.origin_identity());
-        write_owner_only(kp, &origin_key.private_bytes())?;
-        write_owner_only(cap_path, &cap.encode())?;
+        let key_tmp = format!("{kp}.new");
+        let cap_tmp = format!("{cap_path}.new");
+        write_owner_only(&key_tmp, &origin_key.private_bytes())?;
+        if let Err(e) = write_owner_only(&cap_tmp, &cap.encode()) {
+            let _ = std::fs::remove_file(&key_tmp);
+            return Err(e);
+        }
+        std::fs::rename(&key_tmp, kp)?;
+        std::fs::rename(&cap_tmp, cap_path)?;
         return Ok((cap, origin_key.private_bytes()));
     }
     // Default: a fresh, unique single-agent identity.
@@ -387,6 +403,36 @@ mod tests {
         for f in [&key, &cap, &tmp("c.bin"), &tmp("d.bin")] {
             let _ = std::fs::remove_file(f);
         }
+    }
+
+    #[test]
+    fn first_boot_leaves_no_partial_state_when_the_capability_write_fails() {
+        // The "First agent" branch shares the same crash window `rotate_origin_key`
+        // (#51) had: two independent writes for a shared identity's key + capability.
+        // Force the failure on the capability's staging write (a directory pre-
+        // created at exactly `cap_path.new`, EISDIR -- unconditional, not
+        // permission-based, so it isn't bypassed running as root).
+        let key = tmp("firstboot-origin.key");
+        let cap = tmp("firstboot-cap.bin");
+        let cap_tmp = format!("{cap}.new");
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&cap);
+        let _ = std::fs::remove_dir_all(&cap_tmp);
+        std::fs::create_dir_all(&cap_tmp).unwrap();
+
+        let err = match resolve_serving_identity(Some(&key), &cap, "edge:443", None) {
+            Err(e) => e,
+            Ok(_) => panic!("staging the capability must fail (EISDIR)"),
+        };
+        assert!(!err.to_string().contains("not 32 bytes"), "{err}");
+
+        assert!(!std::path::Path::new(&key).exists(), "no partial key file on a failed first boot");
+        assert!(!std::path::Path::new(&cap).exists(), "no partial capability file on a failed first boot");
+        assert!(!std::path::Path::new(&format!("{key}.new")).exists(), "no leftover key temp file");
+
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&cap);
+        let _ = std::fs::remove_dir_all(&cap_tmp);
     }
 
     #[test]
