@@ -37,6 +37,20 @@ pub const DEFAULT_RESOLVER_URLS: &[&str] = &["https://cloudflare-dns.com/dns-que
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Bound on a single DoH lookup (or Cloudflare purge) round-trip. Without it,
+/// `reqwest::Client::new()` has NO request timeout at all -- a resolver that
+/// accepts the connection and then never responds (a stall, not a refusal;
+/// `tolerates_resolver_errors_and_keeps_retrying` below already covers a
+/// refused connection) hangs `lookup().await` forever. `wait_for`'s own
+/// `deadline` check (see below) only runs AFTER a full round of lookups
+/// completes, so an unbounded single request silently defeats the entire
+/// `timeout` budget this module exists to enforce. Same bug class already
+/// fixed at #295/#296/#408/#486 elsewhere in this codebase family -- missed
+/// here. Generous relative to real DoH latency (this module's own docs cite
+/// up to ~90s of measured propagation, but that is INTER-request retry time,
+/// not a single request's own round-trip).
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Wait this long after publishing before the *first* lookup.
 ///
 /// Much shorter than earlier versions of this constant on purpose: the
@@ -75,6 +89,14 @@ const DEFAULT_INITIAL_DELAY: Duration = Duration::from_secs(5);
 const CLOUDFLARE_DOH: &str = "https://cloudflare-dns.com/dns-query";
 const CLOUDFLARE_PURGE_URL: &str = "https://cloudflare-dns.com/api/v1/purge";
 
+/// Same fallback idiom used throughout this codebase's other `reqwest::Client`
+/// construction sites (e.g. `CADS-Tunnel/crates/control-plane/src/client.rs`):
+/// a client without the intended timeout is still strictly safer than a
+/// panic on an unlikely TLS-backend build failure.
+fn build_http(request_timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder().timeout(request_timeout).build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
 pub struct PropagationWaiter {
     http: reqwest::Client,
     resolver_urls: Vec<String>,
@@ -103,7 +125,7 @@ impl PropagationWaiter {
 
     pub(crate) fn with_interval(resolver_urls: Vec<String>, timeout: Duration, interval: Duration) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http(DEFAULT_REQUEST_TIMEOUT),
             resolver_urls,
             timeout,
             interval,
@@ -121,6 +143,14 @@ impl PropagationWaiter {
         self
     }
 
+    /// Tests only: override the per-request timeout so a hang-simulation test
+    /// doesn't have to wait out the real (generous) production default.
+    #[cfg(test)]
+    fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.http = build_http(request_timeout);
+        self
+    }
+
     #[cfg(test)]
     fn with_cloudflare_urls(
         resolver_urls: Vec<String>,
@@ -130,7 +160,7 @@ impl PropagationWaiter {
         cloudflare_purge_url: String,
     ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http(DEFAULT_REQUEST_TIMEOUT),
             resolver_urls,
             timeout,
             interval,
@@ -322,6 +352,42 @@ mod tests {
             Duration::from_millis(10),
         ).without_initial_delay();
         let err = waiter.wait_for("_acme-challenge.example.test", "whatever").await.unwrap_err();
+        assert!(err.contains("did not become publicly resolvable"), "{err}");
+    }
+
+    /// A resolver that accepts the TCP connection and then never answers (a
+    /// stall -- distinct from `tolerates_resolver_errors_and_keeps_retrying`,
+    /// which covers nothing listening at all) must not hang `wait_for`
+    /// indefinitely. Without a per-request timeout, `lookup().await` never
+    /// returns, so `wait_for`'s own `deadline` check (only reached AFTER a
+    /// full round of lookups completes) is never even evaluated -- the whole
+    /// `timeout` budget is silently defeated by one stuck connection.
+    #[tokio::test]
+    async fn a_resolver_that_accepts_and_never_answers_does_not_hang_wait_for_forever() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept every connection and hold it open, reading and writing
+            // nothing -- a real stall, not a refusal.
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    std::mem::forget(socket);
+                }
+            }
+        });
+        let url = format!("http://{addr}/dns-query");
+
+        let waiter = PropagationWaiter::with_interval(vec![url], Duration::from_millis(300), Duration::from_millis(10))
+            .without_initial_delay()
+            .with_request_timeout(Duration::from_millis(100));
+
+        // A generous outer bound completely independent of the per-request
+        // timeout under test: proves `wait_for` returns at all, rather than
+        // hanging past its own configured `timeout` budget.
+        let outcome = tokio::time::timeout(Duration::from_secs(5), waiter.wait_for("_acme-challenge.example.test", "whatever")).await;
+        let err = outcome
+            .expect("wait_for must return within a bounded time, not hang on a stalled connection forever")
+            .unwrap_err();
         assert!(err.contains("did not become publicly resolvable"), "{err}");
     }
 

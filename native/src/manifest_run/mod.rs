@@ -310,7 +310,13 @@ pub async fn run_publish() -> Result<(), String> {
         );
     }
 
-    let resp = reqwest::Client::new()
+    // A bare `reqwest::Client::new()` has no request timeout -- a stalled
+    // publish endpoint would hang `ct-agent manifest publish` indefinitely
+    // rather than surfacing a clear error. Same bug class as #54.
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
         .put(&url)
         .header("content-type", "application/json")
         .body(body)
