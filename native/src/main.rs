@@ -42,9 +42,32 @@ USAGE:
     ct-agent channel agent-card --verify <file>  Verify a card file's signature/expiry
     ct-agent channel super-peer           Run as an opt-in LAN-local relay for same-network members
     ct-agent channel                      Join a channel (CT_CHANNEL_* env config)
+    ct-agent manifest create              Print an UNSIGNED service manifest skeleton
+    ct-agent manifest sign                Sign a manifest skeleton with the holder key
+    ct-agent manifest publish             PUT a signed manifest to an object-storage URL
+    ct-agent manifest activate            Fetch, verify and install a signed manifest
 
 Every subcommand is configured entirely via CT_*/CT_AGENT_*/CT_CHANNEL_* environment
 variables, not flags -- see docs.bunsenbrenner.org for the full reference per command.
+
+`manifest` (CADS-agent-marketplace Phase 1, docker compose services only) reads:
+    create    CT_MANIFEST_NAME, CT_MANIFEST_VERSION, CT_MANIFEST_BUNDLE_URL,
+              CT_MANIFEST_BUNDLE_SHA256 (64 hex), CT_MANIFEST_COMPOSE_FILE,
+              CT_MANIFEST_VERIFY_SCRIPT, CT_MANIFEST_VERIFY_TIMEOUT_SECS; optional
+              CT_MANIFEST_ENV_VARS (`;`-separated NAME:required:description, NAMES only --
+              never a secret value) and CT_MANIFEST_EXPIRES_IN_SECS (default 31536000).
+              Writes the unsigned JSON to stdout; needs no key and no network.
+    sign      CT_MANIFEST_HOLDER_KEY (64 hex ed25519 private key, same format as
+              CT_CHANNEL_HOLDER_KEY); manifest JSON from CT_MANIFEST_IN or stdin.
+              Writes the signed JSON to stdout; no network.
+    publish   CT_MANIFEST_PUBLISH_URL (https://); signed JSON from CT_MANIFEST_IN or stdin.
+    activate  CT_MANIFEST_URL (https:// URL or local path), CT_MANIFEST_PROJECT_NAME,
+              CT_MANIFEST_WORK_DIR, and exactly one of CT_MANIFEST_TRUST_ALLOWLIST
+              (comma-separated 64-hex publisher pubkeys) / CT_MANIFEST_TRUST_ALLOWLIST_FILE
+              (one per line); optional CT_MANIFEST_ENV_FILE (KEY=value secrets, supplied
+              locally, never from the manifest) and CT_MANIFEST_PROTECTED_NAMES (comma-
+              separated substrings this install must never collide with). Writes the install
+              report JSON to stdout and exits non-zero unless the status is \"ok\".
 ";
 
 #[tokio::main]
@@ -357,6 +380,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let cfg = ct_agent::channel_run::ChannelRunConfig::from_env()
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         return ct_agent::channel_run::run_channel_command(cfg).await;
+    }
+
+    // `manifest` subcommand (CADS-agent-marketplace Phase 1): author, sign, publish and install
+    // a signed ServiceManifest describing ONE docker-compose service. The three authoring steps
+    // are split so the holder key is needed exactly once and never alongside the network:
+    // `create` (no key, no network) -> `sign` (key, no network) -> `publish` (network, no key).
+    // `activate` is the consuming side and delegates the whole fetch/verify/guardrail/compose/
+    // verify pipeline to installer-engine -- nothing here decides whether a publisher is trusted.
+    // Config comes from CT_MANIFEST_* (see USAGE); every parser fails loudly on a missing or
+    // malformed value rather than guessing a default.
+    if std::env::args().nth(1).as_deref() == Some("manifest") {
+        match std::env::args().nth(2).as_deref() {
+            Some("create") => {
+                let cfg = ct_agent::manifest_run::CreateConfig::from_env()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                let now = ct_agent::manifest_run::unix_now()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                let json = cfg
+                    .unsigned(now)
+                    .to_json()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                println!("{json}");
+                return Ok(());
+            }
+            Some("sign") => {
+                let json = ct_agent::manifest_run::run_sign()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                println!("{json}");
+                return Ok(());
+            }
+            Some("publish") => {
+                ct_agent::manifest_run::run_publish()
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                return Ok(());
+            }
+            Some("activate") => {
+                let cfg = ct_agent::manifest_run::ActivateCliConfig::from_env()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                let report = ct_agent::manifest_run::run_activate(cfg)
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                // The report is the product of the command -- print it either way, then let the
+                // exit code carry the verdict so `manifest activate && …` scripts correctly.
+                println!("{}", report.to_json());
+                if !ct_agent::manifest_run::report_is_ok(&report) {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            // Same #239/#14 discipline as `channel` above: a typo'd subcommand must never fall
+            // through to the default serve path.
+            Some(other) => {
+                eprintln!("ct-agent: unrecognized manifest subcommand '{other}'\n");
+                eprint!("{USAGE}");
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("ct-agent: `manifest` requires a subcommand (create|sign|publish|activate)\n");
+                eprint!("{USAGE}");
+                std::process::exit(1);
+            }
+        }
     }
 
     // #239: every recognized subcommand above already returned. `onboard` is the
