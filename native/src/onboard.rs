@@ -19,14 +19,20 @@ use ct_control_plane::client::{ControlPlaneClient, CpError};
 use std::path::Path;
 
 /// Decode exactly 64 lowercase/uppercase hex chars into 32 bytes.
+///
+/// #606: `s.len()` is BYTE length -- a multi-byte UTF-8 char in a malformed
+/// `CT_AGENT_JOIN_TOKEN` (set by the install one-liner, not necessarily
+/// hand-typed) can pass this guard while a raw `&s[i*2..i*2+2]` slice would
+/// land mid-character and panic during onboarding instead of returning the
+/// intended error.
 fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
     let s = s.trim();
     if s.len() != 64 {
         return None;
     }
     let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
     }
     Some(out)
 }
@@ -256,6 +262,13 @@ mod tests {
     use ct_control_plane::storage::SqliteEnrollment;
     use std::sync::Arc;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn hex_decode_32_rejects_rather_than_panics_on_a_multi_byte_char_606() {
+        let s: String = "\u{FFFD}".to_string() + &"a".repeat(61);
+        assert_eq!(s.len(), 64, "byte-length guard alone would let this through");
+        assert_eq!(hex_decode_32(&s), None);
+    }
 
     /// Serve an enrollment router backed by `store` on an ephemeral port and
     /// return its base URL.
