@@ -201,9 +201,32 @@ pub fn rotate_origin_key(
     let retired = std::path::Path::new(extra_keys_dir)
         .join(format!("retired-{}.key", hex8(&old_cap.origin.0)));
     write_owner_only(&retired.to_string_lossy(), &old_key)?;
-    // Promote the new key + capability.
-    write_owner_only(key_path, &new_key.private_bytes())?;
-    write_owner_only(cap_path, &new_cap.encode())?;
+    // Promote the new key + capability as a near-atomic unit, not two independent
+    // writes: stage both to `.new` temp paths first, then rename both into place.
+    // `resolve_primary_identity`'s shared-identity load reads `key_path`/`cap_path`
+    // independently with no cross-check that they name the SAME origin identity --
+    // if the old code's two direct writes landed key_path=NEW but cap_path=OLD (a
+    // crash or a write error, e.g. disk full, between them), the agent would next
+    // boot with a private key that doesn't match its own persisted capability, and
+    // silently fail every Noise handshake with no clear signal why. Staging first
+    // means the FAR more likely failure (an error mid-write) leaves key_path/
+    // cap_path completely untouched -- still a consistent OLD pair -- rather than a
+    // mismatched mix; only a crash landing exactly between the two renames (fast,
+    // near-instantaneous syscalls) remains a residual window, far smaller than
+    // spanning two full-content writes.
+    let key_tmp = format!("{key_path}.new");
+    let cap_tmp = format!("{cap_path}.new");
+    write_owner_only(&key_tmp, &new_key.private_bytes())?;
+    if let Err(e) = write_owner_only(&cap_tmp, &new_cap.encode()) {
+        // key_tmp already landed -- clean it up so a failed rotation doesn't leave
+        // a stray `.new` file (containing key material) sitting next to key_path
+        // forever. Best-effort: the real key_path/cap_path pair is what matters
+        // for correctness, and is already untouched at this point either way.
+        let _ = std::fs::remove_file(&key_tmp);
+        return Err(e);
+    }
+    std::fs::rename(&key_tmp, key_path)?;
+    std::fs::rename(&cap_tmp, cap_path)?;
     Ok(new_cap)
 }
 
@@ -451,6 +474,45 @@ mod tests {
         assert_eq!(id.origin_keys.len(), 1, "missing dir -> only the primary key");
         let _ = std::fs::remove_file(&key);
         let _ = std::fs::remove_file(&cap);
+    }
+
+    #[test]
+    fn rotate_leaves_key_and_capability_untouched_when_the_capability_write_fails() {
+        // A crash-consistency regression test: rotation must not be observable as a
+        // half-done state (key_path already the NEW origin while cap_path still
+        // names the OLD one) -- that pair would fail every future Noise handshake
+        // with no clear signal why. Forces the failure on the capability's staging
+        // write by pre-creating a DIRECTORY at exactly `cap_path.new` -- opening a
+        // directory for writing fails with EISDIR unconditionally (unlike a
+        // permission bit, this isn't bypassed when the test runs as root, which
+        // Docker-based CI does).
+        let key = tmp("crash-origin.key");
+        let cap = tmp("crash-cap.bin");
+        let dir = tmp("crash-dir");
+        let cap_tmp = format!("{cap}.new");
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&cap);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cap_tmp);
+
+        resolve_serving_identity(Some(&key), &cap, "edge:443", None).unwrap();
+        let key_before = std::fs::read(&key).unwrap();
+        let cap_before = std::fs::read(&cap).unwrap();
+
+        std::fs::create_dir_all(&cap_tmp).unwrap(); // blocks writing cap_path.new, EISDIR
+
+        let err = rotate_origin_key(&key, &cap, &dir)
+            .expect_err("writing the new capability's staging file must fail (EISDIR)");
+        assert!(!err.to_string().contains("not 32 bytes"), "{err}"); // real failure, not the guard
+
+        assert_eq!(std::fs::read(&key).unwrap(), key_before, "key_path untouched by a failed rotation");
+        assert_eq!(std::fs::read(&cap).unwrap(), cap_before, "cap_path untouched by a failed rotation");
+        assert!(!std::path::Path::new(&format!("{key}.new")).exists(), "no leftover key temp file");
+
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&cap);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cap_tmp);
     }
 
     #[test]
