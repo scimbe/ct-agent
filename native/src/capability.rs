@@ -87,14 +87,22 @@ pub fn resolve_serving_identity_with_token(
 }
 
 /// Parse a 64-hex routing token (e.g. from `CT_AGENT_TOKEN`), if valid.
+///
+/// #49: `s.len()` is BYTE length -- a string containing a multi-byte UTF-8
+/// character can have `len() == 64` while a raw `&s[i*2..i*2+2]` slice lands
+/// mid-character and panics. Chunk the bytes instead of slicing the `str`, so
+/// a malformed `CT_AGENT_TOKEN` (set by the install one-liner / portal
+/// onboarding, not necessarily hand-typed) is rejected -- falling back to a
+/// freshly minted token, the documented "unset" behavior -- instead of
+/// crashing the agent process at startup.
 pub fn parse_routing_token_hex(s: &str) -> Option<RoutingToken> {
     let s = s.trim();
     if s.len() != 64 {
         return None;
     }
     let mut t = [0u8; 32];
-    for (i, byte) in t.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        t[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
     }
     Some(RoutingToken(t))
 }
@@ -317,6 +325,16 @@ mod tests {
         assert_eq!(parse_routing_token_hex(&"5a".repeat(32)), Some(RoutingToken([0x5a; 32])));
         assert!(parse_routing_token_hex("deadbeef").is_none(), "too short");
         assert!(parse_routing_token_hex(&"zz".repeat(32)).is_none(), "non-hex");
+    }
+
+    #[test]
+    fn parse_routing_token_hex_rejects_rather_than_panics_on_a_multi_byte_char_49() {
+        // #49: a multi-byte UTF-8 char (U+FFFD, 3 bytes) plus enough ASCII to reach
+        // exactly 64 BYTES -- the old code's `s.len() != 64` guard passes (byte length),
+        // then a raw `&s[i*2..i*2+2]` slice lands mid-character and panics.
+        let s: String = "\u{FFFD}".to_string() + &"a".repeat(61);
+        assert_eq!(s.len(), 64, "byte-length guard alone would let this through");
+        assert_eq!(parse_routing_token_hex(&s), None);
     }
 
     #[test]
