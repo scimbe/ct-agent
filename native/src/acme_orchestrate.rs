@@ -318,10 +318,26 @@ pub async fn obtain_or_renew(config: &AcmeCertConfig) -> Result<bool, BoxError> 
         }
     };
 
-    // Write key before cert (an origin polling for the cert file should never
-    // see a cert with no matching key on disk yet).
-    write_private(&config.key_path(), issued.key_pem.as_bytes())?;
-    std::fs::write(config.cert_path(), issued.cert_chain_pem.as_bytes())?;
+    // Stage both to `.new` temp paths first, promote only once both
+    // stage-writes succeed. Two direct writes (the previous shape) leave a
+    // crash/write-error window where a FRESH key lands on disk paired with
+    // the STALE cert -- an origin's webserver that reloads key material as
+    // soon as it changes would then serve a key that doesn't match its own
+    // certificate, and nothing self-corrects the mismatch until the next
+    // renewal is due (up to `RENEW_AFTER_DAYS`). Renamed key-before-cert,
+    // same as before, so a reader polling for the cert file still never sees
+    // a cert with no matching key on disk yet.
+    let key_path = config.key_path();
+    let cert_path = config.cert_path();
+    let key_tmp = PathBuf::from(format!("{}.new", key_path.display()));
+    let cert_tmp = PathBuf::from(format!("{}.new", cert_path.display()));
+    write_private(&key_tmp, issued.key_pem.as_bytes())?;
+    if let Err(e) = std::fs::write(&cert_tmp, issued.cert_chain_pem.as_bytes()) {
+        let _ = std::fs::remove_file(&key_tmp);
+        return Err(e.into());
+    }
+    std::fs::rename(&key_tmp, &key_path)?;
+    std::fs::rename(&cert_tmp, &cert_path)?;
     eprintln!(
         "ct-agent: obtained a certificate for {} ({} -> {})",
         config.hostname,
@@ -749,6 +765,51 @@ mod tests {
         // proving the file-age renewal check actually gates re-issuance.
         let did_issue_again = obtain_or_renew(&config).await.unwrap();
         assert!(!did_issue_again, "a fresh cert must not trigger a redundant issuance");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crash/write-error between the key write and the cert write must
+    /// never leave a FRESH key on disk paired with a STALE (or missing)
+    /// cert -- an origin reloading key material as soon as it changes would
+    /// then serve a key that doesn't match its own certificate.
+    ///
+    /// Forces the cert stage-write to fail unconditionally: a pre-existing
+    /// directory at the exact `.new` target path errors with `EISDIR`
+    /// regardless of user/permissions. `chmod`-based fault injection is
+    /// silently useless here -- `cargo test` runs as root in this repo's
+    /// Docker test environment, and root ignores permission bits entirely
+    /// (the #51/#52 lesson).
+    #[tokio::test]
+    async fn obtain_or_renew_leaves_no_key_cert_pair_on_disk_when_the_cert_write_fails() {
+        let (base, _mock) = spawn_mock(true).await;
+        let dir = std::env::temp_dir().join(format!("ct-acme-e2e-certfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let config = AcmeCertConfig {
+            cp_url: base.clone(),
+            routing_token: "deadbeef".to_string(),
+            hostname: "app.example.com".to_string(),
+            cert_out_dir: dir.clone(),
+            account_key_path: dir.join("account.der"),
+            dns01_resolver_urls: vec![format!("{base}/doh")],
+            dns01_propagation_timeout: Duration::from_secs(5),
+            dns01_initial_delay: Some(Duration::ZERO),
+            dns01_use_authoritative: false,
+            dns01_attempts: Some(1),
+        };
+
+        let cert_tmp = PathBuf::from(format!("{}.new", config.cert_path().display()));
+        std::fs::create_dir_all(&cert_tmp).unwrap();
+
+        let result = obtain_or_renew(&config).await;
+        assert!(result.is_err(), "cert stage-write failure must surface as an error, not a silent partial write");
+
+        assert!(!config.key_path().exists(), "no key may be promoted when the cert never staged successfully");
+        assert!(!config.cert_path().exists(), "no cert may appear either");
+        let key_tmp = PathBuf::from(format!("{}.new", config.key_path().display()));
+        assert!(!key_tmp.exists(), "no leftover key temp file");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
