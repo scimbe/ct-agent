@@ -285,6 +285,14 @@ pub(crate) fn should_serve_loop(role: ChannelRole, serve_env: Option<&str>) -> b
 /// admission per peer), build the relay fallback + optional direct listener, and run the session
 /// with a fresh local app stream. Factored out so [`run_channel_join_command`]'s #179 serve loop can
 /// repeat it for each successive peer without re-parsing config.
+///
+/// Thin wrapper over [`run_one_admission_session_with_local`] that builds the local app stream via
+/// [`channel_local`] itself — the shape every existing caller (this one-shot CALL path, the #179
+/// serve loop) wants. ct-agent#47's persistent-CALL reconnect loop needs the OTHER split: it must
+/// call `channel_local()` itself ONCE (setting up the stdin-reading thread), then reuse the shared
+/// `mpsc` feed across many redials — calling `channel_local()` again per attempt would re-enter the
+/// already-documented #248 trap (stdin is only readable to EOF once). See
+/// [`run_one_admission_session_with_local`].
 pub(crate) async fn run_one_admission_session(
     cfg: &ChannelJoinCliConfig,
     request: &ChannelJoinRequest,
@@ -292,6 +300,26 @@ pub(crate) async fn run_one_admission_session(
     relay_ladder: &[ChannelDialRung],
     front_door_cert: &Option<CertificateDer<'static>>,
 ) -> Result<(), BoxError> {
+    let local = channel_local();
+    run_one_admission_session_with_local(cfg, request, broker_ladder, relay_ladder, front_door_cert, local).await
+}
+
+/// [`run_one_admission_session`]'s body, minus its own `channel_local()` call — `local` is supplied
+/// by the caller instead. Exists so a caller that must control the local app stream's lifecycle
+/// itself (ct-agent#47: redialing this admission cycle repeatedly while reusing ONE stdin feed
+/// across attempts) can drive the identical admission/relay/session logic without re-entering
+/// `channel_local()`.
+pub(crate) async fn run_one_admission_session_with_local<L>(
+    cfg: &ChannelJoinCliConfig,
+    request: &ChannelJoinRequest,
+    broker_ladder: &[ChannelDialRung],
+    relay_ladder: &[ChannelDialRung],
+    front_door_cert: &Option<CertificateDer<'static>>,
+    local: L,
+) -> Result<(), BoxError>
+where
+    L: AsyncRead + AsyncWrite + Unpin,
+{
     let admission = match front_door_cert {
         Some(edge_cert) => {
             present_channel_join_via_ladder(broker_ladder, request, &cfg.holder, edge_cert.clone(), DIRECT_DIAL_TIMEOUT).await?
@@ -322,7 +350,6 @@ pub(crate) async fn run_one_admission_session(
         ChannelRole::Accept if !cfg.relay_only => Some(crate::transport::build_direct_listener_at(cfg.listen_addr)?.0),
         _ => None,
     };
-    let local = channel_local();
     run_channel_join_with_admission(
         admission,
         relay,

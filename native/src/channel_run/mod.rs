@@ -609,7 +609,27 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
         if serve_loop { " — persistent serve: concurrent sessions (#200)" } else { "" }
     );
     if !serve_loop {
-        // One-shot roles (initiator / `--call` / a non-serve accept): exactly one session, unchanged.
+        // ct-agent#47: a persistent --call-service session (the default under
+        // CT_CHANNEL_CALL_PERSISTENT) gets its own internal redial loop unless the operator
+        // opted out (CT_CHANNEL_CALL_RECONNECT=0) -- see run_persistent_call_reconnect_loop's
+        // doc comment for why this can't just be another channel_local() branch (the #248
+        // stdin-reuse trap). Every other one-shot role (initiator / `--call` / a non-serve
+        // accept, and non-reconnect persistent CALL mode) keeps exactly one session, unchanged.
+        if let Ok(slug) = std::env::var("CT_CHANNEL_CALL_SERVICE") {
+            if cfg.call_reconnect
+                && call_persistent_enabled_from(std::env::var("CT_CHANNEL_CALL_PERSISTENT").ok().as_deref())
+            {
+                return run_persistent_call_reconnect_loop(
+                    slug.trim().to_string(),
+                    &cfg,
+                    &request,
+                    &broker_ladder,
+                    &relay_ladder,
+                    &front_door_cert,
+                )
+                .await;
+            }
+        }
         return run_one_admission_session(&cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert).await;
     }
     // #200: persistent serve is now CONCURRENT. The #179 loop admitted a peer, served it to

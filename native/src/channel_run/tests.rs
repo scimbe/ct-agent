@@ -4826,3 +4826,119 @@ fn own_endpoint_looks_reachable_only_gives_up_on_real_evidence_agent22() {
     assert!(own_endpoint_looks_reachable("relay-only", Some(g)), "the sentinel is not an address");
     assert!(own_endpoint_looks_reachable("not-an-address", Some(g)));
 }
+
+#[tokio::test]
+async fn persistent_call_reconnect_survives_a_session_death_without_losing_a_queued_line_47() {
+    // ct-agent#47: the direct regression test for the already-documented #248 stdin-reuse
+    // trap. The stdin-reading side is simulated by an mpsc pair THIS TEST owns (never a real
+    // process stdin) -- if the reconnect loop ever re-created that feed per attempt instead of
+    // reusing it once, a line queued between attempts would be silently lost, exactly the #248
+    // failure mode. Attempt 1's `admit` deliberately dies near-instantly (a #250-shaped flap,
+    // no line touched yet); attempt 2's `admit` is a real in-process MCP peer
+    // (`serve_local`, the same helper `call_role_service_calls_a_service_tool_over_a_duplex_and_fails_closed`
+    // above uses) spliced to the loop's `local` via `copy_bidirectional` -- so the queued line
+    // must come back with a REAL answer from the SECOND attempt, not a canned test double.
+    use ct_common::channel::ServiceType;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let attempts = std::sync::Arc::new(AtomicU32::new(0));
+    let admit = {
+        let attempts = attempts.clone();
+        move |local: ChannelLocal| {
+            let attempts = attempts.clone();
+            async move {
+                let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    // The first "session" dies before ever exchanging a byte -- `calls` (still
+                    // waiting on its very first `lines.recv()`, nothing sent yet) is genuinely
+                    // pending, so this branch unambiguously wins the loop's `select!`.
+                    drop(local);
+                    return Err::<(), BoxError>("simulated first-attempt session death (#47 test)".into());
+                }
+                let mut reg = ct_common::mcp::default_registry();
+                ct_common::mcp::register_service_tools(&mut reg, &[ServiceType::TextGeneration], |_svc, input| {
+                    Ok(format!("{{\"echoed\":\"{input}\"}}"))
+                });
+                let reg = std::sync::Arc::new(reg);
+                let peer = serve_local(move |req: Vec<u8>| {
+                    let reg = reg.clone();
+                    async move { reg.dispatch(&req) }
+                });
+                let mut local = local;
+                let mut peer = peer;
+                let _ = tokio::io::copy_bidirectional(&mut local, &mut peer).await;
+                Ok(())
+            }
+        }
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (out_write, mut out_read) = tokio::io::duplex(1 << 16);
+
+    let loop_fut = run_persistent_call_reconnect_loop_over(
+        "text_generation".to_string(),
+        true,
+        admit,
+        &mut rx,
+        out_write,
+    );
+
+    let feed_fut = async {
+        // Wait for attempt 1 to actually happen before queuing the line -- this is what
+        // makes the test exercise "queued mid-reconnect" rather than "queued before the
+        // loop even started" (which #250's own >=400ms backoff after one flap gives ample
+        // slack for, but polling on the real signal keeps this deterministic either way).
+        while attempts.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tx.send("a matrix theme".to_string()).await.unwrap();
+        drop(tx); // "stdin EOF" once this one queued line is drained and answered.
+    };
+
+    let (loop_result, ()) = tokio::join!(loop_fut, feed_fut);
+    loop_result.expect("clean stdin EOF after the queued call is answered");
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "exactly one failed attempt, then one that succeeds");
+
+    use tokio::io::AsyncReadExt;
+    let mut out = Vec::new();
+    out_read.read_to_end(&mut out).await.unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("\"ok\":true"), "the queued line got answered, not dropped: {out}");
+    assert!(out.contains("echoed") && out.contains("a matrix theme"), "answered by the SECOND (real) attempt: {out}");
+}
+
+#[tokio::test]
+async fn persistent_call_reconnect_off_fails_instead_of_redialing_47() {
+    // CT_CHANNEL_CALL_RECONNECT=0 must restore the exact pre-#47 contract: no internal
+    // redial. The function returns Err (which the real entry point turns into a nonzero
+    // process exit -- see that Err arm's own doc comment for why this is testable while
+    // still preserving the observable "exit(1) on a mid-run death" contract). Bounded by a
+    // timeout so a wrongly-still-looping implementation fails loudly instead of hanging the
+    // suite. The reconnect-enabled test above already proves the opposite (a second attempt
+    // DOES happen when the flag is on), so this is the two branches' actual behavioral
+    // difference, not a redundant restatement.
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let admit = {
+        let attempts = attempts.clone();
+        move |local: ChannelLocal| {
+            let attempts = attempts.clone();
+            async move {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(local);
+                Err::<(), BoxError>("simulated session death (#47 test)".into())
+            }
+        }
+    };
+    let (_tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (out_write, _out_read) = tokio::io::duplex(1 << 16);
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        run_persistent_call_reconnect_loop_over("text_generation".to_string(), false, admit, &mut rx, out_write),
+    )
+    .await
+    .expect("must not hang");
+    assert!(outcome.is_err(), "CT_CHANNEL_CALL_RECONNECT=0 must fail rather than redial on a session death");
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1, "no second attempt without reconnect enabled");
+}

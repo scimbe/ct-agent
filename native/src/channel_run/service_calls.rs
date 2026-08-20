@@ -361,6 +361,139 @@ pub(crate) fn call_service_persistent_local(slug: String) -> tokio::io::DuplexSt
     session_side
 }
 
+/// ct-agent#47: the internal-reconnect counterpart to [`call_service_persistent_local`] --
+/// entry point for persistent `--call-service` when `CT_CHANNEL_CALL_RECONNECT` is on (the
+/// default). Where that function spawns ONE admission+session attempt and exits(1) on failure,
+/// this one owns a whole redial loop: the stdin-reading thread and its `mpsc` receiver are set
+/// up exactly ONCE (the already-documented #248 trap -- re-entering `channel_local()`'s stdin
+/// setup on every retry silently drops everything after the first attempt, since stdin is only
+/// readable to EOF once), then each loop iteration builds a FRESH duplex, admits a FRESH session
+/// over it via [`crate::channel_run::serving::run_one_admission_session_with_local`] (the exact
+/// ladder/relay/admission logic every other caller uses, untouched), and races that admission's
+/// session pump against [`run_service_calls_persistent`] driving the SAME shared receiver. A
+/// stdin line that arrives mid-reconnect simply waits in the channel and is answered once the
+/// next session is up, instead of being lost with the whole process the way it used to be.
+///
+/// Failure classification reuses #250's own `is_flapping_session`/`flapping_session_backoff`
+/// (see `channel_run::errors`) rather than inventing a new backoff policy -- a session that dies
+/// near-instantly repeatedly backs off exponentially (capped), exactly like the SERVE-side loop
+/// already does for the same symptom class. Only a clean stdin EOF ends the process (exit 0).
+pub(crate) async fn run_persistent_call_reconnect_loop(
+    slug: String,
+    cfg: &ChannelJoinCliConfig,
+    request: &ChannelJoinRequest,
+    broker_ladder: &[ChannelDialRung],
+    relay_ladder: &[ChannelDialRung],
+    front_door_cert: &Option<CertificateDer<'static>>,
+) -> Result<(), BoxError> {
+    let admit = |local: ChannelLocal| {
+        run_one_admission_session_with_local(cfg, request, broker_ladder, relay_ladder, front_door_cert, local)
+    };
+    run_persistent_call_reconnect_loop_with(slug, cfg.call_reconnect, admit).await
+}
+
+/// [`run_persistent_call_reconnect_loop`]'s actual loop, parameterized over the admission step
+/// (`admit`) so it's unit-testable without a real broker/edge -- mirrors `dial_ladder`'s own
+/// injected-closure pattern (`channel_run::dialing`). See that function's doc comment for the
+/// full rationale (the #248 stdin-reuse trap, the #250 backoff reuse, the select!-races-pump-
+/// against-calls shape).
+pub(crate) async fn run_persistent_call_reconnect_loop_with<A, Fut>(
+    slug: String,
+    call_reconnect: bool,
+    admit: A,
+) -> Result<(), BoxError>
+where
+    A: Fn(ChannelLocal) -> Fut,
+    Fut: std::future::Future<Output = Result<(), BoxError>>,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(l) => {
+                    if tx.blocking_send(l).is_err() {
+                        break; // consumer gone (process exiting) -- stop reading
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        // Thread end drops `tx` -> the loop below sees source EOF -> clean teardown.
+    });
+    run_persistent_call_reconnect_loop_over(slug, call_reconnect, admit, &mut rx, tokio::io::stdout()).await
+}
+
+/// The reconnect loop's core, split out one layer further so a test can feed it lines through an
+/// `mpsc::Sender` it controls directly (no real stdin/process involved) and capture output via an
+/// in-memory `out` instead of real stdout.
+pub(crate) async fn run_persistent_call_reconnect_loop_over<A, Fut, W>(
+    slug: String,
+    call_reconnect: bool,
+    admit: A,
+    rx: &mut tokio::sync::mpsc::Receiver<String>,
+    mut out: W,
+) -> Result<(), BoxError>
+where
+    A: Fn(ChannelLocal) -> Fut,
+    Fut: std::future::Future<Output = Result<(), BoxError>>,
+    W: AsyncWrite + Unpin,
+{
+    let retry_backoff = std::time::Duration::from_millis(200);
+    let mut consecutive_flaps: u32 = 0;
+
+    loop {
+        let (session_side, serve_side) = tokio::io::duplex(1 << 16);
+        let attempt_started = std::time::Instant::now();
+
+        let pump = admit(ChannelLocal::Serve(session_side));
+        let calls = run_service_calls_persistent(serve_side, &slug, rx, &mut out);
+        tokio::pin!(pump);
+        tokio::pin!(calls);
+
+        let clean_eof = tokio::select! {
+            _ = &mut pump => false,
+            r = &mut calls => matches!(r, Ok(())),
+        };
+        // Whichever future didn't finish is dropped here, cancelling it -- the same
+        // shutdown-by-drop idiom this codebase already relies on elsewhere (e.g. the
+        // shutdown-signal races in ct-edge's channel broker).
+
+        if clean_eof {
+            return Ok(());
+        }
+
+        if !call_reconnect {
+            // Return, don't `std::process::exit` directly: the error envelope
+            // `run_service_calls_persistent` already wrote (and flushed) for a mid-run call
+            // failure happened before this point, so the process-contract from the pre-#47
+            // behavior (envelope out, THEN nonzero exit) still holds once this Err propagates
+            // through the normal one-shot session error path all the way to `main`'s own
+            // `#[tokio::main]`-generated nonzero exit -- same observable outcome, but testable
+            // without killing the test binary the way a direct `process::exit` call would.
+            return Err(format!(
+                "ct-agent channel --call-service {slug} (persistent): session ended, \
+                 CT_CHANNEL_CALL_RECONNECT=0 -- not reconnecting (#47)"
+            )
+            .into());
+        }
+
+        if is_flapping_session(attempt_started.elapsed(), true) {
+            consecutive_flaps += 1;
+        } else {
+            consecutive_flaps = 0;
+        }
+        let delay = flapping_session_backoff(retry_backoff, consecutive_flaps);
+        eprintln!(
+            "ct-agent channel --call-service {slug} (persistent): session ended after {:?}, \
+             reconnecting in {delay:?} (streak {consecutive_flaps}, #47)",
+            attempt_started.elapsed()
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
 /// The initiator-side one-shot **service** call (#173 distributed crew topology): dial done by the
 /// channel session, this drives the local side — call the peer's `service/<slug>` with `input`, print
 /// the bare service output, then EOF the session so the process exits. This is exactly the

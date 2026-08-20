@@ -668,6 +668,15 @@ pub struct ChannelJoinCliConfig {
     /// parse time otherwise — a front-door-only ladder with no front door would have
     /// zero rungs). Default `false`: ladder order unchanged.
     pub front_door_only: bool,
+    /// ct-agent#47: whether a persistent `--call-service` session (`CT_CHANNEL_CALL_PERSISTENT`,
+    /// on by default) reconnects internally when the underlying network session dies, instead of
+    /// exiting non-zero and leaving the calling application to detect the dead process and
+    /// respawn it externally (`CT_CHANNEL_CALL_RECONNECT`). Default **on** — only an explicit
+    /// `0`/`false`/`no` restores the pre-#47 exit(1) contract — same "the safer behavior is the
+    /// default, a typo can't silently disable it" convention as
+    /// [`crate::channel_run::service_calls::call_persistent_enabled_from`]. Has no effect outside
+    /// persistent CALL_SERVICE mode.
+    pub call_reconnect: bool,
 }
 
 /// Parse the optional `CT_CHANNEL_CIRCUIT_RELAY` libp2p circuit-relay multiaddr (#136 N-wire):
@@ -1020,6 +1029,13 @@ impl ChannelJoinCliConfig {
                     .to_string(),
             );
         }
+        // ct-agent#47: default ON, same truthy-opt-out idiom as
+        // service_calls::call_persistent_enabled_from (only an explicit off value disables --
+        // a typo can never silently reintroduce the exit(1)-on-death contract).
+        let call_reconnect = !matches!(
+            f("CT_CHANNEL_CALL_RECONNECT").as_deref().map(str::trim),
+            Some(s) if s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("no")
+        );
         Ok(Self {
             role,
             broker_addr,
@@ -1038,6 +1054,7 @@ impl ChannelJoinCliConfig {
             direct_upgrade,
             relay_addr_direct,
             front_door_only,
+            call_reconnect,
         })
     }
 }
