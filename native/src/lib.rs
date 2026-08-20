@@ -14,6 +14,7 @@ pub mod dns01_authoritative;
 pub mod dns01_propagation;
 pub mod ladder;
 pub mod identity;
+pub mod manifest_run;
 pub mod observe;
 pub mod onboard;
 pub mod origin;
