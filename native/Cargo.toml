@@ -22,8 +22,8 @@ ct-dns = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.17" }
 # the fetch/verify/guardrail/compose/verify install pipeline (installer-engine) behind
 # `ct-agent manifest {create,sign,publish,activate}`. Same pinned-tag git dependency style as
 # ct-control-plane/ct-dns above; bumped by tag, never floating.
-manifest-core = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.1.0-phase1.3" }
-installer-engine = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.1.0-phase1.3" }
+manifest-core = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.1.0-phase1.4" }
+installer-engine = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.1.0-phase1.4" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 # #248-follow: opt-in only (see main.rs -- initialized only when RUST_LOG is set, same
 # off-by-default pattern as CT_DEBUG_A2A_TIMING). quinn/libp2p already emit their own
