@@ -200,11 +200,46 @@ impl OnboardedAgent {
     /// was bound to. Writes into `state_dir` (created if absent). The single-use
     /// join token is deliberately NOT stored — it is spent and must never be
     /// replayed (#141).
+    ///
+    /// Staged: all three files are written to `.new` siblings first, and only
+    /// renamed into their real names once every write has succeeded. By the time
+    /// this is called, `onboard()` has already redeemed (spent) the single-use
+    /// join token -- so a crash or write error partway through the OLD
+    /// three-independent-writes shape (e.g. `IDENTITY_FILE` landed but
+    /// `AGENT_FILE` didn't) left `restore()` unable to find a complete, consistent
+    /// state on the next boot, propagating a raw I/O error instead of its
+    /// documented "no persisted identity yet -> fresh enrollment" fallback --
+    /// except a fresh enrollment isn't actually possible either, since the token
+    /// is already spent. That's exactly the permanent crash-loop #141 exists to
+    /// prevent, reintroduced by a partial persist. Staging narrows the window from
+    /// "any one of three sequential writes" down to "a crash landing exactly
+    /// between the renames" (fast, near-instantaneous syscalls).
     pub fn persist(&self, state_dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(state_dir)?;
-        self.identity.save_secret_to(&state_dir.join(Self::IDENTITY_FILE))?;
-        std::fs::write(state_dir.join(Self::AGENT_FILE), &self.agent_id.0)?;
-        std::fs::write(state_dir.join(Self::TENANT_FILE), &self.tenant.0)?;
+        let identity_path = state_dir.join(Self::IDENTITY_FILE);
+        let agent_path = state_dir.join(Self::AGENT_FILE);
+        let tenant_path = state_dir.join(Self::TENANT_FILE);
+        let identity_tmp = state_dir.join(format!("{}.new", Self::IDENTITY_FILE));
+        let agent_tmp = state_dir.join(format!("{}.new", Self::AGENT_FILE));
+        let tenant_tmp = state_dir.join(format!("{}.new", Self::TENANT_FILE));
+
+        let staged = self
+            .identity
+            .save_secret_to(&identity_tmp)
+            .and_then(|()| std::fs::write(&agent_tmp, &self.agent_id.0))
+            .and_then(|()| std::fs::write(&tenant_tmp, &self.tenant.0));
+        if let Err(e) = staged {
+            // Best-effort cleanup so a failed persist doesn't leave partial `.new`
+            // files (one of which may hold key material) lying around forever.
+            let _ = std::fs::remove_file(&identity_tmp);
+            let _ = std::fs::remove_file(&agent_tmp);
+            let _ = std::fs::remove_file(&tenant_tmp);
+            return Err(e);
+        }
+
+        std::fs::rename(&identity_tmp, &identity_path)?;
+        std::fs::rename(&agent_tmp, &agent_path)?;
+        std::fs::rename(&tenant_tmp, &tenant_path)?;
         Ok(())
     }
 
@@ -345,6 +380,44 @@ mod tests {
             OnboardedAgent::restore(&dir, &AgentId("other-agent".into())).unwrap().is_none(),
             "persisted state for one agent id is not restored for another"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_leaves_no_partial_state_when_the_last_file_write_fails() {
+        // Crash-consistency regression test: if `persist` fails partway through, the
+        // next boot must see EITHER a complete, consistent triple of files or NONE
+        // of them -- never one or two present and the rest missing, which
+        // `restore()` can't distinguish from corruption and surfaces as a raw I/O
+        // error. By the time `persist` runs, `onboard()` has already spent the
+        // single-use join token, so that failure mode is a PERMANENT crash-loop,
+        // exactly what #141 exists to prevent.
+        //
+        // Force the failure on the tenant file's staging write by pre-creating a
+        // DIRECTORY at exactly `tenant.new` -- opening a directory for writing
+        // fails with EISDIR unconditionally, unlike a permission bit (which Docker-
+        // based CI's root user would simply ignore).
+        let dir = std::env::temp_dir().join(format!("ct-onboard-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("tenant.new")).unwrap();
+
+        let onboarded = OnboardedAgent {
+            identity: AgentIdentity::generate(),
+            agent_id: AgentId("crash-agent".into()),
+            tenant: TenantId("crash-tenant".into()),
+            config: AgentConfig::parse("127.0.0.1:4433", "127.0.0.1:8080").unwrap(),
+        };
+
+        let err = onboarded.persist(&dir).expect_err("staging the tenant file must fail (EISDIR)");
+        assert!(!matches!(err.kind(), std::io::ErrorKind::InvalidData), "{err}");
+
+        assert!(!dir.join(OnboardedAgent::IDENTITY_FILE).exists(), "no partial identity file");
+        assert!(!dir.join(OnboardedAgent::AGENT_FILE).exists(), "no partial agent file");
+        assert!(!dir.join(OnboardedAgent::TENANT_FILE).exists(), "no partial tenant file");
+        assert!(!dir.join(format!("{}.new", OnboardedAgent::IDENTITY_FILE)).exists(), "no leftover identity temp file");
+        assert!(!dir.join(format!("{}.new", OnboardedAgent::AGENT_FILE)).exists(), "no leftover agent temp file");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
