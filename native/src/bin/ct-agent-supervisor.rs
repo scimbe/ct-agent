@@ -213,7 +213,17 @@ fn classify_exit(signal: Option<i32>, code: Option<i32>, stderr_ring: &VecDeque<
     }
     if let Some(panic_line) = stderr_ring.iter().rev().find(|l| l.contains("panicked at")) {
         const MAX_LEN: usize = 300;
-        let truncated = if panic_line.len() > MAX_LEN { &panic_line[..MAX_LEN] } else { panic_line.as_str() };
+        // A byte-index slice on a &str panics unless the index falls on a UTF-8
+        // character boundary -- and a panic payload is arbitrary program output
+        // (a path, a Display impl, anything), so it can easily contain a
+        // multi-byte character straddling MAX_LEN. Walking back to the nearest
+        // valid boundary avoids the supervisor itself panicking while trying to
+        // report a panic -- exactly the failure mode this binary exists to survive.
+        let mut end = MAX_LEN.min(panic_line.len());
+        while end > 0 && !panic_line.is_char_boundary(end) {
+            end -= 1;
+        }
+        let truncated = &panic_line[..end];
         return CrashReason::Panic(truncated.to_string());
     }
     CrashReason::CleanExit(code)
@@ -314,6 +324,30 @@ mod tests {
         let r = classify_exit(None, Some(101), &ring(&[&long_line]));
         match r {
             CrashReason::Panic(msg) => assert!(msg.len() <= 300, "expected truncation, got len {}", msg.len()),
+            other => panic!("expected Panic, got {other:?}"),
+        }
+    }
+
+    /// A panic payload is arbitrary program output -- a path, a Display impl, anything
+    /// -- and can contain multi-byte UTF-8 characters. `MAX_LEN` (300) must never land
+    /// mid-character: a byte-index slice on a &str panics unless the index falls on a
+    /// character boundary. Constructs a line where byte offset 300 falls INSIDE a 3-byte
+    /// '中' character (299 ASCII bytes, then '中' spans bytes 299..302) -- the classifier
+    /// itself must not panic while classifying a crash.
+    #[test]
+    fn truncation_never_lands_mid_character_even_when_max_len_would_split_one() {
+        let head = "thread 'main' panicked at ".to_string();
+        // Pad so '中' (a 3-byte character) starts exactly one byte before MAX_LEN
+        // (300) -- its middle byte then sits AT byte 300, which is provably not a
+        // char boundary, regardless of how long the fixed head text is.
+        let pad_len = 299 - head.len();
+        let long_line = format!("{head}{}中{}", "x".repeat(pad_len), "y".repeat(50));
+        assert!(!long_line.is_char_boundary(300), "test setup: byte 300 must NOT be a char boundary");
+        let r = classify_exit(None, Some(101), &ring(&[&long_line]));
+        match r {
+            CrashReason::Panic(msg) => {
+                assert!(msg.len() <= 300, "expected truncation at or before 300 bytes, got len {}", msg.len());
+            }
             other => panic!("expected Panic, got {other:?}"),
         }
     }
