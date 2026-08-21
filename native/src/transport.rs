@@ -737,6 +737,18 @@ pub async fn tcp_tls_connect_with_alpn_sni(
     tcp_tls_connect_with_alpns_sni(addr, edge_cert, &[alpn], sni).await
 }
 
+/// ct-agent#57: bound on the whole TCP connect + TLS handshake for a `:443` TLS-TCP
+/// fallback dial. Neither `TcpStream::connect` nor `tokio_rustls`'s `connect` carry any
+/// built-in bound on their own -- a black-holed SYN (a firewall that silently drops
+/// rather than resets a blocked port, exactly the kind of restrictive network these
+/// `:443` fallback rungs exist to route around) leaves this hanging for however long the
+/// OS TCP stack keeps retrying, far outlasting the rest of a dial ladder that exists
+/// specifically to fail fast and fall through. 10s matches CADS-Tunnel's own
+/// `RELAY_UPSTREAM_CONNECT_TIMEOUT` for the structurally equivalent internal upstream
+/// connect (#616) -- generous for a real handshake, short enough that a blocked rung
+/// gives the ladder a chance to fall through promptly.
+const TCP_TLS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// [`tcp_tls_connect_with_alpn_sni`] offering an ordered LIST of ALPN ids (#500 K2): the
 /// server's preference over this list is the capability negotiation -- see the channel
 /// dialers above for the two concrete offer tables. Single-id callers use the thin wrapper.
@@ -754,10 +766,16 @@ pub async fn tcp_tls_connect_with_alpns_sni(
         .with_no_client_auth();
     cfg.alpn_protocols = alpns.iter().map(|a| a.to_vec()).collect();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
-    let tcp = TcpStream::connect(addr).await?;
-    apply_tcp_keepalive(&tcp);
     let server_name = rustls::pki_types::ServerName::try_from(sni)?.to_owned();
-    Ok(connector.connect(server_name, tcp).await?)
+    tokio::time::timeout(TCP_TLS_CONNECT_TIMEOUT, async {
+        let tcp = TcpStream::connect(addr).await?;
+        apply_tcp_keepalive(&tcp);
+        connector.connect(server_name, tcp).await.map_err(BoxError::from)
+    })
+    .await
+    .map_err(|_| -> BoxError {
+        format!("TLS-TCP connect to {addr} stalled after {TCP_TLS_CONNECT_TIMEOUT:?} (ct-agent#57)").into()
+    })?
 }
 
 /// Load an Edge certificate (DER) the Edge published to a shared path.
@@ -825,6 +843,37 @@ mod tests {
             sock.keepalive_retries().unwrap() > 3,
             "TCP_KEEPCNT must be left at the OS default (~9 on Linux), NOT bounded to 3: \
              an explicit low bound is what killed quiet in-flight connections early"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_tls_connect_with_alpns_sni_times_out_instead_of_hanging_forever_57() {
+        // ct-agent#57: a peer that accepts the TCP connection and then never speaks TLS
+        // at all (the post-connect analog of a black-holed SYN -- both leave this call
+        // with nothing to wait on but time) must not hang forever. Bind a real listener,
+        // accept the connection, and deliberately never write a single TLS byte.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _held = tokio::spawn(async move {
+            // Held for the test's lifetime so the socket stays open (connected, silent)
+            // rather than the peer resetting it, which would surface as a fast connection
+            // error instead of exercising the timeout path this test is about.
+            let (stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let (cert, _key) = self_signed().unwrap();
+
+        let started = tokio::time::Instant::now();
+        let result = tcp_tls_connect_with_alpns_sni(addr, cert, &[b"ct-edge"], DEFAULT_SNI).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "a peer that never speaks TLS must surface as an error, not hang");
+        assert_eq!(
+            elapsed, TCP_TLS_CONNECT_TIMEOUT,
+            "must fail at exactly the timeout bound (virtual clock, #57) -- not immediately \
+             (which would mean the connect itself failed for an unrelated reason) and not \
+             later (which would mean something is still unbounded)"
         );
     }
 
