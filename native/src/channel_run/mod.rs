@@ -820,5 +820,8 @@ pub use dialing::*;
 mod connectivity;
 pub use connectivity::*;
 
+mod join_config;
+pub use join_config::*;
+
 #[cfg(test)]
 mod tests;
