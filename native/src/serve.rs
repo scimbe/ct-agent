@@ -55,6 +55,28 @@ async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Vec<u8>, BoxEr
     Ok(body)
 }
 
+/// ct-agent#58: bound on dialing the locally-configured Origin. Shorter than
+/// `transport::TCP_TLS_CONNECT_TIMEOUT` (10s, #57) because that one crosses the
+/// internet to the Edge; this one is typically localhost or the same LAN/container
+/// network. Every relay-serving entry point in this file dials the Origin exactly
+/// once per relayed connection, so an unbounded connect here means a stalled Origin
+/// path (a firewall/router that drops rather than resets, an Origin host up but not
+/// accepting on that port) leaks one hung task per incoming Client connection
+/// instead of failing fast with an operator-visible error.
+const ORIGIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Dial the locally-configured Origin, bounded by [`ORIGIN_CONNECT_TIMEOUT`] — the
+/// one place every relay-serving function in this file reaches the Origin, so the
+/// bound can never drift between call sites (ct-agent#58).
+async fn connect_origin(origin: SocketAddr) -> Result<TcpStream, BoxError> {
+    tokio::time::timeout(ORIGIN_CONNECT_TIMEOUT, TcpStream::connect(origin))
+        .await
+        .map_err(|_| -> BoxError {
+            format!("connect to origin {origin} stalled after {ORIGIN_CONNECT_TIMEOUT:?} (ct-agent#58)").into()
+        })?
+        .map_err(BoxError::from)
+}
+
 /// Serve one relayed QUIC stream: dial the local `origin` (TCP) and relay bytes
 /// bidirectionally between the QUIC stream and the Origin connection.
 pub async fn serve_stream_to_origin(
@@ -92,7 +114,7 @@ where
     if n == 0 {
         return Ok(()); // Client closed before ever sending anything -- nothing to relay.
     }
-    let mut tcp = TcpStream::connect(origin).await?;
+    let mut tcp = connect_origin(origin).await?;
     tcp.write_all(&first[..n]).await?;
     copy_bidirectional(&mut client, &mut tcp).await?;
     Ok(())
@@ -284,7 +306,7 @@ where
                     let w = match origin_w.as_mut() {
                         Some(w) => w,
                         None => {
-                            let (r, w) = TcpStream::connect(origin).await?.into_split();
+                            let (r, w) = connect_origin(origin).await?.into_split();
                             // A send error means the writer half already ended, so
                             // this relay is over regardless.
                             let _ = origin_r_tx.take().expect("dial happens once").send(r);
@@ -569,7 +591,7 @@ where
     let n = transport.read_message(&req_ct, &mut tmp)?;
     let request = tmp[..n].to_vec();
 
-    let mut tcp = TcpStream::connect(origin).await?;
+    let mut tcp = connect_origin(origin).await?;
     tcp.write_all(&request).await?;
     tcp.shutdown().await?;
     let mut response = Vec::new();
@@ -647,7 +669,7 @@ where
     // Meter the Origin socket: bytes read from it flow back to the Client
     // (bytes_to_client); bytes written to it came from the Client
     // (bytes_to_origin).
-    let tcp = TcpStream::connect(origin).await?;
+    let tcp = connect_origin(origin).await?;
     let tcp = Metered::new(
         tcp,
         Arc::clone(&metrics.bytes_to_client),
@@ -3496,5 +3518,45 @@ mod tests {
         drop(client_side);
         let _ = relay.await;
         let _ = origin.await;
+    }
+
+    #[tokio::test]
+    async fn connect_origin_succeeds_promptly_against_a_real_listener_58() {
+        // ct-agent#58: the happy path must stay fast and unaffected by the new bound --
+        // a real, already-listening Origin is accepted well within ORIGIN_CONNECT_TIMEOUT.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+        let started = Instant::now();
+        let result = connect_origin(addr).await;
+        assert!(result.is_ok(), "a real listener must be reachable: {:?}", result.err());
+        assert!(
+            started.elapsed() < ORIGIN_CONNECT_TIMEOUT,
+            "a live Origin must connect long before the timeout bound"
+        );
+        let _ = accept.await;
+    }
+
+    #[tokio::test]
+    async fn connect_origin_reports_a_real_refusal_distinctly_not_as_a_generic_timeout_58() {
+        // ct-agent#58: an ordinary "nothing is listening here" failure (ECONNREFUSED on
+        // loopback) must surface immediately as itself, not get swallowed into looking
+        // like the new timeout fired -- the two are different problems for an operator
+        // to act on (a wrong/down Origin vs. a genuinely stalled network path).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // frees the port; nothing is listening on it now
+
+        let started = Instant::now();
+        let err = connect_origin(addr).await.expect_err("nothing listens on this port");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a real refusal must be fast, not wait out the connect timeout"
+        );
+        assert!(
+            !err.to_string().contains("ct-agent#58"),
+            "a real connection refusal must not be misreported as the timeout firing: {err}"
+        );
     }
 }
