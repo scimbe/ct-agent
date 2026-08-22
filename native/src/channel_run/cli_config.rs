@@ -79,14 +79,28 @@ pub(crate) fn der_certificate_shape(der: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Decode a run of ASCII hex digits into bytes.
+///
+/// The ASCII-hex check comes BEFORE any indexed slicing: `&s[i..i+2]` on unchecked `&str`
+/// input can land mid multi-byte-UTF-8-char and panic instead of returning `None` -- the
+/// #417 / `grant/src/main.rs::from_hex32` bug class this codebase has already hit five
+/// times (`capability.rs`, `admin.rs`, `edge_mesh.rs`, `payment_provider.rs` x2, the
+/// supervisor binary). This value is exactly the kind of input that trips it: holder keys
+/// and DER certificates (`CT_CHANNEL_FRONT_DOOR_CERT`/`CT_CHANNEL_RELAY_GATE_CERT`/
+/// `CT_CHANNEL_PEER_CERT`) copied by hand out of a join page, where `der_certificate_shape`'s
+/// own doc comment already documents one field transcription mishap on this exact value.
 pub(crate) fn hex_bytes(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim();
-    if s.is_empty() || s.len() % 2 != 0 {
+    let digits = s.trim().as_bytes();
+    if digits.is_empty() || digits.len() % 2 != 0 || !digits.iter().all(u8::is_ascii_hexdigit) {
         return None;
     }
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok())
-        .collect()
+    let mut out = Vec::with_capacity(digits.len() / 2);
+    for i in 0..digits.len() / 2 {
+        let hi = (digits[2 * i] as char).to_digit(16)?;
+        let lo = (digits[2 * i + 1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
 }
 
 pub(crate) fn hex32(s: &str) -> Option<[u8; 32]> {

@@ -2061,6 +2061,21 @@ fn required_env_helpers_keep_the_exact_message_format() {
 }
 
 #[test]
+fn hex_bytes_rejects_non_ascii_instead_of_panicking() {
+    // #417 bug class: a naive `&s[i..i+2]` byte-index slice on unchecked `&str` input panics
+    // if a multi-byte UTF-8 character straddles the slice boundary, instead of returning
+    // `None`. `hex_bytes` feeds holder keys and DER certificates that are hand-copied out of
+    // a join page (`der_certificate_shape`'s own doc comment documents exactly this kind of
+    // transcription mishap on this exact value) -- a stray non-ASCII character (a curly quote,
+    // an accented letter) must be a clean rejection, not a crashed process.
+    assert_eq!(hex_bytes("a\u{4e2d}bc"), None, "a 3-byte char straddling a slice boundary must not panic");
+    assert_eq!(hex_bytes(&"\u{e9}".repeat(32)), None, "32 2-byte chars (64 bytes) still isn't hex");
+    assert_eq!(hex_bytes("zz"), None, "ASCII but non-hex is still rejected");
+    assert_eq!(hex_bytes("ab"), Some(vec![0xab]));
+    assert_eq!(hex_bytes("DeadBEEF"), Some(vec![0xde, 0xad, 0xbe, 0xef]), "case-insensitive");
+}
+
+#[test]
 fn serve_concurrency_parses_the_cap_or_falls_back() {
     // #200 (frozen): a positive integer overrides; absent/blank/zero/garbage → the default.
     assert_eq!(serve_concurrency_from_env(Some("4")), 4);
