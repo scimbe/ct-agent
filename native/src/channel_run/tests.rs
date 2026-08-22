@@ -3047,14 +3047,73 @@ fn channel_config_parses_roles_keys_and_the_initiator_cert_requirement() {
     let no_cert = cfg_from(&base).expect("initiator without a cert is valid (accept-any dial)");
     assert!(no_cert.peer_cert_der.is_none());
     let mut with_cert = base.to_vec();
-    with_cert.push(("CT_CHANNEL_PEER_CERT", "deadbeef"));
-    let init = cfg_from(&with_cert).expect("initiator with a cert is valid");
-    assert_eq!(init.peer_cert_der.as_deref(), Some(&[0xde, 0xad, 0xbe, 0xef][..]));
+    with_cert.push(("CT_CHANNEL_PEER_CERT", "3003010203"));
+    let init = cfg_from(&with_cert).expect("initiator with a well-shaped DER cert is valid");
+    assert_eq!(init.peer_cert_der.as_deref(), Some(&[0x30, 0x03, 0x01, 0x02, 0x03][..]));
 
     // Rejections.
     assert!(cfg_from(&[("CT_CHANNEL_ROLE", "bogus"), ("CT_CHANNEL_ADDR", "0.0.0.0:1"), ("CT_CHANNEL_NOISE_KEY", K64), ("CT_CHANNEL_PEER_NOISE_KEY", K64)]).is_err(), "bad role");
     assert!(cfg_from(&[("CT_CHANNEL_ROLE", "accept"), ("CT_CHANNEL_ADDR", "not-an-addr"), ("CT_CHANNEL_NOISE_KEY", K64), ("CT_CHANNEL_PEER_NOISE_KEY", K64)]).is_err(), "bad addr");
     assert!(cfg_from(&[("CT_CHANNEL_ROLE", "accept"), ("CT_CHANNEL_ADDR", "0.0.0.0:1"), ("CT_CHANNEL_NOISE_KEY", "tooshort"), ("CT_CHANNEL_PEER_NOISE_KEY", K64)]).is_err(), "bad key");
+
+    // ct-agent#63: CT_CHANNEL_PEER_CERT is hand-copied out of a responder's printed cert
+    // (same transcription-mishap-prone value class as CT_CHANNEL_FRONT_DOOR_CERT/
+    // CT_CHANNEL_RELAY_GATE_CERT). "deadbeef" is valid hex but not a well-shaped DER
+    // SEQUENCE (starts with 0xde, not 0x30) -- before this fix it was silently accepted
+    // here and would only fail as an opaque TLS error later, at dial time.
+    let mut bad_der = base.to_vec();
+    bad_der.push(("CT_CHANNEL_PEER_CERT", "deadbeef"));
+    let err = cfg_from(&bad_der).expect_err("malformed DER shape must be rejected at config parse time, not silently accepted");
+    assert!(err.contains("CT_CHANNEL_PEER_CERT"), "error names the field: {err}");
+}
+
+#[test]
+fn channel_join_relay_gate_cert_rejects_malformed_der_shape() {
+    // ct-agent#63: CT_CHANNEL_RELAY_GATE_CERT's own doc comment (join_config.rs) already
+    // promised "same treatment as front_door_cert" -- but until now only the front-door
+    // cert actually got the der_certificate_shape() structural check. Prove both halves:
+    // a well-shaped DER value is accepted, a malformed one is rejected here (named), not
+    // silently passed through to fail as an opaque TLS error later at dial time.
+    use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+    use ed25519_dalek::Signer;
+    let id = ChannelIdentity::generate();
+    let op = SigningKey::from_bytes(&[9u8; 32]);
+    let g = ChannelGrant {
+        channel: ChannelId([0x5Fu8; 32]),
+        holder: id.holder.verifying_key().to_bytes(),
+        direction: Direction::Initiate,
+        rights: Rights::ReadWrite,
+        delegable: false,
+        expires_at: 1_000,
+    };
+    let grant_hex = hex_encode(
+        &SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }.encode(),
+    );
+    let base: Vec<(&str, String)> = vec![
+        ("CT_CHANNEL_ROLE", "initiate".into()),
+        ("CT_CHANNEL_BROKER", "203.0.113.5:9443".into()),
+        ("CT_CHANNEL_RELAY", "203.0.113.5:9444".into()),
+        ("CT_CHANNEL_LISTEN", "203.0.113.5:7000".into()),
+        ("CT_CHANNEL_GRANT", grant_hex),
+        ("CT_CHANNEL_HOLDER_KEY", id.holder_key_hex()),
+        ("CT_CHANNEL_NOISE_KEY", id.noise_key_hex()),
+        ("CT_CHANNEL_RELAY_GATE", "203.0.113.5:443".into()),
+    ];
+    let lookup = |pairs: &[(&str, String)]| {
+        let m: HashMap<String, String> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        ChannelJoinCliConfig::from_lookup(move |k| m.get(k).cloned())
+    };
+
+    let mut good = base.clone();
+    good.push(("CT_CHANNEL_RELAY_GATE_CERT", "3003010203".into()));
+    let cfg = lookup(&good).expect("a well-shaped DER relay-gate cert is accepted");
+    assert!(cfg.relay_gate_cert.is_some());
+
+    let mut bad = base.clone();
+    bad.push(("CT_CHANNEL_RELAY_GATE_CERT", "deadbeef".into()));
+    let err = lookup(&bad).err().expect("malformed DER shape is rejected at parse time");
+    assert!(err.contains("CT_CHANNEL_RELAY_GATE_CERT"), "error names the field: {err}");
 }
 
 #[tokio::test]

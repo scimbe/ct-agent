@@ -426,9 +426,24 @@ impl ChannelJoinCliConfig {
             _ => None,
         };
         let relay_gate_cert = match f("CT_CHANNEL_RELAY_GATE_CERT") {
-            Some(s) if !s.trim().is_empty() => Some(CertificateDer::from(
-                hex_bytes(s.trim()).ok_or("CT_CHANNEL_RELAY_GATE_CERT must be hex DER")?,
-            )),
+            Some(s) if !s.trim().is_empty() => {
+                let raw = s.trim();
+                let der = hex_bytes(raw).ok_or_else(|| {
+                    format!(
+                        "CT_CHANNEL_RELAY_GATE_CERT must be hex DER -- got {} character(s), \
+                         {}",
+                        raw.len(),
+                        if raw.len() % 2 != 0 { "an odd count (one nibble lost?)" } else { "with a non-hex character in it" }
+                    )
+                })?;
+                // ct-agent#26: same structural check as CT_CHANNEL_FRONT_DOOR_CERT above --
+                // this field's own doc comment already promises "same treatment", but until
+                // now only the front-door cert got it, leaving a hand-copied relay-gate cert
+                // to fail as an opaque TLS error later instead of a named one here.
+                der_certificate_shape(&der)
+                    .map_err(|why| format!("invalid CT_CHANNEL_RELAY_GATE_CERT: {why}"))?;
+                Some(CertificateDer::from(der))
+            }
             _ => None,
         };
         // #104 in-band relay->direct upgrade: opt-in, off by default (unset -> false,

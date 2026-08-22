@@ -734,7 +734,16 @@ impl ChannelRunConfig {
         // Optional: pin the peer's transport cert. Omit it and the initiator dials
         // accept-any (Noise_IK authenticates), which keeps the one-liner self-contained.
         let peer_cert_der = match f("CT_CHANNEL_PEER_CERT").filter(|s| !s.trim().is_empty()) {
-            Some(h) => Some(hex_bytes(&h).ok_or("CT_CHANNEL_PEER_CERT must be hex DER")?),
+            Some(h) => {
+                let der = hex_bytes(&h).ok_or("CT_CHANNEL_PEER_CERT must be hex DER")?;
+                // ct-agent#26: same structural DER check CT_CHANNEL_FRONT_DOOR_CERT already
+                // gets (join_config.rs) -- this is hand-copied out of a responder's printed
+                // cert too, so it deserves the same named-here-not-a-generic-TLS-error-later
+                // treatment.
+                der_certificate_shape(&der)
+                    .map_err(|why| format!("invalid CT_CHANNEL_PEER_CERT: {why}"))?;
+                Some(der)
+            }
             None => None,
         };
         Ok(Self { role, addr, own_noise_private, peer_noise_public, peer_cert_der })
