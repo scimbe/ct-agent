@@ -265,13 +265,18 @@ fn hex8(bytes: &[u8]) -> String {
 /// This adds no constraint that sharing an identity did not already impose: `key_path` in
 /// the shared-identity branch has always been written 0600, so peer agents that share an
 /// identity already had to run as the same user.
+///
+/// Delegates to [`crate::secret_file::write_private`] (#36) rather than the plain
+/// `fs::write` + `set_permissions` this used to do directly: that shape opens a real
+/// window on the CREATE path — the file exists at the umask's default (commonly 0644)
+/// until the second syscall lands, and a crash/power-loss exactly there leaves this
+/// module's *sufficient* secret (the origin key, or the capability itself) readable by
+/// anyone, forever, on the next boot. `secret_file` exists precisely so a single,
+/// already-hardened helper closes that window by construction instead of narrowing
+/// after the fact — every other secret-writing call site in this agent already goes
+/// through it (see its own module doc); this one had simply never been migrated.
 fn write_owner_only(path: &str, bytes: &[u8]) -> Result<(), BoxError> {
-    std::fs::write(path, bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    crate::secret_file::write_private(std::path::Path::new(path), bytes)?;
     Ok(())
 }
 
