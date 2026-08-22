@@ -68,11 +68,17 @@ struct Admission {
 /// Poll the control-plane's admission broker (#233) for `hostname`. Returns
 /// `None` on ANY failure — network error, non-2xx, unparseable body — which
 /// is exactly what an older control-plane without this endpoint yet (a 404)
-/// or one with the broker feature disabled looks like from here. This is a
-/// deliberate backward-compatibility choice: [`obtain_or_renew`] treats `None`
-/// as "no admission gate configured, proceed exactly as before this feature
-/// existed" rather than blocking issuance on a control-plane that doesn't
-/// speak this protocol yet.
+/// or one with the broker feature disabled looks like from here.
+///
+/// The two callers treat `None` differently on purpose, and neither is a
+/// legacy fallback: [`admission_poll_interval`] (a cheap side read, purely to
+/// pace [`run_renewal_loop`]'s sleep) folds `None` into its default arm and
+/// simply keeps the long [`CHECK_INTERVAL`] — a harmless "nothing to tighten
+/// the loop for" outcome. [`obtain_or_renew`] does the opposite: since the
+/// admission broker is a hard requirement there (see its own doc comment), a
+/// `None` there surfaces as a real, loud error instead of silently proceeding
+/// with issuance. Read this function's return value in the context of its
+/// caller, not as one shared "backward-compatible" meaning.
 async fn poll_admission(http: &reqwest::Client, cp_url: &str, token: &str, hostname: &str) -> Option<Admission> {
     let url = format!("{}/agent/acme-admission/{token}/{hostname}", cp_url.trim_end_matches('/'));
     let resp = http.get(&url).send().await.ok()?;
