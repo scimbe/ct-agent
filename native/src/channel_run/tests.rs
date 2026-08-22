@@ -2447,6 +2447,63 @@ async fn serve_loop_concurrent_backs_off_after_repeated_flapping_sessions_then_r
 }
 
 #[test]
+fn record_flap_outcome_never_loses_a_concurrent_increment_250() {
+    // #250 concurrency fix: serve_loop_concurrent runs up to `max` sessions at once, and
+    // flapping sessions die near-instantly -- exactly the scenario where several of them
+    // finish around the same moment and race to update the SAME shared counter. The old
+    // implementation did a plain `load` then `store`, which loses increments when two
+    // concurrent flaps read the same pre-increment value before either writes back --
+    // silently undercounting the very streak #250's backoff escalates on.
+    //
+    // Real OS threads, not tokio tasks, are used deliberately: cooperative scheduling inside
+    // a single-threaded async runtime never actually interleaves two `load`s before either
+    // `store`s, so this race stayed latent under every existing `tokio::test` in this file
+    // (the only prior #250 end-to-end test above pins `max=1`, i.e. no concurrency at all).
+    //
+    // A naive "just spawn N threads" version of this test is itself unreliable: the
+    // load-then-store critical section is only a few nanoseconds wide, so uncoordinated OS
+    // thread scheduling (microsecond-scale jitter between threads reaching it) rarely lands
+    // two threads inside that exact window even under real parallelism -- confirmed live
+    // while developing this fix (#61): that version passed even against the reverted,
+    // genuinely racy implementation. A spin-gate all threads busy-wait on collapses that
+    // jitter to the width of one cache-coherency propagation, turning "maybe, eventually"
+    // contention into reliably-overlapping contention every trial.
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Arc;
+    const THREADS: u32 = 200;
+    const TRIALS: u32 = 20;
+    for _ in 0..TRIALS {
+        let counter = Arc::new(AtomicU32::new(0));
+        let go = Arc::new(AtomicBool::new(false));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let counter = counter.clone();
+                let go = go.clone();
+                std::thread::spawn(move || {
+                    while !go.load(Ordering::Acquire) {
+                        std::hint::spin_loop();
+                    }
+                    record_flap_outcome(&counter, true);
+                })
+            })
+            .collect();
+        // Let every thread reach and start spinning on the gate before releasing it, so the
+        // release wakes them all at nearly the same instant instead of a trickle that never
+        // overlaps.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        go.store(true, Ordering::Release);
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            THREADS,
+            "every concurrent flap must be counted -- a lost increment here undercounts the #250 streak"
+        );
+    }
+}
+
+#[test]
 fn reject_refused_outcome_converts_refused_to_the_err_string_is_definitive_admission_refusal_recognizes() {
     // #248 live-observed bug: `admit_one_peer` used to return `Ok(ChannelJoinOutcome::Refused)`
     // for a broker round-trip whose answer was "no" — indistinguishable, at `serve_loop_concurrent`'s

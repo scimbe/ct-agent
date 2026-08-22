@@ -141,6 +141,22 @@ pub(crate) fn serve_concurrency_from_env(value: Option<&str>) -> usize {
         .unwrap_or(DEFAULT_SERVE_CONCURRENCY)
 }
 
+/// #250: atomically record one just-ended session's flap outcome on the shared streak counter.
+/// A single [`AtomicU32::fetch_add`]/[`AtomicU32::store`] — never a separate load followed by a
+/// store — because [`serve_loop_concurrent`] runs up to `max` sessions concurrently and their
+/// completions (and therefore their calls here) can race: a `load`-then-`store` sequence lets two
+/// concurrently-completing flapping sessions both read the same pre-increment value and one
+/// increment is then silently lost on write-back, undercounting the very streak #250's backoff
+/// escalates on (and, symmetrically, a `store(0)` from a session that raced in between a
+/// concurrent flap's load and store could itself be clobbered by that flap's stale write).
+pub(crate) fn record_flap_outcome(counter: &std::sync::atomic::AtomicU32, flapped: bool) {
+    if flapped {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        counter.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// #200: drive a persistent serve member as CONCURRENT sessions. `admit` parks at the broker and
 /// returns the next paired peer's session work `W` (called sequentially — only one admission is ever
 /// in flight); `serve` runs a session to completion and is SPAWNED, so the loop returns to `admit`
@@ -211,14 +227,7 @@ where
                     let started = std::time::Instant::now();
                     let result = fut.await;
                     let flapped = is_flapping_session(started.elapsed(), result.is_err());
-                    flap_counter.store(
-                        if flapped {
-                            flap_counter.load(std::sync::atomic::Ordering::Relaxed).saturating_add(1)
-                        } else {
-                            0
-                        },
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    record_flap_outcome(&flap_counter, flapped);
                     if let Err(e) = result {
                         eprintln!("ct-agent channel: serve session ended with error (#200): {e}");
                     }
