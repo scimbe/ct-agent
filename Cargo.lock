@@ -535,6 +535,7 @@ dependencies = [
  "ct-dns",
  "ct-edge",
  "ed25519-dalek",
+ "harness-core",
  "hickory-resolver 0.26.1",
  "http-body-util",
  "installer-engine",
@@ -1130,6 +1131,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-core"
+version = "0.1.0"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.2.1-phase2#c23d96a1fa9ae5b6d9e97f577fc62bd0c926c9c3"
+dependencies = [
+ "installer-engine",
+ "manifest-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1609,7 +1622,7 @@ dependencies = [
 [[package]]
 name = "installer-engine"
 version = "0.1.0"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.1.0-phase1.4#04f07db214d0f876f1824b705c2963dd6688b918"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.2.1-phase2#c23d96a1fa9ae5b6d9e97f577fc62bd0c926c9c3"
 dependencies = [
  "flate2",
  "libc",
@@ -2205,7 +2218,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "manifest-core"
 version = "0.1.0"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.1.0-phase1.4#04f07db214d0f876f1824b705c2963dd6688b918"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.2.1-phase2#c23d96a1fa9ae5b6d9e97f577fc62bd0c926c9c3"
 dependencies = [
  "ed25519-dalek",
  "serde",
