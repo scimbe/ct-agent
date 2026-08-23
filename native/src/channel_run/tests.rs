@@ -2176,6 +2176,58 @@ async fn serve_loop_caps_concurrency_so_a_flood_cannot_fork_bomb() {
     assert_eq!(admits.load(Ordering::SeqCst), 2, "backpressure stopped admitting a peer we couldn't serve");
 }
 
+#[tokio::test]
+async fn a_panicking_admit_attempt_does_not_crash_the_persistent_serve_loop_ct_agent_64() {
+    // ct-agent#64: serve() runs SPAWNED (tokio::spawn), so a panic inside it is isolated to
+    // that one session's task -- but admit() used to run unspawned, directly in the loop
+    // body, so a panic there propagated out of serve_loop_concurrent entirely and would take
+    // the whole persistent serve process down. admit() processes broker/edge-driven network
+    // data, exactly the threat-model class CADS-Tunnel's convergence.rs (#490) already
+    // isolates for its own concurrent probes. Real proof: an admit closure that panics on its
+    // first two calls, then succeeds on the third -- the loop must survive both panics and
+    // still admit the peer once admit() stops panicking, not propagate the panic out of
+    // serve_loop_concurrent and end the test task with it.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let served = Arc::new(AtomicUsize::new(0));
+
+    let a = attempts.clone();
+    let admit = move || {
+        let a = a.clone();
+        async move {
+            let n = a.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                panic!("simulated admit() panic #{n} (ct-agent#64)");
+            }
+            Ok::<(), BoxError>(())
+        }
+    };
+    let sv = served.clone();
+    let serve = move |_w: ()| {
+        let sv = sv.clone();
+        async move {
+            sv.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            Ok::<(), BoxError>(())
+        }
+    };
+
+    // max=1: the single permit is taken by the eventual successful admit's spawned session
+    // (which parks on pending() forever, never releasing it), so the loop deterministically
+    // blocks trying to acquire a second permit for a 4th admit -- attempts and served both land
+    // on exact, non-racy values instead of depending on how many cycles fit before the timeout.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        serve_loop_concurrent(1, std::time::Duration::from_millis(10), admit, serve),
+    )
+    .await;
+
+    assert!(result.is_err(), "serve_loop_concurrent never returns under normal operation (timed out waiting, not panicked)");
+    assert_eq!(attempts.load(Ordering::SeqCst), 3, "two panicking admits plus the one that succeeded: {attempts:?}");
+    assert_eq!(served.load(Ordering::SeqCst), 1, "the third, non-panicking admit was actually served");
+}
+
 #[test]
 fn admission_refusal_classification_is_typed_and_survives_rewording_20() {
     // #20 (consolidation): the classification is a DOWNCAST now, not a substring search --
