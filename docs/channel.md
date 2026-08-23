@@ -161,7 +161,9 @@ picture first.
 Since v0.4.7 ([#16]) a **mid-life** UDP failure falls back to TLS-TCP (pool, [#229]) and probes
 QUIC every 30 s to upgrade back — previously only the *first* dial ever fell back, so a UDP flap
 took the tunnel down for its whole duration. `CT_AGENT_REGISTER_TCP_ONLY=1` pins registration to
-TLS-TCP outright (combine with `CT_AGENT_FALLBACK_443=1` for the `:443` front door).
+TLS-TCP outright (combine with `CT_AGENT_FALLBACK_443=1` for the `:443` front door). The TCP
+fallback pool holds `CT_AGENT_TCP_FALLBACK_POOL_SIZE` parallel registrations (default **6**,
+must be ≥1) — raise it on a deployment juggling many concurrent tunnels per agent process.
 
 A *parked* TLS-TCP registration is kept alive across middleboxes that ignore ACK-only keepalives
 by real-payload PING/PONG (roles `'K'` mesh / `'L'` browser). That framing stops the moment a
@@ -204,6 +206,7 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_CHANNEL_SERVE` / `CT_CHANNEL_SERVE_CONCURRENCY` | accept-side persistent serve, session cap (default 8) |
 | `CT_CHANNEL_DIRECT_UPGRADE=1` | opt-in in-band relay→direct upgrade (#104) |
 | `CT_AGENT_SERVICE_HANDLER_CMD` / `CT_AGENT_SERVICES` | the handler command + offered service slugs on the serve side |
+| `CT_SERVICE_TYPE` | not read by `ct-agent` itself — set **in the handler child's own environment** by `CT_AGENT_SERVICE_HANDLER_CMD` (#149-A.1) so one handler script can branch on which of several registered `service/<slug>` calls was actually invoked |
 | `CT_CHANNEL_REFLEXIVE_EDGE` | `host:port` of the edge's QUIC "whoami" listener (its `'W'` reflexive-address echo, #248/#238). Defaults to the relay-gate host on port `4433`; override only when the edge's QUIC listener is somewhere else. |
 | `CT_CHANNEL_SUPER_PEER_LISTEN` / `CT_CHANNEL_SUPER_PEER_UPSTREAM` | LAN super-peer mode (both required): `CT_CHANNEL_SUPER_PEER_LISTEN` is the `host:port` that LAN-local members point their own `CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY` at **instead of the real edge**; `CT_CHANNEL_SUPER_PEER_UPSTREAM` is this super-peer's real edge. One WAN hop plus N−1 local ones. |
 
@@ -214,6 +217,54 @@ ack-reader fix. Markers are on by default, and only the literal `off`/`0` disabl
 typo cannot silently drop the marker. **Do not set it in production:** an unmarked member
 cannot pair phase-deterministically and hits an N×10 s retry staircase on a large share of
 pairings (field-measured 2026-08-14, p=0.013).
+
+## Environment variables (agent-card & marketplace-offer CLI, #144/#152)
+
+`ct-agent channel agent-card` and the `--serve`-time `CapacityOffer` both reuse
+`CT_CHANNEL_HOLDER_KEY` as their signing key — no separate key config.
+
+| Variable | Meaning |
+|---|---|
+| `CT_AGENT_CARD_ROLES` / `CT_AGENT_CARD_SKILLS` / `CT_AGENT_CARD_CHANNELS` / `CT_AGENT_CARD_CELLS` | the agent card's claims: CSV role tags, `;`-separated `id\|desc` skills, and CSV 64-hex channel/cell ids |
+| `CT_AGENT_CARD_TTL_SECS` / `CT_AGENT_CARD_OUT` | card lifetime and the output directory `write_agent_card_for_origin` drops `.well-known/agent-card.json` into |
+| `CT_AGENT_OFFER_KIND` | `cloud` (`cloud-api`) or `local` (`local-hardware`) — required, no default |
+| `CT_AGENT_OFFER_MODELS` | comma-separated model ids served by this offer — at least one required |
+| `CT_AGENT_OFFER_UNITS` / `CT_AGENT_OFFER_MIN_PRICE` / `CT_AGENT_OFFER_CURRENCY` | units offered, the buyer's guaranteed-minimum price floor, and an opaque settlement-currency id — all required |
+| `CT_AGENT_OFFER_TTL_SECS` | offer validity window in seconds (default `86400`) |
+| `CT_AGENT_OFFER_MAX_BIDS` / `CT_AGENT_OFFER_WINDOW_SECS` | #149-A.3 per-consumer bid rate limit: max bids per window (default `60`) and window length in seconds (default `60`) |
+| `CT_AGENT_OFFER_SERVICES` | #167/#149-A.1: comma-separated service slugs (same vocabulary as `CT_AGENT_SERVICES`) this offer **declares** — the signed, buyer-verifiable ceiling on which `service/<slug>` tools the agent may register. Empty ⇒ a generic offer declaring no services |
+
+When `CT_AGENT_OFFER_*` is present, `--serve` mode additionally exposes the
+`auction/offer` + `auction/bid` MCP tools so a live bid can clear against a live offer
+over a real authenticated channel. An absent/incomplete config is treated the same as
+an absent agent card: the auction tools simply stay off, not an error.
+
+## Environment variables (`ct-agent manifest` subsystem, CADS-agent-marketplace Phase 1)
+
+`ct-agent manifest {create,sign,publish,activate}` authors, signs, publishes and
+installs a docker-compose-only `ServiceManifest`. Every parser fails LOUDLY — a missing
+or malformed value is an error naming the variable, never a guessed default — and
+nothing security-relevant (a key, a trust allowlist, a compose project name) has a
+default at all. The three-step split (`create`/`sign`/`publish`) means the holder key is
+needed exactly once, at `sign`, so an operator can review the unsigned skeleton first.
+
+| Subcommand | Variable | Meaning |
+|---|---|---|
+| `create` | `CT_MANIFEST_NAME` / `CT_MANIFEST_VERSION` | the service's name and version |
+| `create` | `CT_MANIFEST_BUNDLE_URL` / `CT_MANIFEST_BUNDLE_SHA256` | `https://` URL of the bundle tarball and its 64-hex sha256 |
+| `create` | `CT_MANIFEST_COMPOSE_FILE` | path to the compose file **inside** the bundle |
+| `create` | `CT_MANIFEST_VERIFY_SCRIPT` / `CT_MANIFEST_VERIFY_TIMEOUT_SECS` | path to `verify.sh` inside the bundle, and how many seconds it may run |
+| `create` | `CT_MANIFEST_ENV_VARS` | optional; `;`-separated `NAME:required:description` entries (NAMES only, never a secret value) declaring which env vars the installed service needs |
+| `create` | `CT_MANIFEST_EXPIRES_IN_SECS` | optional, default `31536000` (one year) — manifest lifetime from signing |
+| `sign` | `CT_MANIFEST_HOLDER_KEY` | 64-hex ed25519 publisher PRIVATE key, same format as `CT_CHANNEL_HOLDER_KEY`. SECRET |
+| `sign` / `publish` | `CT_MANIFEST_IN` | optional; read the manifest JSON from this file instead of stdin |
+| `publish` | `CT_MANIFEST_PUBLISH_URL` | `https://` URL the signed manifest is `PUT` to (plain `http://` is refused — `installer-engine` would never be able to fetch it) |
+| `activate` | `CT_MANIFEST_URL` | an `https://` URL or local file path of the signed manifest JSON |
+| `activate` | `CT_MANIFEST_TRUST_ALLOWLIST` / `CT_MANIFEST_TRUST_ALLOWLIST_FILE` | **exactly one** required: comma-separated 64-hex publisher pubkeys, or a file with one per line. An empty allowlist trusts nothing — activation rejects every manifest whose publisher isn't named here |
+| `activate` | `CT_MANIFEST_PROJECT_NAME` | required, no default: the isolated docker-compose project name, so an install can never collide with real infrastructure |
+| `activate` | `CT_MANIFEST_WORK_DIR` | scratch directory the bundle is unpacked into |
+| `activate` | `CT_MANIFEST_ENV_FILE` | optional; local `KEY=value` secrets file supplied to the installed service — never read from the manifest itself |
+| `activate` | `CT_MANIFEST_PROTECTED_NAMES` | optional, comma-separated substrings this install's resources must never collide with |
 
 [#16]: https://github.com/scimbe/ct-agent/issues/16
 [#18]: https://github.com/scimbe/ct-agent/issues/18
