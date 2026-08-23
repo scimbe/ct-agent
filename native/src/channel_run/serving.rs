@@ -175,7 +175,7 @@ pub(crate) async fn serve_loop_concurrent<A, Fa, S, Fs, W>(
 ) -> Result<(), BoxError>
 where
     A: FnMut() -> Fa,
-    Fa: std::future::Future<Output = Result<W, BoxError>>,
+    Fa: std::future::Future<Output = Result<W, BoxError>> + Send + 'static,
     S: Fn(W) -> Fs,
     Fs: std::future::Future<Output = Result<(), BoxError>> + Send + 'static,
     W: Send + 'static,
@@ -216,8 +216,18 @@ where
             );
             tokio::time::sleep(backoff).await;
         }
-        match admit().await {
-            Ok(work) => {
+        // ct-agent#64: admit() is run inside its own spawned task (joined immediately below,
+        // so this is NOT concurrency -- purely panic isolation). serve() has been isolated via
+        // tokio::spawn since #200 ("A serve error is a single peer's problem, logged and
+        // dropped"); admit() had no equivalent, so a panic deep in it (it drives
+        // present_channel_join_via_ladder/build_channel_dialer, both processing broker/edge-
+        // supplied network data -- the same threat-model class CADS-Tunnel's own
+        // convergence.rs::drain_probe_round (#490) already isolates for its DNS probes) used to
+        // propagate out of this whole function and crash the persistent serve process, tearing
+        // down every concurrently-running session with it -- a far larger blast radius than one
+        // bad admission attempt.
+        match tokio::spawn(admit()).await {
+            Ok(Ok(work)) => {
                 consecutive_refusals = 0;
                 consecutive_handshake_eofs = 0;
                 let fut = serve(work);
@@ -233,7 +243,22 @@ where
                     }
                 });
             }
-            Err(e) => {
+            Err(join_err) => {
+                // A panic inside admit() itself -- see this match's own doc comment above.
+                // Not a refusal, not a handshake-EOF: fold it into the generic transient-error
+                // backoff path so a repeatedly-panicking admit still eventually backs off,
+                // exactly like any other admission error.
+                drop(permit);
+                consecutive_handshake_eofs = 0;
+                consecutive_refusals = 0;
+                eprintln!(
+                    "ct-agent channel: WARNING -- an admission attempt panicked ({join_err}); treating \
+                     it as a transient admission error rather than crashing the persistent serve loop \
+                     (ct-agent#64, mirrors CADS-Tunnel#490's probe-panic isolation)"
+                );
+                tokio::time::sleep(retry_backoff).await;
+            }
+            Ok(Err(e)) => {
                 drop(permit);
                 // #21: a park expiry re-parks IMMEDIATELY on the same transport -- it is neither
                 // a refusal (never counts toward the #231 backoff) nor a failure worth the
