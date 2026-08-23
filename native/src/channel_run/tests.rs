@@ -2213,14 +2213,18 @@ async fn a_panicking_admit_attempt_does_not_crash_the_persistent_serve_loop_ct_a
         }
     };
 
+    // max=1: the single permit is taken by the eventual successful admit's spawned session
+    // (which parks on pending() forever, never releasing it), so the loop deterministically
+    // blocks trying to acquire a second permit for a 4th admit -- attempts and served both land
+    // on exact, non-racy values instead of depending on how many cycles fit before the timeout.
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(500),
-        serve_loop_concurrent(4, std::time::Duration::from_millis(10), admit, serve),
+        serve_loop_concurrent(1, std::time::Duration::from_millis(10), admit, serve),
     )
     .await;
 
     assert!(result.is_err(), "serve_loop_concurrent never returns under normal operation (timed out waiting, not panicked)");
-    assert!(attempts.load(Ordering::SeqCst) >= 3, "the loop kept calling admit() past both panics: {attempts:?}");
+    assert_eq!(attempts.load(Ordering::SeqCst), 3, "two panicking admits plus the one that succeeded: {attempts:?}");
     assert_eq!(served.load(Ordering::SeqCst), 1, "the third, non-panicking admit was actually served");
 }
 
