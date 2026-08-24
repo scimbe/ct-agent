@@ -163,18 +163,29 @@ EOF
 
 ensure_env() {
   log "checking for .env"
-  if [ ! -f .env ]; then
+  if [ -f .env ]; then
+    ok ".env found"
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+  elif [ -n "${CT_BOOTSTRAP:-}" ] || { [ -n "${CT_AGENT_JOIN_TOKEN:-}" ] && [ -n "${CT_AGENT_TOKEN:-}" ]; }; then
+    # Real gap found live (help.bunsenbrenner.org sandbox-instructions work): a
+    # genuine one-liner (CT_BOOTSTRAP=... curl ... | sh, matching the portal's
+    # own rendered command in installer.rs's install_one_liner_bootstrap) could
+    # never actually complete non-interactively -- this gate unconditionally
+    # demanded a real .env FILE on disk even when the one secret that actually
+    # matters was already sitting right there in the process environment.
+    # Every other required var (CT_AGENT_CP_URL/CT_AGENT_HOSTNAME/CT_AGENT_ORIGIN)
+    # is still validated by the `missing` check below regardless of source.
+    ok "no .env file, but a real bootstrap/join token is already set in the environment — proceeding without one"
+  else
     warn ".env not found in $(pwd)"
     write_env_template
     warn "wrote .env.example — copy it to .env, fill in the values from your portal"
     warn "tunnel page, then re-run this script. Stopping here."
     exit 1
   fi
-  ok ".env found"
-  set -a
-  # shellcheck disable=SC1091
-  . ./.env
-  set +a
 
   if [ -n "${CT_BOOTSTRAP:-}" ]; then
     log "redeeming CT_BOOTSTRAP server-side"
@@ -406,4 +417,9 @@ main() {
   poll_status
   final_report
 }
-main
+# Guarded so scripts/tests/*.sh can `source` this file to unit-test individual
+# functions (e.g. ensure_env) without it immediately downloading/running a
+# real agent -- `main` only fires on a direct invocation, matching `${0}`.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main
+fi

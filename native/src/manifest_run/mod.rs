@@ -30,6 +30,39 @@ pub fn unix_now() -> Result<u64, String> {
         .map_err(|e| format!("system clock is before the Unix epoch: {e}"))
 }
 
+/// `CT_MANIFEST_REGISTRY_URL` carries `CT_MANIFEST_REGISTRY_WRITE_TOKEN` as a Bearer header on
+/// every request -- both the publish POST (which also carries the full signed manifest and bundle
+/// bytes) and the activation-ledger POST -- so it gets the same https:// discipline this file
+/// already applies to `CT_MANIFEST_PUBLISH_URL`/`CT_MANIFEST_BUNDLE_URL`/`CT_MANIFEST_URL`. Unlike
+/// those (which only ever point at real object storage), a registry is realistically also run
+/// locally during development, so plain `http://` is allowed for loopback and nowhere else: a
+/// typo'd or misconfigured non-loopback `http://` endpoint would otherwise silently leak the write
+/// token and the manifest/bundle bytes in cleartext to anyone on path, with no warning from the
+/// tool -- exactly the class of bug the https:// checks elsewhere in this file exist to prevent.
+fn require_registry_url_scheme(url: &str) -> Result<(), String> {
+    if url.starts_with("https://") {
+        return Ok(());
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        let host = rest.split(['/', '?']).next().unwrap_or("");
+        // Bracketed IPv6 (`[::1]:8787`) needs its own split -- a bare `:` split would chop it
+        // apart at every colon inside the address itself.
+        let host = match host.strip_prefix('[') {
+            Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
+            None => host.split(':').next().unwrap_or(""),
+        };
+        if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "CT_MANIFEST_REGISTRY_URL must be https:// (got '{url}') -- it carries \
+         CT_MANIFEST_REGISTRY_WRITE_TOKEN plus the manifest/bundle bytes on every request, so a \
+         non-loopback http:// endpoint would leak all of it in cleartext to anyone on path; \
+         http://127.0.0.1, http://localhost or http://[::1] is allowed for local development"
+    ))
+}
+
 /// Decode exactly 64 ASCII hex characters into 32 bytes.
 ///
 /// The ASCII-hex check comes BEFORE any indexed slicing. `&s[i..i + 2]` on unchecked input can
@@ -366,6 +399,7 @@ async fn run_publish_dumb_put(url: String) -> Result<(), String> {
 /// always going to be rejected.
 async fn run_publish_to_registry<F: Fn(&str) -> Option<String>>(f: &F, registry_url: String) -> Result<(), String> {
     let registry_url = registry_url.trim_end_matches('/').to_string();
+    require_registry_url_scheme(&registry_url)?;
     let bundle_path = req(f, "CT_MANIFEST_BUNDLE_PATH", "local path to the bundle tarball this manifest's bundle.sha256 commits to")?;
     let token = req(f, "CT_MANIFEST_REGISTRY_WRITE_TOKEN", "the registry's REGISTRY_WRITE_TOKEN")?;
 
@@ -471,17 +505,21 @@ impl ActivateCliConfig {
         let registry_url = opt(&f, "CT_MANIFEST_REGISTRY_URL");
         let registry = match registry_url {
             None => None,
-            Some(registry_url) => Some(RegistryActivationConfig {
-                registry_url: registry_url.trim_end_matches('/').to_string(),
-                registry_write_token: req(&f, "CT_MANIFEST_REGISTRY_WRITE_TOKEN", "the registry's REGISTRY_WRITE_TOKEN")?,
-                activator_pubkey: {
-                    let hex = req(&f, "CT_MANIFEST_ACTIVATOR_PUBKEY", "this agent's own 64-hex holder pubkey, reported on the activation ledger")?;
-                    if hex32(&hex).is_none() {
-                        return Err("CT_MANIFEST_ACTIVATOR_PUBKEY must be exactly 64 ASCII hex characters".to_string());
-                    }
-                    hex
-                },
-            }),
+            Some(registry_url) => {
+                let registry_url = registry_url.trim_end_matches('/').to_string();
+                require_registry_url_scheme(&registry_url)?;
+                Some(RegistryActivationConfig {
+                    registry_url,
+                    registry_write_token: req(&f, "CT_MANIFEST_REGISTRY_WRITE_TOKEN", "the registry's REGISTRY_WRITE_TOKEN")?,
+                    activator_pubkey: {
+                        let hex = req(&f, "CT_MANIFEST_ACTIVATOR_PUBKEY", "this agent's own 64-hex holder pubkey, reported on the activation ledger")?;
+                        if hex32(&hex).is_none() {
+                            return Err("CT_MANIFEST_ACTIVATOR_PUBKEY must be exactly 64 ASCII hex characters".to_string());
+                        }
+                        hex
+                    },
+                })
+            }
         };
         Ok(Self {
             manifest_location: req(
@@ -796,6 +834,51 @@ mod tests {
         env.push(("CT_MANIFEST_ACTIVATOR_PUBKEY", "not-hex"));
         let err = ActivateCliConfig::from_lookup(lookup(&env)).unwrap_err();
         assert!(err.contains("CT_MANIFEST_ACTIVATOR_PUBKEY"), "{err}");
+    }
+
+    #[test]
+    fn registry_url_scheme_accepts_https_and_loopback_http_only() {
+        for ok in [
+            "https://registry.example.invalid",
+            "http://127.0.0.1:8787",
+            "http://localhost:8787",
+            "http://[::1]:8787",
+        ] {
+            assert!(require_registry_url_scheme(ok).is_ok(), "{ok} should be accepted");
+        }
+        for bad in [
+            "http://registry.example.invalid",
+            "http://evil.invalid",
+            "http://127.0.0.1.evil.invalid",
+            "ftp://127.0.0.1:8787",
+        ] {
+            let err = require_registry_url_scheme(bad)
+                .expect_err(&format!("{bad} must be rejected -- it would leak the registry write token and manifest/bundle bytes in cleartext"));
+            assert!(err.contains("https://"), "{err}");
+        }
+    }
+
+    #[test]
+    fn activate_rejects_a_non_loopback_http_registry_url() {
+        // #70-follow: CT_MANIFEST_REGISTRY_URL carries CT_MANIFEST_REGISTRY_WRITE_TOKEN as a
+        // Bearer header on every request, exactly like the other network-facing manifest URLs in
+        // this file that already require https://. A typo'd or misconfigured non-loopback
+        // http:// endpoint must be refused loudly, not silently accepted and leaked in cleartext.
+        let mut env = activate_base_env();
+        env.push(("CT_MANIFEST_REGISTRY_URL", "http://registry.example.invalid"));
+        env.push(("CT_MANIFEST_REGISTRY_WRITE_TOKEN", "secret-token"));
+        env.push(("CT_MANIFEST_ACTIVATOR_PUBKEY", SHA));
+        let err = ActivateCliConfig::from_lookup(lookup(&env)).unwrap_err();
+        assert!(err.contains("CT_MANIFEST_REGISTRY_URL") && err.contains("https://"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn publish_to_registry_rejects_a_non_loopback_http_registry_url_before_touching_the_network() {
+        let env = [("CT_MANIFEST_REGISTRY_WRITE_TOKEN", "secret-token")];
+        let err = run_publish_to_registry(&lookup(&env), "http://registry.example.invalid".to_string())
+            .await
+            .unwrap_err();
+        assert!(err.contains("CT_MANIFEST_REGISTRY_URL") && err.contains("https://"), "{err}");
     }
 
     #[test]

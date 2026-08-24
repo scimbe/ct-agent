@@ -796,7 +796,16 @@ pub async fn run_agent(
     if let Some(addr) = config.metrics_listen {
         let mmetrics = Arc::clone(&metrics);
         tokio::spawn(async move {
-            let _ = crate::observe::serve_metrics(addr, mmetrics).await;
+            // Real gap found live 2026-08-24: serve_metrics's TcpListener::bind
+            // can genuinely fail (port already in use, permission denied on a
+            // privileged port) -- the failure was discarded with no log line
+            // anywhere in this spawned task. An operator who opted into
+            // --metrics-listen would see it silently never come up, with zero
+            // signal in the agent's own logs -- only discoverable by noticing
+            // missing scrape data on the monitoring side.
+            if let Err(e) = crate::observe::serve_metrics(addr, mmetrics).await {
+                eprintln!("ct-agent: metrics listener on {addr} failed: {e}");
+            }
         });
     }
     if let Some(ip) = config.direct_advertise_ip {
