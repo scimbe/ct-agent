@@ -535,6 +535,7 @@ dependencies = [
  "ct-dns",
  "ct-edge",
  "ed25519-dalek",
+ "harness-core",
  "hickory-resolver 0.26.1",
  "http-body-util",
  "installer-engine",
@@ -552,6 +553,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "socket2 0.5.10",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
@@ -868,6 +870,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1127,6 +1135,18 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "harness-core"
+version = "0.1.0"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.2.1-phase2#c23d96a1fa9ae5b6d9e97f577fc62bd0c926c9c3"
+dependencies = [
+ "installer-engine",
+ "manifest-core",
+ "reqwest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1609,7 +1629,7 @@ dependencies = [
 [[package]]
 name = "installer-engine"
 version = "0.1.0"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.1.0-phase1.4#04f07db214d0f876f1824b705c2963dd6688b918"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.2.1-phase2#c23d96a1fa9ae5b6d9e97f577fc62bd0c926c9c3"
 dependencies = [
  "flate2",
  "libc",
@@ -2205,7 +2225,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "manifest-core"
 version = "0.1.0"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.1.0-phase1.4#04f07db214d0f876f1824b705c2963dd6688b918"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.2.1-phase2#c23d96a1fa9ae5b6d9e97f577fc62bd0c926c9c3"
 dependencies = [
  "ed25519-dalek",
  "serde",
@@ -3522,6 +3542,19 @@ dependencies = [
  "filetime",
  "libc",
  "xattr",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
