@@ -30,6 +30,39 @@ pub fn unix_now() -> Result<u64, String> {
         .map_err(|e| format!("system clock is before the Unix epoch: {e}"))
 }
 
+/// `CT_MANIFEST_REGISTRY_URL` carries `CT_MANIFEST_REGISTRY_WRITE_TOKEN` as a Bearer header on
+/// every request -- both the publish POST (which also carries the full signed manifest and bundle
+/// bytes) and the activation-ledger POST -- so it gets the same https:// discipline this file
+/// already applies to `CT_MANIFEST_PUBLISH_URL`/`CT_MANIFEST_BUNDLE_URL`/`CT_MANIFEST_URL`. Unlike
+/// those (which only ever point at real object storage), a registry is realistically also run
+/// locally during development, so plain `http://` is allowed for loopback and nowhere else: a
+/// typo'd or misconfigured non-loopback `http://` endpoint would otherwise silently leak the write
+/// token and the manifest/bundle bytes in cleartext to anyone on path, with no warning from the
+/// tool -- exactly the class of bug the https:// checks elsewhere in this file exist to prevent.
+fn require_registry_url_scheme(url: &str) -> Result<(), String> {
+    if url.starts_with("https://") {
+        return Ok(());
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        let host = rest.split(['/', '?']).next().unwrap_or("");
+        // Bracketed IPv6 (`[::1]:8787`) needs its own split -- a bare `:` split would chop it
+        // apart at every colon inside the address itself.
+        let host = match host.strip_prefix('[') {
+            Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
+            None => host.split(':').next().unwrap_or(""),
+        };
+        if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "CT_MANIFEST_REGISTRY_URL must be https:// (got '{url}') -- it carries \
+         CT_MANIFEST_REGISTRY_WRITE_TOKEN plus the manifest/bundle bytes on every request, so a \
+         non-loopback http:// endpoint would leak all of it in cleartext to anyone on path; \
+         http://127.0.0.1, http://localhost or http://[::1] is allowed for local development"
+    ))
+}
+
 /// Decode exactly 64 ASCII hex characters into 32 bytes.
 ///
 /// The ASCII-hex check comes BEFORE any indexed slicing. `&s[i..i + 2]` on unchecked input can
@@ -287,24 +320,35 @@ pub fn run_sign() -> Result<String, String> {
     serde_json::to_string_pretty(&signed).map_err(|e| format!("serialize signed manifest: {e}"))
 }
 
-/// `ct-agent manifest publish`: PUT a signed manifest where the operator points us.
+/// `ct-agent manifest publish`: either PUT a signed manifest where the operator points us (Phase
+/// 1's dumb object-storage mode), or, if `CT_MANIFEST_REGISTRY_URL` is set, POST it + its bundle
+/// to a Phase 3 registry instead. Exactly one of `CT_MANIFEST_PUBLISH_URL` /
+/// `CT_MANIFEST_REGISTRY_URL` must be set -- same "for the one input that decides X, refuse to
+/// guess" discipline as `ActivateCliConfig`'s trust-allowlist parsing above.
 ///
-/// Phase 1 has no registry service -- this is deliberately a dumb PUT to an operator-supplied
-/// object-storage URL. The manifest's own signature, not the transport, is what makes it
-/// trustworthy at activation time; HTTPS is still required because `installer-engine` refuses to
-/// fetch over plain HTTP, so a manifest published to an `http://` URL would be unusable.
+/// The manifest's own signature, not the transport, is what makes it trustworthy at activation
+/// time; HTTPS is still required because `installer-engine` refuses to fetch over plain HTTP, so a
+/// manifest published to an `http://` URL would be unusable either way.
 pub async fn run_publish() -> Result<(), String> {
     let f = |k: &str| std::env::var(k).ok();
-    let url = req(&f, "CT_MANIFEST_PUBLISH_URL", "https:// URL to PUT the signed manifest to")?;
-    if !url.starts_with("https://") {
-        return Err(format!(
-            "CT_MANIFEST_PUBLISH_URL must be https:// (got '{url}') -- installer-engine refuses to \
-             fetch a manifest over plain HTTP, so this one could never be activated"
-        ));
+    let dumb_put_url = opt(&f, "CT_MANIFEST_PUBLISH_URL");
+    let registry_url = opt(&f, "CT_MANIFEST_REGISTRY_URL");
+    match (dumb_put_url, registry_url) {
+        (Some(_), Some(_)) => Err("set exactly one of CT_MANIFEST_PUBLISH_URL or \
+                                    CT_MANIFEST_REGISTRY_URL, not both"
+            .to_string()),
+        (None, None) => Err("CT_MANIFEST_PUBLISH_URL (https:// object-storage URL) or \
+                              CT_MANIFEST_REGISTRY_URL (Phase 3 registry base URL) required"
+            .to_string()),
+        (Some(url), None) => run_publish_dumb_put(url).await,
+        (None, Some(registry_url)) => run_publish_to_registry(&f, registry_url).await,
     }
+}
+
+/// Load + parse + verify the manifest to publish -- the one step both publish modes share, so a
+/// manifest that no one could ever activate is caught before either transport ever runs.
+fn load_and_verify_manifest_to_publish() -> Result<(String, ServiceManifest), String> {
     let body = read_manifest_input()?;
-    // Parse + verify before uploading: publishing a manifest that no one could ever activate is a
-    // silent failure that only surfaces on someone else's machine.
     let manifest: ServiceManifest = serde_json::from_str(&body)
         .map_err(|e| format!("input is not a valid signed manifest: {e}"))?;
     let now = unix_now()?;
@@ -321,6 +365,17 @@ pub async fn run_publish() -> Result<(), String> {
                 .to_string(),
         );
     }
+    Ok((body, manifest))
+}
+
+async fn run_publish_dumb_put(url: String) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err(format!(
+            "CT_MANIFEST_PUBLISH_URL must be https:// (got '{url}') -- installer-engine refuses to \
+             fetch a manifest over plain HTTP, so this one could never be activated"
+        ));
+    }
+    let (body, manifest) = load_and_verify_manifest_to_publish()?;
 
     // A bare `reqwest::Client::new()` has no request timeout -- a stalled
     // publish endpoint would hang `ct-agent manifest publish` indefinitely
@@ -348,6 +403,47 @@ pub async fn run_publish() -> Result<(), String> {
     Ok(())
 }
 
+/// `CT_MANIFEST_REGISTRY_URL` mode: POST the manifest JSON + the bundle tarball
+/// (`CT_MANIFEST_BUNDLE_PATH`) as multipart to `{registry_url}/manifests`, authenticated with
+/// `CT_MANIFEST_REGISTRY_WRITE_TOKEN`. The registry re-verifies the signature and the bundle's
+/// hash itself (never trust a client-side check alone for something a network peer asserts), but
+/// checking here first still avoids uploading a multi-megabyte bundle for a manifest that was
+/// always going to be rejected.
+async fn run_publish_to_registry<F: Fn(&str) -> Option<String>>(f: &F, registry_url: String) -> Result<(), String> {
+    let registry_url = registry_url.trim_end_matches('/').to_string();
+    require_registry_url_scheme(&registry_url)?;
+    let bundle_path = req(f, "CT_MANIFEST_BUNDLE_PATH", "local path to the bundle tarball this manifest's bundle.sha256 commits to")?;
+    let token = req(f, "CT_MANIFEST_REGISTRY_WRITE_TOKEN", "the registry's REGISTRY_WRITE_TOKEN")?;
+
+    let (body, manifest) = load_and_verify_manifest_to_publish()?;
+    let bundle_bytes = std::fs::read(&bundle_path).map_err(|e| format!("read CT_MANIFEST_BUNDLE_PATH {bundle_path}: {e}"))?;
+
+    let manifest_part = reqwest::multipart::Part::text(body).mime_str("application/json").map_err(|e| e.to_string())?;
+    let bundle_part = reqwest::multipart::Part::bytes(bundle_bytes)
+        .file_name("bundle.tar.gz")
+        .mime_str("application/gzip")
+        .map_err(|e| e.to_string())?;
+    let form = reqwest::multipart::Form::new().part("manifest", manifest_part).part("bundle", bundle_part);
+
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+        .post(format!("{registry_url}/manifests"))
+        .header("authorization", format!("Bearer {token}"))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("POST {registry_url}/manifests: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("POST {registry_url}/manifests: HTTP {status} -- {}", text.trim().chars().take(200).collect::<String>()));
+    }
+    eprintln!("published manifest {} to registry {registry_url}: {}", hex_encode(&manifest.manifest_id), text.trim());
+    Ok(())
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -367,6 +463,22 @@ pub struct ActivateCliConfig {
     pub project_name: String,
     pub protected_name_substrings: Vec<String>,
     pub work_dir: PathBuf,
+    /// Phase 3, opt-in: when set, a successful activation additionally POSTs a ledger-only
+    /// activation event to `{registry_url}/manifests/:id/activations`. All three of
+    /// `registry_url`/`registry_write_token`/`activator_pubkey` are required together (checked in
+    /// `from_lookup`) -- a partially-configured registry mode would silently skip the ledger write
+    /// instead of failing loudly.
+    pub registry: Option<RegistryActivationConfig>,
+}
+
+#[derive(Debug)]
+pub struct RegistryActivationConfig {
+    pub registry_url: String,
+    pub registry_write_token: String,
+    /// This agent's own holder pubkey, reported (not cryptographically proven) as the activator --
+    /// Phase 3's ledger is honest bookkeeping, not a payment-grade attestation (see
+    /// `registry::post_activation`'s own doc comment for the full rationale).
+    pub activator_pubkey: String,
 }
 
 impl ActivateCliConfig {
@@ -402,6 +514,25 @@ impl ActivateCliConfig {
                         every manifest; name at least one 64-hex publisher pubkey"
                 .to_string());
         }
+        let registry_url = opt(&f, "CT_MANIFEST_REGISTRY_URL");
+        let registry = match registry_url {
+            None => None,
+            Some(registry_url) => {
+                let registry_url = registry_url.trim_end_matches('/').to_string();
+                require_registry_url_scheme(&registry_url)?;
+                Some(RegistryActivationConfig {
+                    registry_url,
+                    registry_write_token: req(&f, "CT_MANIFEST_REGISTRY_WRITE_TOKEN", "the registry's REGISTRY_WRITE_TOKEN")?,
+                    activator_pubkey: {
+                        let hex = req(&f, "CT_MANIFEST_ACTIVATOR_PUBKEY", "this agent's own 64-hex holder pubkey, reported on the activation ledger")?;
+                        if hex32(&hex).is_none() {
+                            return Err("CT_MANIFEST_ACTIVATOR_PUBKEY must be exactly 64 ASCII hex characters".to_string());
+                        }
+                        hex
+                    },
+                })
+            }
+        };
         Ok(Self {
             manifest_location: req(
                 &f,
@@ -425,6 +556,7 @@ impl ActivateCliConfig {
                 "CT_MANIFEST_WORK_DIR",
                 "a scratch directory to unpack the bundle into",
             )?),
+            registry,
         })
     }
 }
@@ -436,6 +568,7 @@ pub async fn run_activate(cfg: ActivateCliConfig) -> Result<InstallReport, Strin
     let now = unix_now()?;
     std::fs::create_dir_all(&cfg.work_dir)
         .map_err(|e| format!("create CT_MANIFEST_WORK_DIR {}: {e}", cfg.work_dir.display()))?;
+    let registry = cfg.registry;
     let opts = ActivateOptions {
         manifest_location: cfg.manifest_location,
         allowlist: cfg.allowlist,
@@ -445,9 +578,40 @@ pub async fn run_activate(cfg: ActivateCliConfig) -> Result<InstallReport, Strin
         work_dir: cfg.work_dir,
         now,
     };
-    tokio::task::spawn_blocking(move || installer_engine::activate(opts))
+    let report = tokio::task::spawn_blocking(move || installer_engine::activate(opts))
         .await
-        .map_err(|e| format!("activation task failed: {e}"))
+        .map_err(|e| format!("activation task failed: {e}"))?;
+
+    // Phase 3, opt-in: a ledger write only, and only after a REAL successful install -- a
+    // Rejected/Failed activation must never be recorded as if it happened. A failure posting the
+    // ledger event does not undo (or fail) the activation itself: the service is already up, and
+    // the ledger is bookkeeping, not the source of truth for whether activation succeeded -- but
+    // it IS surfaced loudly on stderr so it doesn't silently go missing.
+    if let (Some(registry), InstallReport::Ok { manifest_id, .. }) = (&registry, &report) {
+        if let Err(e) = post_activation_ledger_event(registry, manifest_id).await {
+            eprintln!("warning: activation succeeded but the registry ledger event failed: {e}");
+        }
+    }
+    Ok(report)
+}
+
+async fn post_activation_ledger_event(registry: &RegistryActivationConfig, manifest_id: &str) -> Result<(), String> {
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+        .post(format!("{}/manifests/{manifest_id}/activations", registry.registry_url))
+        .header("authorization", format!("Bearer {}", registry.registry_write_token))
+        .json(&serde_json::json!({ "activator_pubkey": registry.activator_pubkey, "status": "ok" }))
+        .send()
+        .await
+        .map_err(|e| format!("POST activation ledger event: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let detail: String = resp.text().await.unwrap_or_default().trim().chars().take(200).collect();
+        return Err(format!("HTTP {status}{}", if detail.is_empty() { String::new() } else { format!(" -- {detail}") }));
+    }
+    Ok(())
 }
 
 /// Whether the install actually succeeded -- the caller exits non-zero when it did not, so that
@@ -656,6 +820,94 @@ mod tests {
         assert!(cfg.allowlist.contains(&[0x99; 32]));
         assert_eq!(cfg.env_file, Some(PathBuf::from("/local/secrets.env")));
         assert_eq!(cfg.protected_name_substrings, vec!["litellm-proxy", "cads-tunnel"]);
+        assert!(cfg.registry.is_none(), "CT_MANIFEST_REGISTRY_URL unset -> registry mode is off, not silently defaulted on");
+    }
+
+    fn activate_base_env() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("CT_MANIFEST_URL", "/local/path/manifest.json"),
+            ("CT_MANIFEST_PROJECT_NAME", "proof-run"),
+            ("CT_MANIFEST_WORK_DIR", "/tmp/work"),
+            ("CT_MANIFEST_TRUST_ALLOWLIST", SHA),
+        ]
+    }
+
+    #[test]
+    fn activate_parses_registry_mode_when_all_three_registry_vars_are_set() {
+        let mut env = activate_base_env();
+        env.push(("CT_MANIFEST_REGISTRY_URL", "http://127.0.0.1:8787/"));
+        env.push(("CT_MANIFEST_REGISTRY_WRITE_TOKEN", "secret-token"));
+        env.push(("CT_MANIFEST_ACTIVATOR_PUBKEY", SHA));
+        let cfg = ActivateCliConfig::from_lookup(lookup(&env)).unwrap();
+        let registry = cfg.registry.expect("registry mode should be parsed");
+        // Trailing slash stripped so `{registry_url}/manifests/...` never double-slashes.
+        assert_eq!(registry.registry_url, "http://127.0.0.1:8787");
+        assert_eq!(registry.registry_write_token, "secret-token");
+        assert_eq!(registry.activator_pubkey, SHA);
+    }
+
+    #[test]
+    fn activate_registry_mode_requires_a_write_token() {
+        let mut env = activate_base_env();
+        env.push(("CT_MANIFEST_REGISTRY_URL", "http://127.0.0.1:8787"));
+        env.push(("CT_MANIFEST_ACTIVATOR_PUBKEY", SHA));
+        let err = ActivateCliConfig::from_lookup(lookup(&env)).unwrap_err();
+        assert!(err.contains("CT_MANIFEST_REGISTRY_WRITE_TOKEN"), "{err}");
+    }
+
+    #[test]
+    fn activate_registry_mode_requires_a_well_formed_activator_pubkey() {
+        let mut env = activate_base_env();
+        env.push(("CT_MANIFEST_REGISTRY_URL", "http://127.0.0.1:8787"));
+        env.push(("CT_MANIFEST_REGISTRY_WRITE_TOKEN", "secret-token"));
+        env.push(("CT_MANIFEST_ACTIVATOR_PUBKEY", "not-hex"));
+        let err = ActivateCliConfig::from_lookup(lookup(&env)).unwrap_err();
+        assert!(err.contains("CT_MANIFEST_ACTIVATOR_PUBKEY"), "{err}");
+    }
+
+    #[test]
+    fn registry_url_scheme_accepts_https_and_loopback_http_only() {
+        for ok in [
+            "https://registry.example.invalid",
+            "http://127.0.0.1:8787",
+            "http://localhost:8787",
+            "http://[::1]:8787",
+        ] {
+            assert!(require_registry_url_scheme(ok).is_ok(), "{ok} should be accepted");
+        }
+        for bad in [
+            "http://registry.example.invalid",
+            "http://evil.invalid",
+            "http://127.0.0.1.evil.invalid",
+            "ftp://127.0.0.1:8787",
+        ] {
+            let err = require_registry_url_scheme(bad)
+                .expect_err(&format!("{bad} must be rejected -- it would leak the registry write token and manifest/bundle bytes in cleartext"));
+            assert!(err.contains("https://"), "{err}");
+        }
+    }
+
+    #[test]
+    fn activate_rejects_a_non_loopback_http_registry_url() {
+        // #70-follow: CT_MANIFEST_REGISTRY_URL carries CT_MANIFEST_REGISTRY_WRITE_TOKEN as a
+        // Bearer header on every request, exactly like the other network-facing manifest URLs in
+        // this file that already require https://. A typo'd or misconfigured non-loopback
+        // http:// endpoint must be refused loudly, not silently accepted and leaked in cleartext.
+        let mut env = activate_base_env();
+        env.push(("CT_MANIFEST_REGISTRY_URL", "http://registry.example.invalid"));
+        env.push(("CT_MANIFEST_REGISTRY_WRITE_TOKEN", "secret-token"));
+        env.push(("CT_MANIFEST_ACTIVATOR_PUBKEY", SHA));
+        let err = ActivateCliConfig::from_lookup(lookup(&env)).unwrap_err();
+        assert!(err.contains("CT_MANIFEST_REGISTRY_URL") && err.contains("https://"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn publish_to_registry_rejects_a_non_loopback_http_registry_url_before_touching_the_network() {
+        let env = [("CT_MANIFEST_REGISTRY_WRITE_TOKEN", "secret-token")];
+        let err = run_publish_to_registry(&lookup(&env), "http://registry.example.invalid".to_string())
+            .await
+            .unwrap_err();
+        assert!(err.contains("CT_MANIFEST_REGISTRY_URL") && err.contains("https://"), "{err}");
     }
 
     #[test]

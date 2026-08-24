@@ -46,6 +46,7 @@ USAGE:
     ct-agent manifest sign                Sign a manifest skeleton with the holder key
     ct-agent manifest publish             PUT a signed manifest to an object-storage URL
     ct-agent manifest activate            Fetch, verify and install a signed manifest
+    ct-agent harness run                  Run a signed task against an installed manifest's bundle
 
 Every subcommand is configured entirely via CT_*/CT_AGENT_*/CT_CHANNEL_* environment
 variables, not flags -- see docs.bunsenbrenner.org for the full reference per command.
@@ -63,14 +64,31 @@ Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
     sign      CT_MANIFEST_HOLDER_KEY (64 hex ed25519 private key, same format as
               CT_CHANNEL_HOLDER_KEY); manifest JSON from CT_MANIFEST_IN or stdin.
               Writes the signed JSON to stdout; no network.
-    publish   CT_MANIFEST_PUBLISH_URL (https://); signed JSON from CT_MANIFEST_IN or stdin.
+    publish   Exactly one of: CT_MANIFEST_PUBLISH_URL (https:// object-storage PUT) or
+              CT_MANIFEST_REGISTRY_URL (Phase 3 registry POST -- also needs
+              CT_MANIFEST_BUNDLE_PATH, the local bundle tarball, and
+              CT_MANIFEST_REGISTRY_WRITE_TOKEN). Signed JSON from CT_MANIFEST_IN or stdin.
     activate  CT_MANIFEST_URL (https:// URL or local path), CT_MANIFEST_PROJECT_NAME,
               CT_MANIFEST_WORK_DIR, and exactly one of CT_MANIFEST_TRUST_ALLOWLIST
               (comma-separated 64-hex publisher pubkeys) / CT_MANIFEST_TRUST_ALLOWLIST_FILE
               (one per line); optional CT_MANIFEST_ENV_FILE (KEY=value secrets, supplied
               locally, never from the manifest) and CT_MANIFEST_PROTECTED_NAMES (comma-
               separated substrings this install must never collide with). Writes the install
-              report JSON to stdout and exits non-zero unless the status is \"ok\".
+              report JSON to stdout and exits non-zero unless the status is \"ok\". Optional
+              Phase 3 registry ledger mode: if CT_MANIFEST_REGISTRY_URL is set, a successful
+              activation additionally POSTs a ledger-only activation event (also needs
+              CT_MANIFEST_REGISTRY_WRITE_TOKEN and CT_MANIFEST_ACTIVATOR_PUBKEY, this agent's
+              own 64-hex holder pubkey).
+
+`harness run` (CADS-agent-marketplace Phase 2, bounded local-LLM bundle maintenance) reads:
+    CT_HARNESS_TASK_URL_OR_PATH, CT_HARNESS_MANIFEST_URL_OR_PATH (the same manifest reference
+    used at `manifest activate` time), CT_HARNESS_BUNDLE_DIR (that manifest's already-activated
+    work_dir), CT_HARNESS_LITELLM_URL, CT_HARNESS_LITELLM_KEY_FILE (a budget-capped LiteLLM
+    virtual key, in a file, never inline), CT_HARNESS_ALLOWED_MODELS (comma-separated), and
+    exactly one of CT_HARNESS_TRUST_ALLOWLIST / CT_HARNESS_TRUST_ALLOWLIST_FILE. The harness may
+    only read/write files inside CT_HARNESS_BUNDLE_DIR and rebuild that bundle's own compose file
+    -- no shell access, no host-wide filesystem access. Writes the run report JSON to stdout and
+    exits non-zero unless the status is \"ok\".
 ";
 
 #[tokio::main]
@@ -442,6 +460,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             None => {
                 eprintln!("ct-agent: `manifest` requires a subcommand (create|sign|publish|activate)\n");
+                eprint!("{USAGE}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // `harness` subcommand (CADS-agent-marketplace Phase 2): run a signed task against ONE
+    // already-activated manifest's own bundle directory, via a bounded local-LLM agent loop that
+    // can only read/write inside that directory and rebuild its own compose file. Same
+    // fail-loudly-on-typo discipline (#239/#14) as `channel`/`manifest` above.
+    if std::env::args().nth(1).as_deref() == Some("harness") {
+        match std::env::args().nth(2).as_deref() {
+            Some("run") => {
+                let cfg = ct_agent::harness_run::HarnessCliConfig::from_env()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                let report = ct_agent::harness_run::run_harness(cfg)
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                println!("{}", report.to_json());
+                if !matches!(report, harness_core::HarnessReport::Ok { .. }) {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            Some(other) => {
+                eprintln!("ct-agent: unrecognized harness subcommand '{other}'\n");
+                eprint!("{USAGE}");
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("ct-agent: `harness` requires a subcommand (run)\n");
                 eprint!("{USAGE}");
                 std::process::exit(1);
             }

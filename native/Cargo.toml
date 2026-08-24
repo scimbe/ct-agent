@@ -18,9 +18,6 @@ ct-control-plane = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.
 # ACME (ADR-0003): Dns01Provider (SelfHosted ct-dns / deSEC) publishes the
 # _acme-challenge TXT record the DNS-01 validation reads.
 ct-dns = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.17" }
-# CADS-agent-marketplace: the signed ServiceManifest schema (manifest-core, no I/O) and the
-# fetch/verify/guardrail/compose|binary-run/verify install pipeline (installer-engine) behind
-# `ct-agent manifest {create,sign,publish,activate}`. Same pinned-tag git dependency style as
 # ct-control-plane/ct-dns above; bumped by tag, never floating. v0.4.0-phase5 adds the
 # installer_kind Binary executor (K8s stays schema-only) on top of Phase 1's Compose executor.
 # v0.4.1-phase5 fixes a path-traversal gap found in review of this repo's #72: installer-engine's
@@ -32,6 +29,12 @@ ct-dns = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.17" }
 # to tar entry paths, now applied to this field too -- see that repo's activate.rs history.
 manifest-core = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.1-phase5" }
 installer-engine = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.1-phase5" }
+# CADS-agent-marketplace Phase 2: the bounded local-LLM code-maintenance agent loop behind
+# `ct-agent harness run` -- same pinned-tag style as the two deps directly above (all three come
+# from the same repo/tag together, never mixed across tags; harness-core's content at
+# v0.4.1-phase5 is byte-identical to v0.2.1-phase2, so this bump is purely "keep the trio on one
+# tag", not a functional change to the harness).
+harness-core = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.1-phase5" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 # #248-follow: opt-in only (see main.rs -- initialized only when RUST_LOG is set, same
 # off-by-default pattern as CT_DEBUG_A2A_TIMING). quinn/libp2p already emit their own
@@ -73,7 +76,7 @@ base64 = "0.22"
 ring = "0.17"
 # ACME (ADR-0003): the network driver's HTTP client -- rustls-tls to match the rest of
 # CADS-Tunnel's zero-OpenSSL policy (control-plane/edge/dns already do this).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 # ACME (ADR-0003, #229): query the zone's AUTHORITATIVE nameservers directly when
 # confirming a DNS-01 record has propagated. Public resolvers are the wrong thing to
 # ask -- Let's Encrypt validates against the authoritative servers themselves from
@@ -106,3 +109,7 @@ http-body-util = "0.1"
 # runtime deps above -- these are dev-only, never shipped in a release binary.
 ct-edge = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.17" }
 ct-client = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.17" }
+# harness_run's manifest-trust regression tests need real temp directories/files (a signed
+# manifest/task pair on disk, containment-check escapes) -- same "3" pin `installer-engine`/
+# `harness-core` already use for the same purpose.
+tempfile = "3"
