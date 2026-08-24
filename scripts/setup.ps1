@@ -100,19 +100,30 @@ CT_AGENT_ORIGIN_PROTO=tcp
 
 function Import-DotEnv {
   Log "checking for .env"
-  if (-not (Test-Path .env)) {
+  if (Test-Path .env) {
+    Ok ".env found"
+    Get-Content .env | Where-Object { $_ -match '^\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$' } | ForEach-Object {
+      $name = $Matches[1]; $value = $Matches[2]
+      if ($name -and -not $name.StartsWith('#')) {
+        Set-Item -Path "env:$name" -Value $value
+      }
+    }
+  } elseif ($env:CT_BOOTSTRAP -or ($env:CT_AGENT_JOIN_TOKEN -and $env:CT_AGENT_TOKEN)) {
+    # Real gap found live (help.bunsenbrenner.org sandbox-instructions work,
+    # mirrors the identical setup.sh fix): a genuine one-liner ($env:CT_BOOTSTRAP=...;
+    # irm ... | iex, matching the portal's own rendered command in installer.rs's
+    # install_one_liner_bootstrap) could never actually complete non-interactively --
+    # this gate unconditionally demanded a real .env FILE on disk even when the one
+    # secret that actually matters was already sitting right there in the process
+    # environment. Every other required var is still validated by the `missing`
+    # check below regardless of source.
+    Ok "no .env file, but a real bootstrap/join token is already set in the environment -- proceeding without one"
+  } else {
     Warn ".env not found in $(Get-Location)"
     Set-Content -Path .env.example -Value $EnvTemplate -NoNewline
     Warn "wrote .env.example -- copy it to .env, fill in the values from your portal"
     Warn "tunnel page, then re-run this script. Stopping here."
     exit 1
-  }
-  Ok ".env found"
-  Get-Content .env | Where-Object { $_ -match '^\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$' } | ForEach-Object {
-    $name = $Matches[1]; $value = $Matches[2]
-    if ($name -and -not $name.StartsWith('#')) {
-      Set-Item -Path "env:$name" -Value $value
-    }
   }
 
   if ($env:CT_BOOTSTRAP) {
@@ -335,10 +346,19 @@ function Show-FinalReport {
   }
 }
 
-Test-Environment
-Confirm-Mode
-Import-DotEnv
-Install-Template
-if ($Mode -eq 'docker') { Install-Docker } else { Install-Direct }
-Wait-ForTier
-Show-FinalReport
+function Invoke-Main {
+  Test-Environment
+  Confirm-Mode
+  Import-DotEnv
+  Install-Template
+  if ($Mode -eq 'docker') { Install-Docker } else { Install-Direct }
+  Wait-ForTier
+  Show-FinalReport
+}
+# Guarded so scripts/tests/*.ps1 can dot-source this file to unit-test
+# individual functions (e.g. Import-DotEnv) without it immediately
+# downloading/running a real agent -- Invoke-Main only fires on a direct
+# invocation, mirroring setup.sh's identical BASH_SOURCE guard.
+if ($MyInvocation.InvocationName -ne '.') {
+  Invoke-Main
+}

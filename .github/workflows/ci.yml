@@ -95,3 +95,22 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
       - name: Build ct-agent-wasm for wasm32
         run: cargo build -p ct-agent-wasm --release --target wasm32-unknown-unknown --locked
+
+  setup-scripts:
+    # scripts/setup.sh and scripts/setup.ps1 are the actual code the portal's
+    # own one-liners (installer.rs's install_one_liner_bootstrap) redirect to --
+    # CADS-Tunnel's /install.sh and /install.ps1 are a thin 307 to these files.
+    # Neither had ANY test coverage before this job: a real gap found live
+    # while writing help.bunsenbrenner.org's sandbox-instructions section
+    # (ensure_env()/Import-DotEnv unconditionally demanded a real .env FILE on
+    # disk even when the one secret that matters was already in the process
+    # environment -- meaning the advertised one-liner could never actually
+    # complete non-interactively). ubuntu-latest ships both bash and pwsh, so
+    # both real customer-facing scripts get exercised, not just one.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup.sh ensure_env() regression test
+        run: bash scripts/tests/test-setup-sh-ensure-env.sh
+      - name: setup.ps1 Import-DotEnv regression test
+        run: pwsh -File scripts/tests/test-setup-ps1-import-dotenv.ps1
