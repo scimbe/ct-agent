@@ -61,14 +61,21 @@ variables, not flags -- see docs.bunsenbrenner.org for the full reference per co
     sign      CT_MANIFEST_HOLDER_KEY (64 hex ed25519 private key, same format as
               CT_CHANNEL_HOLDER_KEY); manifest JSON from CT_MANIFEST_IN or stdin.
               Writes the signed JSON to stdout; no network.
-    publish   CT_MANIFEST_PUBLISH_URL (https://); signed JSON from CT_MANIFEST_IN or stdin.
+    publish   Exactly one of: CT_MANIFEST_PUBLISH_URL (https:// object-storage PUT) or
+              CT_MANIFEST_REGISTRY_URL (Phase 3 registry POST -- also needs
+              CT_MANIFEST_BUNDLE_PATH, the local bundle tarball, and
+              CT_MANIFEST_REGISTRY_WRITE_TOKEN). Signed JSON from CT_MANIFEST_IN or stdin.
     activate  CT_MANIFEST_URL (https:// URL or local path), CT_MANIFEST_PROJECT_NAME,
               CT_MANIFEST_WORK_DIR, and exactly one of CT_MANIFEST_TRUST_ALLOWLIST
               (comma-separated 64-hex publisher pubkeys) / CT_MANIFEST_TRUST_ALLOWLIST_FILE
               (one per line); optional CT_MANIFEST_ENV_FILE (KEY=value secrets, supplied
               locally, never from the manifest) and CT_MANIFEST_PROTECTED_NAMES (comma-
               separated substrings this install must never collide with). Writes the install
-              report JSON to stdout and exits non-zero unless the status is \"ok\".
+              report JSON to stdout and exits non-zero unless the status is \"ok\". Optional
+              Phase 3 registry ledger mode: if CT_MANIFEST_REGISTRY_URL is set, a successful
+              activation additionally POSTs a ledger-only activation event (also needs
+              CT_MANIFEST_REGISTRY_WRITE_TOKEN and CT_MANIFEST_ACTIVATOR_PUBKEY, this agent's
+              own 64-hex holder pubkey).
 
 `harness run` (CADS-agent-marketplace Phase 2, bounded local-LLM bundle maintenance) reads:
     CT_HARNESS_TASK_URL_OR_PATH, CT_HARNESS_MANIFEST_URL_OR_PATH (the same manifest reference

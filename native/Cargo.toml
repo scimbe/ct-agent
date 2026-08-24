@@ -69,7 +69,7 @@ base64 = "0.22"
 ring = "0.17"
 # ACME (ADR-0003): the network driver's HTTP client -- rustls-tls to match the rest of
 # CADS-Tunnel's zero-OpenSSL policy (control-plane/edge/dns already do this).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 # ACME (ADR-0003, #229): query the zone's AUTHORITATIVE nameservers directly when
 # confirming a DNS-01 record has propagated. Public resolvers are the wrong thing to
 # ask -- Let's Encrypt validates against the authoritative servers themselves from
