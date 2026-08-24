@@ -105,10 +105,14 @@ impl HarnessCliConfig {
     }
 }
 
-/// Runs the full flow: fetch the task, fetch the manifest it claims to be scoped to, cross-check
-/// `manifest_id` and that `bundle_dir` really contains that manifest's `compose_file` (fail closed
-/// on any mismatch -- a task pointed at the wrong bundle must never reach the agent loop), read
-/// the LiteLLM key file, then hand off to `harness_core::run_task`.
+/// Runs the full flow: fetch the task, fetch the manifest it claims to be scoped to, validate that
+/// fetched manifest exactly the way `installer_engine::activate` does (signature/expiry via
+/// `is_valid`, then the publisher trust allowlist -- `fetch_manifest` alone is unauthenticated JSON
+/// parsing, so both checks are required before any of the manifest's fields are trusted), cross-check
+/// `manifest_id` and that `bundle_dir` really contains that manifest's `compose_file` (containment-
+/// checked against `bundle_dir` the same way the harness's own file tools are, then fail closed on
+/// any mismatch -- a task pointed at the wrong bundle must never reach the agent loop), read the
+/// LiteLLM key file, then hand off to `harness_core::run_task`.
 ///
 /// `installer_engine`/`harness_core` are entirely synchronous (blocking HTTP, `docker`
 /// subprocesses), so the whole flow runs on the blocking pool -- same shape as
@@ -129,6 +133,28 @@ fn run_harness_blocking(cfg: HarnessCliConfig) -> Result<harness_core::HarnessRe
     let manifest = installer_engine::fetch::fetch_manifest(&cfg.manifest_location)
         .map_err(|e| format!("fetch manifest: {e}"))?;
 
+    let now = crate::manifest_run::unix_now()?;
+
+    // Same two checks `installer_engine::activate` performs immediately after its own
+    // `fetch_manifest` call (steps 2-3 of the activate flow) -- `fetch_manifest` is plain JSON
+    // parsing with no cryptographic check, so without these, anything served at
+    // CT_HARNESS_MANIFEST_URL_OR_PATH with a matching manifest_id (not secret -- observable from
+    // the SignedTask itself) would be trusted to say where `rebuild()` runs `docker compose build`.
+    if !manifest.is_valid(now) {
+        return Err(
+            "manifest fetched from CT_HARNESS_MANIFEST_URL_OR_PATH failed signature/expiry validation -- \
+             refusing to trust its bundle.compose_file"
+                .to_string(),
+        );
+    }
+    if !cfg.allowlist.contains(&manifest.publisher_pubkey) {
+        return Err(
+            "the manifest fetched from CT_HARNESS_MANIFEST_URL_OR_PATH is signed by a publisher not on \
+             CT_HARNESS_TRUST_ALLOWLIST -- refusing to trust its bundle.compose_file"
+                .to_string(),
+        );
+    }
+
     if manifest.manifest_id != task.manifest_id {
         return Err(format!(
             "task.manifest_id ({}) does not match the manifest fetched from CT_HARNESS_MANIFEST_URL_OR_PATH ({}) -- \
@@ -137,7 +163,13 @@ fn run_harness_blocking(cfg: HarnessCliConfig) -> Result<harness_core::HarnessRe
             hex32(&manifest.manifest_id)
         ));
     }
-    let expected_compose = cfg.bundle_dir.join(&manifest.bundle.compose_file);
+
+    // Containment-check compose_file against bundle_dir the same way `harness_core`'s own
+    // read_file/write_file tools do (symlinks resolved, `..`/absolute paths rejected) -- a bare
+    // `bundle_dir.join(..)` would silently discard bundle_dir entirely for an absolute
+    // compose_file, letting `rebuild()` build a compose file outside the trusted bundle.
+    let expected_compose = harness_core::containment::resolve_in_bundle(&cfg.bundle_dir, &manifest.bundle.compose_file)
+        .map_err(|e| format!("manifest bundle.compose_file '{}' is invalid: {e}", manifest.bundle.compose_file))?;
     if !expected_compose.is_file() {
         return Err(format!(
             "{} does not exist -- CT_HARNESS_BUNDLE_DIR does not look like it was actually \
@@ -154,7 +186,6 @@ fn run_harness_blocking(cfg: HarnessCliConfig) -> Result<harness_core::HarnessRe
         return Err(format!("{} is empty -- no LiteLLM key to use", cfg.litellm_key_file.display()));
     }
 
-    let now = crate::manifest_run::unix_now()?;
     let opts = harness_core::RunOptions {
         bundle_dir: cfg.bundle_dir,
         compose_file: manifest.bundle.compose_file,
@@ -178,6 +209,8 @@ fn hex32(b: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
+    use manifest_core::{BundleRef, EnvVarSpec, InstallerKind, ServiceManifest, VerifySpec};
     use std::collections::HashMap;
 
     fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -186,6 +219,123 @@ mod tests {
     }
 
     const SHA: &str = "9999999999999999999999999999999999999999999999999999999999999999";
+
+    /// Builds and signs a `ServiceManifest` with `compose_file` pointing at a file that actually
+    /// exists inside `bundle_dir` -- so that a test exercising the manifest-trust checks (not the
+    /// containment/existence checks) never trips over those instead.
+    fn signed_manifest(key: &SigningKey, manifest_id: [u8; 32], issued_at: u64, expires_at: u64) -> ServiceManifest {
+        ServiceManifest::sign_new(
+            key,
+            manifest_id,
+            "harness-proof".to_string(),
+            "0.1.0".to_string(),
+            InstallerKind::Compose,
+            BundleRef {
+                url: "https://example.invalid/bundle.tar.gz".to_string(),
+                sha256: [0u8; 32],
+                compose_file: "docker-compose.yml".to_string(),
+            },
+            Vec::<EnvVarSpec>::new(),
+            VerifySpec { script: "verify.sh".to_string(), timeout_secs: 60 },
+            issued_at,
+            expires_at,
+        )
+    }
+
+    fn signed_task(key: &SigningKey, task_id: [u8; 32], manifest_id: [u8; 32], issued_at: u64, expires_at: u64) -> SignedTask {
+        SignedTask::sign_new(
+            key,
+            task_id,
+            manifest_id,
+            "do nothing".to_string(),
+            "local-devstral-small2".to_string(),
+            1,
+            1,
+            issued_at,
+            expires_at,
+        )
+    }
+
+    /// Builds a `HarnessCliConfig` pointing at real local files for the task/manifest, with a
+    /// bundle_dir that already contains the manifest's `compose_file` -- so a test can isolate the
+    /// manifest-trust checks (`is_valid`/allowlist) from the later containment/existence checks.
+    fn cfg_for(dir: &std::path::Path, allowlist: TrustAllowlist) -> HarnessCliConfig {
+        HarnessCliConfig {
+            task_location: dir.join("task.json").to_string_lossy().to_string(),
+            manifest_location: dir.join("manifest.json").to_string_lossy().to_string(),
+            allowlist,
+            bundle_dir: dir.to_path_buf(),
+            litellm_base_url: "http://127.0.0.1:1".to_string(),
+            litellm_key_file: dir.join("key"),
+            allowed_models: vec!["local-devstral-small2".to_string()],
+        }
+    }
+
+    #[test]
+    fn run_harness_blocking_rejects_a_manifest_that_fails_signature_expiry_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("docker-compose.yml"), "services: {}").unwrap();
+
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let manifest_id = [7u8; 32];
+        // issued/expired deep in the past relative to real wall-clock time -- `is_valid(now)`
+        // must fail on expiry regardless of the (otherwise-correct) signature.
+        let manifest = signed_manifest(&key, manifest_id, 1_000, 1_001);
+        let task = signed_task(&key, [9u8; 32], manifest_id, 1_000, 1_001);
+        std::fs::write(dir.path().join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        std::fs::write(dir.path().join("task.json"), serde_json::to_vec(&task).unwrap()).unwrap();
+
+        // Publisher IS on the allowlist -- isolates this test to the is_valid/expiry check, not
+        // the separate allowlist check.
+        let allowlist = TrustAllowlist::parse(&hex32(&key.verifying_key().to_bytes())).unwrap();
+        let err = run_harness_blocking(cfg_for(dir.path(), allowlist)).unwrap_err();
+        assert!(err.contains("signature/expiry"), "{err}");
+    }
+
+    #[test]
+    fn run_harness_blocking_rejects_a_validly_signed_manifest_from_a_publisher_not_on_the_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("docker-compose.yml"), "services: {}").unwrap();
+
+        let publisher_key = SigningKey::from_bytes(&[3u8; 32]);
+        let untrusted_other_key = SigningKey::from_bytes(&[4u8; 32]);
+        let manifest_id = [7u8; 32];
+        let now = crate::manifest_run::unix_now().unwrap();
+        // Valid signature, not expired -- isolates this test to the allowlist check.
+        let manifest = signed_manifest(&publisher_key, manifest_id, now, now + 7_200);
+        let task = signed_task(&publisher_key, [9u8; 32], manifest_id, now, now + 7_200);
+        std::fs::write(dir.path().join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        std::fs::write(dir.path().join("task.json"), serde_json::to_vec(&task).unwrap()).unwrap();
+
+        // Allowlist names a DIFFERENT publisher than the one that actually signed the manifest.
+        let allowlist = TrustAllowlist::parse(&hex32(&untrusted_other_key.verifying_key().to_bytes())).unwrap();
+        let err = run_harness_blocking(cfg_for(dir.path(), allowlist)).unwrap_err();
+        assert!(err.contains("CT_HARNESS_TRUST_ALLOWLIST"), "{err}");
+    }
+
+    #[test]
+    fn run_harness_blocking_rejects_a_trusted_manifest_whose_compose_file_escapes_the_bundle_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("evil-compose.yml"), "services: {}").unwrap();
+
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let manifest_id = [7u8; 32];
+        let now = crate::manifest_run::unix_now().unwrap();
+        let mut manifest = signed_manifest(&key, manifest_id, now, now + 7_200);
+        // An absolute path: std::path::Path::join() discards the base for an absolute joined
+        // component, so a naive `bundle_dir.join(compose_file)` would silently point outside
+        // bundle_dir entirely -- this manifest is otherwise perfectly trusted (valid signature,
+        // on the allowlist), so only the containment check can catch this.
+        manifest.bundle.compose_file = outside.path().join("evil-compose.yml").to_string_lossy().to_string();
+        let task = signed_task(&key, [9u8; 32], manifest_id, now, now + 7_200);
+        std::fs::write(dir.path().join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        std::fs::write(dir.path().join("task.json"), serde_json::to_vec(&task).unwrap()).unwrap();
+
+        let allowlist = TrustAllowlist::parse(&hex32(&key.verifying_key().to_bytes())).unwrap();
+        let err = run_harness_blocking(cfg_for(dir.path(), allowlist)).unwrap_err();
+        assert!(err.contains("bundle.compose_file"), "{err}");
+    }
 
     fn full_env() -> Vec<(&'static str, &'static str)> {
         vec![

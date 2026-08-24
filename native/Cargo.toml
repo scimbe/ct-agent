@@ -102,3 +102,7 @@ http-body-util = "0.1"
 # runtime deps above -- these are dev-only, never shipped in a release binary.
 ct-edge = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.17" }
 ct-client = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.17" }
+# harness_run's manifest-trust regression tests need real temp directories/files (a signed
+# manifest/task pair on disk, containment-check escapes) -- same "3" pin `installer-engine`/
+# `harness-core` already use for the same purpose.
+tempfile = "3"
