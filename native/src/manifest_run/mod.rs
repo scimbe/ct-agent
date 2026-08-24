@@ -102,6 +102,7 @@ impl UnsignedManifest {
 pub struct CreateConfig {
     pub name: String,
     pub version: String,
+    pub installer_kind: InstallerKind,
     pub bundle: BundleRef,
     pub env_template: Vec<EnvVarSpec>,
     pub verify: VerifySpec,
@@ -124,16 +125,27 @@ impl CreateConfig {
         if expires_in_secs == 0 {
             return Err("CT_MANIFEST_EXPIRES_IN_SECS must be greater than 0".to_string());
         }
+        // Absent defaults to Compose (Phase 1's only kind, and still the common case) --
+        // Binary (Phase 5) is opt-in via an explicit value, never inferred. K8s is accepted here
+        // too (the schema slot exists) but `installer-engine::activate` still hard-rejects it;
+        // `create` doesn't second-guess that, it just builds the skeleton the operator asked for.
+        let installer_kind = match opt(&f, "CT_MANIFEST_KIND").as_deref() {
+            None | Some("compose") => InstallerKind::Compose,
+            Some("binary") => InstallerKind::Binary,
+            Some("k8s") => InstallerKind::K8s,
+            Some(other) => return Err(format!("CT_MANIFEST_KIND '{other}' is not one of compose|binary|k8s")),
+        };
         Ok(Self {
             name: req(&f, "CT_MANIFEST_NAME", "the service's name")?,
             version: req(&f, "CT_MANIFEST_VERSION", "the service's version")?,
+            installer_kind,
             bundle: BundleRef {
                 url: req(&f, "CT_MANIFEST_BUNDLE_URL", "https:// URL of the bundle tarball")?,
                 sha256,
                 compose_file: req(
                     &f,
                     "CT_MANIFEST_COMPOSE_FILE",
-                    "path to the compose file INSIDE the bundle",
+                    "path INSIDE the bundle to the compose file (Compose kind) or the executable (Binary kind)",
                 )?,
             },
             // Absent/blank is legitimate: a service that needs no operator-supplied secret has an
@@ -151,13 +163,13 @@ impl CreateConfig {
         })
     }
 
-    /// Build the unsigned skeleton. Phase 1 only has a Compose executor, so `installer_kind` is
-    /// always `compose` here (`installer-engine` hard-rejects the other variants anyway).
+    /// Build the unsigned skeleton, `installer_kind` as resolved in `from_lookup` above (Compose
+    /// unless `CT_MANIFEST_KIND` says otherwise).
     pub fn unsigned(self, now: u64) -> UnsignedManifest {
         UnsignedManifest {
             name: self.name,
             version: self.version,
-            installer_kind: InstallerKind::Compose,
+            installer_kind: self.installer_kind,
             bundle: self.bundle,
             env_template: self.env_template,
             verify: self.verify,
@@ -522,6 +534,23 @@ mod tests {
         assert!(unsigned.env_template.is_empty(), "no CT_MANIFEST_ENV_VARS -> no declared vars");
         let json = unsigned.to_json().unwrap();
         assert_eq!(serde_json::from_str::<UnsignedManifest>(&json).unwrap(), unsigned);
+    }
+
+    #[test]
+    fn create_kind_binary_produces_an_installer_kind_binary_skeleton() {
+        let mut env = with_sha(create_env(), SHA);
+        env.push(("CT_MANIFEST_KIND", "binary"));
+        let cfg = CreateConfig::from_lookup(lookup(&env)).unwrap();
+        assert_eq!(cfg.unsigned(1_000).installer_kind, InstallerKind::Binary);
+    }
+
+    #[test]
+    fn create_kind_rejects_an_unknown_value_rather_than_defaulting() {
+        let mut env = with_sha(create_env(), SHA);
+        env.push(("CT_MANIFEST_KIND", "docker-swarm"));
+        let err = CreateConfig::from_lookup(lookup(&env)).unwrap_err();
+        assert!(err.contains("CT_MANIFEST_KIND"), "{err}");
+        assert!(err.contains("docker-swarm"), "{err}");
     }
 
     #[test]

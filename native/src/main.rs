@@ -50,12 +50,15 @@ USAGE:
 Every subcommand is configured entirely via CT_*/CT_AGENT_*/CT_CHANNEL_* environment
 variables, not flags -- see docs.bunsenbrenner.org for the full reference per command.
 
-`manifest` (CADS-agent-marketplace Phase 1, docker compose services only) reads:
+`manifest` (CADS-agent-marketplace: Compose services since Phase 1, Binary executables since
+Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
     create    CT_MANIFEST_NAME, CT_MANIFEST_VERSION, CT_MANIFEST_BUNDLE_URL,
-              CT_MANIFEST_BUNDLE_SHA256 (64 hex), CT_MANIFEST_COMPOSE_FILE,
+              CT_MANIFEST_BUNDLE_SHA256 (64 hex), CT_MANIFEST_COMPOSE_FILE (path inside the
+              bundle to the compose file for Compose kind, or the executable for Binary kind),
               CT_MANIFEST_VERIFY_SCRIPT, CT_MANIFEST_VERIFY_TIMEOUT_SECS; optional
-              CT_MANIFEST_ENV_VARS (`;`-separated NAME:required:description, NAMES only --
-              never a secret value) and CT_MANIFEST_EXPIRES_IN_SECS (default 31536000).
+              CT_MANIFEST_KIND (compose|binary|k8s, default compose), CT_MANIFEST_ENV_VARS
+              (`;`-separated NAME:required:description, NAMES only -- never a secret value) and
+              CT_MANIFEST_EXPIRES_IN_SECS (default 31536000).
               Writes the unsigned JSON to stdout; needs no key and no network.
     sign      CT_MANIFEST_HOLDER_KEY (64 hex ed25519 private key, same format as
               CT_CHANNEL_HOLDER_KEY); manifest JSON from CT_MANIFEST_IN or stdin.
