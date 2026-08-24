@@ -27,14 +27,17 @@ ct-dns = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.17" }
 # entirely outside the sandboxed work_dir at a pre-existing host file and have it chmod+x'd and
 # run, bypassing the bundle's sha256 verification. Same check unpack_tar_gz_safely already applied
 # to tar entry paths, now applied to this field too -- see that repo's activate.rs history.
-manifest-core = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.1-phase5" }
-installer-engine = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.1-phase5" }
+manifest-core = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.2-phase5" }
+installer-engine = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.2-phase5" }
 # CADS-agent-marketplace Phase 2: the bounded local-LLM code-maintenance agent loop behind
 # `ct-agent harness run` -- same pinned-tag style as the two deps directly above (all three come
-# from the same repo/tag together, never mixed across tags; harness-core's content at
-# v0.4.1-phase5 is byte-identical to v0.2.1-phase2, so this bump is purely "keep the trio on one
-# tag", not a functional change to the harness).
-harness-core = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.1-phase5" }
+# from the same repo/tag together, never mixed across tags). v0.4.2-phase5 bump: harness-core's
+# SignedTask.max_turns previously had no upper bound -- a signed task could drive up to u32::MAX
+# turns of the harness's rebuild() tool (up to 300s `docker compose build` each) with no LiteLLM
+# budget touched at all, since rebuild() never calls the LLM. v0.4.1-phase5 (this crate's tag
+# until now) predates the fix (CADS-agent-marketplace#9/#10); v0.4.2-phase5 is the first tag with
+# the MAX_TASK_TURNS=200 ceiling in place.
+harness-core = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.2-phase5" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 # #248-follow: opt-in only (see main.rs -- initialized only when RUST_LOG is set, same
 # off-by-default pattern as CT_DEBUG_A2A_TIMING). quinn/libp2p already emit their own
