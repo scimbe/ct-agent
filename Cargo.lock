@@ -1140,7 +1140,7 @@ dependencies = [
 [[package]]
 name = "harness-core"
 version = "0.1.0"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.4.1-phase5#093972c174b959f812b0058a177c156b0df07dbd"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.4.2-phase5#76d934475452832822e1e25e55971f7ec9708564"
 dependencies = [
  "installer-engine",
  "manifest-core",
@@ -1630,7 +1630,7 @@ dependencies = [
 [[package]]
 name = "installer-engine"
 version = "0.1.0"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.4.1-phase5#093972c174b959f812b0058a177c156b0df07dbd"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.4.2-phase5#76d934475452832822e1e25e55971f7ec9708564"
 dependencies = [
  "flate2",
  "libc",
@@ -2226,7 +2226,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "manifest-core"
 version = "0.1.0"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.4.1-phase5#093972c174b959f812b0058a177c156b0df07dbd"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.4.2-phase5#76d934475452832822e1e25e55971f7ec9708564"
 dependencies = [
  "ed25519-dalek",
  "serde",
