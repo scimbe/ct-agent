@@ -13,6 +13,8 @@ use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::net::{TcpListener, UdpSocket};
 
+const TEST_TOKEN: &str = "test-shared-token";
+
 /// One self-signed cert valid for both roles `dial_quic_via_masque` trusts it for
 /// (the outer TLS-to-proxy layer's SNI, and the inner tunneled QUIC handshake's
 /// SNI) -- realistic, not a test shortcut: in every real deployment this ADR
@@ -80,7 +82,11 @@ async fn spawn_fake_masque_proxy(cert: CertificateDer<'static>, key: PrivateKeyD
                 while let Some(Ok((req, mut respond))) = conn.accept().await {
                     let is_connect_udp = req.method() == http::Method::CONNECT
                         && req.extensions().get::<h2::ext::Protocol>() == Some(&h2::ext::Protocol::from_static("connect-udp"));
-                    if !is_connect_udp || req.uri().path() != expected_path {
+                    // Mirrors CADS-Tunnel masque-proxy's own x-ct-masque-token check --
+                    // proves dial_quic_via_masque actually sends the header, not just
+                    // that it compiles with the extra parameter.
+                    let token_ok = req.headers().get("x-ct-masque-token").and_then(|v| v.to_str().ok()) == Some(TEST_TOKEN);
+                    if !is_connect_udp || req.uri().path() != expected_path || !token_ok {
                         respond.send_reset(h2::Reason::REFUSED_STREAM);
                         continue;
                     }
@@ -153,7 +159,7 @@ async fn dial_quic_via_masque_establishes_a_real_quinn_connection_and_exchanges_
         let _ = client_done_rx.await;
     });
 
-    let conn = dial_quic_via_masque(proxy_addr, "masque.test", target_addr, edge_cert)
+    let conn = dial_quic_via_masque(proxy_addr, "masque.test", target_addr, edge_cert, TEST_TOKEN)
         .await
         .expect("ADR-0024 M3: a real quinn::Connection over the MASQUE tunnel");
 
@@ -170,4 +176,17 @@ async fn dial_quic_via_masque_establishes_a_real_quinn_connection_and_exchanges_
     );
 
     target_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dial_quic_via_masque_fails_when_the_proxy_rejects_the_token() {
+    // The client-side half of the masque-proxy security fix: a wrong shared
+    // token must fail the dial cleanly (never silently proceed without it).
+    let (edge_cert, target_key, proxy_key) = test_cert();
+    let (target_server, target_addr) = spawn_quic_target_server(edge_cert.clone(), target_key);
+    let proxy_addr = spawn_fake_masque_proxy(edge_cert.clone(), proxy_key, target_addr).await;
+    drop(target_server); // never reached -- the proxy refuses before any tunneling starts
+
+    let result = dial_quic_via_masque(proxy_addr, "masque.test", target_addr, edge_cert, "wrong-token").await;
+    assert!(result.is_err(), "a wrong token must fail the dial, not silently succeed");
 }
