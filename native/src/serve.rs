@@ -860,20 +860,31 @@ pub async fn run_agent(
         {
             Ok(conn) => conn,
             Err(e) => {
-                eprintln!(
-                    "ct-agent: edge dial failed ({e}); serving over the TLS-TCP fallback until UDP/QUIC recovers (#16)"
-                );
-                run_agent_tcp_fallback_until_quic_recovers(
-                    config,
-                    edge_cert.clone(),
-                    token.clone(),
-                    Arc::clone(&origin_keys),
-                )
-                .await?;
-                // A QUIC probe answered — start over with a fresh budget and dial it
-                // for real.
-                backoff.reset();
-                continue;
+                match try_dial_via_masque(config, edge_cert.clone()).await {
+                    Some(conn) => {
+                        eprintln!(
+                            "ct-agent: edge dial failed ({e}); reached the edge instead through the \
+                             RFC 9298 CONNECT-UDP (MASQUE) tunnel"
+                        );
+                        conn
+                    }
+                    None => {
+                        eprintln!(
+                            "ct-agent: edge dial failed ({e}); serving over the TLS-TCP fallback until UDP/QUIC recovers (#16)"
+                        );
+                        run_agent_tcp_fallback_until_quic_recovers(
+                            config,
+                            edge_cert.clone(),
+                            token.clone(),
+                            Arc::clone(&origin_keys),
+                        )
+                        .await?;
+                        // A QUIC probe answered — start over with a fresh budget and
+                        // dial it for real.
+                        backoff.reset();
+                        continue;
+                    }
+                }
             }
         };
         if let Err(e) = register_tunnel(&conn, &token).await {
@@ -921,6 +932,33 @@ pub async fn run_agent(
         match backoff.next_delay_jittered(rand::random::<f64>()) {
             Some(d) => tokio::time::sleep(d).await,
             None => return Err("ct-agent: gave up reconnecting after the connection dropped".into()),
+        }
+    }
+}
+
+/// ADR-0024 M3-followup: one MASQUE dial attempt, tried between a failed direct
+/// QUIC dial and falling all the way back to the TLS-TCP framing fallback.
+/// Returns `None` (never blocking on retries itself) when MASQUE isn't
+/// configured or the attempt fails -- either way the caller's existing TLS-TCP
+/// fallback path is the safety net, so a MASQUE misconfiguration or a down
+/// `masque-proxy` degrades to today's behavior rather than a hard failure.
+async fn try_dial_via_masque(
+    config: &AgentConfig,
+    edge_cert: CertificateDer<'static>,
+) -> Option<quinn::Connection> {
+    let masque = config.masque_fallback.as_ref()?;
+    match crate::masque::dial_quic_via_masque(
+        masque.proxy_addr,
+        &masque.sni_host,
+        masque.target,
+        edge_cert,
+    )
+    .await
+    {
+        Ok(conn) => Some(conn),
+        Err(e) => {
+            eprintln!("ct-agent: MASQUE dial to {} also failed ({e})", masque.proxy_addr);
+            None
         }
     }
 }
@@ -3395,6 +3433,7 @@ mod tests {
             tcp_fallback_pool_size: 4,
             framed_fallback: false,
             register_tcp_only: false,
+            masque_fallback: None,
         };
         let token_a = token.clone();
         let origin_priv = origin_kp.private;
