@@ -2325,6 +2325,26 @@ fn admission_retry_backoff_is_flat_for_transient_and_exponential_for_refused() {
 }
 
 #[test]
+fn equal_jitter_spreads_admission_layer_backoffs_into_half_to_full_range() {
+    // Network-resilience pass (operator request 24.08./25.08.): the three admission-layer
+    // backoffs above were deterministic (no jitter), unlike the network-level reconnect
+    // loop's own equal jitter (reconnect.rs). Same algorithm, applied here: rand01=1.0 ->
+    // the unchanged deterministic delay, rand01=0.0 -> exactly half, and every point in
+    // between lands inside [d/2, d].
+    let d = std::time::Duration::from_secs(4);
+    assert_eq!(equal_jitter(d, 1.0), d, "rand01=1 -> the full deterministic delay");
+    assert_eq!(equal_jitter(d, 0.0), d / 2, "rand01=0 -> exactly half");
+    let mid = equal_jitter(d, 0.5);
+    assert!(mid > d / 2 && mid < d, "rand01=0.5 lands strictly between half and full: {mid:?}");
+    // Out-of-range input is clamped rather than producing a delay outside [d/2, d].
+    assert_eq!(equal_jitter(d, -1.0), d / 2, "negative rand01 clamps to 0");
+    assert_eq!(equal_jitter(d, 2.0), d, "rand01 > 1 clamps to 1");
+    // A zero delay (the park-expiry immediate-reparks that flow through the same sleep
+    // sites) stays zero -- jitter must never turn a "retry now" into an actual wait.
+    assert_eq!(equal_jitter(std::time::Duration::ZERO, 0.7), std::time::Duration::ZERO);
+}
+
+#[test]
 fn is_transport_handshake_eof_matches_the_field_captured_wording_40() {
     // #40 (CADS-Tunnel#335): the exact production log line the field incident captured
     // (`ct-agent channel: debug relay-gate tcp+tls connect to ... failed after ~35ms: tls

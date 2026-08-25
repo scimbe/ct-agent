@@ -10,6 +10,21 @@
 
 use super::BoxError;
 
+/// Equal-jitter transform for a deterministic backoff delay `d`: given a uniform random
+/// sample `rand01` in `[0, 1)`, returns a value uniformly in `[d/2, d]` -- same algorithm
+/// and rationale as [`crate::reconnect::Backoff::next_delay_jittered`] (#114 #3: desync a
+/// fleet's retries after a shared-edge outage so they don't all hammer it back in lockstep
+/// exactly as it recovers), applied here to the three ADMISSION-layer backoffs below
+/// ([`admission_retry_backoff`], [`flapping_session_backoff`], [`handshake_eof_backoff`]),
+/// which -- unlike the network-level reconnect loop -- were deterministic. Pure: the caller
+/// supplies the randomness (`rand::random::<f64>()` at the call sites, mirroring
+/// `serve.rs`'s existing convention for the reconnect loop's own jitter).
+pub(crate) fn equal_jitter(d: std::time::Duration, rand01: f64) -> std::time::Duration {
+    let half = d / 2;
+    let span = d - half;
+    half + span.mul_f64(rand01.clamp(0.0, 1.0))
+}
+
 /// #231: ceiling on the exponential backoff a persistent serve loop applies after consecutive
 /// **refused** (not transient) admission attempts — see [`serve_loop_concurrent`].
 pub(crate) const REFUSED_ADMISSION_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);

@@ -484,7 +484,7 @@ where
         } else {
             consecutive_flaps = 0;
         }
-        let delay = flapping_session_backoff(retry_backoff, consecutive_flaps);
+        let delay = equal_jitter(flapping_session_backoff(retry_backoff, consecutive_flaps), rand::random::<f64>());
         eprintln!(
             "ct-agent channel --call-service {slug} (persistent): session ended after {:?}, \
              reconnecting in {delay:?} (streak {consecutive_flaps}, #47)",

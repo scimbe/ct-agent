@@ -206,7 +206,7 @@ where
         // splice for nothing).
         let flaps = consecutive_flaps.load(std::sync::atomic::Ordering::Relaxed);
         if flaps > 0 {
-            let backoff = flapping_session_backoff(retry_backoff, flaps);
+            let backoff = equal_jitter(flapping_session_backoff(retry_backoff, flaps), rand::random::<f64>());
             eprintln!(
                 "ct-agent channel: {flaps} consecutive session(s) died within {}ms of pairing (#250) -- \
                  backing off {backoff:?} before the next admit (peer may be experiencing network \
@@ -281,7 +281,10 @@ where
                 if is_transport_handshake_eof(&e) {
                     consecutive_refusals = 0;
                     consecutive_handshake_eofs = consecutive_handshake_eofs.saturating_add(1);
-                    let backoff = handshake_eof_backoff(retry_backoff, consecutive_handshake_eofs);
+                    let backoff = equal_jitter(
+                        handshake_eof_backoff(retry_backoff, consecutive_handshake_eofs),
+                        rand::random::<f64>(),
+                    );
                     eprintln!(
                         "ct-agent channel: {consecutive_handshake_eofs} consecutive TLS-handshake-EOF \
                          admission attempt(s) (#40/CADS-Tunnel#335) -- backing off {backoff:?} before \
@@ -294,7 +297,10 @@ where
                 consecutive_handshake_eofs = 0;
                 let refused = is_definitive_admission_refusal(&e);
                 consecutive_refusals = if refused { consecutive_refusals.saturating_add(1) } else { 0 };
-                let backoff = admission_retry_backoff(retry_backoff, refused, consecutive_refusals);
+                let backoff = equal_jitter(
+                    admission_retry_backoff(retry_backoff, refused, consecutive_refusals),
+                    rand::random::<f64>(),
+                );
                 eprintln!("ct-agent channel: admission error, re-admitting (#200): {e}");
                 tokio::time::sleep(backoff).await;
             }
