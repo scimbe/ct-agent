@@ -224,3 +224,51 @@ async fn dial_quic_via_masque_rejects_a_proxy_cert_the_public_ca_set_does_not_tr
         "a self-signed proxy cert with no matching public-CA root must fail the dial, not silently succeed"
     );
 }
+
+// ADR-0024 M4: the real regression that caused a live outage on
+// kali.bunsenbrenner.org -- `dial_quic_via_masque_with_proxy_roots`'s connection-
+// driving task was fire-and-forget `tokio::spawn`ed, so every failure AFTER the h2
+// handshake (extended-CONNECT timeout, a non-200 response, a QUIC handshake
+// failure) leaked one socket + one zombie task per dial attempt. Dormant before
+// the outer-TLS trust-anchor fix (every attempt failed at the TLS handshake,
+// before this point was ever reached); live once TLS started succeeding. These
+// two tests prove `AbortOnDrop` itself, the actual fix, rather than trying to
+// reproduce file-descriptor exhaustion directly.
+
+#[tokio::test]
+async fn abort_on_drop_aborts_the_task_when_not_disarmed() {
+    let ran_to_completion = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = ran_to_completion.clone();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    {
+        let _guard = AbortOnDrop(handle);
+        // guard drops here, before the sleep above finishes -- must abort the task
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !ran_to_completion.load(std::sync::atomic::Ordering::SeqCst),
+        "an un-disarmed AbortOnDrop must abort its task on drop, not leave it running \
+         (this is the exact leak that took kali.bunsenbrenner.org down)"
+    );
+}
+
+#[tokio::test]
+async fn abort_on_drop_disarm_lets_the_task_run_to_completion() {
+    let ran_to_completion = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = ran_to_completion.clone();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let guard = AbortOnDrop(handle);
+    guard.disarm();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        ran_to_completion.load(std::sync::atomic::Ordering::SeqCst),
+        "disarm() must let the task keep running -- the real tunnel's connection \
+         must stay driven for its whole life once it's actually established"
+    );
+}
