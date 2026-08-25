@@ -200,7 +200,7 @@ pub async fn probe_udp_reachable(
     )
 }
 
-fn install_crypto_provider() {
+pub(crate) fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
@@ -216,14 +216,20 @@ fn client_endpoint(edge_cert: CertificateDer<'static>) -> Result<Endpoint, BoxEr
     client_endpoint_with(edge_cert, Some(AGENT_KEEPALIVE), AGENT_MAX_IDLE)
 }
 
-/// Build the Agent's QUIC client endpoint trusting `edge_cert`, applying a
+/// Build the `quinn::ClientConfig` trusting `edge_cert`, applying a
 /// `keep_alive_interval` and `max_idle_timeout` so the registered control
-/// connection to the Edge stays alive across idle gaps (issue #2).
-fn client_endpoint_with(
+/// connection to the Edge stays alive across idle gaps (issue #2). Split out of
+/// [`client_endpoint_with`] (ADR-0024 M3) so the MASQUE dial path
+/// (`crate::masque`) can share the EXACT same TLS/cert-pinning and keepalive
+/// posture as the real QUIC dial below, rather than a second, driftable copy of
+/// this logic -- the two paths differ only in what socket the resulting
+/// `quinn::Endpoint` is bound to (a real kernel UDP socket here, an
+/// `AsyncUdpSocket` bridging to the CONNECT-UDP tunnel there).
+pub(crate) fn quic_client_config(
     edge_cert: CertificateDer<'static>,
     keep_alive: Option<Duration>,
     max_idle: Duration,
-) -> Result<Endpoint, BoxError> {
+) -> Result<quinn::ClientConfig, BoxError> {
     install_crypto_provider();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(edge_cert)?;
@@ -239,10 +245,29 @@ fn client_endpoint_with(
         quinn::IdleTimeout::try_from(max_idle).map_err(|_| "agent max_idle_timeout out of range")?,
     ));
     cfg.transport_config(Arc::new(transport));
+    Ok(cfg)
+}
+
+/// Build the Agent's QUIC client endpoint trusting `edge_cert`, applying a
+/// `keep_alive_interval` and `max_idle_timeout` so the registered control
+/// connection to the Edge stays alive across idle gaps (issue #2).
+fn client_endpoint_with(
+    edge_cert: CertificateDer<'static>,
+    keep_alive: Option<Duration>,
+    max_idle: Duration,
+) -> Result<Endpoint, BoxError> {
+    let cfg = quic_client_config(edge_cert, keep_alive, max_idle)?;
     // Bind all interfaces (not loopback) so the Agent can reach a non-local Edge.
     let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
     endpoint.set_default_client_config(cfg);
     Ok(endpoint)
+}
+
+/// `AGENT_KEEPALIVE`/`AGENT_MAX_IDLE` (this module's own constants), exposed for
+/// [`crate::masque`]'s dial path to reuse -- same reasoning as
+/// [`quic_client_config`]'s doc: one posture, not two.
+pub(crate) fn agent_keepalive_and_max_idle() -> (Duration, Duration) {
+    (AGENT_KEEPALIVE, AGENT_MAX_IDLE)
 }
 
 /// Dial the Edge over QUIC, returning the established connection. `edge_cert` is

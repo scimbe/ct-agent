@@ -39,6 +39,14 @@ installer-engine = { git = "https://github.com/scimbe/CADS-agent-marketplace", t
 # the MAX_TASK_TURNS=200 ceiling in place.
 harness-core = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.2-phase5" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+# ADR-0024 M3 (crate::masque): the RFC 9298 CONNECT-UDP client dial -- HTTP/2
+# Extended CONNECT (RFC 9220) plus RFC 9297 capsule framing, the same primitives
+# this codebase already proved twice (ct-agent's own spike-masque-h2/, M1;
+# CADS-Tunnel's masque-proxy, M2). `h2`/`http`/`bytes` were transitive already;
+# named directly now that native's own code speaks the protocol, not just tests.
+h2 = "0.4"
+http = "1"
+bytes = "1"
 # #248-follow: opt-in only (see main.rs -- initialized only when RUST_LOG is set, same
 # off-by-default pattern as CT_DEBUG_A2A_TIMING). quinn/libp2p already emit their own
 # `tracing` spans/events; this crate is the only thing missing to actually see them --
