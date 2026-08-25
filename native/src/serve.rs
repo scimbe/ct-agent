@@ -952,6 +952,7 @@ async fn try_dial_via_masque(
         &masque.sni_host,
         masque.target,
         edge_cert,
+        &masque.token,
     )
     .await
     {

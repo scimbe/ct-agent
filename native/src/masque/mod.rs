@@ -68,11 +68,18 @@ fn connect_udp_path(target: SocketAddr) -> String {
 /// * `edge_cert` -- the Edge's certificate this agent already trusts for QUIC
 ///   (reused here for BOTH the outer TLS-to-the-proxy-front-door layer and the
 ///   inner tunneled QUIC handshake's own cert pinning -- one trust anchor, not two).
+/// * `token` -- the shared secret sent as `x-ct-masque-token`. `masque-proxy`
+///   hard-restricts *where* a tunnel can go (its one configured target) but that
+///   alone says nothing about *who* may open one -- since the target is the
+///   Edge's own INTERNAL QUIC listener, the proxy also requires this token from
+///   every caller (fail-closed on its own side: `CT_MASQUE_PROXY_TOKEN`). Must
+///   match that deployment's token byte-for-byte.
 pub async fn dial_quic_via_masque(
     proxy_tcp_addr: SocketAddr,
     sni_host: &str,
     target: SocketAddr,
     edge_cert: CertificateDer<'static>,
+    token: &str,
 ) -> Result<quinn::Connection, BoxError> {
     let tcp = TcpStream::connect(proxy_tcp_addr).await?;
 
@@ -112,6 +119,7 @@ pub async fn dial_quic_via_masque(
     let mut request = Request::builder()
         .method(Method::CONNECT)
         .uri(format!("https://{sni_host}{path}"))
+        .header("x-ct-masque-token", token)
         .body(())?;
     request.extensions_mut().insert(Protocol::from_static("connect-udp"));
 
