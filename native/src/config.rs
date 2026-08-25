@@ -86,6 +86,37 @@ pub struct AgentConfig {
     /// them (combine with `CT_AGENT_FALLBACK_443` to reach the `:443` front
     /// door). `CT_AGENT_REGISTER_TCP_ONLY`; default `false`.
     pub register_tcp_only: bool,
+    /// ADR-0024 M3-followup: when set, a failed direct QUIC dial tries reaching
+    /// the Edge's real QUIC endpoint through an RFC 9298 CONNECT-UDP tunnel
+    /// (`crate::masque::dial_quic_via_masque`) before falling all the way back
+    /// to the TLS-TCP framing fallback -- a genuine QUIC connection (migration,
+    /// loss recovery) carried over a path that looks like ordinary HTTPS on the
+    /// wire, for networks that block raw UDP outright. `None` = disabled
+    /// (default): this needs a deployed `masque-proxy` (CADS-Tunnel ADR-0024 M2)
+    /// registered on the Edge, so it stays opt-in rather than probed on every
+    /// agent in the fleet.
+    pub masque_fallback: Option<MasqueFallbackConfig>,
+}
+
+/// The three values `dial_quic_via_masque` needs, read together (ADR-0024 M3-followup).
+/// All-or-nothing: partially setting these is almost certainly a misconfiguration
+/// (a copy-pasted proxy address with no matching SNI host, say), so `from_env_with`
+/// treats "some but not all three set" as a hard config error rather than silently
+/// leaving MASQUE disabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasqueFallbackConfig {
+    /// Where to dial TCP+TLS+h2 -- the Edge's own public front door
+    /// (`CT_AGENT_MASQUE_PROXY`, e.g. `edge_host:443`).
+    pub proxy_addr: SocketAddr,
+    /// TLS SNI / `:authority` routing this connection to the Edge's registered
+    /// MASQUE proxy target (`CT_AGENT_MASQUE_SNI_HOST`; must match `CT_EDGE_
+    /// MASQUE_HOST` on that Edge deployment, CADS-Tunnel ADR-0024 M2).
+    pub sni_host: String,
+    /// The RFC 9298 CONNECT-UDP target to request (`CT_AGENT_MASQUE_TARGET`;
+    /// must match, byte-for-byte once encoded, the deployed `masque-proxy`'s own
+    /// `CT_MASQUE_PROXY_TARGET_ADDR` -- an operator-maintained convention across
+    /// the two processes, not something this Agent can verify on its own).
+    pub target: SocketAddr,
 }
 
 /// Resolve a `host:port` (or `IP:port`) to a [`SocketAddr`] (#45). A literal
@@ -117,6 +148,7 @@ impl AgentConfig {
             tcp_fallback_pool_size: DEFAULT_TCP_FALLBACK_POOL_SIZE,
             framed_fallback: false,
             register_tcp_only: false,
+            masque_fallback: None,
         })
     }
 
@@ -183,7 +215,48 @@ impl AgentConfig {
                 })?,
             _ => DEFAULT_TCP_FALLBACK_POOL_SIZE,
         };
+        cfg.masque_fallback = parse_masque_fallback(&get)?;
         Ok(cfg)
+    }
+}
+
+/// Parses `CT_AGENT_MASQUE_PROXY` / `CT_AGENT_MASQUE_SNI_HOST` /
+/// `CT_AGENT_MASQUE_TARGET` together (ADR-0024 M3-followup). None set at all ->
+/// `Ok(None)` (disabled, the default). All three set -> `Ok(Some(..))`. Some but
+/// not all set -> `Err`, naming which are missing, rather than silently treating
+/// it as disabled -- a half-set MASQUE config is far more likely a typo than an
+/// intentional partial opt-out.
+fn parse_masque_fallback(
+    get: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<MasqueFallbackConfig>, String> {
+    let proxy = get("CT_AGENT_MASQUE_PROXY").filter(|s| !s.trim().is_empty());
+    let sni_host = get("CT_AGENT_MASQUE_SNI_HOST").filter(|s| !s.trim().is_empty());
+    let target = get("CT_AGENT_MASQUE_TARGET").filter(|s| !s.trim().is_empty());
+    match (proxy, sni_host, target) {
+        (None, None, None) => Ok(None),
+        (proxy, sni_host, target) => {
+            let mut missing = Vec::new();
+            if proxy.is_none() {
+                missing.push("CT_AGENT_MASQUE_PROXY");
+            }
+            if sni_host.is_none() {
+                missing.push("CT_AGENT_MASQUE_SNI_HOST");
+            }
+            if target.is_none() {
+                missing.push("CT_AGENT_MASQUE_TARGET");
+            }
+            if !missing.is_empty() {
+                return Err(format!(
+                    "MASQUE fallback is only partially configured -- missing {}",
+                    missing.join(", ")
+                ));
+            }
+            Ok(Some(MasqueFallbackConfig {
+                proxy_addr: resolve_addr("CT_AGENT_MASQUE_PROXY", &proxy.unwrap())?,
+                sni_host: sni_host.unwrap().trim().to_string(),
+                target: resolve_addr("CT_AGENT_MASQUE_TARGET", &target.unwrap())?,
+            }))
+        }
     }
 }
 
@@ -401,5 +474,37 @@ mod tests {
         // gate has none, so it resolves the documented defaults.
         let c = AgentConfig::from_env().expect("defaults parse");
         assert_eq!(c.origin_proto, OriginProto::Tcp);
+    }
+
+    #[test]
+    fn masque_fallback_is_disabled_when_none_of_the_three_vars_are_set() {
+        // ADR-0024 M3-followup: the default, no-op state.
+        let c = AgentConfig::from_env_with(|_| None).unwrap();
+        assert_eq!(c.masque_fallback, None);
+    }
+
+    #[test]
+    fn masque_fallback_parses_when_all_three_vars_are_set() {
+        let c = AgentConfig::from_env_with(get_from(&[
+            ("CT_AGENT_MASQUE_PROXY", "10.0.0.9:443"),
+            ("CT_AGENT_MASQUE_SNI_HOST", "masque.example.org"),
+            ("CT_AGENT_MASQUE_TARGET", "10.0.0.9:4433"),
+        ]))
+        .unwrap();
+        let masque = c.masque_fallback.expect("all three set -> Some");
+        assert_eq!(masque.proxy_addr, "10.0.0.9:443".parse().unwrap());
+        assert_eq!(masque.sni_host, "masque.example.org");
+        assert_eq!(masque.target, "10.0.0.9:4433".parse().unwrap());
+    }
+
+    #[test]
+    fn masque_fallback_errors_loudly_on_partial_configuration() {
+        // A half-set MASQUE config is far more likely a typo (copy-pasted proxy
+        // address, forgotten SNI host) than an intentional partial opt-out --
+        // silently treating it as disabled would hide that mistake.
+        let err = AgentConfig::from_env_with(get_from(&[("CT_AGENT_MASQUE_PROXY", "10.0.0.9:443")]))
+            .unwrap_err();
+        assert!(err.contains("CT_AGENT_MASQUE_SNI_HOST"), "names the missing var: {err}");
+        assert!(err.contains("CT_AGENT_MASQUE_TARGET"), "names the missing var: {err}");
     }
 }
