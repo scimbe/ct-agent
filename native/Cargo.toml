@@ -47,6 +47,16 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 h2 = "0.4"
 http = "1"
 bytes = "1"
+# ADR-0024 M4: the OUTER TLS hop in dial_quic_via_masque (agent -> the Edge's
+# public masque.<zone> front door) terminates with a REAL publicly-trusted
+# Let's Encrypt cert, same as Portal/Auth (CADS-Tunnel's masque-proxy front-door
+# registration) -- NOT the Edge's own self-signed QUIC-pinned cert. Found live,
+# 2026-08-25: reusing `edge_cert` as the trust root for that hop (like every
+# OTHER dial in this crate correctly does, since they all really do terminate
+# at the pinned cert) rejected the real chain with UnknownIssuer. webpki-roots
+# bundles the same public CA program a real HTTPS client would trust, so this
+# one hop -- and only this one -- verifies against it instead.
+webpki-roots = "0.26"
 # #248-follow: opt-in only (see main.rs -- initialized only when RUST_LOG is set, same
 # off-by-default pattern as CT_DEBUG_A2A_TIMING). quinn/libp2p already emit their own
 # `tracing` spans/events; this crate is the only thing missing to actually see them --

@@ -81,12 +81,35 @@ pub async fn dial_quic_via_masque(
     edge_cert: CertificateDer<'static>,
     token: &str,
 ) -> Result<quinn::Connection, BoxError> {
+    // This hop terminates at the Edge's public masque.<zone> front door, which
+    // presents a REAL publicly-trusted cert (Let's Encrypt via deSEC DNS-01, same
+    // as Portal/Auth) -- not the Edge's own self-signed QUIC-pinned `edge_cert`.
+    // `edge_cert` is still the right (and only) trust anchor for the INNER
+    // tunneled QUIC handshake, which really is that pinned cert (see
+    // `dial_quic_via_masque_with_proxy_roots`, below, which this production entry
+    // point wraps with the real public CA set).
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    dial_quic_via_masque_with_proxy_roots(proxy_tcp_addr, sni_host, target, edge_cert, token, roots).await
+}
+
+/// Same as [`dial_quic_via_masque`], but with the OUTER (agent-to-proxy-front-door)
+/// trust root injected rather than hardcoded to the real public CA set -- lets
+/// tests exercise this function against a self-signed test cert without needing a
+/// real publicly-trusted one, while production always goes through the wrapper
+/// above.
+async fn dial_quic_via_masque_with_proxy_roots(
+    proxy_tcp_addr: SocketAddr,
+    sni_host: &str,
+    target: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    token: &str,
+    proxy_roots: rustls::RootCertStore,
+) -> Result<quinn::Connection, BoxError> {
     let tcp = TcpStream::connect(proxy_tcp_addr).await?;
 
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(edge_cert.clone())?;
     let mut tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
+        .with_root_certificates(proxy_roots)
         .with_no_client_auth();
     tls_config.alpn_protocols = vec![b"h2".to_vec()];
     let connector = TlsConnector::from(Arc::new(tls_config));

@@ -35,6 +35,16 @@ fn test_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>, PrivateKeyDe
     (cert, key_for_target, key_for_proxy)
 }
 
+/// The outer (agent-to-proxy) hop trusts the real public CA set in production
+/// (`webpki-roots`, see `mod.rs`'s crate doc) -- a self-signed test cert can never
+/// validate against that, so tests go through `dial_quic_via_masque_with_proxy_roots`
+/// and inject a root store containing just the one test cert instead.
+fn test_proxy_roots(cert: &CertificateDer<'static>) -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.clone()).expect("test cert adds to a fresh root store");
+    roots
+}
+
 /// A real quinn QUIC server bound to a loopback UDP port -- stands in for "the
 /// Edge's own `CT_EDGE_LISTEN`", the one legitimate CONNECT-UDP target.
 fn spawn_quic_target_server(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> (Endpoint, SocketAddr) {
@@ -159,7 +169,8 @@ async fn dial_quic_via_masque_establishes_a_real_quinn_connection_and_exchanges_
         let _ = client_done_rx.await;
     });
 
-    let conn = dial_quic_via_masque(proxy_addr, "masque.test", target_addr, edge_cert, TEST_TOKEN)
+    let proxy_roots = test_proxy_roots(&edge_cert);
+    let conn = dial_quic_via_masque_with_proxy_roots(proxy_addr, "masque.test", target_addr, edge_cert, TEST_TOKEN, proxy_roots)
         .await
         .expect("ADR-0024 M3: a real quinn::Connection over the MASQUE tunnel");
 
@@ -187,6 +198,29 @@ async fn dial_quic_via_masque_fails_when_the_proxy_rejects_the_token() {
     let proxy_addr = spawn_fake_masque_proxy(edge_cert.clone(), proxy_key, target_addr).await;
     drop(target_server); // never reached -- the proxy refuses before any tunneling starts
 
-    let result = dial_quic_via_masque(proxy_addr, "masque.test", target_addr, edge_cert, "wrong-token").await;
+    let proxy_roots = test_proxy_roots(&edge_cert);
+    let result =
+        dial_quic_via_masque_with_proxy_roots(proxy_addr, "masque.test", target_addr, edge_cert, "wrong-token", proxy_roots).await;
     assert!(result.is_err(), "a wrong token must fail the dial, not silently succeed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dial_quic_via_masque_rejects_a_proxy_cert_the_public_ca_set_does_not_trust() {
+    // ADR-0024 M4 regression test for the real bug found live (2026-08-25): the
+    // OUTER (agent-to-proxy) hop must validate against the real public CA set in
+    // production (see mod.rs's crate doc for why edge_cert alone was wrong), so a
+    // proxy presenting a self-signed cert with NO matching root in that store must
+    // fail closed -- never silently proceed. This test exercises the real
+    // production entry point (dial_quic_via_masque), not the roots-injectable
+    // variant, specifically to prove the wrapper's own trust decision.
+    let (edge_cert, target_key, proxy_key) = test_cert();
+    let (target_server, target_addr) = spawn_quic_target_server(edge_cert.clone(), target_key);
+    let proxy_addr = spawn_fake_masque_proxy(edge_cert.clone(), proxy_key, target_addr).await;
+    drop(target_server); // never reached -- the TLS handshake itself must fail first
+
+    let result = dial_quic_via_masque(proxy_addr, "masque.test", target_addr, edge_cert, TEST_TOKEN).await;
+    assert!(
+        result.is_err(),
+        "a self-signed proxy cert with no matching public-CA root must fail the dial, not silently succeed"
+    );
 }
