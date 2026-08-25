@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["native", "wasm"]
+members = ["native", "wasm", "spike-masque-h2"]
 
 # One shared pin for CADS-Tunnel's ct-common, used by BOTH the native binary
 # (native/) and the browser build (wasm/) -- the whole point of this workspace: a

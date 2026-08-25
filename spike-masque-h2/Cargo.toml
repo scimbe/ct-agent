@@ -1,0 +1,22 @@
+[package]
+name = "spike-masque-h2"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = """
+ADR-0024 M1 feasibility spike -- NOT production code, NOT integrated into the
+native ct-agent binary. Proves (or disproves) that an HTTP/2 Extended CONNECT
+(RFC 9220) handshake plus an RFC 9298 CONNECT-UDP datagram, carried as an RFC
+9297 DATAGRAM Capsule (HTTP/2 has no native QUIC-style DATAGRAM frame), is
+buildable end-to-end with the mainstream Rust h2 crate. See docs/adr/0024 in
+CADS-Tunnel for the design this spike de-risks.
+"""
+
+[dependencies]
+h2 = "0.4"
+http = "1"
+bytes = "1"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
