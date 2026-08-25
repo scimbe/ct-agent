@@ -722,7 +722,10 @@ where
                 }
                 attempt = 0;
                 consecutive_refusals = refusals;
-                tokio::time::sleep(delay).await;
+                // #114-style jitter (see errors::equal_jitter): dcutr_loop_action stays pure/
+                // deterministic for testability, so jitter is applied here at the sleep site
+                // instead, same as the other four admission-layer backoff call sites.
+                tokio::time::sleep(equal_jitter(delay, rand::random::<f64>())).await;
             }
             DcutrLoopAction::RetryBounded { next_attempt, delay } => {
                 attempt = next_attempt;
