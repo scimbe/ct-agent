@@ -68,17 +68,23 @@ impl ChannelIdentity {
 
     /// A copy-pasteable shell block a self-service participant `eval`s (or sources)
     /// before running `ct-agent channel` (#117): the two **secret** private keys as
-    /// `export`s the CLI reads, plus the two **public** keys as comments to hand to the
-    /// channel operator (who signs this member's grant / registers the channel). The
-    /// operator still supplies `CT_CHANNEL_GRANT` and the broker/relay/front-door
-    /// addresses. Private keys are generated locally and never printed as anything but
-    /// the participant's own env — they never reach the operator or the server.
+    /// `export`s the CLI reads, plus the two **public** keys — ALSO as `export`s, not
+    /// only comments, because `channel member-material` and `channel join-pipeline-role`
+    /// consume `CT_CHANNEL_HOLDER_PUBKEY`/`CT_CHANNEL_NOISE_PUBKEY` as env vars (found
+    /// live: an agent following the hello-world README sourced this block, then hit
+    /// "CT_CHANNEL_NOISE_PUBKEY required" and had to hand-copy the value out of a
+    /// comment — the one file this block exists to make copy-paste-complete). The
+    /// pubkeys are public by definition, so exporting them leaks nothing. The channel
+    /// operator (who signs this member's grant / registers the channel) still supplies
+    /// `CT_CHANNEL_GRANT` and the broker/relay/front-door addresses. Private keys are
+    /// generated locally and never printed as anything but the participant's own env —
+    /// they never reach the operator or the server.
     pub fn env_block(&self) -> String {
         format!(
             "# Agent-Fabric channel identity — generated locally, keep the private keys secret.\n\
              # Give these PUBLIC keys to the channel operator (to sign your grant / register):\n\
-             #   holder_pubkey = {holder_pub}\n\
-             #   noise_pubkey  = {noise_pub}\n\
+             export CT_CHANNEL_HOLDER_PUBKEY={holder_pub}\n\
+             export CT_CHANNEL_NOISE_PUBKEY={noise_pub}\n\
              export CT_CHANNEL_HOLDER_KEY={holder_priv}\n\
              export CT_CHANNEL_NOISE_KEY={noise_priv}\n\
              #\n\

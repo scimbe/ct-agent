@@ -693,8 +693,18 @@ fn channel_identity_env_block_exports_the_keys_the_cli_reads() {
         block.contains(&format!("export CT_CHANNEL_NOISE_KEY={}", id.noise_key_hex())),
         "exports the Noise private key the CLI reads"
     );
-    assert!(block.contains(&id.holder_pubkey_hex()), "surfaces the holder public key for the operator");
-    assert!(block.contains(&id.noise_pubkey_hex()), "surfaces the Noise public key for the operator");
+    // The pubkeys must be real `export`s, not comment-only: `channel member-material` and
+    // `channel join-pipeline-role` consume CT_CHANNEL_HOLDER_PUBKEY/CT_CHANNEL_NOISE_PUBKEY
+    // as env vars, so a sourced init block must satisfy them without hand-copying values
+    // out of comments (found live during a real hello-world onboarding).
+    assert!(
+        block.contains(&format!("export CT_CHANNEL_HOLDER_PUBKEY={}", id.holder_pubkey_hex())),
+        "exports the holder public key the pubkey-consuming subcommands read"
+    );
+    assert!(
+        block.contains(&format!("export CT_CHANNEL_NOISE_PUBKEY={}", id.noise_pubkey_hex())),
+        "exports the Noise public key the pubkey-consuming subcommands read"
+    );
 
     // Safe to `eval`: every non-blank line is a comment or an `export`.
     for line in block.lines().filter(|l| !l.trim().is_empty()) {
