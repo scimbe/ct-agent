@@ -200,6 +200,23 @@ fn call_persistent_defaults_on_and_disables_only_on_explicit_off() {
     assert!(!call_persistent_enabled_from(Some(" No ")), "no (trimmed, any case) opts out");
 }
 
+/// ct-agent#94: CT_CHANNEL_CALL_SERVICE silently ignores CT_CHANNEL_CALL_PARAMS (it reads its
+/// input from stdin, not that variable) -- the "worst failure mode" the issue reported was zero
+/// signal that the two vars don't combine. This must warn when both are in play, and stay silent
+/// otherwise (no regression for the common case of CT_CHANNEL_CALL_SERVICE used alone).
+#[test]
+fn call_service_warns_when_params_env_is_set_and_ignored() {
+    use super::service_calls::call_service_params_ignored_warning;
+    let warning = call_service_params_ignored_warning(true).expect("must warn -- the params var is set but unused");
+    assert!(warning.contains("CT_CHANNEL_CALL_PARAMS"), "must name the ignored var: {warning}");
+    assert!(warning.contains("CT_CHANNEL_CALL_SERVICE"), "must name the mode it's ignored by: {warning}");
+    assert!(warning.contains("CT_CHANNEL_CALL=tools/call"), "must show the working alternative: {warning}");
+    assert!(
+        call_service_params_ignored_warning(false).is_none(),
+        "no warning when CT_CHANNEL_CALL_PARAMS isn't set -- the common, correct usage must stay silent"
+    );
+}
+
 /// #24 test helpers: one result per admission-outcome class.
 fn dcutr_ok() -> Result<(), BoxError> {
     Ok(())
