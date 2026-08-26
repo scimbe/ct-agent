@@ -132,6 +132,88 @@ pub(crate) async fn serve_admitted_session(
 /// fan-out of handler subprocesses (`claude -p`) a flood of Builds can trigger.
 pub(crate) const DEFAULT_SERVE_CONCURRENCY: usize = 8;
 
+/// ct-agent#95: how long a one-shot Initiate keeps retrying admission before giving up, in case
+/// the acceptor it's trying to reach is simply between #21 park windows (each a few tens of
+/// seconds). ~75s comfortably covers at least two such cycles.
+pub(crate) const DEFAULT_INITIATE_RETRY_SECS: u64 = 75;
+/// How long between retry attempts within the window above.
+const INITIATE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Parse `CT_CHANNEL_INITIATE_RETRY_SECS` into the retry window: a positive integer overrides the
+/// default; anything absent/blank/zero/malformed falls back to [`DEFAULT_INITIATE_RETRY_SECS`].
+/// Pure, same shape as [`serve_concurrency_from_env`] below.
+pub(crate) fn initiate_retry_window_from_env(value: Option<&str>) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        value.and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n >= 1).unwrap_or(DEFAULT_INITIATE_RETRY_SECS),
+    )
+}
+
+/// ct-agent#95: retry a one-shot Initiate's admission attempt for up to `window` instead of
+/// failing (or, per the reported bug, sometimes silently succeeding-shaped-as-nothing) on the
+/// very first attempt. Only the ADMISSION step is retried here -- once a real
+/// `ChannelJoinOutcome::Admitted` comes back, the caller runs the rest of the session (dial,
+/// Noise attestation, data pump) exactly once, unchanged; retrying past that point would risk
+/// masking a genuine post-admission failure as "peer unavailable".
+///
+/// Every non-`Admitted` result is treated as retryable within the window -- a `ParkExpired` is
+/// retryable by definition (#21), and even a `Refused`/transport error gets the same bounded
+/// tolerance here (unlike the accept side's infinite exponential backoff) because this is a
+/// SHORT, bounded window aimed squarely at the timing gap the issue describes, not a standing
+/// service. When the window closes without an `Admitted` outcome, returns ct-agent#95's own
+/// named timeout error (naming the channel, the window, and the attempt count) instead of
+/// whatever the last raw outcome/error happened to be -- the whole point being an actionable,
+/// distinguishable message instead of the prior silent-stall/silent-exit nondeterminism.
+pub(crate) async fn admit_one_shot_with_retry<A, Fut>(
+    window: std::time::Duration,
+    channel: &ct_common::channel::ChannelId,
+    mut admit: A,
+) -> Result<ChannelJoinOutcome, BoxError>
+where
+    A: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<ChannelJoinOutcome, BoxError>>,
+{
+    let deadline = std::time::Instant::now() + window;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let result = admit().await;
+        if let Ok(outcome @ ChannelJoinOutcome::Admitted { .. }) = result {
+            return Ok(outcome);
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            let reason = match &result {
+                Ok(outcome) => format!("-- the peer may be between park windows (#21), offline, or parked at a different pairer (last outcome: {outcome:?})"),
+                Err(e) => format!("-- last error: {e}"),
+            };
+            return Err(format!(
+                "no acceptor for channel {} parked at this edge within {}s (attempt {attempt}, ct-agent#95) {reason}",
+                hex_encode(&channel.0),
+                window.as_secs()
+            )
+            .into());
+        }
+        // Sleep only until whichever comes first: the next retry, or the deadline -- a short
+        // window (as a fast test wants, or in principle a caller wanting a snappy failure) must
+        // not overshoot by up to a whole INITIATE_RETRY_INTERVAL just because the deadline check
+        // above already passed before this sleep. The deadline is rechecked at the top of the
+        // next iteration regardless (this sleep is a ceiling, not a guarantee of full duration).
+        let next_check = deadline.min(now + INITIATE_RETRY_INTERVAL);
+        match &result {
+            Ok(outcome) => eprintln!(
+                "ct-agent channel: admission attempt {attempt} got {outcome:?}, retrying in {:?} \
+                 (ct-agent#95 -- the peer may be between #21 park windows)",
+                next_check - now
+            ),
+            Err(e) => eprintln!(
+                "ct-agent channel: admission attempt {attempt} error, retrying in {:?} (ct-agent#95): {e}",
+                next_check - now
+            ),
+        }
+        tokio::time::sleep_until(next_check.into()).await;
+    }
+}
+
 /// Parse `CT_CHANNEL_SERVE_CONCURRENCY` into a concurrency cap: a positive integer overrides the
 /// default; anything absent/blank/zero/malformed falls back to [`DEFAULT_SERVE_CONCURRENCY`]. Pure.
 pub(crate) fn serve_concurrency_from_env(value: Option<&str>) -> usize {
@@ -360,17 +442,34 @@ pub(crate) async fn run_one_admission_session_with_local<L>(
 where
     L: AsyncRead + AsyncWrite + Unpin,
 {
-    let admission = match front_door_cert {
-        Some(edge_cert) => {
-            present_channel_join_via_ladder(broker_ladder, request, &cfg.holder, edge_cert.clone(), DIRECT_DIAL_TIMEOUT).await?
+    let admit_once = || async {
+        match front_door_cert {
+            Some(edge_cert) => {
+                present_channel_join_via_ladder(broker_ladder, request, &cfg.holder, edge_cert.clone(), DIRECT_DIAL_TIMEOUT).await
+            }
+            None => {
+                let broker_conn = crate::transport::build_channel_dialer()?.connect(cfg.broker_addr, "localhost")?.await?;
+                // CADS-Tunnel#495 U2 (a'): broker_conn is admission-only -- PHASE_MARKER_RENDEZVOUS.
+                present_channel_join_marked(&broker_conn, request, &cfg.holder, PHASE_MARKER_RENDEZVOUS).await
+            }
         }
-        None => {
-            let broker_conn = crate::transport::build_channel_dialer()?
-                .connect(cfg.broker_addr, "localhost")?
-                .await?;
-            // CADS-Tunnel#495 U2 (a'): broker_conn is admission-only -- PHASE_MARKER_RENDEZVOUS.
-            present_channel_join_marked(&broker_conn, request, &cfg.holder, PHASE_MARKER_RENDEZVOUS).await?
-        }
+    };
+    // ct-agent#95: the accept side got persistent re-admission (#200) and park-expiry re-parking
+    // (#21), so it's resilient to timing by default -- but a one-shot Initiate had exactly one
+    // silent attempt. If admission lands inside the gap between two of the acceptor's park
+    // windows, that one attempt gets ParkExpired (or a transient broker error) and the whole call
+    // fails nondeterministically, with nothing telling the caller a retry would help. Bounded
+    // retry closes that gap for Initiate specifically -- Accept's own one-shot semantics (a
+    // non-serve Accept parks once and waits) are unchanged, matching the issue's scope.
+    let admission = if cfg.role == ChannelRole::Initiate {
+        admit_one_shot_with_retry(
+            initiate_retry_window_from_env(std::env::var("CT_CHANNEL_INITIATE_RETRY_SECS").ok().as_deref()),
+            &request.grant.grant.channel,
+            admit_once,
+        )
+        .await?
+    } else {
+        admit_once().await?
     };
     // The relay data leg mirrors the broker leg (#106 relay-leg-443): with a `:443` front-door cert
     // the relay fallback walks its own ladder — direct QUIC to the relay port, then the `:443` front

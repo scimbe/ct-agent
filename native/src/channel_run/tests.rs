@@ -5229,3 +5229,78 @@ async fn persistent_call_reconnect_off_fails_instead_of_redialing_47() {
     assert!(outcome.is_err(), "CT_CHANNEL_CALL_RECONNECT=0 must fail rather than redial on a session death");
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1, "no second attempt without reconnect enabled");
 }
+
+#[test]
+fn initiate_retry_window_defaults_and_parses_75s() {
+    use super::serving::{initiate_retry_window_from_env, DEFAULT_INITIATE_RETRY_SECS};
+    assert_eq!(initiate_retry_window_from_env(None), std::time::Duration::from_secs(DEFAULT_INITIATE_RETRY_SECS));
+    assert_eq!(initiate_retry_window_from_env(Some("")), std::time::Duration::from_secs(DEFAULT_INITIATE_RETRY_SECS));
+    assert_eq!(initiate_retry_window_from_env(Some("0")), std::time::Duration::from_secs(DEFAULT_INITIATE_RETRY_SECS), "0 is not a valid window");
+    assert_eq!(initiate_retry_window_from_env(Some("not-a-number")), std::time::Duration::from_secs(DEFAULT_INITIATE_RETRY_SECS));
+    assert_eq!(initiate_retry_window_from_env(Some(" 30 ")), std::time::Duration::from_secs(30), "trimmed, valid override honored");
+}
+
+/// ct-agent#95: the core fix, end to end against the pure retry loop -- a `ParkExpired` (the
+/// #21 timing-gap case the issue is literally about) on the first attempt must not fail or
+/// silently stop the call; a later `Admitted` within the window must be returned as success.
+#[tokio::test]
+async fn admit_one_shot_with_retry_succeeds_after_park_expired_within_the_window_95() {
+    use ct_common::channel::ChannelId;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let channel = ChannelId([0x11u8; 32]);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let a = attempts.clone();
+    let admit = move || {
+        let a = a.clone();
+        async move {
+            let n = a.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Ok(ChannelJoinOutcome::ParkExpired)
+            } else {
+                Ok(ChannelJoinOutcome::Admitted {
+                    peer_endpoint: "127.0.0.1:1".to_string(),
+                    peer_noise_pubkey: None,
+                    peer_holder: None,
+                    peer_attestation: None,
+                    observed_reflexive: None,
+                })
+            }
+        }
+    };
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        admit_one_shot_with_retry(std::time::Duration::from_secs(30), &channel, admit),
+    )
+    .await
+    .expect("must not hang waiting out the whole window when a later attempt succeeds")
+    .expect("must succeed once admission goes through");
+
+    assert!(matches!(outcome, ChannelJoinOutcome::Admitted { .. }), "the successful admission must be returned");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "retried exactly once after the ParkExpired");
+}
+
+/// ct-agent#95: when the whole window elapses without ever admitting, the error must be the
+/// named, actionable one from the issue -- not a bare propagation of the last ParkExpired/Err,
+/// and not a silent success. This is the fail-first proof: before this fix, a one-shot Initiate
+/// had exactly one attempt and no window concept at all.
+#[tokio::test]
+async fn admit_one_shot_with_retry_gives_a_named_error_when_the_window_closes_95() {
+    use ct_common::channel::ChannelId;
+    let channel = ChannelId([0x22u8; 32]);
+    let admit = || async { Ok(ChannelJoinOutcome::ParkExpired) };
+
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        admit_one_shot_with_retry(std::time::Duration::from_millis(50), &channel, admit),
+    )
+    .await
+    .expect("must not hang past the window")
+    .expect_err("must fail once the window closes without an Admitted outcome");
+
+    let msg = err.to_string();
+    assert!(msg.contains("ct-agent#95"), "must reference the issue for a searchable error: {msg}");
+    assert!(msg.contains("park windows (#21)"), "must name the #21 park-window explanation an agent can act on: {msg}");
+    assert!(msg.contains(&hex_encode(&channel.0)), "must name the channel: {msg}");
+}
