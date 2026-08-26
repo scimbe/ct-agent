@@ -44,7 +44,17 @@ fn require_registry_url_scheme(url: &str) -> Result<(), String> {
         return Ok(());
     }
     if let Some(rest) = url.strip_prefix("http://") {
-        let host = rest.split(['/', '?']).next().unwrap_or("");
+        let authority = rest.split(['/', '?']).next().unwrap_or("");
+        // Strip userinfo (`user:pass@host`) before host extraction (#97): without this, an
+        // authority like `127.0.0.1:8787@evil.invalid` string-splits on `:` to `127.0.0.1`
+        // here (loopback exception granted) while reqwest/the `url` crate parse
+        // `127.0.0.1:8787` as userinfo and actually connect to `evil.invalid` -- the two
+        // parsers disagreeing lets the real request leak the write token and manifest/bundle
+        // bytes in cleartext to whatever host is named after the `@`. `rsplit` (not `split`)
+        // keeps the LAST `@`-separated segment, matching how userinfo parsing works even if
+        // the (URL-illegal but not rejected by this string-split guard) userinfo itself
+        // contains an `@`.
+        let host = authority.rsplit('@').next().unwrap_or(authority);
         // Bracketed IPv6 (`[::1]:8787`) needs its own split -- a bare `:` split would chop it
         // apart at every colon inside the address itself.
         let host = match host.strip_prefix('[') {
