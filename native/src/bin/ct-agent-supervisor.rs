@@ -15,6 +15,12 @@
 //!   supervise.
 //! - `CT_AGENT_SUPERVISOR_STATUS_LISTEN` (optional `host:port`): serves `GET /crashes` with
 //!   the crash history as JSON, for live debugging.
+//! - `CT_AGENT_SUPERVISOR_STATUS_TOKEN` (64-hex, required whenever `..._STATUS_LISTEN` is
+//!   set): bearer token gating `/crashes` (#99 -- the endpoint discloses internal crash
+//!   state, including source `path:line:col` from panic locations, so it must not be
+//!   servable unauthenticated). Fail-closed: if `..._STATUS_LISTEN` is set but this isn't a
+//!   valid 64-hex token, the status endpoint does not start at all rather than falling back
+//!   to serving unauthenticated.
 //!
 //! Deliberately deferred (open design questions the issue itself flags as needing a decision
 //! before coding, not attempted here): Prometheus metrics alongside `ct-agent`'s own
@@ -64,6 +70,7 @@ impl std::fmt::Display for CrashReason {
 /// the child had been running before it exited (so a supervisor operator can distinguish "died
 /// instantly on every restart" from "ran fine for hours, then died once").
 #[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 struct CrashRecord {
     reason: String,
     at_unix: u64,
@@ -101,12 +108,31 @@ async fn main() {
     let history = Arc::new(Mutex::new(CrashHistory::default()));
 
     if let Ok(listen) = std::env::var("CT_AGENT_SUPERVISOR_STATUS_LISTEN") {
-        let history = history.clone();
-        tokio::spawn(async move {
-            if let Err(e) = serve_status(&listen, history).await {
-                eprintln!("ct-agent-supervisor: status endpoint failed to bind {listen}: {e}");
+        match std::env::var("CT_AGENT_SUPERVISOR_STATUS_TOKEN") {
+            Ok(token) if is_valid_status_token(&token) => {
+                let history = history.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_status(&listen, history, token).await {
+                        eprintln!("ct-agent-supervisor: status endpoint failed to bind {listen}: {e}");
+                    }
+                });
             }
-        });
+            Ok(_) => {
+                eprintln!(
+                    "ct-agent-supervisor: CT_AGENT_SUPERVISOR_STATUS_LISTEN is set but \
+                     CT_AGENT_SUPERVISOR_STATUS_TOKEN is not a valid 64-hex token -- refusing \
+                     to start the status endpoint (fail-closed, #99)"
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "ct-agent-supervisor: CT_AGENT_SUPERVISOR_STATUS_LISTEN is set but \
+                     CT_AGENT_SUPERVISOR_STATUS_TOKEN is not -- refusing to start the status \
+                     endpoint unauthenticated (fail-closed, #99); set a 64-hex \
+                     CT_AGENT_SUPERVISOR_STATUS_TOKEN to enable it"
+                );
+            }
+        }
     }
 
     // Never gives up (a supervisor's whole job is to keep trying) -- max_attempts is
@@ -229,32 +255,89 @@ fn classify_exit(signal: Option<i32>, code: Option<i32>, stderr_ring: &VecDeque<
     CrashReason::CleanExit(code)
 }
 
-/// Serve `GET /crashes` (the restart count + the bounded crash history as JSON) on `listen`
-/// (`host:port`) until the process exits. A deliberately minimal, dependency-free-beyond-axum
-/// status surface -- see the module doc comment for why this isn't Prometheus/control-plane
-/// integrated yet.
-async fn serve_status(listen: &str, history: Arc<Mutex<CrashHistory>>) -> std::io::Result<()> {
-    use axum::{routing::get, Json, Router};
+/// #99: the status token must be a real 64-hex secret, not e.g. an accidentally-empty env
+/// var that would make `CT_AGENT_SUPERVISOR_STATUS_TOKEN` "set" but trivially guessable --
+/// same shape as this codebase's other bearer/routing tokens (cf. `capability::
+/// parse_routing_token_hex`), though this one stays a string since it's only ever compared,
+/// never decoded into bytes for cryptographic use.
+fn is_valid_status_token(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
 
-    #[derive(serde::Serialize)]
-    struct StatusResp {
-        restart_count: u64,
-        crashes: Vec<CrashRecord>,
+/// Constant-time equality -- avoids a timing oracle that could let a remote caller learn the
+/// status token byte-by-byte from response-time differences (#99). Both inputs are expected
+/// to already be the same fixed length in the real call path (`is_valid_status_token` pins
+/// the configured side to exactly 64 bytes); the length check here is a safe fallback for a
+/// caller-supplied value of any length, not a timing-sensitive comparison itself since token
+/// length isn't secret.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
     }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
-    let app = Router::new().route(
-        "/crashes",
-        get({
-            let history = history.clone();
-            move || {
-                let history = history.clone();
-                async move {
-                    let h = history.lock().expect("history mutex poisoned");
-                    Json(StatusResp { restart_count: h.restart_count, crashes: h.records.iter().cloned().collect() })
-                }
-            }
-        }),
-    );
+/// Checks the `Authorization: Bearer <token>` header against the configured status token
+/// (#99). Anything else -- header absent, malformed, wrong scheme, wrong token -- is treated
+/// identically (`false`) so there's no oracle distinguishing failure reasons.
+fn bearer_token_matches(headers: &axum::http::HeaderMap, expected: &str) -> bool {
+    let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) else {
+        return false;
+    };
+    let Ok(auth) = auth.to_str() else {
+        return false;
+    };
+    let Some(provided) = auth.strip_prefix("Bearer ") else {
+        return false;
+    };
+    constant_time_eq(provided.as_bytes(), expected.as_bytes())
+}
+
+#[derive(serde::Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
+struct StatusResp {
+    restart_count: u64,
+    crashes: Vec<CrashRecord>,
+}
+
+#[derive(Clone)]
+struct StatusState {
+    history: Arc<Mutex<CrashHistory>>,
+    token: Arc<String>,
+}
+
+async fn crashes_handler(
+    axum::extract::State(state): axum::extract::State<StatusState>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::Json<StatusResp>, axum::http::StatusCode> {
+    if !bearer_token_matches(&headers, &state.token) {
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
+    let h = state.history.lock().expect("history mutex poisoned");
+    Ok(axum::Json(StatusResp { restart_count: h.restart_count, crashes: h.records.iter().cloned().collect() }))
+}
+
+/// Builds the `/crashes` router gated behind `expected_token` (#99), separated from
+/// `serve_status`'s socket-binding so it's exercisable in tests via `tower::ServiceExt::
+/// oneshot` without a real listener.
+fn status_router(history: Arc<Mutex<CrashHistory>>, expected_token: String) -> axum::Router {
+    use axum::routing::get;
+    let state = StatusState { history, token: Arc::new(expected_token) };
+    axum::Router::new().route("/crashes", get(crashes_handler)).with_state(state)
+}
+
+/// Serve `GET /crashes` (the restart count + the bounded crash history as JSON) on `listen`
+/// (`host:port`) until the process exits, gated behind `expected_token` (#99 -- see the
+/// module doc comment; the caller is responsible for only invoking this with a validated
+/// 64-hex token, never an empty/missing one). A deliberately minimal,
+/// dependency-free-beyond-axum status surface -- see the module doc comment for why this
+/// isn't Prometheus/control-plane integrated yet.
+async fn serve_status(listen: &str, history: Arc<Mutex<CrashHistory>>, expected_token: String) -> std::io::Result<()> {
+    let app = status_router(history, expected_token);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     axum::serve(listener, app).await
 }
@@ -358,5 +441,100 @@ mod tests {
         // the SUPERVISOR itself -- degrade to a sentinel rather than unwrap.
         let r = classify_exit(None, None, &ring(&[]));
         assert!(matches!(r, CrashReason::CleanExit(-1)));
+    }
+
+    // #99: the /crashes status endpoint must be gated behind a bearer token, fail-closed.
+
+    // Exactly 64 hex chars (32 repeated "a1" pairs) -- deliberately not hand-typed hex noise,
+    // so its length is trivially verifiable by inspection rather than by counting characters.
+    const TEST_TOKEN: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+
+    #[test]
+    fn a_real_64_hex_token_validates() {
+        assert!(is_valid_status_token(TEST_TOKEN));
+    }
+
+    #[test]
+    fn wrong_length_or_non_hex_tokens_are_rejected() {
+        assert!(!is_valid_status_token(""));
+        assert!(!is_valid_status_token(&TEST_TOKEN[..63]));
+        assert!(!is_valid_status_token(&format!("{TEST_TOKEN}0")));
+        let mut bad = TEST_TOKEN.to_string();
+        bad.replace_range(0..1, "g"); // 'g' is not a hex digit
+        assert!(!is_valid_status_token(&bad));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_equal_byte_strings_and_rejects_everything_else() {
+        assert!(constant_time_eq(b"same-value", b"same-value"));
+        assert!(!constant_time_eq(b"same-value", b"different"));
+        assert!(!constant_time_eq(b"short", b"much-longer-value"));
+        assert!(!constant_time_eq(b"", b"nonempty"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    fn ring_history() -> Arc<Mutex<CrashHistory>> {
+        Arc::new(Mutex::new(CrashHistory {
+            records: ring(&["init"])
+                .into_iter()
+                .map(|reason| CrashRecord { reason, at_unix: 0, uptime_secs: 0 })
+                .collect(),
+            restart_count: 3,
+        }))
+    }
+
+    #[tokio::test]
+    async fn crashes_endpoint_with_no_authorization_header_is_401_not_the_real_data() {
+        use tower::ServiceExt;
+        let app = status_router(ring_history(), TEST_TOKEN.to_string());
+        let req = axum::http::Request::builder().uri("/crashes").body(axum::body::Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn crashes_endpoint_with_the_wrong_token_is_401() {
+        use tower::ServiceExt;
+        let app = status_router(ring_history(), TEST_TOKEN.to_string());
+        let wrong = "0".repeat(64);
+        let req = axum::http::Request::builder()
+            .uri("/crashes")
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {wrong}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn crashes_endpoint_with_a_non_bearer_scheme_is_401_even_with_the_right_token() {
+        use tower::ServiceExt;
+        let app = status_router(ring_history(), TEST_TOKEN.to_string());
+        let req = axum::http::Request::builder()
+            .uri("/crashes")
+            .header(axum::http::header::AUTHORIZATION, format!("Token {TEST_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn crashes_endpoint_with_the_correct_token_returns_the_real_crash_history() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let app = status_router(ring_history(), TEST_TOKEN.to_string());
+        let req = axum::http::Request::builder()
+            .uri("/crashes")
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let parsed: StatusResp = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.restart_count, 3);
+        assert_eq!(parsed.crashes.len(), 1);
+        assert_eq!(parsed.crashes[0].reason, "init");
     }
 }
