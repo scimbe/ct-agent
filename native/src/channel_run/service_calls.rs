@@ -698,6 +698,20 @@ pub(crate) fn call_persistent_enabled_from(v: Option<&str>) -> bool {
     )
 }
 
+/// ct-agent#94: the warning to print (if any) when `CT_CHANNEL_CALL_SERVICE` is in effect and
+/// `CT_CHANNEL_CALL_PARAMS` is also set -- the latter is silently ignored by this mode (it only
+/// belongs to the separate `CT_CHANNEL_CALL=<method>` client). Pure and unit-testable, same
+/// shape as [`call_persistent_enabled_from`] above.
+pub(crate) fn call_service_params_ignored_warning(params_env_is_set: bool) -> Option<String> {
+    params_env_is_set.then(|| {
+        "ct-agent channel: warning: CT_CHANNEL_CALL_PARAMS is set but CT_CHANNEL_CALL_SERVICE \
+         does not read it -- this mode takes its call input from stdin, not this variable \
+         (ct-agent#94). For a single params-driven call instead, use CT_CHANNEL_CALL=tools/call \
+         with CT_CHANNEL_CALL_PARAMS='{\"name\":\"service/<slug>\",\"arguments\":<params>}'."
+            .to_string()
+    })
+}
+
 /// Build the channel session's local app duplex from the environment (#135 L2.x). `CT_CHANNEL_CALL=<method>`
 /// → one-shot MCP **client** (invoke a peer's tool, print the reply, exit). `CT_CHANNEL_SERVE=1` → the
 /// persistent MCP **service** (JSON-RPC `tools/list`/`tools/call` via the tool registry). Neither → the
@@ -708,6 +722,17 @@ pub(crate) fn channel_local() -> ChannelLocal {
     // the raw CT_CHANNEL_CALL below because it's the service-specific (and jq-free) path.
     if let Ok(slug) = std::env::var("CT_CHANNEL_CALL_SERVICE") {
         let slug = slug.trim().to_string();
+        // ct-agent#94: CT_CHANNEL_CALL_PARAMS is a real, working env var -- just for the OTHER
+        // client mode below (CT_CHANNEL_CALL=<method>). It is never read on this branch (input
+        // comes from stdin instead), and silently ignoring it is exactly the "worst failure
+        // mode" #94 reported: no join/call/error, just a silent success-shaped exit, because
+        // nothing ever told the caller their params never reached anything. Diagnostic-only --
+        // does not change what CT_CHANNEL_CALL_SERVICE does, only makes the misconfiguration
+        // visible.
+        if let Some(warning) = call_service_params_ignored_warning(std::env::var("CT_CHANNEL_CALL_PARAMS").is_ok())
+        {
+            eprintln!("{warning}");
+        }
         // #19: persistent call mode -- hold ONE session and multiplex line-framed calls over it
         // until stdin EOF, instead of one pairing per call. THE DEFAULT since v0.5.0 (the
         // operator-staged flip: opt-in through v0.4.x, default once the reference bridges
