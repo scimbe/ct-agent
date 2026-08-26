@@ -79,9 +79,31 @@ struct Admission {
 /// `None` there surfaces as a real, loud error instead of silently proceeding
 /// with issuance. Read this function's return value in the context of its
 /// caller, not as one shared "backward-compatible" meaning.
+/// ct-agent#98/CADS-Tunnel#666: header carrying the routing token on the `:hostname`-only
+/// route forms below, so it never lands in a URL path (and therefore never in a
+/// proxy/LB/access log). Must match the control-plane's own `AGENT_TOKEN_HEADER`.
+const AGENT_TOKEN_HEADER: &str = "x-ct-agent-token";
+
 async fn poll_admission(http: &reqwest::Client, cp_url: &str, token: &str, hostname: &str) -> Option<Admission> {
-    let url = format!("{}/agent/acme-admission/{token}/{hostname}", cp_url.trim_end_matches('/'));
-    let resp = http.get(&url).send().await.ok()?;
+    let base = cp_url.trim_end_matches('/');
+    // ct-agent#98: try the new host-only route (token via header) first -- an older
+    // control-plane without this route yet 404s, which this function already treats
+    // identically to any other failure (see the doc comment above), so falling back to
+    // the legacy path-based route on ANY failure preserves this function's existing
+    // "None means unavailable" contract while adding no new failure mode. This is the
+    // "compatibility window for mixed CP/agent versions" CADS-Tunnel#666 asked for --
+    // self-adapting to whichever route the control plane actually has, no version
+    // negotiation needed.
+    let new_url = format!("{base}/agent/acme-admission/{hostname}");
+    if let Ok(resp) = http.get(&new_url).header(AGENT_TOKEN_HEADER, token).send().await {
+        if resp.status().is_success() {
+            if let Ok(admission) = resp.json::<Admission>().await {
+                return Some(admission);
+            }
+        }
+    }
+    let legacy_url = format!("{base}/agent/acme-admission/{token}/{hostname}");
+    let resp = http.get(&legacy_url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -95,8 +117,15 @@ async fn poll_admission(http: &reqwest::Client, cp_url: &str, token: &str, hostn
 /// `record_issuance_complete` is naturally idempotent — a later successful
 /// call (e.g. after a renewal) still records correctly.
 async fn notify_issuance_complete(http: &reqwest::Client, cp_url: &str, token: &str, hostname: &str) {
-    let url = format!("{}/agent/acme-issuance-complete/{token}/{hostname}", cp_url.trim_end_matches('/'));
-    if let Err(e) = http.post(&url).send().await {
+    let base = cp_url.trim_end_matches('/');
+    // ct-agent#98: same new-route-first, legacy-fallback shape as poll_admission above.
+    let new_url = format!("{base}/agent/acme-issuance-complete/{hostname}");
+    match http.post(&new_url).header(AGENT_TOKEN_HEADER, token).send().await {
+        Ok(resp) if resp.status().is_success() => return,
+        _ => {}
+    }
+    let legacy_url = format!("{base}/agent/acme-issuance-complete/{token}/{hostname}");
+    if let Err(e) = http.post(&legacy_url).send().await {
         eprintln!("ct-agent: acme-issuance-complete callback failed (non-fatal, cert is already written): {e}");
     }
 }
@@ -408,7 +437,7 @@ async fn admission_poll_interval(config: &AcmeCertConfig) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::{Json as AxJson, State as AxState};
+    use axum::extract::{Json as AxJson, Path, State as AxState};
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::{get, head, post};
     use axum::Router;
@@ -994,5 +1023,78 @@ mod tests {
         assert!(did_issue, "succeeded via the admission broker's assigned directory (a different mock server)");
         assert_eq!(*mock.issuance_complete_hits.lock().unwrap(), 1, "completion callback fired exactly once");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ct-agent#98/CADS-Tunnel#666: the routing token must go via the `x-ct-agent-token`
+    /// header on the new host-only route -- proves the new form works standalone (a
+    /// server that has ONLY upgraded, no legacy route at all), and that the token
+    /// actually arrives as a header, not embedded in the path.
+    #[tokio::test]
+    async fn poll_admission_uses_the_new_header_route_when_available() {
+        async fn admission_new(
+            AxState(seen): AxState<Arc<Mutex<Option<String>>>>,
+            headers: HeaderMap,
+        ) -> AxJson<Value> {
+            *seen.lock().unwrap() = headers.get(AGENT_TOKEN_HEADER).and_then(|v| v.to_str().ok()).map(String::from);
+            AxJson(serde_json::json!({"status": "rot", "may_issue_now": false, "assigned_ca": null}))
+        }
+        let seen_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route("/agent/acme-admission/:hostname", get(admission_new))
+            .with_state(seen_token.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let http = reqwest::Client::new();
+        let admission = poll_admission(&http, &format!("http://{addr}"), "deadbeef-token", "app.example.com")
+            .await
+            .expect("the new route alone (no legacy route mounted) must be enough to succeed");
+        assert_eq!(admission.status, "rot");
+        assert_eq!(seen_token.lock().unwrap().as_deref(), Some("deadbeef-token"), "token must arrive via the header");
+    }
+
+    /// ct-agent#98/CADS-Tunnel#666: an older control-plane that only has the legacy
+    /// path-based route (the new route 404s) must still work via fallback -- the
+    /// "compatibility window for mixed CP/agent versions" CADS-Tunnel#666 asked for.
+    #[tokio::test]
+    async fn poll_admission_falls_back_to_the_legacy_path_route_when_the_new_one_is_missing() {
+        async fn admission_legacy(Path((token, _hostname)): Path<(String, String)>) -> AxJson<Value> {
+            AxJson(serde_json::json!({"status": if token == "deadbeef-token" { "gruen" } else { "rot" }, "may_issue_now": token == "deadbeef-token", "assigned_ca": null}))
+        }
+        // Deliberately does NOT mount /agent/acme-admission/:hostname -- simulates an
+        // unupgraded control-plane that has never heard of the new route.
+        let app = Router::new().route("/agent/acme-admission/:token/:hostname", get(admission_legacy));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let http = reqwest::Client::new();
+        let admission = poll_admission(&http, &format!("http://{addr}"), "deadbeef-token", "app.example.com")
+            .await
+            .expect("must fall back to the legacy route and still succeed against an unupgraded control plane");
+        assert_eq!(admission.status, "gruen");
+        assert!(admission.may_issue_now);
+    }
+
+    /// ct-agent#98/CADS-Tunnel#666: same fallback shape, mirrored for the issuance-complete
+    /// callback -- proves the fix covers both endpoints, not just admission polling.
+    #[tokio::test]
+    async fn notify_issuance_complete_falls_back_to_the_legacy_path_route() {
+        let hits: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        async fn issuance_legacy(AxState(hits): AxState<Arc<Mutex<u32>>>, Path((_token, _hostname)): Path<(String, String)>) -> StatusCode {
+            *hits.lock().unwrap() += 1;
+            StatusCode::OK
+        }
+        let app = Router::new()
+            .route("/agent/acme-issuance-complete/:token/:hostname", post(issuance_legacy))
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let http = reqwest::Client::new();
+        notify_issuance_complete(&http, &format!("http://{addr}"), "deadbeef-token", "app.example.com").await;
+        assert_eq!(*hits.lock().unwrap(), 1, "the legacy callback must still fire once via fallback");
     }
 }
