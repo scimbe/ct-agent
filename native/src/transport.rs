@@ -414,6 +414,22 @@ where
     register_tunnel_stream_with_role(stream, token, b'K').await
 }
 
+/// Bound on the registration write+ack round trip (#589 forensics, 2026-08-26
+/// sort recurrence): every other blocking step in this file already has one
+/// (`TCP_TLS_CONNECT_TIMEOUT` on the dial), but the registration write/read
+/// itself did not -- so a stalled edge (or a middlebox that completes the TLS
+/// handshake but then silently drops the connection) left a fallback worker
+/// blocked on `read_exact` forever, with no error to trigger the caller's
+/// existing reconnect/backoff ladder. That worker never re-parks, so the pool
+/// slot it should hold degrades to zero and stays there -- only a process
+/// restart clears it, which matches exactly what was observed live: a 28-minute
+/// outage where `tcp_fallback_pool=0` on 100% of the edge's connection attempts
+/// and zero of the edge's own dead-park reaps (#522) fired, i.e. the connection
+/// never got far enough to be parked (and later die) at all. The round trip is
+/// normally sub-second; 15s is generous headroom for a loaded edge or a slow
+/// path, while still being finite so the ladder can recover on its own.
+const REGISTER_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Shared body of the `'A'`/`'K'` TCP-fallback registration: both roles have a
 /// byte-identical wire format (`role(1) | token(32)` → 2-byte `OK`/`NO` ack), so
 /// the only thing that varies is the role byte itself.
@@ -427,15 +443,24 @@ where
 {
     let mut msg = vec![role];
     msg.extend_from_slice(&token.0);
-    stream.write_all(&msg).await?;
-    stream.flush().await?;
-    let mut ack = [0u8; 2];
-    stream.read_exact(&mut ack).await?;
-    if &ack == b"OK" {
-        Ok(())
-    } else {
-        Err("edge rejected tunnel registration".into())
-    }
+    tokio::time::timeout(REGISTER_ACK_TIMEOUT, async {
+        stream.write_all(&msg).await?;
+        stream.flush().await?;
+        let mut ack = [0u8; 2];
+        stream.read_exact(&mut ack).await?;
+        Ok::<[u8; 2], BoxError>(ack)
+    })
+    .await
+    .map_err(|_| -> BoxError {
+        format!("tunnel registration ack timed out after {REGISTER_ACK_TIMEOUT:?}").into()
+    })?
+    .and_then(|ack| {
+        if &ack == b"OK" {
+            Ok(())
+        } else {
+            Err("edge rejected tunnel registration".into())
+        }
+    })
 }
 
 /// Drive the ping phase of a `'K'` registration to its end: answer every PING
@@ -580,15 +605,27 @@ where
     msg.extend_from_slice(&token.0);
     msg.extend_from_slice(&host_len.to_be_bytes());
     msg.extend_from_slice(host_bytes);
-    stream.write_all(&msg).await?;
-    stream.flush().await?;
-    let mut ack = [0u8; 2];
-    stream.read_exact(&mut ack).await?;
-    if &ack == b"OK" {
-        Ok(())
-    } else {
-        Err("edge rejected browser hostname registration".into())
-    }
+    // See REGISTER_ACK_TIMEOUT's doc (#589 forensics) -- this is the exact live
+    // path a `CT_AGENT_MODE=browser` agent (e.g. sort.bunsenbrenner.org) uses.
+    tokio::time::timeout(REGISTER_ACK_TIMEOUT, async {
+        stream.write_all(&msg).await?;
+        stream.flush().await?;
+        let mut ack = [0u8; 2];
+        stream.read_exact(&mut ack).await?;
+        Ok::<[u8; 2], BoxError>(ack)
+    })
+    .await
+    .map_err(|_| -> BoxError {
+        format!("browser hostname registration ack timed out after {REGISTER_ACK_TIMEOUT:?}")
+            .into()
+    })?
+    .and_then(|ack| {
+        if &ack == b"OK" {
+            Ok(())
+        } else {
+            Err("edge rejected browser hostname registration".into())
+        }
+    })
 }
 
 /// Connect to the Edge over **TLS-over-TCP** — the UDP-blocked fallback dialer
@@ -1693,6 +1730,49 @@ mod tests {
         let r = register_tunnel_stream(&mut agent_side, &token).await;
         assert!(r.is_err(), "a non-OK ack is a rejection");
         edge.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn register_tunnel_stream_ack_times_out_instead_of_hanging_forever_589() {
+        // #589 forensics (2026-08-26 sort recurrence): a peer that reads the
+        // registration frame but then never sends the ack -- an edge-side stall, or
+        // a middlebox that black-holes just the return path after completing the
+        // TLS handshake -- must not leave this call blocked forever. Before this
+        // fix a fallback worker wedged here indefinitely: no error, no backoff
+        // retry, nothing to re-park with, and no way to recover short of killing
+        // the whole agent process. Mirrors #57's proof for the TLS-connect step.
+        let (mut agent_side, edge_side) = tokio::io::duplex(1024);
+        let token = RoutingToken([0x42; 32]);
+        // Held for the test's lifetime: the peer accepted the write, but never acks.
+        let _held = edge_side;
+
+        let started = tokio::time::Instant::now();
+        let result = register_tunnel_stream(&mut agent_side, &token).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "a stalled ack must surface as an error, not hang");
+        assert_eq!(
+            elapsed, REGISTER_ACK_TIMEOUT,
+            "must fail at exactly the timeout bound (virtual clock, #589) -- not \
+             immediately (unrelated failure) and not never (the bug this fixes)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn register_tunnel_stream_browser_ack_times_out_instead_of_hanging_forever_589() {
+        // Same proof as above, for the Browser-Plane 'B'/'L'/'F' registration --
+        // the live path a CT_AGENT_MODE=browser agent (e.g. sort.bunsenbrenner.org)
+        // actually uses, and the one implicated by tonight's outage.
+        let (mut agent_side, edge_side) = tokio::io::duplex(1024);
+        let token = RoutingToken([0x37; 32]);
+        let _held = edge_side;
+
+        let started = tokio::time::Instant::now();
+        let result = register_tunnel_stream_browser(&mut agent_side, &token, "sort.bunsenbrenner.org").await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "a stalled ack must surface as an error, not hang");
+        assert_eq!(elapsed, REGISTER_ACK_TIMEOUT, "must fail at exactly the timeout bound (#589)");
     }
 
     #[tokio::test]
