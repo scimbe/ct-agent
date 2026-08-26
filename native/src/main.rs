@@ -149,8 +149,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // comment) -- network isolation, not anything checked in this process, is the gate.
     // Never bind CT_RELAY_LISTEN to a publicly reachable address directly.
     if std::env::args().nth(1).as_deref() == Some("relay-node") {
+        // ct-agent#100: the example here used to show a bind-all address
+        // (/ip4/0.0.0.0/tcp/4437), contradicting the "never bind this to a publicly
+        // reachable address" warning immediately above -- an operator skimming past the
+        // comment to just copy the error message's example could bind exactly the wrong
+        // thing. A loopback/internal-only placeholder can't be misread as guidance to
+        // expose this port.
         let listen = std::env::var("CT_RELAY_LISTEN")
-            .map_err(|_| "relay-node requires CT_RELAY_LISTEN (e.g. /ip4/0.0.0.0/tcp/4437)")?;
+            .map_err(|_| "relay-node requires CT_RELAY_LISTEN (an internal-only address, e.g. /ip4/127.0.0.1/tcp/4437 -- never a publicly reachable one)")?;
         ct_agent::p2p::nat_lab_relay(&listen).await?;
         return Ok(());
     }
