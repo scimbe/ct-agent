@@ -1146,6 +1146,63 @@ fn channel_register_request_parses_env_and_derives_the_operator_pubkey() {
     }
 }
 
+#[test]
+fn channel_id_env_aliasing_prefers_the_semantic_name_but_keeps_the_grant_name_working_96() {
+    // #96: `channel register`/`channel allowlist` aren't grant operations, so requiring
+    // CT_GRANT_CHANNEL for their channel id pointed a user who naturally exported
+    // CT_CHANNEL_ID (the name `channel member-material` itself prints) at the unrelated
+    // grant namespace. CT_CHANNEL_ID is now the primary name; CT_GRANT_CHANNEL keeps
+    // working for every existing script.
+    let channel = [0x42u8; 32];
+    let lookup = |pairs: &[(&str, String)]| {
+        let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        ChannelAllowlistRequest::from_lookup(move |k| m.get(k).cloned())
+    };
+    let base = |channel_key: &'static str, channel_val: String| -> Vec<(&'static str, String)> {
+        vec![
+            ("CT_AGENT_CP_URL", "http://cp:8090".into()),
+            (channel_key, channel_val),
+            ("CT_OIDC_TOKEN", "tok".into()),
+        ]
+    };
+    // CT_CHANNEL_ID alone parses.
+    let via_channel_id: Vec<(&str, String)> = base("CT_CHANNEL_ID", hex_encode(&channel));
+    assert_eq!(
+        lookup(&via_channel_id).expect("CT_CHANNEL_ID alone parses").channel_hex,
+        hex_encode(&channel)
+    );
+    // CT_GRANT_CHANNEL alone still parses (back-compat with every existing script).
+    let via_grant_channel: Vec<(&str, String)> = base("CT_GRANT_CHANNEL", hex_encode(&channel));
+    assert_eq!(
+        lookup(&via_grant_channel).expect("CT_GRANT_CHANNEL alone still parses").channel_hex,
+        hex_encode(&channel)
+    );
+    // When both are set, CT_CHANNEL_ID (the primary, semantically-correct name) wins.
+    let other_channel = [0x77u8; 32];
+    let both: Vec<(&str, String)> = vec![
+        ("CT_AGENT_CP_URL", "http://cp:8090".into()),
+        ("CT_CHANNEL_ID", hex_encode(&channel)),
+        ("CT_GRANT_CHANNEL", hex_encode(&other_channel)),
+        ("CT_OIDC_TOKEN", "tok".into()),
+    ];
+    assert_eq!(
+        lookup(&both).expect("both set parses").channel_hex,
+        hex_encode(&channel),
+        "CT_CHANNEL_ID takes priority over CT_GRANT_CHANNEL when both are set"
+    );
+    // Neither set → the error names both env vars, not just the unrelated grant one.
+    let neither: Vec<(&str, String)> = vec![
+        ("CT_AGENT_CP_URL", "http://cp:8090".into()),
+        ("CT_OIDC_TOKEN", "tok".into()),
+    ];
+    let err = match lookup(&neither) {
+        Err(e) => e,
+        Ok(_) => panic!("neither channel id var set must fail"),
+    };
+    assert!(err.contains("CT_CHANNEL_ID"), "error must name the primary var: {err}");
+    assert!(err.contains("CT_GRANT_CHANNEL"), "error must also name the back-compat var: {err}");
+}
+
 #[tokio::test]
 async fn dial_ladder_falls_through_to_the_front_door_then_errors_when_all_blocked() {
     // #106-client-dial (frozen): the ladder-walk tries rungs in order and returns the

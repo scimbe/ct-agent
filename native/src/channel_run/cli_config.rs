@@ -130,6 +130,23 @@ pub(crate) fn opt_hex32<F: Fn(&str) -> Option<String>>(f: &F, key: &str) -> Opti
     f(key).as_deref().and_then(hex32)
 }
 
+/// Required 32-byte hex env field with a fallback key name (#96): tries `primary` first, then
+/// `fallback` -- for a value that has one semantically-correct name but is also read by an older
+/// call site under a different, misleading one (e.g. a grant-namespaced var reused by a
+/// non-grant command). Neither name set → the error mentions both, so a user who set the
+/// "obvious" name sees it acknowledged rather than pointed at the unrelated one.
+pub(crate) fn req_hex32_aliased<F: Fn(&str) -> Option<String>>(
+    f: &F,
+    primary: &str,
+    fallback: &str,
+    what: &str,
+) -> Result<[u8; 32], String> {
+    if let Some(v) = opt_hex32(f, primary) {
+        return Ok(v);
+    }
+    opt_hex32(f, fallback).ok_or_else(|| format!("{primary} (or {fallback}) required ({what})"))
+}
+
 /// Split a comma-separated env value into trimmed, non-empty tokens (empty input → no tokens).
 pub(crate) fn split_csv(s: &str) -> Vec<String> {
     s.split(',')

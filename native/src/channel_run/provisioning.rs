@@ -577,9 +577,12 @@ impl MemberMaterialRequest {
 /// end-to-end self-service Agent-Fabric channel. Parsed from the environment like
 /// [`OperatorGrantRequest::from_lookup`], reusing the onboarding/operator vars:
 /// the control-plane URL (`CT_AGENT_CP_URL`, as onboarding uses), the channel id
-/// (`CT_GRANT_CHANNEL`), the OIDC bearer token (`CT_OIDC_TOKEN`), and the operator public
-/// key — derived from `CT_CHANNEL_OPERATOR_KEY` (the operator's own private key from
-/// `channel operator-init`) or supplied directly as `CT_CHANNEL_OPERATOR_PUBKEY`.
+/// (`CT_CHANNEL_ID`, falling back to the grant-flow's `CT_GRANT_CHANNEL` for
+/// back-compat -- #96, this command isn't a grant operation so the primary name
+/// shouldn't be grant-namespaced), the OIDC bearer token (`CT_OIDC_TOKEN`), and the
+/// operator public key — derived from `CT_CHANNEL_OPERATOR_KEY` (the operator's own
+/// private key from `channel operator-init`) or supplied directly as
+/// `CT_CHANNEL_OPERATOR_PUBKEY`.
 pub struct ChannelRegisterRequest {
     /// Control-plane base URL (`POST {cp_url}/me/channels`).
     pub cp_url: String,
@@ -600,7 +603,7 @@ impl ChannelRegisterRequest {
         let cp_url = f("CT_AGENT_CP_URL")
             .filter(|s| !s.trim().is_empty())
             .ok_or("CT_AGENT_CP_URL required (control-plane base URL)")?;
-        let channel_hex = hex_encode(&req_hex32(&f, "CT_GRANT_CHANNEL", "64 hex channel id")?);
+        let channel_hex = hex_encode(&req_hex32_aliased(&f, "CT_CHANNEL_ID", "CT_GRANT_CHANNEL", "64 hex channel id")?);
         // The channel authority: derive from the operator's own private key
         // (CT_CHANNEL_OPERATOR_KEY, from `channel operator-init`), or take the public key
         // directly (CT_CHANNEL_OPERATOR_PUBKEY) when only the pubkey is at hand.
@@ -626,8 +629,9 @@ impl ChannelRegisterRequest {
 /// owner-scoped self-service channel-allowlist CLI, so an operator can manage a
 /// channel's e-mail allow-list without leaving the terminal for the portal web UI.
 /// Shares its shape with [`ChannelRegisterRequest`] (same `CT_AGENT_CP_URL`/
-/// `CT_GRANT_CHANNEL`/`CT_OIDC_TOKEN`), minus the operator pubkey — the allow-list
-/// routes are owner-scoped by the bearer token alone, no operator key needed.
+/// `CT_CHANNEL_ID` (or `CT_GRANT_CHANNEL`)/`CT_OIDC_TOKEN`), minus the operator
+/// pubkey — the allow-list routes are owner-scoped by the bearer token alone, no
+/// operator key needed.
 pub struct ChannelAllowlistRequest {
     /// Control-plane base URL (`{cp_url}/me/channels/:channel/allowlist`).
     pub cp_url: String,
@@ -646,7 +650,7 @@ impl ChannelAllowlistRequest {
         let cp_url = f("CT_AGENT_CP_URL")
             .filter(|s| !s.trim().is_empty())
             .ok_or("CT_AGENT_CP_URL required (control-plane base URL)")?;
-        let channel_hex = hex_encode(&req_hex32(&f, "CT_GRANT_CHANNEL", "64 hex channel id")?);
+        let channel_hex = hex_encode(&req_hex32_aliased(&f, "CT_CHANNEL_ID", "CT_GRANT_CHANNEL", "64 hex channel id")?);
         let token = f("CT_OIDC_TOKEN")
             .filter(|s| !s.trim().is_empty())
             .ok_or("CT_OIDC_TOKEN required (OIDC bearer token for the channel owner)")?;
