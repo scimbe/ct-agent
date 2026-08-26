@@ -54,6 +54,15 @@ impl Drop for AbortOnDrop {
 
 const CONNECT_UDP_PATH_PREFIX: &str = "/.well-known/masque/udp";
 
+/// How long to wait for the MASQUE proxy's SETTINGS_ENABLE_CONNECT_PROTOCOL=1
+/// frame to be processed after the h2 handshake completes (ct-agent#110) -- see
+/// the call site's own doc for why this was widened from an original 500ms.
+const EXTENDED_CONNECT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+const EXTENDED_CONNECT_POLL_ATTEMPTS: u32 = 400;
+const EXTENDED_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_millis(
+    EXTENDED_CONNECT_POLL_INTERVAL.as_millis() as u64 * EXTENDED_CONNECT_POLL_ATTEMPTS as u64,
+);
+
 /// RFC 9298 section 2's target_host encoding -- see CADS-Tunnel's `masque-proxy`
 /// crate for the matching server-side function; must produce byte-identical output
 /// to it, since the proxy compares this client's request path against its own
@@ -164,16 +173,27 @@ async fn dial_quic_via_masque_with_proxy_roots(
     // ADR-0024 M1 finding: `ready()` resolving does not guarantee the proxy's
     // SETTINGS_ENABLE_CONNECT_PROTOCOL=1 frame has already been processed --
     // bounded poll, not a one-shot check.
-    for _ in 0..50 {
+    //
+    // ct-agent#110: the original 500ms budget (50 x 10ms) was a placeholder from
+    // when M1/M3 were built, not derived from measured real-world proxy
+    // negotiation latency -- and it was live-caught missing on sort.bunsenbrenner.org
+    // (2026-08-26), causing a real dial failure and reconnect flap. Widened 8x to
+    // absorb realistic negotiation/scheduling delay under load. Still bounded and
+    // still fails fast for a genuinely unreachable/non-conforming proxy -- a truly
+    // dead proxy is silent from the first poll, so it pays this budget in full
+    // either way; only a slow-but-real proxy benefits from the wider window.
+    for _ in 0..EXTENDED_CONNECT_POLL_ATTEMPTS {
         if send_request.is_extended_connect_protocol_enabled() {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(EXTENDED_CONNECT_POLL_INTERVAL).await;
     }
     if !send_request.is_extended_connect_protocol_enabled() {
-        return Err("MASQUE proxy never enabled the HTTP/2 extended CONNECT protocol (RFC 9220) \
-                     within 500ms -- not a real CONNECT-UDP proxy, or unreachable"
-            .into());
+        return Err(format!(
+            "MASQUE proxy never enabled the HTTP/2 extended CONNECT protocol (RFC 9220) \
+             within {EXTENDED_CONNECT_BUDGET:?} -- not a real CONNECT-UDP proxy, or unreachable"
+        )
+        .into());
     }
 
     let path = connect_udp_path(target);
