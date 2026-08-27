@@ -1125,6 +1125,75 @@ fn operator_invite_request_parses_env_and_issues_a_verifiable_invitation() {
 }
 
 #[test]
+fn operator_topology_bind_request_parses_env_and_issues_a_verifiable_proof() {
+    // #698: `ct-agent channel bind-topology` was the missing producer for the Topology
+    // Editor's operator-binding step -- a live walkthrough found the guided flow promises
+    // it but never surfaces it, and there was in fact no tool anywhere to compute
+    // PUT /me/topologies/:id/operator's `proof` field at all. Parses CT_CHANNEL_OPERATOR_KEY
+    // + CT_TOPOLOGY_ID from env and issues a proof that verifies under
+    // ct_common::channel::verify_topology_operator_binding -- the exact function the
+    // control-plane endpoint calls -- and is bound to both the topology id and the
+    // operator's own public key (can't be replayed for a different topology or forged by
+    // an attacker who doesn't hold the operator's private key).
+    use ct_common::channel::verify_topology_operator_binding;
+
+    let op = OperatorIdentity::generate();
+    let topology_id = "t-live-walkthrough-1".to_string();
+
+    let base: Vec<(&str, String)> =
+        vec![("CT_CHANNEL_OPERATOR_KEY", op.key_hex()), ("CT_TOPOLOGY_ID", topology_id.clone())];
+    let lookup = |pairs: &[(&str, String)]| {
+        let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        OperatorTopologyBindRequest::from_lookup(move |k| m.get(k).cloned())
+    };
+
+    let req = lookup(&base).expect("valid operator topology-bind request parses");
+    assert_eq!(req.topology_id, topology_id);
+
+    // The printed output carries both fields, formatted for direct copy-paste, in the
+    // exact field-name spelling PUT /me/topologies/:id/operator's JSON body expects.
+    let printed = req.issue();
+    let op_pub_hex = op.pubkey_hex();
+    assert!(printed.contains(&format!("operator_pubkey = {op_pub_hex}")), "prints operator_pubkey");
+    assert!(printed.contains("proof           ="), "prints proof");
+
+    // Extract the proof hex the same way a human copy-pastes it, and confirm it verifies
+    // under the exact function the control-plane endpoint calls.
+    let proof_hex = printed
+        .lines()
+        .find_map(|l| l.strip_prefix("proof           = "))
+        .expect("proof line present")
+        .trim();
+    let proof: [u8; 64] = hex_bytes(proof_hex).expect("proof is hex").try_into().expect("64 bytes");
+    let op_pub: [u8; 32] = hex_bytes(&op_pub_hex).expect("pubkey is hex").try_into().expect("32 bytes");
+    assert!(
+        verify_topology_operator_binding(&topology_id, &op_pub, &proof),
+        "the issued proof verifies under the operator key for this exact topology id"
+    );
+
+    // Bound to the topology id: the same proof must NOT verify against a different one.
+    assert!(
+        !verify_topology_operator_binding("some-other-topology", &op_pub, &proof),
+        "a proof for one topology must not verify for another"
+    );
+
+    // Forged: a different operator's signature over the same message must not verify.
+    let attacker = OperatorIdentity::generate();
+    let (_, forged_proof_hex) = attacker.bind_topology(&topology_id);
+    let forged: [u8; 64] = hex_bytes(&forged_proof_hex).expect("hex").try_into().expect("64 bytes");
+    assert!(
+        !verify_topology_operator_binding(&topology_id, &op_pub, &forged),
+        "an attacker who doesn't hold the operator's private key can't forge a valid proof"
+    );
+
+    // Each required field is enforced.
+    for drop_key in ["CT_CHANNEL_OPERATOR_KEY", "CT_TOPOLOGY_ID"] {
+        let pruned: Vec<(&str, String)> = base.iter().filter(|(k, _)| *k != drop_key).cloned().collect();
+        assert!(lookup(&pruned).is_err(), "missing {drop_key} must be rejected");
+    }
+}
+
+#[test]
 fn channel_register_request_parses_env_and_derives_the_operator_pubkey() {
     // #117-operator-register (frozen): `ct-agent channel register` parses the CP URL,
     // channel id, OIDC token, and the operator authority from env — deriving the

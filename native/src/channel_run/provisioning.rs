@@ -335,6 +335,18 @@ impl OperatorIdentity {
             op_priv = self.key_hex(),
         )
     }
+
+    /// Prove possession of this operator key for binding to a Topology-Editor topology
+    /// (#698): a signature over [`ct_common::channel::topology_operator_binding_bytes`],
+    /// the exact preimage `PUT /me/topologies/:id/operator` verifies. Pure local crypto —
+    /// no server round-trip, the operator private key never leaves this machine. Returns
+    /// `(operator_pubkey_hex, proof_hex)`, the two fields that request body wants.
+    pub fn bind_topology(&self, topology_id: &str) -> (String, String) {
+        let op_pub = self.key.verifying_key().to_bytes();
+        let msg = ct_common::channel::topology_operator_binding_bytes(topology_id, &op_pub);
+        let proof = self.key.sign(&msg).to_bytes();
+        (hex_encode(&op_pub), hex_encode(&proof))
+    }
 }
 
 /// Inputs for `ct-agent channel join-pipeline-role` (#214 follow-up: generic pipeline
@@ -516,6 +528,41 @@ impl OperatorInviteRequest {
             self.delegable,
             self.expires_at,
         )
+    }
+}
+
+/// #698 `ct-agent channel bind-topology`: the missing producer for the Topology Editor's
+/// operator-binding step. A live-walkthrough finding (#698) confirmed the guided flow's
+/// intro text promises this step but the editor never surfaces it — the actual gap was
+/// never a missing UI checkbox, it was that no tool existed to compute `PUT
+/// /me/topologies/:id/operator`'s `proof` (a signature over
+/// [`ct_common::channel::topology_operator_binding_bytes`]) at all. This closes that:
+/// pure local crypto over `CT_CHANNEL_OPERATOR_KEY` (from `channel operator-init`) +
+/// `CT_TOPOLOGY_ID` (the topology's id, shown in its editor URL), no server round-trip,
+/// private key never leaves this machine — same shape as `channel grant`/`channel invite`.
+pub struct OperatorTopologyBindRequest {
+    pub operator: SigningKey,
+    pub topology_id: String,
+}
+
+impl OperatorTopologyBindRequest {
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let operator = req_key(&f, "CT_CHANNEL_OPERATOR_KEY", "64 hex; from `channel operator-init`")?;
+        let topology_id = req_str(&f, "CT_TOPOLOGY_ID", "the topology's id, from its editor URL")?;
+        Ok(Self { operator, topology_id })
+    }
+
+    /// The `operator_pubkey`/`proof` pair, formatted for direct copy-paste into the
+    /// Topology Editor's operator-binding fields (and matching `PUT
+    /// /me/topologies/:id/operator`'s JSON body field names byte-for-byte).
+    pub fn issue(&self) -> String {
+        let (operator_pubkey, proof) =
+            OperatorIdentity { key: self.operator.clone() }.bind_topology(&self.topology_id);
+        format!("operator_pubkey = {operator_pubkey}\nproof           = {proof}\n")
     }
 }
 
