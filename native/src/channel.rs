@@ -419,8 +419,9 @@ where
             Ok(r) => r,
             Err(_) if ka_tick_wait => {
                 return Err(format!(
-                    "KA park went silent — no keepalive tick or ack for {}s: dead park or \
-                     wedged edge, not a refusal; retry (#506)",
+                    "KA park went silent — no keepalive tick or ack for {}s; not a refusal, \
+                     retry. Cause unknown from here: could be a dead/wedged park on the edge, \
+                     or a local uplink loss (#506)",
                     KA_PARK_INACTIVITY_BOUND.as_secs()
                 )
                 .into())
