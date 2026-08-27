@@ -36,6 +36,7 @@ USAGE:
     ct-agent channel join-pipeline-role   Derive a published pipeline role's channel_id
     ct-agent channel grant                As operator, sign a member's channel grant
     ct-agent channel invite               As operator, sign a cross-account channel invitation
+    ct-agent channel bind-topology        As operator, sign a Topology Editor operator-binding proof
     ct-agent channel register             Register a channel authority with the CP
     ct-agent channel allowlist add|remove|list   Manage a channel's self-service allow-list
     ct-agent channel agent-card           Write (and optionally register) this agent's card
@@ -234,6 +235,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("{}", req.issue());
             return Ok(());
         }
+        // #698 `ct-agent channel bind-topology`: as the operator, sign the proof of
+        // possession the Topology Editor's operator-binding step needs (PUT
+        // /me/topologies/:id/operator's `proof` field). Reads CT_CHANNEL_OPERATOR_KEY +
+        // CT_TOPOLOGY_ID, pure local compute, mirrors `grant`/`invite`.
+        if std::env::args().nth(2).as_deref() == Some("bind-topology") {
+            let req = ct_agent::channel_run::OperatorTopologyBindRequest::from_env()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            print!("{}", req.issue());
+            return Ok(());
+        }
         // #276 piece 2 `ct-agent channel super-peer`: run this process as an opt-in LAN-local
         // relay for other same-network channel members, turning N edge-relay connections into
         // 1 (this process) + N-1 local hops. LISTEN is what LAN-local members point their own
@@ -388,7 +399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(sub) = std::env::args().nth(2) {
             const KNOWN: &[&str] = &[
                 "init", "operator-init", "member-material", "join-pipeline-role", "grant",
-                "invite", "super-peer", "register", "allowlist", "agent-card",
+                "invite", "bind-topology", "super-peer", "register", "allowlist", "agent-card",
             ];
             if !KNOWN.contains(&sub.as_str()) {
                 eprintln!("ct-agent: unrecognized channel subcommand '{sub}'\n");
