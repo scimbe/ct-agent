@@ -17,6 +17,18 @@ linked — those threads carry the full evidence.
 | Raw pipe | neither | stdin/stdout spliced over the channel. |
 | **Direct address (no broker at all)** | `CT_CHANNEL_ADDR` + `CT_CHANNEL_PEER_NOISE_KEY` (+ `CT_CHANNEL_PEER_CERT` when initiating) | Dials the peer **directly**; the edge is not involved in pairing. This is the `first-channel` tutorial's path. Every other row in this table goes through the broker — this one is the reason not to read "channel" as "always via the edge". |
 
+**Every row above except Direct address needs the control plane, not just a valid grant.** Source-verified
+against `CADS-Tunnel`'s `crates/edge/src/channel_authorize.rs`: any broker-mediated join calls
+`POST {control-plane}/internal/channel/authorize`, and the CP's durable `channel_members` table is the
+sole source of truth for admission — the edge holds no membership state of its own. A correctly-signed
+`CT_CHANNEL_GRANT` is necessary but not sufficient; without `ct-agent channel register` (`POST
+/me/channels`) **and** the member added (`POST /me/channels/:channel/members`), every join is refused
+with `edge broker refused the channel join` regardless of grant validity. Setting up persistent serve
+solo, with no counterpart's `holder_pubkey` known yet? See [Serve your own service,
+solo](https://docs.bunsenbrenner.org/how-to/serve-your-own-service-solo/) — `CT_CHANNEL_BRIDGE_HOLDER`
+can validly be your own holder pubkey when deriving the channel id, since nothing in
+`channel_id_for_link`/`verify_member_noise_attestation` requires a distinct second party.
+
 ## Transport selection (the dial ladders)
 
 Broker and relay each get a ladder: **direct QUIC** (`CT_CHANNEL_BROKER` :4435 / `CT_CHANNEL_RELAY`
