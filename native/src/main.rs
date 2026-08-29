@@ -28,6 +28,8 @@ USAGE:
                                  subcommand needed if you already have a routing token)
     ct-agent onboard            Redeem CT_AGENT_JOIN_TOKEN, then serve
     ct-agent rotate             Rotate the origin key, keeping the routing token
+    ct-agent login              Log in via OIDC device grant (RFC 8628); the token is stored
+                                 locally and used automatically by `channel register`/`allowlist`
     ct-agent certificate        Run the ACME DNS-01 certificate renewal loop
     ct-agent relay-node         Run a Circuit-Relay v2 / DCUtR relay node
     ct-agent channel init                 Mint a fresh channel member identity
@@ -51,6 +53,17 @@ USAGE:
 
 Every subcommand is configured entirely via CT_*/CT_AGENT_*/CT_CHANNEL_* environment
 variables, not flags -- see docs.bunsenbrenner.org for the full reference per command.
+
+`login` (RFC 8628 OAuth 2.0 Device Authorization Grant, against the same Keycloak realm the
+portal login uses) reads CT_OIDC_ISSUER (the realm URL, e.g.
+https://auth.bunsenbrenner.org/realms/ct-demo) and optional CT_OIDC_CLI_CLIENT_ID (default
+ct-agent-cli, the realm's public device-grant-enabled CLI client -- no client secret). Prints a
+verification URL and code to open in any browser, waits for you to authorize, then stores the
+token at CT_AGENT_LOGIN_TOKEN_FILE (default <CT_AGENT_STATE_DIR>/oidc-token.json, or
+$HOME/.ct-agent/oidc-token.json with neither set). `channel register`/`channel allowlist` use
+this automatically whenever CT_OIDC_TOKEN is NOT set in the environment, refreshing it
+transparently when it is close to expiry -- CT_OIDC_TOKEN explicitly set always takes priority,
+so no existing script/CI usage changes.
 
 `manifest` (CADS-agent-marketplace: Compose services since Phase 1, Binary executables since
 Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
@@ -139,6 +152,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
              capability and remove the retired key once the window closes."
         );
         let _ = new_cap;
+        return Ok(());
+    }
+
+    // `login` subcommand: RFC 8628 OAuth 2.0 Device Authorization Grant against the
+    // realm's public `ct-agent-cli` client (device grant enabled, no client secret),
+    // so an operator no longer has to open the portal in a browser and hand-copy a
+    // bearer token into CT_OIDC_TOKEN. Prints a verification URL + code, polls until
+    // authorized, and stores the token locally (see `ct_agent::login`'s doc comment
+    // for exactly where) -- `channel register`/`channel allowlist` pick it up
+    // automatically via `ct_agent::login::resolve_oidc_token` whenever CT_OIDC_TOKEN
+    // is not explicitly set in the environment.
+    if std::env::args().nth(1).as_deref() == Some("login") {
+        let cfg = ct_agent::login::LoginConfig::from_env()?;
+        ct_agent::login::run_login(cfg).await?;
         return Ok(());
     }
 
@@ -269,10 +296,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // the control plane (POST /me/channels, owner = the OIDC subject) so the edge
         // accepts the grants that operator signs — the last CP round-trip that makes an
         // Agent-Fabric channel fully self-service. Reads CT_AGENT_CP_URL + CT_GRANT_CHANNEL
-        // + CT_OIDC_TOKEN + the operator key (CT_CHANNEL_OPERATOR_KEY / _PUBKEY).
+        // + the operator key (CT_CHANNEL_OPERATOR_KEY / _PUBKEY). The OIDC bearer token is
+        // CT_OIDC_TOKEN if explicitly set, else whatever `ct-agent login` stored locally
+        // (transparently refreshed if stale) — see `ct_agent::login::resolve_oidc_token`.
         if std::env::args().nth(2).as_deref() == Some("register") {
-            let req = ct_agent::channel_run::ChannelRegisterRequest::from_env()
+            let token = ct_agent::login::resolve_oidc_token()
+                .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            let req = ct_agent::channel_run::ChannelRegisterRequest::from_lookup_with_token(
+                |k| std::env::var(k).ok(),
+                token,
+            )
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             ct_control_plane::client::ControlPlaneClient::new(req.cp_url.clone())
                 .register_channel(&req.channel_hex, &req.operator_pubkey_hex, &req.token)
                 .await
@@ -282,12 +317,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         // #248-follow `ct-agent channel allowlist add|remove|list`: manage a channel's
         // self-service e-mail allow-list from the CLI (owner-scoped, same
-        // CT_AGENT_CP_URL/CT_GRANT_CHANNEL/CT_OIDC_TOKEN as `register`) — the CLI
-        // counterpart to the portal web UI, so an operator never has to leave the
-        // terminal to grant a teammate self-service channel access.
+        // CT_AGENT_CP_URL/CT_GRANT_CHANNEL as `register`, same CT_OIDC_TOKEN-or-stored-login
+        // resolution) — the CLI counterpart to the portal web UI, so an operator never has
+        // to leave the terminal to grant a teammate self-service channel access.
         if std::env::args().nth(2).as_deref() == Some("allowlist") {
-            let req = ct_agent::channel_run::ChannelAllowlistRequest::from_env()
+            let token = ct_agent::login::resolve_oidc_token()
+                .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            let req = ct_agent::channel_run::ChannelAllowlistRequest::from_lookup_with_token(
+                |k| std::env::var(k).ok(),
+                token,
+            )
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             let client = ct_control_plane::client::ControlPlaneClient::new(req.cp_url.clone());
             match std::env::args().nth(3).as_deref() {
                 Some("add") => {

@@ -14,6 +14,7 @@ pub mod dns01_authoritative;
 pub mod dns01_propagation;
 pub mod harness_run;
 pub mod ladder;
+pub mod login;
 pub mod masque;
 pub mod identity;
 pub mod manifest_run;
