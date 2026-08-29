@@ -4,6 +4,10 @@
 //! instead of a portal session cookie. This is the CLI-driven counterpart to the
 //! portal browser's "Create tunnel" button.
 //!
+//! One command, not two: if no stored login exists yet, [`run_signup`] runs the
+//! interactive device-code login itself before proceeding, instead of erroring
+//! out and telling the operator to run `ct-agent login` first separately.
+//!
 //! Anti-abuse (repeat free-account creation): this also computes and reports a
 //! device+user fingerprint — `sha256(machine_id || "\0" || os_username)` — that the
 //! control plane uses to cap how many distinct free accounts one machine can create
@@ -107,7 +111,21 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// whatever `ct-agent login` stored — see [`crate::login::resolve_oidc_token`]),
 /// compute the device fingerprint, and call `POST /me/signup` against `cp_url`.
 pub async fn run_signup(cp_url: &str, name: &str) -> Result<SignupResult, String> {
-    let token = crate::login::resolve_oidc_token().await?;
+    let token = match crate::login::resolve_oidc_token().await {
+        Ok(t) => t,
+        // No usable stored login (never logged in, or a stale one with no
+        // refresh token) -- run the interactive device-code flow right here
+        // instead of erroring out and telling the operator to run a SECOND,
+        // separate command. This was the review's own highest-leverage
+        // onboarding-friction finding: "Login+Signup zu einem Schritt
+        // zusammenlegen" (competitors need one command, we needed two).
+        Err(_) => {
+            eprintln!("ct-agent: no stored login found -- logging in first");
+            let login_cfg = crate::login::LoginConfig::from_env()?;
+            crate::login::run_login(login_cfg).await?;
+            crate::login::resolve_oidc_token().await?
+        }
+    };
     let fingerprint = device_fingerprint();
     ControlPlaneClient::new(cp_url)
         .signup(name, &token, fingerprint.as_deref())
@@ -137,5 +155,38 @@ mod tests {
     #[test]
     fn hex_encode_matches_a_known_vector() {
         assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+    }
+
+    /// Serializes tests that mutate process env vars -- same reasoning as
+    /// `login.rs`'s own `ENV_MUTEX` (a separate lock, not shared: cross-file env
+    /// races are a pre-existing, accepted risk in this codebase's test suite).
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn clear_env() {
+        for k in ["CT_OIDC_TOKEN", "CT_AGENT_LOGIN_TOKEN_FILE", "CT_AGENT_STATE_DIR", "CT_OIDC_ISSUER", "CT_OIDC_CLI_CLIENT_ID"] {
+            std::env::remove_var(k);
+        }
+    }
+
+    /// One command, not two (the review's own highest-leverage onboarding
+    /// finding): with no stored login AND no OIDC config at all, `run_signup`
+    /// must still fail with a clear, actionable config error -- not panic, not
+    /// hang, and not silently proceed unauthenticated. This is the boundary
+    /// case the new auto-login branch adds; the happy-path (login succeeds,
+    /// then signup proceeds) needs a full mock IdP + mock control-plane server
+    /// and is exercised at the level of `login.rs`'s own `run_login`/
+    /// `resolve_oidc_token` tests, not duplicated here.
+    #[tokio::test]
+    async fn run_signup_fails_loudly_with_no_stored_login_and_no_oidc_config() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        clear_env();
+        std::env::set_var("CT_AGENT_LOGIN_TOKEN_FILE", "/nonexistent/dir/oidc-token.json");
+
+        let err = run_signup("http://127.0.0.1:1", "my-tunnel")
+            .await
+            .expect_err("no stored login and no CT_OIDC_ISSUER must fail, not hang or panic");
+        assert!(err.contains("CT_OIDC_ISSUER"), "names the actual missing config, got: {err}");
+
+        clear_env();
     }
 }
