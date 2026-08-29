@@ -275,8 +275,22 @@ fn hex8(bytes: &[u8]) -> String {
 /// already-hardened helper closes that window by construction instead of narrowing
 /// after the fact — every other secret-writing call site in this agent already goes
 /// through it (see its own module doc); this one had simply never been migrated.
+/// #117: off-container (no `/shared/` volume mount), the default
+/// `CT_AGENT_CAPABILITY_OUT=/shared/capability.bin` used to fail with a bare
+/// `Os { code: 2, kind: NotFound, ... }` -- no path, no indication of which write
+/// failed, since `secret_file::write_private` creates the FILE but never its
+/// parent directory, and nothing in the call chain added context before `main()`'s
+/// default `Result` printing Debug-formatted the raw `io::Error`. Two independent
+/// fixes: create the parent directory first (so a plausible non-container path
+/// like `./capability.bin` or a first-boot `CT_AGENT_STATE_DIR` just works), and
+/// wrap any remaining failure with the path so it's diagnosable on first read.
 fn write_owner_only(path: &str, bytes: &[u8]) -> Result<(), BoxError> {
-    crate::secret_file::write_private(std::path::Path::new(path), bytes)?;
+    let p = std::path::Path::new(path);
+    if let Some(parent) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating parent directory for {path}: {e}"))?;
+    }
+    crate::secret_file::write_private(p, bytes).map_err(|e| format!("writing {path}: {e}"))?;
     Ok(())
 }
 
@@ -341,6 +355,40 @@ mod tests {
             let _ = std::fs::remove_file(p);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #117: off-container, `CT_AGENT_CAPABILITY_OUT`'s default parent (`/shared/`)
+    /// doesn't exist -- the write must not require the caller to have pre-created it.
+    #[test]
+    fn write_owner_only_creates_missing_parent_directories_117() {
+        let dir = tmp("missing-parent-117");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!std::path::Path::new(&dir).exists(), "the parent must not exist yet");
+        let path = format!("{dir}/nested/capability.bin");
+
+        write_owner_only(&path, b"cap-bytes").expect("parent dirs are created, not required to pre-exist");
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"cap-bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #117: a genuine failure (here: the "parent" is actually an existing plain file,
+    /// so `create_dir_all` cannot succeed) must name the path in its error -- the bare
+    /// `Os { code: 2, .. }` with no path was the actual bug report.
+    #[test]
+    fn write_owner_only_names_the_path_on_failure_117() {
+        let dir = tmp("blocked-parent-117");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::write(&dir, b"i am a file, not a directory").unwrap();
+        let path = format!("{dir}/capability.bin");
+
+        let err = write_owner_only(&path, b"cap-bytes").expect_err("the parent path is a file, this must fail");
+        assert!(
+            err.to_string().contains(&path),
+            "error must name the path that failed, got: {err}"
+        );
+
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
