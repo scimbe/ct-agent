@@ -583,7 +583,7 @@ dependencies = [
 [[package]]
 name = "ct-client"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.17#cdfdf77b58ab26e9d50effd1bfccac1528a06789"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.18#cc6edcd0f958f5fd9c5ee29941f58fcac95def37"
 dependencies = [
  "ct-common",
  "futures-util",
@@ -596,7 +596,7 @@ dependencies = [
 [[package]]
 name = "ct-common"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.17#cdfdf77b58ab26e9d50effd1bfccac1528a06789"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.18#cc6edcd0f958f5fd9c5ee29941f58fcac95def37"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
@@ -613,7 +613,7 @@ dependencies = [
 [[package]]
 name = "ct-control-plane"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.17#cdfdf77b58ab26e9d50effd1bfccac1528a06789"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.18#cc6edcd0f958f5fd9c5ee29941f58fcac95def37"
 dependencies = [
  "axum",
  "base64",
@@ -632,12 +632,13 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "x509-parser",
 ]
 
 [[package]]
 name = "ct-dns"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.17#cdfdf77b58ab26e9d50effd1bfccac1528a06789"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.18#cc6edcd0f958f5fd9c5ee29941f58fcac95def37"
 dependencies = [
  "axum",
  "hickory-resolver 0.26.1",
@@ -649,7 +650,7 @@ dependencies = [
 [[package]]
 name = "ct-edge"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.17#cdfdf77b58ab26e9d50effd1bfccac1528a06789"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.18#cc6edcd0f958f5fd9c5ee29941f58fcac95def37"
 dependencies = [
  "axum",
  "ct-common",
@@ -660,6 +661,7 @@ dependencies = [
  "rand 0.8.8",
  "rcgen",
  "reqwest",
+ "rusqlite",
  "rustls",
  "rustls-pki-types",
  "serde",

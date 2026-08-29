@@ -319,7 +319,9 @@ mod tests {
     async fn onboard_enrolls_and_binds_a_fresh_identity() {
         let store = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
         let tenant = TenantId("tenant-1".into());
-        let token = store.issue_join_token(&tenant).unwrap();
+        let token = store
+            .issue_join_token(&tenant, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
+            .unwrap();
         let url = serve(store.clone()).await;
 
         let cfg = AgentConfig::parse("127.0.0.1:4433", "127.0.0.1:8080").unwrap();
@@ -348,7 +350,9 @@ mod tests {
         // persists; a restart RESTORES the bound identity/tenant and never touches the CP.
         let store = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
         let tenant = TenantId("tenant-help".into());
-        let token = store.issue_join_token(&tenant).unwrap();
+        let token = store
+            .issue_join_token(&tenant, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
+            .unwrap();
         let url = serve(store.clone()).await;
         let cfg = AgentConfig::parse("127.0.0.1:4433", "127.0.0.1:8080").unwrap();
         let agent_id = AgentId("help-agent".into());
@@ -504,7 +508,9 @@ mod tests {
     async fn onboard_env_drives_the_full_flow() {
         let store = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
         let tenant = TenantId("tenant-1".into());
-        let token = store.issue_join_token(&tenant).unwrap();
+        let token = store
+            .issue_join_token(&tenant, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
+            .unwrap();
         let url = serve(store.clone()).await;
         let token_hex: String = token.0.iter().map(|b| format!("{b:02x}")).collect();
         let cfg = AgentConfig::parse("127.0.0.1:4433", "127.0.0.1:8080").unwrap();
@@ -523,7 +529,9 @@ mod tests {
     async fn join_token_is_single_use() {
         let store = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
         let tenant = TenantId("tenant-1".into());
-        let token = store.issue_join_token(&tenant).unwrap();
+        let token = store
+            .issue_join_token(&tenant, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
+            .unwrap();
         let url = serve(store).await;
         let cfg = AgentConfig::parse("127.0.0.1:4433", "127.0.0.1:8080").unwrap();
 

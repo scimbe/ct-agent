@@ -25,6 +25,7 @@ pub mod p2p;
 pub mod reconnect;
 pub mod secret_file;
 pub mod serve;
+pub mod signup;
 pub mod super_peer;
 pub mod transport;
 pub mod well_known;

@@ -1690,12 +1690,13 @@ mod tests {
         let state_e = state.clone();
         let edge = tokio::spawn(async move {
             loop {
-                let (tcp, _) = tcp_listener.accept().await.unwrap();
+                let (tcp, peer) = tcp_listener.accept().await.unwrap();
                 let (acc, st, ch) = (acceptor.clone(), state_e.clone(), challenge.clone());
                 tokio::spawn(async move {
                     if let Ok(tls) = acc.accept(tcp).await {
-                        // The trailing None is ct-edge's per-connection cap (no cap in this test).
-                        let _ = serve_tcp_connection(tls, &st, &ch, None).await;
+                        // The trailing None is ct-edge's per-connection cap (no cap in this
+                        // test); peer.ip() (#603) is the real accept()-time address.
+                        let _ = serve_tcp_connection(tls, &st, &ch, None, peer.ip()).await;
                     }
                 });
             }
@@ -3054,13 +3055,16 @@ mod tests {
             // difficulty 0: the PoW gate is not what this test is about.
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
             loop {
-                let Ok((tcp, _)) = tcp_listener.accept().await else { break };
+                let Ok((tcp, peer)) = tcp_listener.accept().await else { break };
                 let acc = acceptor.clone();
                 let st = st.clone();
                 let ch = challenge.clone();
                 tokio::spawn(async move {
                     if let Ok(tls) = acc.accept(tcp).await {
-                        let _ = ct_edge::serve::serve_tcp_connection(tls, &st, &ch, None).await;
+                        // #603: this test's own local mini-edge, so the real peer
+                        // address the OS handed back at accept() is the genuine
+                        // one to report, not a placeholder.
+                        let _ = ct_edge::serve::serve_tcp_connection(tls, &st, &ch, None, peer.ip()).await;
                     }
                 });
             }

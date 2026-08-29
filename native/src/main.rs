@@ -30,6 +30,8 @@ USAGE:
     ct-agent rotate             Rotate the origin key, keeping the routing token
     ct-agent login              Log in via OIDC device grant (RFC 8628); the token is stored
                                  locally and used automatically by `channel register`/`allowlist`
+    ct-agent signup <name>      Self-service tunnel creation (CT_AGENT_CP_URL), authenticated via
+                                 the stored `login` token; prints CT_AGENT_TOKEN for the next run
     ct-agent certificate        Run the ACME DNS-01 certificate renewal loop
     ct-agent relay-node         Run a Circuit-Relay v2 / DCUtR relay node
     ct-agent channel init                 Mint a fresh channel member identity
@@ -166,6 +168,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if std::env::args().nth(1).as_deref() == Some("login") {
         let cfg = ct_agent::login::LoginConfig::from_env()?;
         ct_agent::login::run_login(cfg).await?;
+        return Ok(());
+    }
+
+    // `signup <name>` (anti-abuse repeat-signup mitigation): self-service tunnel
+    // creation against CADS-Tunnel's `POST /me/signup`, authenticated with the
+    // OIDC token `login` already obtained -- see `ct_agent::signup`'s own doc for
+    // why this deliberately does NOT chain into serving in this same process
+    // (unlike `onboard`, below, whose join-token flow this codebase already has
+    // deep serve-bootstrap wiring for).
+    if std::env::args().nth(1).as_deref() == Some("signup") {
+        let name = std::env::args()
+            .nth(2)
+            .ok_or("ct-agent signup requires a tunnel name: ct-agent signup <name>")?;
+        let cp_url = std::env::var("CT_AGENT_CP_URL")
+            .map_err(|_| "ct-agent signup requires CT_AGENT_CP_URL (the control-plane base URL)")?;
+        let result = ct_agent::signup::run_signup(&cp_url, &name).await?;
+        eprintln!(
+            "ct-agent: signed up -- set CT_AGENT_TOKEN={} and run `ct-agent` to start serving{}",
+            result.routing_token,
+            result
+                .hostname
+                .as_deref()
+                .map(|h| format!(" (hostname: {h})"))
+                .unwrap_or_default(),
+        );
         return Ok(());
     }
 
