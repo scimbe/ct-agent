@@ -653,6 +653,19 @@ impl ChannelRegisterRequest {
     }
 
     pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let token = f("CT_OIDC_TOKEN")
+            .filter(|s| !s.trim().is_empty())
+            .ok_or("CT_OIDC_TOKEN required (OIDC bearer token for the channel owner)")?;
+        Self::from_lookup_with_token(f, token)
+    }
+
+    /// Like [`Self::from_lookup`], but the caller has already resolved the OIDC bearer
+    /// token itself (`CT_OIDC_TOKEN` if it was explicitly set, else the token
+    /// `ct-agent login` stored on disk — see [`crate::login::resolve_oidc_token`]) rather
+    /// than requiring `CT_OIDC_TOKEN` to be present in `f`. Every other field is read
+    /// from `f` exactly as `from_lookup` does — `from_lookup` itself is just this with
+    /// `CT_OIDC_TOKEN` read out of `f` first, so nothing about its behavior changed.
+    pub fn from_lookup_with_token(f: impl Fn(&str) -> Option<String>, token: String) -> Result<Self, String> {
         let cp_url = f("CT_AGENT_CP_URL")
             .filter(|s| !s.trim().is_empty())
             .ok_or("CT_AGENT_CP_URL required (control-plane base URL)")?;
@@ -671,9 +684,6 @@ impl ChannelRegisterRequest {
                     .to_string(),
             );
         };
-        let token = f("CT_OIDC_TOKEN")
-            .filter(|s| !s.trim().is_empty())
-            .ok_or("CT_OIDC_TOKEN required (OIDC bearer token for the channel owner)")?;
         Ok(Self { cp_url, channel_hex, operator_pubkey_hex, token })
     }
 }
@@ -700,13 +710,20 @@ impl ChannelAllowlistRequest {
     }
 
     pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let token = f("CT_OIDC_TOKEN")
+            .filter(|s| !s.trim().is_empty())
+            .ok_or("CT_OIDC_TOKEN required (OIDC bearer token for the channel owner)")?;
+        Self::from_lookup_with_token(f, token)
+    }
+
+    /// See [`ChannelRegisterRequest::from_lookup_with_token`] — same shape, same reason:
+    /// the caller supplies an already-resolved OIDC token instead of requiring
+    /// `CT_OIDC_TOKEN` in `f`.
+    pub fn from_lookup_with_token(f: impl Fn(&str) -> Option<String>, token: String) -> Result<Self, String> {
         let cp_url = f("CT_AGENT_CP_URL")
             .filter(|s| !s.trim().is_empty())
             .ok_or("CT_AGENT_CP_URL required (control-plane base URL)")?;
         let channel_hex = hex_encode(&req_hex32_aliased(&f, "CT_CHANNEL_ID", "CT_GRANT_CHANNEL", "64 hex channel id")?);
-        let token = f("CT_OIDC_TOKEN")
-            .filter(|s| !s.trim().is_empty())
-            .ok_or("CT_OIDC_TOKEN required (OIDC bearer token for the channel owner)")?;
         Ok(Self { cp_url, channel_hex, token })
     }
 }

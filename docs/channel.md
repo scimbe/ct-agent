@@ -29,6 +29,36 @@ solo](https://docs.bunsenbrenner.org/how-to/serve-your-own-service-solo/) — `C
 can validly be your own holder pubkey when deriving the channel id, since nothing in
 `channel_id_for_link`/`verify_member_noise_attestation` requires a distinct second party.
 
+## Getting the OIDC bearer token (`ct-agent login`)
+
+`ct-agent channel register` and `ct-agent channel allowlist` both need an OIDC bearer token
+proving who the channel owner is (`CT_OIDC_TOKEN`, checked against the control plane's Keycloak
+realm — `sub`+`iss` only, see the control plane's own `CT_OIDC_ISSUER`). **`ct-agent login` is
+now the preferred way to obtain it** — it replaces logging into the portal in a browser and
+hand-copying a bearer token out of dev tools:
+
+```
+CT_OIDC_ISSUER=https://auth.bunsenbrenner.org/realms/ct-demo ct-agent login
+```
+
+This runs an [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628) OAuth 2.0 Device Authorization
+Grant against the realm's public `ct-agent-cli` client (device grant enabled, no client secret —
+a CLI can't keep one confidential): it prints a short code and a URL to open in **any** browser
+(does not have to be on the same machine — handy for a headless box), waits for you to
+authorize, then stores the token locally. `ct-agent channel register`/`ct-agent channel
+allowlist` pick it up **automatically** from then on — you no longer need to set `CT_OIDC_TOKEN`
+by hand at all, and a near-expiry token is silently refreshed before use. `CT_OIDC_TOKEN` set
+explicitly in the environment still always takes priority (nothing changes for existing
+scripts/CI that already export it). If nothing is configured — no `CT_OIDC_TOKEN` and no prior
+`ct-agent login` — `channel register`/`allowlist` fail loudly and tell you to run `ct-agent
+login`, rather than silently proceeding unauthenticated.
+
+Where the token is stored (in priority order): `CT_AGENT_LOGIN_TOKEN_FILE` (an explicit path),
+else `<CT_AGENT_STATE_DIR>/oidc-token.json` (the same persistent-volume directory
+onboarding/#141 already uses), else `$HOME/.ct-agent/oidc-token.json`. Written via the same
+create-at-`0600` helper every other on-disk secret in this codebase uses (`secret_file.rs`) — it
+is never world- or group-readable, even for an instant.
+
 ## Transport selection (the dial ladders)
 
 Broker and relay each get a ladder: **direct QUIC** (`CT_CHANNEL_BROKER` :4435 / `CT_CHANNEL_RELAY`
@@ -221,6 +251,10 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_SERVICE_TYPE` | not read by `ct-agent` itself — set **in the handler child's own environment** by `CT_AGENT_SERVICE_HANDLER_CMD` (#149-A.1) so one handler script can branch on which of several registered `service/<slug>` calls was actually invoked |
 | `CT_CHANNEL_REFLEXIVE_EDGE` | `host:port` of the edge's QUIC "whoami" listener (its `'W'` reflexive-address echo, #248/#238). Defaults to the relay-gate host on port `4433`; override only when the edge's QUIC listener is somewhere else. |
 | `CT_CHANNEL_SUPER_PEER_LISTEN` / `CT_CHANNEL_SUPER_PEER_UPSTREAM` | LAN super-peer mode (both required): `CT_CHANNEL_SUPER_PEER_LISTEN` is the `host:port` that LAN-local members point their own `CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY` at **instead of the real edge**; `CT_CHANNEL_SUPER_PEER_UPSTREAM` is this super-peer's real edge. One WAN hop plus N−1 local ones. |
+| `CT_OIDC_TOKEN` | `channel register`/`channel allowlist` only: the OIDC bearer token identifying the channel owner. Explicit env value always wins; unset ⇒ falls back to the token `ct-agent login` stored locally (see [Getting the OIDC bearer token](#getting-the-oidc-bearer-token-ct-agent-login) above) |
+| `CT_OIDC_ISSUER` | `ct-agent login` only: the Keycloak realm URL (e.g. `https://auth.bunsenbrenner.org/realms/ct-demo`) — same knob CADS-Tunnel's own portal login already reads |
+| `CT_OIDC_CLI_CLIENT_ID` | `ct-agent login` only: overrides the realm's public device-grant CLI client id (default `ct-agent-cli`) |
+| `CT_AGENT_LOGIN_TOKEN_FILE` | overrides where `ct-agent login` stores (and `channel register`/`allowlist` read) the token; default `<CT_AGENT_STATE_DIR>/oidc-token.json`, else `$HOME/.ct-agent/oidc-token.json` |
 
 **`CT_CHANNEL_PHASE_MARKER=off` (or `0`) is a measurement tool, not a tuning knob.** It
 suppresses the v0.4.14 phase preamble while keeping everything else identical — the only way
