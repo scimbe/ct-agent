@@ -9,4 +9,4 @@ members = ["native", "wasm", "spike-masque-h2"]
 # drifting pins. Bump deliberately, in lockstep with native/Cargo.lock's own
 # ct-edge/ct-client dev-dependency pins (kept at the same tag by convention).
 [workspace.dependencies]
-ct-common = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.17" }
+ct-common = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.18" }

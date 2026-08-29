@@ -1049,10 +1049,11 @@ mod tests {
         // Minimal edge TCP loop: accept one TLS connection, serve it.
         let state_e = state.clone();
         let edge = tokio::spawn(async move {
-            let (tcp, _) = tcp_listener.accept().await.unwrap();
+            let (tcp, peer) = tcp_listener.accept().await.unwrap();
             let tls = acceptor.accept(tcp).await.unwrap();
-            // The trailing None is ct-edge's per-connection cap (no cap in this test).
-            let _ = serve_tcp_connection(tls, &state_e, &challenge, None).await;
+            // The trailing None is ct-edge's per-connection cap (no cap in this test);
+            // peer.ip() (#603) is the real accept()-time address.
+            let _ = serve_tcp_connection(tls, &state_e, &challenge, None, peer.ip()).await;
         });
 
         // Agent: connect over TLS-TCP (trusting the CA root) and register.
