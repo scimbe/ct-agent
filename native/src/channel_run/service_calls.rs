@@ -72,7 +72,14 @@ where
     let (session_side, serve_side) = tokio::io::duplex(1 << 16);
     tokio::spawn(async move {
         let (mut recv, mut send) = tokio::io::split(serve_side);
-        let _ = ct_common::a2a::serve_request_loop(&mut send, &mut recv, handle).await;
+        // ct-agent#115: `serve_request_loop`'s `Err` used to be silently discarded here (`let _ =`)
+        // -- including `write_message`'s pre-wire rejection of an oversize response
+        // (`ct_common::a2a::MAX_MESSAGE_BYTES`, 65535 bytes). That left a peer seeing a bare "early
+        // eof" with zero diagnostic on this side, even under `CT_DEBUG_A2A_TIMING`. A clean peer
+        // close still returns `Ok`, so this only ever fires on a genuine session-ending error.
+        if let Err(e) = ct_common::a2a::serve_request_loop(&mut send, &mut recv, handle).await {
+            eprintln!("ct-agent channel: serve session ended: {e}");
+        }
     });
     session_side
 }
