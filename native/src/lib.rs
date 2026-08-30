@@ -24,6 +24,7 @@ pub mod origin;
 pub mod p2p;
 pub mod reconnect;
 pub mod secret_file;
+pub mod self_update;
 pub mod serve;
 pub mod signup;
 pub mod super_peer;

@@ -322,15 +322,23 @@ install_direct() {
 }
 
 install_docker() {
-  log "building the Docker image"
+  # Security-hardening pass: this used to build from `#main`, which drifts
+  # silently -- an install today and an install tomorrow could pull different,
+  # unaudited commits with nothing to pin them apart. Resolve the latest
+  # RELEASE tag instead (same GitHub API endpoint the self-update mechanism
+  # uses, `ct-agent update`) -- a real, versioned, `version-matches-tag`-CI-
+  # checked point rather than a moving branch tip. Every install always gets
+  # the CURRENT latest release automatically; nothing here needs a manual bump.
+  log "resolving the latest ct-agent release tag"
+  local latest_tag
+  latest_tag=$(curl -fsSL "https://api.github.com/repos/scimbe/ct-agent/releases/latest" \
+    | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$latest_tag" ] || die "could not resolve the latest ct-agent release tag from GitHub"
+  log "building the Docker image (pinned to release ${latest_tag})"
   # Build straight from this repo's git history (docker supports git-URL build
   # contexts natively) rather than a local ../docker path -- this script is
   # commonly run via `curl ... | bash`, where no local checkout exists.
-  # buildx (not the classic builder) is required here: the Dockerfile's
-  # TARGETOS/TARGETARCH build args are only auto-populated by buildx, and a
-  # plain `docker build` leaves them empty, failing with "unsupported
-  # TARGETARCH: " on every platform (#3).
-  docker buildx build --load -t ct-agent:local "https://github.com/scimbe/ct-agent.git#main:docker" \
+  docker buildx build --load -t ct-agent:local "https://github.com/scimbe/ct-agent.git#${latest_tag}:docker" \
     || die "docker build failed"
   log "starting the container"
   docker rm -f ct-agent >/dev/null 2>&1 || true

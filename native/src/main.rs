@@ -32,6 +32,8 @@ USAGE:
                                  locally and used automatically by `channel register`/`allowlist`
     ct-agent signup <name>      Self-service tunnel creation (CT_AGENT_CP_URL), authenticated via
                                  the stored `login` token; prints CT_AGENT_TOKEN for the next run
+    ct-agent update             Check for and install the latest release in place (host-native
+                                 installs only -- Docker installs update via a fresh image build)
     ct-agent certificate        Run the ACME DNS-01 certificate renewal loop
     ct-agent relay-node         Run a Circuit-Relay v2 / DCUtR relay node
     ct-agent channel init                 Mint a fresh channel member identity
@@ -193,6 +195,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .map(|h| format!(" (hostname: {h})"))
                 .unwrap_or_default(),
         );
+        return Ok(());
+    }
+
+    // `update` subcommand (operator-directed hardening pass, Q7): check GitHub's
+    // releases API for a newer tag than this binary's own CARGO_PKG_VERSION and,
+    // if one exists, download the matching platform asset and replace the
+    // running binary with it. Independent of (and complementary to)
+    // `scripts/setup.sh`'s install_docker(), which resolves the latest release
+    // tag at INSTALL time for a fresh Docker build -- this is the host-native
+    // counterpart for an already-running install updating itself in place.
+    if std::env::args().nth(1).as_deref() == Some("update") {
+        ct_agent::self_update::run_update(env!("CARGO_PKG_VERSION")).await?;
         return Ok(());
     }
 
