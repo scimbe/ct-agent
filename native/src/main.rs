@@ -34,6 +34,10 @@ USAGE:
                                  the stored `login` token; prints CT_AGENT_TOKEN for the next run
     ct-agent update             Check for and install the latest release in place (host-native
                                  installs only -- Docker installs update via a fresh image build)
+    ct-agent local-auth set <user> <password>   Set the local-auth gate credential explicitly
+    ct-agent local-auth reset   Generate a fresh local-auth gate credential, printed once
+    ct-agent local-auth rotate  Alias for `reset` -- same operation, the name an operator
+                                 reaches for after a suspected leak
     ct-agent certificate        Run the ACME DNS-01 certificate renewal loop
     ct-agent relay-node         Run a Circuit-Relay v2 / DCUtR relay node
     ct-agent channel init                 Mint a fresh channel member identity
@@ -207,6 +211,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // counterpart for an already-running install updating itself in place.
     if std::env::args().nth(1).as_deref() == Some("update") {
         ct_agent::self_update::run_update(env!("CARGO_PKG_VERSION")).await?;
+        return Ok(());
+    }
+
+    // `local-auth set|reset|rotate` (operator-directed hardening pass, Kali-
+    // inspired generic credential gate): manage the credential CT_AGENT_LOCAL_AUTH
+    // checks against, without starting the serve loop. `set` takes an explicit
+    // user/password (provisioning option C -- an operator-chosen credential);
+    // `reset`/`rotate` are the same operation under two names, generating a
+    // fresh random one and printing it exactly once (the same shape as
+    // first-boot generation in `run_agent`'s startup path) -- `rotate` is the
+    // name an operator reaches for after a suspected leak, `reset` after
+    // losing the original. Both need CT_AGENT_STATE_DIR (or, for `set`, any
+    // writable dir -- but CT_AGENT_STATE_DIR is what the live serve path
+    // reads back, so anywhere else silently would not take effect).
+    if std::env::args().nth(1).as_deref() == Some("local-auth") {
+        let state_dir = std::env::var("CT_AGENT_STATE_DIR")
+            .map_err(|_| "ct-agent local-auth requires CT_AGENT_STATE_DIR")?;
+        let state_dir = std::path::Path::new(&state_dir);
+        match std::env::args().nth(2).as_deref() {
+            Some("set") => {
+                let user = std::env::args()
+                    .nth(3)
+                    .ok_or("usage: ct-agent local-auth set <user> <password>")?;
+                let password = std::env::args()
+                    .nth(4)
+                    .ok_or("usage: ct-agent local-auth set <user> <password>")?;
+                ct_agent::local_auth::set_credential(state_dir, &user, &password)?;
+                eprintln!("ct-agent: local-auth credential set for user '{user}'");
+            }
+            Some("reset") | Some("rotate") => {
+                let printed = ct_agent::local_auth::reset_credential(state_dir)?;
+                eprintln!(
+                    "ct-agent: local-auth credential regenerated -- shown ONCE, not \
+                     recoverable after this:\n\n{printed}\n"
+                );
+            }
+            _ => return Err("usage: ct-agent local-auth set <user> <password> | reset | rotate".into()),
+        }
         return Ok(());
     }
 
@@ -757,11 +799,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     );
 
+    // Local-auth gate (operator-directed hardening pass, Kali-inspired):
+    // resolved once here, alongside every other piece of serving state, and
+    // shared across the whole reconnect loop. `state_dir` re-reads
+    // CT_AGENT_STATE_DIR directly rather than reusing the onboarding branch's
+    // local (out of scope here) -- both reads are the same env var and this
+    // one is the only copy needed post-onboarding.
+    let state_dir = std::env::var("CT_AGENT_STATE_DIR").ok().map(std::path::PathBuf::from);
+    let (local_auth_gate, local_auth_notice) =
+        ct_agent::local_auth::LocalAuthGate::from_env(state_dir.as_deref(), |k| std::env::var(k).ok())
+            .map_err(|e| format!("ct-agent: CT_AGENT_LOCAL_AUTH config error: {e}"))?;
+    if let Some(notice) = &local_auth_notice {
+        eprintln!("{notice}");
+    }
+
     run_agent(
         &config,
         edge_cert,
         identity.cap.token,
         std::sync::Arc::new(identity.origin_keys),
+        std::sync::Arc::new(local_auth_gate),
     )
     .await
 }

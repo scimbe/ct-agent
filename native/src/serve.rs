@@ -19,6 +19,7 @@ use tokio::io::{copy_bidirectional, join, split, AsyncRead, AsyncReadExt, AsyncW
 use tokio::net::{TcpStream, UdpSocket};
 
 use crate::config::{AgentConfig, OriginProto};
+use crate::local_auth;
 use crate::transport::{
     await_ping_phase_end, bind_hostname, dial_quic, dial_quic_or_blocked_error, register_tunnel,
     register_tunnel_stream, register_tunnel_stream_browser,
@@ -604,6 +605,114 @@ where
     Ok(())
 }
 
+/// Encrypt `plaintext` as one Noise frame and write it to `send` -- the one
+/// place [`run_local_auth_gate`] writes a challenge/rejection back to the
+/// Client, since that happens BEFORE [`noise_pump`] takes ownership of the
+/// transport.
+async fn write_gate_message<S>(
+    transport: &mut snow::TransportState,
+    send: &mut S,
+    plaintext: &[u8],
+) -> Result<(), BoxError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 65535 + 256];
+    let n = transport
+        .write_message(plaintext, &mut buf)
+        .map_err(|e| -> BoxError { format!("local-auth gate: noise encrypt: {e}").into() })?;
+    send.write_all(&frame(&buf[..n])).await?;
+    send.flush().await?;
+    Ok(())
+}
+
+/// Read and decrypt one Noise frame -- the counterpart to
+/// [`write_gate_message`], used to read the Client's credential attempt.
+async fn read_gate_message<R>(
+    transport: &mut snow::TransportState,
+    recv: &mut R,
+) -> Result<Vec<u8>, BoxError>
+where
+    R: AsyncRead + Unpin,
+{
+    let ct = read_frame(recv).await?;
+    let mut buf = vec![0u8; 65535];
+    let n = transport
+        .read_message(&ct, &mut buf)
+        .map_err(|e| -> BoxError { format!("local-auth gate: noise decrypt: {e}").into() })?;
+    Ok(buf[..n].to_vec())
+}
+
+/// Run the local-auth credential gate (operator-directed hardening pass,
+/// [`local_auth`]) against an already-handshaken Mesh-Plane stream, BEFORE
+/// [`noise_pump`] takes over -- the gate needs to read/write its own Noise
+/// frames for the credential exchange, which `noise_pump` has no hook for.
+///
+/// Returns:
+/// - `Ok(Some(bytes))`: the gate passed AND `bytes` (the Client's first real
+///   request, already decrypted by the HTTP sub-mode's credential check) must
+///   be forwarded to the Origin before starting the pump -- the request line
+///   was already consumed reading the credential, so it cannot be read twice.
+/// - `Ok(None)`: the gate passed with nothing pending to forward (mode is
+///   `Off`, or `TextChallenge` -- its prompt/reply exchange never touches the
+///   Origin at all).
+/// - `Err(_)`: the gate rejected the connection. The caller must tear the
+///   connection down WITHOUT ever dialing the Origin -- a rejection response
+///   has already been written to the Client.
+async fn run_local_auth_gate<S, R>(
+    gate: &local_auth::LocalAuthGate,
+    transport: &mut snow::TransportState,
+    send: &mut S,
+    recv: &mut R,
+) -> Result<Option<Vec<u8>>, BoxError>
+where
+    S: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    match gate.mode {
+        local_auth::GateMode::Off => Ok(None),
+        local_auth::GateMode::Http => {
+            let plaintext = read_gate_message(transport, recv).await?;
+            let verdict = match local_auth::parse_basic_auth(&plaintext) {
+                Some((user, pass)) => gate.verify(&user, &pass),
+                // No Authorization header offered yet -- a browser's very first
+                // attempt, before it has ever seen the 401. Rejected the same as
+                // a wrong credential, but NOT counted against the rate limiter
+                // (gate.verify() is never called here) -- that natural first pass
+                // must not burn part of a real attacker's failure budget away
+                // from a legitimate browser's normal flow.
+                None => Err(local_auth::GateRejection::BadCredential),
+            };
+            match verdict {
+                Ok(()) => Ok(Some(plaintext)),
+                Err(_) => {
+                    write_gate_message(transport, send, &local_auth::http_401_challenge()).await?;
+                    Err("local-auth gate: HTTP credential rejected".into())
+                }
+            }
+        }
+        local_auth::GateMode::TextChallenge => {
+            write_gate_message(transport, send, local_auth::TEXT_CHALLENGE_PROMPT).await?;
+            let attempt = read_gate_message(transport, recv).await?;
+            let attempt = trim_trailing_line_ending(&attempt);
+            match gate.verify_password_only(attempt) {
+                Ok(()) => Ok(None),
+                Err(_) => {
+                    write_gate_message(transport, send, local_auth::TEXT_CHALLENGE_DENIED).await?;
+                    Err("local-auth gate: text-challenge credential rejected".into())
+                }
+            }
+        }
+    }
+}
+
+/// Strip one trailing `\r\n`/`\n` from an interactive text-challenge reply --
+/// `nc`/`telnet`/a shell's `read` all send the line terminator the operator
+/// typed, which is never part of the actual password.
+fn trim_trailing_line_ending(bytes: &[u8]) -> &[u8] {
+    bytes.strip_suffix(b"\r\n").or_else(|| bytes.strip_suffix(b"\n")).unwrap_or(bytes)
+}
+
 /// Serve one relayed stream as the Origin's Noise responder with a **full-duplex
 /// streaming** bridge (M9.2): terminate the `Noise_IK` handshake, then
 /// [`noise_pump`] between the decrypted Client stream and the local Origin TCP
@@ -615,6 +724,7 @@ pub async fn serve_noise_stream<S, R>(
     origin: SocketAddr,
     origin_keys: &[[u8; 32]],
     metrics: Arc<TunnelMetrics>,
+    gate: &local_auth::LocalAuthGate,
 ) -> Result<(), BoxError>
 where
     S: AsyncWrite + Unpin,
@@ -653,7 +763,7 @@ where
         metrics.tunnels_failed.inc();
         return Err(e);
     }
-    let transport = match hs.into_transport_mode() {
+    let mut transport = match hs.into_transport_mode() {
         Ok(t) => {
             metrics.observe_handshake(started.elapsed());
             metrics.tunnels_opened.inc();
@@ -665,16 +775,29 @@ where
         }
     };
 
+    // Local-auth gate (operator-directed hardening pass): runs its own Noise
+    // frame exchange BEFORE the Origin is ever dialed, so a rejected
+    // connection never reaches it at all -- see `local_auth`'s module doc for
+    // the threat model this defends (and does not defend).
+    let gate_prefix = run_local_auth_gate(gate, &mut transport, &mut send, &mut recv).await?;
+
     // Bridge the Noise session <-> the Origin TCP socket, both ways, streaming.
     // Meter the Origin socket: bytes read from it flow back to the Client
     // (bytes_to_client); bytes written to it came from the Client
     // (bytes_to_origin).
     let tcp = connect_origin(origin).await?;
-    let tcp = Metered::new(
+    let mut tcp = Metered::new(
         tcp,
         Arc::clone(&metrics.bytes_to_client),
         Arc::clone(&metrics.bytes_to_origin),
     );
+    // HTTP gate mode already consumed the Client's first request reading the
+    // credential (the Authorization header lives in that same request) -- it
+    // must still reach the Origin, just via this explicit write instead of
+    // noise_pump's own inbound loop, which starts fresh from here.
+    if let Some(prefix) = gate_prefix {
+        tcp.write_all(&prefix).await?;
+    }
     let cipher = join(recv, send);
     noise_pump(transport, cipher, tcp).await?;
     Ok(())
@@ -759,16 +882,18 @@ pub async fn serve_direct(
     origin_keys: Arc<Vec<[u8; 32]>>,
     proto: OriginProto,
     metrics: Arc<TunnelMetrics>,
+    gate: Arc<local_auth::LocalAuthGate>,
 ) -> Result<(), BoxError> {
     while let Some(incoming) = listener.accept().await {
         let metrics = Arc::clone(&metrics);
         let keys = Arc::clone(&origin_keys);
+        let gate = Arc::clone(&gate);
         tokio::spawn(async move {
             if let Ok(conn) = incoming.await {
                 if let Ok((send, recv)) = conn.accept_bi().await {
                     let _ = match proto {
                         OriginProto::Tcp => {
-                            serve_noise_stream(send, recv, origin, &keys, metrics).await
+                            serve_noise_stream(send, recv, origin, &keys, metrics, &gate).await
                         }
                         OriginProto::Udp => serve_noise_udp(send, recv, origin, &keys).await,
                     };
@@ -789,6 +914,7 @@ pub async fn run_agent(
     edge_cert: CertificateDer<'static>,
     token: RoutingToken,
     origin_keys: Arc<Vec<[u8; 32]>>,
+    gate: Arc<local_auth::LocalAuthGate>,
 ) -> Result<(), BoxError> {
     // Shared tunnel metrics for this Agent (M14.1b), plus optional one-time
     // endpoints — set up once, outside the reconnect loop.
@@ -820,8 +946,9 @@ pub async fn run_agent(
                 let (origin, proto) = (config.origin, config.origin_proto);
                 let dmetrics = Arc::clone(&metrics);
                 let dkeys = Arc::clone(&origin_keys);
+                let dgate = Arc::clone(&gate);
                 tokio::spawn(async move {
-                    let _ = serve_direct(listener, origin, dkeys, proto, dmetrics).await;
+                    let _ = serve_direct(listener, origin, dkeys, proto, dmetrics, dgate).await;
                 });
             }
         }
@@ -850,7 +977,7 @@ pub async fn run_agent(
         eprintln!(
             "ct-agent: CT_AGENT_REGISTER_TCP_ONLY set — registering over TLS-TCP exclusively (no QUIC)"
         );
-        return run_agent_tcp_fallback(config, edge_cert, token, origin_keys).await;
+        return run_agent_tcp_fallback(config, edge_cert, token, origin_keys, gate).await;
     }
     let (reconnect_base, reconnect_max) = reconnect_backoff_bounds();
     let mut backoff = Backoff::new(reconnect_base, reconnect_max, reconnect_max_attempts());
@@ -877,6 +1004,7 @@ pub async fn run_agent(
                             edge_cert.clone(),
                             token.clone(),
                             Arc::clone(&origin_keys),
+                            Arc::clone(&gate),
                         )
                         .await?;
                         // A QUIC probe answered — start over with a fresh budget and
@@ -926,6 +1054,7 @@ pub async fn run_agent(
             config.browser_forward,
             &origin_keys,
             Arc::clone(&metrics),
+            &gate,
         )
         .await;
         eprintln!("ct-agent: edge connection dropped; reconnecting");
@@ -1136,6 +1265,7 @@ async fn serve_quic_connection(
     browser_forward: bool,
     origin_keys: &[[u8; 32]],
     metrics: Arc<TunnelMetrics>,
+    gate: &Arc<local_auth::LocalAuthGate>,
 ) {
     loop {
         let (send, recv) = match conn.accept_bi().await {
@@ -1144,6 +1274,7 @@ async fn serve_quic_connection(
         };
         // Browser Plane (#23): forward the relayed stream to the Origin verbatim
         // (raw TLS passthrough); the browser's TLS terminates at the Origin.
+        // Out of scope for the local-auth gate -- see `local_auth`'s module doc.
         if browser_forward {
             tokio::spawn(async move {
                 let _ = serve_stream_to_origin(send, recv, origin).await;
@@ -1152,9 +1283,10 @@ async fn serve_quic_connection(
         }
         let keys = origin_keys.to_vec();
         let m = Arc::clone(&metrics);
+        let gate = Arc::clone(gate);
         tokio::spawn(async move {
             let _ = match proto {
-                OriginProto::Tcp => serve_noise_stream(send, recv, origin, &keys, m).await,
+                OriginProto::Tcp => serve_noise_stream(send, recv, origin, &keys, m, &gate).await,
                 OriginProto::Udp => serve_noise_udp(send, recv, origin, &keys).await,
             };
         });
@@ -1185,6 +1317,7 @@ async fn run_agent_tcp_fallback(
     edge_cert: CertificateDer<'static>,
     token: RoutingToken,
     origin_keys: Arc<Vec<[u8; 32]>>,
+    gate: Arc<local_auth::LocalAuthGate>,
 ) -> Result<(), BoxError> {
     let n = config.tcp_fallback_pool_size.max(1);
     let mut workers = Vec::with_capacity(n);
@@ -1193,8 +1326,9 @@ async fn run_agent_tcp_fallback(
         let edge_cert = edge_cert.clone();
         let token = token.clone();
         let origin_keys = Arc::clone(&origin_keys);
+        let gate = Arc::clone(&gate);
         workers.push(tokio::spawn(async move {
-            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys).await
+            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys, gate).await
         }));
     }
     // If any one worker gives up (its own backoff exhausted), that's fatal to
@@ -1228,6 +1362,7 @@ async fn run_agent_tcp_fallback_until_quic_recovers(
     edge_cert: CertificateDer<'static>,
     token: RoutingToken,
     origin_keys: Arc<Vec<[u8; 32]>>,
+    gate: Arc<local_auth::LocalAuthGate>,
 ) -> Result<(), BoxError> {
     let n = config.tcp_fallback_pool_size.max(1);
     let mut workers = tokio::task::JoinSet::new();
@@ -1236,8 +1371,9 @@ async fn run_agent_tcp_fallback_until_quic_recovers(
         let edge_cert = edge_cert.clone();
         let token = token.clone();
         let origin_keys = Arc::clone(&origin_keys);
+        let gate = Arc::clone(&gate);
         workers.spawn(async move {
-            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys).await
+            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys, gate).await
         });
     }
     loop {
@@ -1278,6 +1414,7 @@ async fn run_agent_tcp_fallback_worker(
     edge_cert: CertificateDer<'static>,
     token: RoutingToken,
     origin_keys: Arc<Vec<[u8; 32]>>,
+    gate: Arc<local_auth::LocalAuthGate>,
 ) -> Result<(), BoxError> {
     let metrics = Arc::new(TunnelMetrics::new());
     // Reconnect loop (issue #5 / P1.2b): re-register and serve again after each
@@ -1295,8 +1432,10 @@ async fn run_agent_tcp_fallback_worker(
         let mut served = false;
         let mut last_err: Option<BoxError> = None;
         for addr in &rungs {
-            match tcp_connect_register_serve(config, *addr, &edge_cert, &token, &origin_keys, &metrics)
-                .await
+            match tcp_connect_register_serve(
+                config, *addr, &edge_cert, &token, &origin_keys, &metrics, &gate,
+            )
+            .await
             {
                 // A tunnel completed cleanly — re-register (re-walk from the primary).
                 Ok(()) => {
@@ -1335,6 +1474,7 @@ async fn tcp_connect_register_serve(
     token: &RoutingToken,
     origin_keys: &[[u8; 32]],
     metrics: &Arc<TunnelMetrics>,
+    gate: &local_auth::LocalAuthGate,
 ) -> Result<(), BoxError> {
     let mut stream = tcp_tls_connect(target, edge_cert.clone()).await?;
     // Browser Plane over the TCP fallback (#41 FB3): register+bind the public
@@ -1452,7 +1592,7 @@ async fn tcp_connect_register_serve(
         await_ping_phase_end(&mut stream).await?;
     }
     let (recv, send) = split(stream);
-    serve_noise_stream(send, recv, config.origin, origin_keys, Arc::clone(metrics)).await
+    serve_noise_stream(send, recv, config.origin, origin_keys, Arc::clone(metrics), gate).await
 }
 
 #[cfg(test)]
@@ -1731,7 +1871,15 @@ mod tests {
         let ca_root_a = ca_root.clone();
         let a_token = token.clone();
         let agent = tokio::spawn(async move {
-            let _ = run_agent_tcp_fallback(&cfg, ca_root_a, a_token, std::sync::Arc::new(vec![origin_kp.private])).await;
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ = run_agent_tcp_fallback(
+                &cfg,
+                ca_root_a,
+                a_token,
+                std::sync::Arc::new(vec![origin_kp.private]),
+                std::sync::Arc::new(gate),
+            )
+            .await;
         });
 
         // Wait until the agent has registered (parked) at the edge.
@@ -1903,8 +2051,9 @@ mod tests {
         let metrics = std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new());
         let mcheck = std::sync::Arc::clone(&metrics);
         let (a_read, a_write) = tokio::io::split(agent_cipher);
+        let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
         let agent = tokio::spawn(async move {
-            serve_noise_stream(a_write, a_read, origin_addr, &[origin_priv], metrics).await
+            serve_noise_stream(a_write, a_read, origin_addr, &[origin_priv], metrics, &gate).await
         });
 
         // Initiator: handshake, then pump a 100 KB app stream over the session.
@@ -1946,6 +2095,212 @@ mod tests {
         assert_eq!(mcheck.bytes_to_client.get(), 100_000, "100 KB echoed back to the client");
     }
 
+    /// Shared scaffolding for the local-auth gate integration tests below: a real
+    /// Noise handshake over an in-memory duplex, an origin TCP listener that
+    /// records whether it was EVER dialed (the key thing a rejected gate must
+    /// prevent), and the gate itself under test.
+    struct GateTestRig {
+        origin_dialed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        transport: snow::TransportState,
+        c_read: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        c_write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        agent_task: tokio::task::JoinHandle<Result<(), BoxError>>,
+    }
+
+    async fn setup_gate_test(gate: local_auth::LocalAuthGate) -> GateTestRig {
+        use ct_common::noise::{client_handshake_for, generate_static_keypair};
+        use ct_common::{Capability, OriginIdentity, RoutingToken};
+        use tokio::net::TcpListener;
+
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: RoutingToken([0u8; 32]),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "edge:443".into(),
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = listener.local_addr().unwrap();
+        let origin_dialed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dialed = std::sync::Arc::clone(&origin_dialed);
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                dialed.store(true, std::sync::atomic::Ordering::SeqCst);
+                let (mut r, mut w) = sock.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+                let _ = w.shutdown().await;
+            }
+        });
+
+        let (ini_cipher, agent_cipher) = tokio::io::duplex(64 * 1024);
+        let metrics = std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new());
+        let (a_read, a_write) = tokio::io::split(agent_cipher);
+        let agent_task = tokio::spawn(async move {
+            serve_noise_stream(a_write, a_read, origin_addr, &[origin_kp.private], metrics, &gate)
+                .await
+        });
+
+        let (mut i_read, mut i_write) = tokio::io::split(ini_cipher);
+        let mut hs = client_handshake_for(&client_kp.private, &cap).unwrap();
+        let mut buf = vec![0u8; 65535];
+        let mut tmp = vec![0u8; 65535];
+        let n = hs.write_message(&[], &mut buf).unwrap();
+        i_write.write_all(&frame(&buf[..n])).await.unwrap();
+        let m2 = read_frame(&mut i_read).await.unwrap();
+        hs.read_message(&m2, &mut tmp).unwrap();
+        let transport = hs.into_transport_mode().unwrap();
+
+        let _ = origin_addr;
+        GateTestRig {
+            origin_dialed,
+            transport,
+            c_read: i_read,
+            c_write: i_write,
+            agent_task,
+        }
+    }
+
+    fn gate_for_test(mode: &str, username: &str, password: &str) -> local_auth::LocalAuthGate {
+        let dir = std::env::temp_dir()
+            .join(format!("ct-gate-test-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        local_auth::set_credential(&dir, username, password).unwrap();
+        let mode = mode.to_string();
+        local_auth::LocalAuthGate::from_env(Some(&dir), move |k| {
+            (k == "CT_AGENT_LOCAL_AUTH").then(|| mode.clone())
+        })
+        .unwrap()
+        .0
+    }
+
+    #[tokio::test]
+    async fn local_auth_http_gate_rejects_a_request_with_no_credential_and_never_dials_origin() {
+        // Fails against the pre-gate code: without this gate, ANY request reaches
+        // the origin regardless of credentials -- this is the exact behavior #A
+        // of the security-hardening design exists to change.
+        let gate = gate_for_test("http", "agent", "s3cret");
+        let mut rig = setup_gate_test(gate).await;
+
+        let mut buf = vec![0u8; 65535];
+        let mut tmp = vec![0u8; 65535];
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        let n = rig.transport.write_message(req, &mut buf).unwrap();
+        rig.c_write.write_all(&frame(&buf[..n])).await.unwrap();
+
+        let resp_ct = read_frame(&mut rig.c_read).await.unwrap();
+        let n = rig.transport.read_message(&resp_ct, &mut tmp).unwrap();
+        let resp = String::from_utf8_lossy(&tmp[..n]);
+        assert!(resp.starts_with("HTTP/1.1 401"), "got: {resp}");
+        assert!(resp.contains("WWW-Authenticate: Basic"), "got: {resp}");
+
+        let result = rig.agent_task.await.unwrap();
+        assert!(result.is_err(), "the gate must fail the connection, not silently drop it");
+        assert!(
+            !rig.origin_dialed.load(std::sync::atomic::Ordering::SeqCst),
+            "origin must NEVER be dialed for a rejected connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_auth_http_gate_forwards_the_first_request_after_a_valid_credential() {
+        let gate = gate_for_test("http", "agent", "s3cret");
+        let mut rig = setup_gate_test(gate).await;
+
+        let creds_b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(b"agent:s3cret")
+        };
+        let req = format!("GET /ok HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {creds_b64}\r\n\r\n");
+
+        let mut buf = vec![0u8; 65535];
+        let n = rig.transport.write_message(req.as_bytes(), &mut buf).unwrap();
+        rig.c_write.write_all(&frame(&buf[..n])).await.unwrap();
+        rig.c_write.shutdown().await.unwrap();
+
+        // The origin echoes back whatever it receives -- proving the exact
+        // request (including the Authorization header) reached it, not just
+        // that the gate returned "ok".
+        let mut tmp = vec![0u8; 65535];
+        let mut echoed = Vec::new();
+        loop {
+            match read_frame(&mut rig.c_read).await {
+                Ok(ct) => {
+                    let n = rig.transport.read_message(&ct, &mut tmp).unwrap();
+                    echoed.extend_from_slice(&tmp[..n]);
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(echoed, req.as_bytes(), "the gated request reached the origin unmodified");
+        assert!(
+            rig.origin_dialed.load(std::sync::atomic::Ordering::SeqCst),
+            "a valid credential must let the origin be dialed"
+        );
+        rig.agent_task.await.unwrap().expect("gate passed, serving completed cleanly");
+    }
+
+    #[tokio::test]
+    async fn local_auth_text_challenge_gate_rejects_the_wrong_password_and_never_dials_origin() {
+        let gate = gate_for_test("text", "agent", "hunter2");
+        let mut rig = setup_gate_test(gate).await;
+
+        // The prompt arrives first -- read and discard it (this test only checks
+        // the reply path), then answer with a wrong password.
+        let mut tmp = vec![0u8; 65535];
+        let prompt_ct = read_frame(&mut rig.c_read).await.unwrap();
+        let n = rig.transport.read_message(&prompt_ct, &mut tmp).unwrap();
+        assert_eq!(&tmp[..n], local_auth::TEXT_CHALLENGE_PROMPT);
+
+        let mut buf = vec![0u8; 65535];
+        let n = rig.transport.write_message(b"wrong-password", &mut buf).unwrap();
+        rig.c_write.write_all(&frame(&buf[..n])).await.unwrap();
+
+        let resp_ct = read_frame(&mut rig.c_read).await.unwrap();
+        let n = rig.transport.read_message(&resp_ct, &mut tmp).unwrap();
+        assert_eq!(&tmp[..n], local_auth::TEXT_CHALLENGE_DENIED);
+
+        let result = rig.agent_task.await.unwrap();
+        assert!(result.is_err());
+        assert!(!rig.origin_dialed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn local_auth_text_challenge_gate_passes_the_correct_password_then_streams() {
+        let gate = gate_for_test("text", "agent", "hunter2");
+        let mut rig = setup_gate_test(gate).await;
+
+        let mut tmp = vec![0u8; 65535];
+        let prompt_ct = read_frame(&mut rig.c_read).await.unwrap();
+        rig.transport.read_message(&prompt_ct, &mut tmp).unwrap();
+
+        let mut buf = vec![0u8; 65535];
+        // A real interactive client sends the typed line INCLUDING the newline
+        // -- the gate must strip it before comparing.
+        let n = rig.transport.write_message(b"hunter2\n", &mut buf).unwrap();
+        rig.c_write.write_all(&frame(&buf[..n])).await.unwrap();
+
+        // Gate passed -- now behaves exactly like the ungated stream: whatever
+        // is sent next reaches the origin and echoes back.
+        let n = rig.transport.write_message(b"post-auth-payload", &mut buf).unwrap();
+        rig.c_write.write_all(&frame(&buf[..n])).await.unwrap();
+        rig.c_write.shutdown().await.unwrap();
+
+        let mut echoed = Vec::new();
+        loop {
+            match read_frame(&mut rig.c_read).await {
+                Ok(ct) => {
+                    let n = rig.transport.read_message(&ct, &mut tmp).unwrap();
+                    echoed.extend_from_slice(&tmp[..n]);
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(echoed, b"post-auth-payload", "no gate bytes leaked into the origin stream");
+        assert!(rig.origin_dialed.load(std::sync::atomic::Ordering::SeqCst));
+        rig.agent_task.await.unwrap().expect("gate passed, serving completed cleanly");
+    }
+
     #[tokio::test]
     async fn serve_noise_stream_selects_the_pinned_key_from_a_rotation_set() {
         // #12 K2: an agent serving a SET of origin keys (a rotation window)
@@ -1981,8 +2336,9 @@ mod tests {
         let metrics = std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new());
         let mcheck = std::sync::Arc::clone(&metrics);
         let (a_read, a_write) = tokio::io::split(agent_cipher);
+        let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
         let agent = tokio::spawn(async move {
-            serve_noise_stream(a_write, a_read, origin_addr, &key_set, metrics).await
+            serve_noise_stream(a_write, a_read, origin_addr, &key_set, metrics, &gate).await
         });
 
         let (mut i_read, mut i_write) = tokio::io::split(ini_cipher);
@@ -2096,7 +2452,16 @@ mod tests {
         let opriv = origin_kp.private;
         let dmetrics = std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new());
         let srv = tokio::spawn(async move {
-            let _ = serve_direct(listener, origin_addr, std::sync::Arc::new(vec![opriv]), OriginProto::Tcp, dmetrics).await;
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ = serve_direct(
+                listener,
+                origin_addr,
+                std::sync::Arc::new(vec![opriv]),
+                OriginProto::Tcp,
+                dmetrics,
+                std::sync::Arc::new(gate),
+            )
+            .await;
         });
 
         // Inline Client: connect directly to the listener, handshake, one payload.
@@ -2155,7 +2520,15 @@ mod tests {
 
         let cfg = AgentConfig::parse(&addr.to_string(), "127.0.0.1:9").unwrap();
         let agent = tokio::spawn(async move {
-            let _ = run_agent(&cfg, cert, RoutingToken([1u8; 32]), std::sync::Arc::new(vec![[0u8; 32]])).await;
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ = run_agent(
+                &cfg,
+                cert,
+                RoutingToken([1u8; 32]),
+                std::sync::Arc::new(vec![[0u8; 32]]),
+                std::sync::Arc::new(gate),
+            )
+            .await;
         });
 
         // Initial registration + one reconnect, within the backoff window.
@@ -2268,7 +2641,10 @@ mod tests {
         cfg.tcp_fallback_pool_size = 1;
         let origin_priv = origin_kp.private;
         let agent = tokio::spawn(async move {
-            let _ = run_agent_tcp_fallback(&cfg, ca_root, token, Arc::new(vec![origin_priv])).await;
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ =
+                run_agent_tcp_fallback(&cfg, ca_root, token, Arc::new(vec![origin_priv]), Arc::new(gate))
+                    .await;
         });
 
         let echoed = tokio::time::timeout(Duration::from_secs(15), edge)
@@ -2998,7 +3374,10 @@ mod tests {
         cfg.framed_fallback = true;
         cfg.tcp_fallback_pool_size = 1;
         let agent = tokio::spawn(async move {
-            let _ = run_agent_tcp_fallback(&cfg, ca_root, token, Arc::new(vec![[0u8; 32]])).await;
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ =
+                run_agent_tcp_fallback(&cfg, ca_root, token, Arc::new(vec![[0u8; 32]]), Arc::new(gate))
+                    .await;
         });
 
         let echoed = tokio::time::timeout(Duration::from_secs(15), edge)
@@ -3077,7 +3456,10 @@ mod tests {
         cfg.tcp_fallback_pool_size = 1;
         let token_a = token.clone();
         let agent = tokio::spawn(async move {
-            let _ = run_agent_tcp_fallback(&cfg, ca_root, token_a, Arc::new(vec![[0u8; 32]])).await;
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ =
+                run_agent_tcp_fallback(&cfg, ca_root, token_a, Arc::new(vec![[0u8; 32]]), Arc::new(gate))
+                    .await;
         });
 
         (state, token, edge, agent)
@@ -3281,7 +3663,15 @@ mod tests {
 
         let cfg = AgentConfig::parse(&tcp_addr.to_string(), "127.0.0.1:9").unwrap();
         let agent = tokio::spawn(async move {
-            let _ = run_agent_tcp_fallback(&cfg, ca_root, RoutingToken([2u8; 32]), std::sync::Arc::new(vec![[0u8; 32]])).await;
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ = run_agent_tcp_fallback(
+                &cfg,
+                ca_root,
+                RoutingToken([2u8; 32]),
+                std::sync::Arc::new(vec![[0u8; 32]]),
+                std::sync::Arc::new(gate),
+            )
+            .await;
         });
 
         for _ in 0..400 {
@@ -3354,7 +3744,17 @@ mod tests {
         cfg.tcp_fallback_pool_size = POOL;
         let agent = tokio::spawn(async move {
             let _ =
-                run_agent_tcp_fallback(&cfg, ca_root, RoutingToken([0x44u8; 32]), Arc::new(vec![[0u8; 32]])).await;
+                {
+                    let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+                    run_agent_tcp_fallback(
+                        &cfg,
+                        ca_root,
+                        RoutingToken([0x44u8; 32]),
+                        Arc::new(vec![[0u8; 32]]),
+                        Arc::new(gate),
+                    )
+                    .await
+                };
         });
 
         // If pooling didn't work (still one-at-a-time), this never reaches
@@ -3443,7 +3843,15 @@ mod tests {
         let token_a = token.clone();
         let origin_priv = origin_kp.private;
         let agent = tokio::spawn(async move {
-            let _ = run_agent(&config, cert, token_a, std::sync::Arc::new(vec![origin_priv])).await;
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ = run_agent(
+                &config,
+                cert,
+                token_a,
+                std::sync::Arc::new(vec![origin_priv]),
+                std::sync::Arc::new(gate),
+            )
+            .await;
         });
 
         let echoed = edge.await.unwrap().unwrap();

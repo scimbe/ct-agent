@@ -91,6 +91,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 base64 = "0.22"
+# local_auth (operator-directed hardening pass): serve.rs's gate needs to name
+# snow::TransportState explicitly (ct_common::noise already depends on it at
+# the same version -- this makes the already-transitive dependency direct so
+# the type can be spelled in a function signature).
+snow = "0.9"
 # ACME (ADR-0003): JWS signing (ES256, RFC 7515) for the account-key-signed protocol
 # requests -- a direct dependency (not just transitive via rustls's "ring" feature) so
 # ct-agent can drive ring::signature::EcdsaKeyPair itself.

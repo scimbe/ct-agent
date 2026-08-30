@@ -16,6 +16,17 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Security-hardening pass: run as an unprivileged uid/gid rather than root, so a
+# future code-execution bug in the Agent's QUIC/Noise/HTTP parsing hands an
+# attacker an unprivileged account instead of container-root. 65532 matches this
+# product family's existing non-root baseline (CADS-Tunnel's relay-node, #305/#667)
+# -- one convention across the fleet, not a value picked in isolation here. No
+# /etc/passwd entry is created (the Agent only ever reads CT_AGENT_* env vars, no
+# home-dir lookups) -- entrypoint.sh drops privileges via `chroot --userspec`
+# instead of `su`/`gosu`, both of which would need either a passwd entry or an
+# extra downloaded binary.
+RUN groupadd --gid 65532 ctagent
+
 # Detect the platform via `uname` at RUN time rather than relying on the
 # `TARGETARCH`/`TARGETOS` build ARGs (#3): those are only auto-populated by
 # BuildKit's multi-platform machinery, which `scripts/setup.sh`'s plain
@@ -42,4 +53,13 @@ RUN arch="$(uname -m)" \
        -o /usr/local/bin/ct-agent \
     && chmod +x /usr/local/bin/ct-agent
 
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# The container still STARTS as root (entrypoint.sh's own job is to migrate any
+# existing root-owned mounted state, then drop to 65532:65532 before exec'ing the
+# real binary) -- so no USER directive here. Do not add one; it would skip the
+# migration step entirely and turn every already-deployed volume into a
+# Permission-denied failure on the next container recreate.
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["ct-agent"]
