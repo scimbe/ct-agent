@@ -216,6 +216,21 @@ impl OnboardedAgent {
     /// between the renames" (fast, near-instantaneous syscalls).
     pub fn persist(&self, state_dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(state_dir)?;
+        // Security-hardening pass, B.1: the files inside `state_dir` are each
+        // written at 0600 (`secret_file::write_private`), but `create_dir_all`
+        // leaves the DIRECTORY itself at the process umask (commonly 0755) --
+        // so on a shared host another local user could list filenames/sizes/
+        // mtimes of `identity.key`/`agent`/`tenant`/`capability.bin` even
+        // though none of their contents are readable. Safe for a fresh
+        // directory; deliberately NOT retroactively tightened for an
+        // already-deployed one elsewhere (a separate local process/user might
+        // depend on reading it today) -- this only ever narrows a directory
+        // this same call just created or already owns.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         let identity_path = state_dir.join(Self::IDENTITY_FILE);
         let agent_path = state_dir.join(Self::AGENT_FILE);
         let tenant_path = state_dir.join(Self::TENANT_FILE);
@@ -385,6 +400,36 @@ mod tests {
             "persisted state for one agent id is not restored for another"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Security-hardening pass, B.1: the files inside `state_dir` were already
+    /// each `0600`, but the directory itself was left at the process umask --
+    /// commonly `0755`, letting another local user on a shared host list the
+    /// filenames/sizes/mtimes of `identity.key`/`agent`/`tenant` even though
+    /// none of their contents are readable. Fails against the pre-fix code.
+    #[cfg(unix)]
+    #[test]
+    fn persist_narrows_the_state_dir_itself_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ct-onboard-dirperm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Simulate a directory freshly created at the common umask default --
+        // create_dir_all alone (what persist() itself does first) would leave
+        // it exactly like this without the fix.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let onboarded = OnboardedAgent {
+            identity: AgentIdentity::generate(),
+            agent_id: AgentId("perm-agent".into()),
+            tenant: TenantId("perm-tenant".into()),
+            config: AgentConfig::parse("127.0.0.1:4433", "127.0.0.1:8080").unwrap(),
+        };
+        onboarded.persist(&dir).unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "persist() must narrow the state dir itself, not just the files in it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
