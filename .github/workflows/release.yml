@@ -106,10 +106,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Security-hardening pass, B.1: cloudflared ships signed binaries;
+          # this repo shipped neither a signature nor even a checksum, so
+          # there was nothing an operator could verify a download against
+          # beyond "it's the file GitHub served me". A detached SHA-256
+          # checksum is the cheap first step (full Sigstore/cosign or
+          # platform Authenticode/notarization signing is a separately
+          # tracked, bigger lift). `sha256sum` on Linux/Windows (Git Bash
+          # ships it); `shasum -a 256` on macOS, which has no `sha256sum`.
+          checksum() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" > "$1.sha256"
+            else
+              shasum -a 256 "$1" > "$1.sha256"
+            fi
+          }
+
           bin="target/${{ matrix.target }}/release/ct-agent"
           [ -f "$bin.exe" ] && bin="$bin.exe"
           cp "$bin" "${{ matrix.asset }}"
-          gh release upload "$RELEASE_TAG" "${{ matrix.asset }}" --clobber
+          checksum "${{ matrix.asset }}"
+          gh release upload "$RELEASE_TAG" "${{ matrix.asset }}" "${{ matrix.asset }}.sha256" --clobber
 
           # `-p ct-agent` builds BOTH binaries of this package. Until now only the first
           # was uploaded, so `ct-agent-supervisor` (#331) was compiled for all eight
@@ -121,4 +138,5 @@ jobs:
           [ -f "$sup.exe" ] && sup="$sup.exe"
           sup_asset="$(printf '%s' "${{ matrix.asset }}" | sed 's/^ct-agent/ct-agent-supervisor/')"
           cp "$sup" "$sup_asset"
-          gh release upload "$RELEASE_TAG" "$sup_asset" --clobber
+          checksum "$sup_asset"
+          gh release upload "$RELEASE_TAG" "$sup_asset" "$sup_asset.sha256" --clobber
