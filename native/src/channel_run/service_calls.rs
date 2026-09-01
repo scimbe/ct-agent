@@ -777,10 +777,10 @@ pub(crate) fn decode_hex_32_bridge_peer(s: &str) -> Option<[u8; 32]> {
 /// tool above, deliberately open to every member; these tools must NOT be). Refusing a
 /// non-bridge caller is the entire security boundary "nur der richtig eingeloggte Nutzer darf
 /// den Agent steuern" rests on at the agent's own admission point, independent of whatever the
-/// portal itself checks. `bridge/status`, `bridge/config`, `bridge/manifest-list`,
-/// `bridge/manifest-install` ship in this pass; cert-status/channel-members (read-only,
-/// cert-status needs cross-process state -- the `channel --serve` process and the `certificate`
-/// renewal daemon are separate processes, not yet wired to share tier state) and
+/// portal itself checks. `bridge/status`, `bridge/config`, `bridge/channel-members`,
+/// `bridge/manifest-list`, `bridge/manifest-install` ship in this pass; `bridge/cert-status`
+/// (needs cross-process state -- the `channel --serve` process and the `certificate` renewal
+/// daemon are separate processes, not yet wired to share tier state) and
 /// allowlist-add/remove/channel-revoke (mutating, need an explicit-confirmation story on the
 /// portal side first) are the next increments, same list this feature's plan already scoped.
 pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, bridge_peer: [u8; 32]) {
@@ -821,6 +821,44 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
                 "grant_issuance_configured": env("CT_CHANNEL_OPERATOR_KEY").is_some(),
                 "manifest_registry_configured": env("CT_MANIFEST_REGISTRY_URL").is_some(),
             }))
+        },
+    );
+    reg.register_ctx(
+        "bridge/channel-members",
+        "List this agent's own channel's members (holder + Noise pubkey per member). Needs \
+         CT_AGENT_CP_URL and CT_CHANNEL_ID (or CT_GRANT_CHANNEL) configured, plus a usable OIDC \
+         credential -- either CT_OIDC_TOKEN or a prior `ct-agent login` (same resolution \
+         `channel register`/`channel allowlist` already use). The channel is always THIS agent's \
+         own -- never caller-supplied, so a bridge peer can't use this to enumerate an unrelated \
+         channel's membership. No arguments.",
+        move |ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
+            if ctx.peer != Some(bridge_peer) {
+                return Err("bridge/channel-members: caller is not this agent's configured bridge peer".to_string());
+            }
+            let env = |k: &str| std::env::var(k).ok();
+            let cp_url = env("CT_AGENT_CP_URL")
+                .ok_or_else(|| "bridge/channel-members: this agent has no CT_AGENT_CP_URL configured".to_string())?
+                .trim_end_matches('/')
+                .to_string();
+            let channel_hex = hex_encode(&req_hex32_aliased(&env, "CT_CHANNEL_ID", "CT_GRANT_CHANNEL", "64 hex channel id")?);
+            let body = tokio::runtime::Handle::current().block_on(async {
+                let token = crate::login::resolve_oidc_token().await?;
+                reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .map_err(|e| format!("building HTTP client: {e}"))?
+                    .get(format!("{cp_url}/me/channels/{channel_hex}/members"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .send()
+                    .await
+                    .map_err(|e| format!("GET .../channels/{channel_hex}/members: {e}"))?
+                    .error_for_status()
+                    .map_err(|e| format!("GET .../channels/{channel_hex}/members: {e}"))?
+                    .json::<serde_json::Value>()
+                    .await
+                    .map_err(|e| format!("GET .../channels/{channel_hex}/members: invalid JSON response: {e}"))
+            })?;
+            Ok(body)
         },
     );
     reg.register_ctx(
