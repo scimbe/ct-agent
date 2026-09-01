@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "ct-agent"
-version = "0.7.18"
+version = "0.7.19"
 dependencies = [
  "axum",
  "base64",
