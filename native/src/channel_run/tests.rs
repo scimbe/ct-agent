@@ -1292,6 +1292,7 @@ fn bridge_manifest_tools_refuse_every_caller_that_is_not_the_configured_bridge_p
 
     for (name, arguments) in [
         ("bridge/config", serde_json::json!({})),
+        ("bridge/channel-members", serde_json::json!({})),
         ("bridge/manifest-list", serde_json::json!({})),
         (
             "bridge/manifest-install",
