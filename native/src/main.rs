@@ -330,6 +330,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // CT_CHANNEL_OPERATOR_KEY + CT_GRANT_*) and print the CT_CHANNEL_GRANT hex the
         // member uses — self-service admission, no central provisioning.
         if std::env::args().nth(2).as_deref() == Some("grant") {
+            // 2026-09-01 `ct-agent channel grant --interactive`: the raw CT_GRANT_* env
+            // interface (each a 64-hex value, plus a hand-computed CT_GRANT_EXPIRES unix
+            // timestamp) was error-prone enough that an operator wrote a wrapper shell
+            // script around it -- this walks the same fields with validation/retry and a
+            // relative expiry ("30d" instead of `date -d ... +%s`), then self-verifies the
+            // issued grant before printing it. The operator's OWN private key still comes
+            // from CT_CHANNEL_OPERATOR_KEY (never typed interactively/echoed to a
+            // terminal) -- only the per-member fields are prompted.
+            if std::env::args().nth(3).as_deref() == Some("--interactive") {
+                use std::io::Write;
+                let operator = ct_agent::channel_run::operator_key_from_env()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                let grant = ct_agent::channel_run::issue_grant_interactively(operator, |label| {
+                    eprint!("{label}");
+                    std::io::stderr().flush().ok();
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line).map_err(|e| e.to_string())?;
+                    Ok(line)
+                })
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                println!("{grant}");
+                return Ok(());
+            }
             let req = ct_agent::channel_run::OperatorGrantRequest::from_env()
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             println!("{}", req.issue());
