@@ -1279,6 +1279,66 @@ fn decode_hex_32_bridge_peer_rejects_wrong_length_and_non_hex_without_panicking(
 }
 
 #[test]
+fn bridge_manifest_tools_refuse_every_caller_that_is_not_the_configured_bridge_peer_without_panicking() {
+    // Same gating boundary as bridge/status (2026-09-01) -- checked FIRST, before either tool
+    // ever touches the process environment or the network, so this needs no env-var setup and
+    // can't race other tests over shared process-global env state.
+    use ct_common::mcp::{decode_response, encode_request, CallContext, ToolRegistry};
+
+    let bridge_peer = [0x99u8; 32];
+    let other_peer = CallContext::authenticated([0x11u8; 32]);
+    let mut reg = ToolRegistry::new();
+    register_bridge_tools(&mut reg, bridge_peer);
+
+    for (name, arguments) in [
+        ("bridge/manifest-list", serde_json::json!({})),
+        (
+            "bridge/manifest-install",
+            serde_json::json!({ "manifest_location": "https://example.invalid/m.json", "project_name": "proof" }),
+        ),
+    ] {
+        let request = encode_request(1, "tools/call", serde_json::json!({ "name": name, "arguments": arguments }));
+        let response = decode_response(&reg.dispatch_ctx(&other_peer, &request)).expect("valid JSON-RPC response");
+        assert!(response.result.is_none(), "{name}: a non-bridge peer must not get a result");
+        assert!(response.error.is_some(), "{name}: a non-bridge peer must be a JSON-RPC error, not a silent failure");
+
+        let response = decode_response(&reg.dispatch(&request)).expect("valid JSON-RPC response");
+        assert!(response.result.is_none(), "{name}: an anonymous caller must not get a result");
+        assert!(response.error.is_some(), "{name}: an anonymous caller must be a JSON-RPC error, not a silent failure");
+    }
+}
+
+#[test]
+fn bridge_manifest_install_rejects_missing_fields_without_panicking() {
+    // Args are validated before touching env or network (see the handler's own ordering) -- so
+    // this, too, needs no env-var setup.
+    use ct_common::mcp::{decode_response, encode_request, CallContext, ToolRegistry};
+
+    let bridge_peer = [0x99u8; 32];
+    let mut reg = ToolRegistry::new();
+    register_bridge_tools(&mut reg, bridge_peer);
+    let ctx = CallContext::authenticated(bridge_peer);
+
+    let request = encode_request(
+        1,
+        "tools/call",
+        serde_json::json!({ "name": "bridge/manifest-install", "arguments": { "project_name": "proof" } }),
+    );
+    let response = decode_response(&reg.dispatch_ctx(&ctx, &request)).expect("valid JSON-RPC response");
+    assert!(response.result.is_none(), "missing manifest_location must not return a result");
+    assert!(response.error.is_some(), "missing manifest_location must be a JSON-RPC error");
+
+    let request = encode_request(
+        2,
+        "tools/call",
+        serde_json::json!({ "name": "bridge/manifest-install", "arguments": { "manifest_location": "https://example.invalid/m.json" } }),
+    );
+    let response = decode_response(&reg.dispatch_ctx(&ctx, &request)).expect("valid JSON-RPC response");
+    assert!(response.result.is_none(), "missing project_name must not return a result");
+    assert!(response.error.is_some(), "missing project_name must be a JSON-RPC error");
+}
+
+#[test]
 fn operator_invite_request_parses_env_and_issues_a_verifiable_invitation() {
     // scimbe/ct-agent#9: `ct-agent channel invite` parses the operator key + CT_INVITE_*
     // from env and issues an invitation that verifies under the operator key and binds the
