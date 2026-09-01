@@ -1107,6 +1107,48 @@ fn issue_grant_interactively_walks_the_operator_through_valid_fields_retries_bad
 }
 
 #[test]
+fn issue_grant_from_fields_validates_each_field_and_self_verifies() {
+    // 2026-09-01 llm2 proposal Phase 2: the REST server's structured-field entry point --
+    // same validated, self-verifying core as `--interactive`, but no retry-in-place prompt
+    // loop (a bad field is one clear error, not a re-prompt).
+    use ct_common::channel::{ChannelId, Direction, SignedChannelGrant};
+
+    let op = OperatorIdentity::generate();
+    let member = ChannelIdentity::generate();
+    let member_holder_hex = hex_encode(&member.holder.verifying_key().to_bytes());
+    let channel_hex = hex_encode(&[0x77u8; 32]);
+
+    let grant_hex = issue_grant_from_fields(op.key.clone(), &channel_hex, &member_holder_hex, "accept", "30d")
+        .expect("valid fields issue a grant");
+    let signed = SignedChannelGrant::decode(&hex_bytes(&grant_hex).expect("hex")).expect("decode");
+    assert_eq!(signed.grant.channel, ChannelId([0x77u8; 32]));
+    assert_eq!(signed.grant.holder, member.holder.verifying_key().to_bytes());
+    assert_eq!(signed.grant.direction, Direction::Accept);
+    assert!(
+        ct_common::channel::verify_stateless(&op.key.verifying_key().to_bytes(), &signed, 0).is_ok(),
+        "the REST-issued grant verifies under the operator's own key"
+    );
+
+    assert!(
+        issue_grant_from_fields(op.key.clone(), "not-hex", &member_holder_hex, "accept", "30d").is_err(),
+        "bad channel hex must be rejected"
+    );
+    assert!(
+        issue_grant_from_fields(op.key.clone(), &channel_hex, "not-hex", "accept", "30d").is_err(),
+        "bad holder hex must be rejected"
+    );
+    assert!(
+        issue_grant_from_fields(op.key.clone(), &channel_hex, &member_holder_hex, "sideways", "30d").is_err(),
+        "bad direction must be rejected"
+    );
+    assert!(
+        issue_grant_from_fields(op.key.clone(), &channel_hex, &member_holder_hex, "accept", "not-a-duration")
+            .is_err(),
+        "bad duration must be rejected"
+    );
+}
+
+#[test]
 fn operator_invite_request_parses_env_and_issues_a_verifiable_invitation() {
     // scimbe/ct-agent#9: `ct-agent channel invite` parses the operator key + CT_INVITE_*
     // from env and issues an invitation that verifies under the operator key and binds the
