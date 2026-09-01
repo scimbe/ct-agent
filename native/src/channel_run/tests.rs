@@ -1228,6 +1228,57 @@ fn channel_grant_tool_rejects_missing_or_invalid_fields_without_panicking() {
 }
 
 #[test]
+fn bridge_status_tool_answers_the_configured_bridge_peer() {
+    // 2026-09-01: Agent bridges' peer-gating boundary -- the calling context's authenticated
+    // peer key must match the one configured CT_CHANNEL_BRIDGE_PEER for a bridge tool to run
+    // at all, independent of the channel's own grant-based admission.
+    use ct_common::mcp::{decode_response, encode_request, CallContext, ToolRegistry};
+
+    let bridge_peer = [0x99u8; 32];
+    let mut reg = ToolRegistry::new();
+    register_bridge_tools(&mut reg, bridge_peer);
+
+    let request = encode_request(1, "tools/call", serde_json::json!({ "name": "bridge/status", "arguments": {} }));
+    let ctx = CallContext::authenticated(bridge_peer);
+    let response = decode_response(&reg.dispatch_ctx(&ctx, &request)).expect("valid JSON-RPC response");
+    assert!(response.error.is_none(), "the configured bridge peer must be answered: {:?}", response.error);
+    let result = response.result.expect("result present");
+    assert_eq!(result.get("bridge_gated").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(result.get("version").and_then(|v| v.as_str()), Some(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn bridge_status_tool_refuses_every_caller_that_is_not_the_configured_bridge_peer_without_panicking() {
+    use ct_common::mcp::{decode_response, encode_request, CallContext, ToolRegistry};
+
+    let bridge_peer = [0x99u8; 32];
+    let mut reg = ToolRegistry::new();
+    register_bridge_tools(&mut reg, bridge_peer);
+    let request = encode_request(1, "tools/call", serde_json::json!({ "name": "bridge/status", "arguments": {} }));
+
+    // A DIFFERENT authenticated peer -- e.g. any other channel member this operator admitted
+    // for ordinary channel/grant purposes, not the bridge. Must be refused, not answered.
+    let other_peer = CallContext::authenticated([0x11u8; 32]);
+    let response = decode_response(&reg.dispatch_ctx(&other_peer, &request)).expect("valid JSON-RPC response");
+    assert!(response.result.is_none(), "a non-bridge peer must not get a result");
+    assert!(response.error.is_some(), "a non-bridge peer must be a JSON-RPC error, not a silent failure");
+
+    // An anonymous/unthreaded caller (CallContext::default(), peer == None) -- what every
+    // pre-#163 dispatch() call site already produces -- must also be refused, not treated as
+    // implicitly trusted.
+    let response = decode_response(&reg.dispatch(&request)).expect("valid JSON-RPC response");
+    assert!(response.result.is_none(), "an anonymous caller must not get a result");
+    assert!(response.error.is_some(), "an anonymous caller must be a JSON-RPC error, not a silent failure");
+}
+
+#[test]
+fn decode_hex_32_bridge_peer_rejects_wrong_length_and_non_hex_without_panicking() {
+    assert_eq!(decode_hex_32_bridge_peer("not-64-hex"), None);
+    assert_eq!(decode_hex_32_bridge_peer(&"zz".repeat(32)), None, "64 chars but not valid hex digits");
+    assert_eq!(decode_hex_32_bridge_peer(&hex_encode(&[0x42u8; 32])), Some([0x42u8; 32]));
+}
+
+#[test]
 fn operator_invite_request_parses_env_and_issues_a_verifiable_invitation() {
     // scimbe/ct-agent#9: `ct-agent channel invite` parses the operator key + CT_INVITE_*
     // from env and issues an invitation that verifies under the operator key and binds the

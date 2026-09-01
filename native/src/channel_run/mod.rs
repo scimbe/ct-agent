@@ -542,7 +542,8 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             return run_dcutr_join_loop("relay-gate", serve_loop, move || async move {
                 let relay_conn =
                     dial_relay_preferring_direct(cfg.relay_addr_direct, cfg.relay_addr, DIRECT_DIAL_TIMEOUT).await?;
-                let local = channel_local();
+                // Admission via the relay gate happens below, after this call -- peer not yet known.
+                let local = channel_local(None);
                 Ok(join_via_relay_gate_dcutr(
                     &relay_conn,
                     request,
@@ -573,7 +574,8 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                 let relay_conn = crate::transport::build_channel_dialer()?
                     .connect(cfg.relay_addr, "localhost")?
                     .await?;
-                let local = channel_local();
+                // Admission via the circuit relay happens below, after this call -- peer not yet known.
+                let local = channel_local(None);
                 Ok(join_via_relay_dcutr(
                     &relay_conn,
                     request,
@@ -756,7 +758,9 @@ impl ChannelRunConfig {
 /// direct path; the initiator dials `addr` trusting the configured peer cert. The
 /// real mutual auth is the Noise_IK session keyed on the member Noise keys.
 pub async fn run_channel_command(cfg: ChannelRunConfig) -> Result<(), BoxError> {
-    let local = channel_local();
+    // Direct-address mode already knows the peer's Noise key from config (CT_CHANNEL_PEER_NOISE_KEY)
+    // -- no admission round-trip needed to learn it, unlike the broker-mediated paths above.
+    let local = channel_local(Some(cfg.peer_noise_public));
     match cfg.role {
         ChannelRole::Accept => {
             let (endpoint, cert) = crate::transport::build_direct_listener_at(cfg.addr)?;

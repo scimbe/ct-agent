@@ -110,7 +110,15 @@ pub(crate) async fn serve_admitted_session(
         None => RelayFallback::QuicLazy(ctx.relay_addr),
     };
     let listener = ctx.listener.clone(); // cheap quinn handle; shared across concurrent sessions
-    let local = channel_local();
+    // The peer's attested Noise key is already resolved in `admission` at this point (broker
+    // admission happened in `admit_one_peer`, before this session-spawning step) -- threading
+    // it into `channel_local` is what lets bridge-gated tools (see `register_bridge_tools`)
+    // check the calling session's actual identity instead of always seeing an anonymous caller.
+    let peer = match &admission {
+        ChannelJoinOutcome::Admitted { peer_noise_pubkey, .. } => *peer_noise_pubkey,
+        _ => None,
+    };
+    let local = channel_local(peer);
     run_channel_join_with_admission(
         admission,
         relay,
@@ -422,7 +430,10 @@ pub(crate) async fn run_one_admission_session(
     relay_ladder: &[ChannelDialRung],
     front_door_cert: &Option<CertificateDer<'static>>,
 ) -> Result<(), BoxError> {
-    let local = channel_local();
+    // Unlike `serve_admitted_session`, admission happens INSIDE
+    // `run_one_admission_session_with_local` below, after this `channel_local()` call --
+    // the peer's Noise key isn't known yet at this call site.
+    let local = channel_local(None);
     run_one_admission_session_with_local(cfg, request, broker_ladder, relay_ladder, front_door_cert, local).await
 }
 
