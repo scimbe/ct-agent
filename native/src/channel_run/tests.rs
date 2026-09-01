@@ -1149,6 +1149,85 @@ fn issue_grant_from_fields_validates_each_field_and_self_verifies() {
 }
 
 #[test]
+fn channel_grant_tool_issues_a_verifiable_grant_over_json_rpc() {
+    // 2026-09-01: the channel/grant tool replaces the removed local REST-server listener --
+    // exercises the exact JSON-RPC path a --serve session's peer would drive (tools/call),
+    // without any env vars, duplex streams, or async runtime (register_grant_tool is split
+    // out from channel_local() specifically so this is possible).
+    use ct_common::channel::SignedChannelGrant;
+    use ct_common::mcp::{decode_response, encode_request, ToolRegistry};
+
+    let op = OperatorIdentity::generate();
+    let member = ChannelIdentity::generate();
+    let member_holder_hex = hex_encode(&member.holder.verifying_key().to_bytes());
+    let channel_hex = hex_encode(&[0x66u8; 32]);
+
+    let mut reg = ToolRegistry::new();
+    register_grant_tool(&mut reg, op.key.clone());
+
+    let request = encode_request(
+        1,
+        "tools/call",
+        serde_json::json!({
+            "name": "channel/grant",
+            "arguments": {
+                "channel": channel_hex,
+                "holder": member_holder_hex,
+                "direction": "accept",
+                "expires_in": "30d",
+            }
+        }),
+    );
+    let response_bytes = reg.dispatch(&request);
+    let response = decode_response(&response_bytes).expect("valid JSON-RPC response");
+    assert!(response.error.is_none(), "unexpected error: {:?}", response.error);
+    let grant_hex = response.result.expect("result present").get("grant").expect("grant field").as_str().unwrap().to_string();
+
+    let signed = SignedChannelGrant::decode(&hex_bytes(&grant_hex).expect("hex")).expect("decode");
+    assert!(
+        ct_common::channel::verify_stateless(&op.key.verifying_key().to_bytes(), &signed, 0).is_ok(),
+        "the tool-issued grant verifies under the operator's own key"
+    );
+}
+
+#[test]
+fn channel_grant_tool_rejects_missing_or_invalid_fields_without_panicking() {
+    use ct_common::mcp::{decode_response, encode_request, ToolRegistry};
+
+    let op = OperatorIdentity::generate();
+    let mut reg = ToolRegistry::new();
+    register_grant_tool(&mut reg, op.key.clone());
+
+    // Missing a required field entirely.
+    let request = encode_request(
+        1,
+        "tools/call",
+        serde_json::json!({ "name": "channel/grant", "arguments": { "channel": hex_encode(&[0x11u8; 32]) } }),
+    );
+    let response = decode_response(&reg.dispatch(&request)).expect("valid JSON-RPC response");
+    assert!(response.result.is_none(), "missing fields must not return a result");
+    assert!(response.error.is_some(), "missing fields must be a JSON-RPC error, not a silent failure");
+
+    // A present-but-garbled field (not 64 hex).
+    let request = encode_request(
+        2,
+        "tools/call",
+        serde_json::json!({
+            "name": "channel/grant",
+            "arguments": {
+                "channel": "not-hex",
+                "holder": hex_encode(&[0x22u8; 32]),
+                "direction": "accept",
+                "expires_in": "30d",
+            }
+        }),
+    );
+    let response = decode_response(&reg.dispatch(&request)).expect("valid JSON-RPC response");
+    assert!(response.result.is_none());
+    assert!(response.error.is_some(), "garbled channel hex must be a JSON-RPC error");
+}
+
+#[test]
 fn operator_invite_request_parses_env_and_issues_a_verifiable_invitation() {
     // scimbe/ct-agent#9: `ct-agent channel invite` parses the operator key + CT_INVITE_*
     // from env and issues an invitation that verifies under the operator key and binds the

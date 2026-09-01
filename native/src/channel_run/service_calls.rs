@@ -719,6 +719,37 @@ pub(crate) fn call_service_params_ignored_warning(params_env_is_set: bool) -> Op
     })
 }
 
+/// Register the `channel/grant` tool on `reg`, backed by `operator` (2026-09-01). Split out
+/// from [`channel_local`]'s --serve construction so it's directly unit-testable against a
+/// bare [`ct_common::mcp::ToolRegistry`] -- no env vars, no duplex streams, no async runtime
+/// needed to prove the JSON-RPC wiring (argument parsing, error propagation, response shape)
+/// is correct. See [`channel_local`]'s own comment at the call site for the design rationale
+/// (replaces the removed local REST-server listener; no new network listener anywhere).
+pub(crate) fn register_grant_tool(reg: &mut ct_common::mcp::ToolRegistry, operator: SigningKey) {
+    reg.register(
+        "channel/grant",
+        "Issue a channel grant. Arguments: {channel, holder, direction, expires_in} \
+         (64-hex channel id, 64-hex member holder pubkey, \"initiate\"|\"accept\", a \
+         relative duration like \"30d\" -- the same fields `channel grant --interactive` \
+         prompts for). Returns {grant: <hex>}.",
+        move |args: &serde_json::Value| {
+            let field = |name: &str| -> Result<&str, String> {
+                args.get(name)
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("missing string field `{name}`"))
+            };
+            let grant = issue_grant_from_fields(
+                operator.clone(),
+                field("channel")?,
+                field("holder")?,
+                field("direction")?,
+                field("expires_in")?,
+            )?;
+            Ok(serde_json::json!({ "grant": grant }))
+        },
+    );
+}
+
 /// Build the channel session's local app duplex from the environment (#135 L2.x). `CT_CHANNEL_CALL=<method>`
 /// → one-shot MCP **client** (invoke a peer's tool, print the reply, exit). `CT_CHANNEL_SERVE=1` → the
 /// persistent MCP **service** (JSON-RPC `tools/list`/`tools/call` via the tool registry). Neither → the
@@ -891,6 +922,27 @@ pub(crate) fn channel_local() -> ChannelLocal {
                     );
                 });
             }
+        }
+        // Grant issuance over the already-authenticated channel (2026-09-01). Replaces
+        // the removed local REST-server listener (`rest_server.rs`, deleted after it
+        // caused a real crash on one operator's install and, more fundamentally, was
+        // architecturally unnecessary): an agent that holds the channel operator's own
+        // key can expose a `channel/grant` tool right here, on the SAME session already
+        // open for --serve mode -- no new network listener anywhere, on either side.
+        // Only a peer this operator already admitted to the channel (the channel's own
+        // grant-based admission, unrelated to this tool) can ever reach it at all.
+        // Silently absent (not registered) when CT_CHANNEL_OPERATOR_KEY isn't set, same
+        // "only exists if configured" posture as agent/card and the auction tools above.
+        if let Ok(operator) = operator_key_from_env() {
+            register_grant_tool(&mut reg, operator);
+            static GRANT_TOOL_LINE: std::sync::Once = std::sync::Once::new();
+            GRANT_TOOL_LINE.call_once(|| {
+                eprintln!(
+                    "ct-agent channel: --serve configured to expose channel/grant \
+                     (CT_CHANNEL_OPERATOR_KEY set) -- served to admitted peers only, no new \
+                     network listener"
+                );
+            });
         }
         let registry = std::sync::Arc::new(reg);
         ChannelLocal::Serve(serve_local(move |req: Vec<u8>| {
