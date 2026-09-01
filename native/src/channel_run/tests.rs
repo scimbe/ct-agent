@@ -1036,6 +1036,77 @@ fn operator_grant_request_parses_env_and_issues_a_verifiable_grant() {
 }
 
 #[test]
+fn parse_duration_secs_accepts_suffixed_and_bare_forms_and_rejects_garbage() {
+    assert_eq!(parse_duration_secs("30d").unwrap(), 30 * 86_400);
+    assert_eq!(parse_duration_secs("24h").unwrap(), 24 * 3_600);
+    assert_eq!(parse_duration_secs("90m").unwrap(), 90 * 60);
+    assert_eq!(parse_duration_secs("45s").unwrap(), 45);
+    assert_eq!(parse_duration_secs("3600").unwrap(), 3_600, "bare digits mean seconds");
+    assert_eq!(parse_duration_secs(" 7D ").unwrap(), 7 * 86_400, "trimmed and case-insensitive");
+    assert!(parse_duration_secs("").is_err(), "empty");
+    assert!(parse_duration_secs("abc").is_err(), "not a number");
+    assert!(parse_duration_secs("-5h").is_err(), "negative");
+    assert!(parse_duration_secs("5x").is_err(), "unknown suffix");
+}
+
+#[test]
+fn issue_grant_interactively_walks_the_operator_through_valid_fields_retries_bad_input_and_self_verifies() {
+    // 2026-09-01 operator ask (relayed via a peer maintainer): the raw CT_GRANT_* env
+    // interface was error-prone enough by hand that a wrapper shell script grew up
+    // around it. This exercises the injected-prompt interactive flow end to end:
+    // invalid input is retried rather than aborting the whole flow, and the returned
+    // grant genuinely verifies under the operator's own key.
+    use ct_common::channel::{ChannelId, Direction, SignedChannelGrant};
+
+    let op = OperatorIdentity::generate();
+    let member = ChannelIdentity::generate();
+    let member_holder_hex = hex_encode(&member.holder.verifying_key().to_bytes());
+    let channel_hex = hex_encode(&[0x99u8; 32]);
+
+    // One bad line per field (bad hex, bad hex, bad direction word, bad duration) before
+    // the good one -- the flow must re-prompt each, not bail out on the first typo.
+    let mut lines = vec![
+        "not-hex".to_string(),
+        channel_hex.clone(),
+        "also-not-hex".to_string(),
+        member_holder_hex.clone(),
+        "sideways".to_string(),
+        "accept".to_string(),
+        "not-a-duration".to_string(),
+        "30d".to_string(),
+    ]
+    .into_iter();
+    let mut prompts_seen = Vec::new();
+    let grant_hex = issue_grant_interactively(op.key.clone(), |label| {
+        prompts_seen.push(label.to_string());
+        lines.next().ok_or_else(|| "ran out of scripted input".to_string())
+    })
+    .expect("valid input eventually issues a grant");
+
+    // All four fields were actually prompted for (retries included).
+    assert_eq!(prompts_seen.len(), 8, "one retry + one success per field, in order: {prompts_seen:?}");
+
+    let signed = SignedChannelGrant::decode(&hex_bytes(&grant_hex).expect("hex")).expect("decode");
+    assert_eq!(signed.grant.channel, ChannelId([0x99u8; 32]));
+    assert_eq!(signed.grant.holder, member.holder.verifying_key().to_bytes());
+    assert_eq!(signed.grant.direction, Direction::Accept);
+    assert!(
+        ct_common::channel::verify_stateless(&op.key.verifying_key().to_bytes(), &signed, 0).is_ok(),
+        "the interactively-issued grant verifies under the operator's own key"
+    );
+    // Expiry is "now + 30d", not some fixed/garbled value -- assert it's in the right
+    // ballpark rather than pinning an exact `now()` this test doesn't control.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let expected = now + 30 * 86_400;
+    assert!(
+        signed.grant.expires_at.abs_diff(expected) < 5,
+        "expiry should be ~30d from now, got {} vs expected ~{}",
+        signed.grant.expires_at,
+        expected
+    );
+}
+
+#[test]
 fn operator_invite_request_parses_env_and_issues_a_verifiable_invitation() {
     // scimbe/ct-agent#9: `ct-agent channel invite` parses the operator key + CT_INVITE_*
     // from env and issues an invitation that verifies under the operator key and binds the

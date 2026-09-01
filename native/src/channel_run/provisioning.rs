@@ -466,6 +466,98 @@ impl OperatorGrantRequest {
     }
 }
 
+/// The operator's own signing key from `CT_CHANNEL_OPERATOR_KEY` — the one piece of
+/// [`OperatorGrantRequest::from_env`]'s parsing `ct-agent channel grant --interactive`
+/// still needs from the environment rather than an interactive prompt (a private key
+/// must never be typed at a terminal where it could be echoed or land in shell
+/// history). `pub` (unlike the `pub(crate)` `req_key` it wraps) since the CLI dispatch
+/// in `main.rs` is a separate crate from this library.
+pub fn operator_key_from_env() -> Result<SigningKey, String> {
+    req_key(&|k: &str| std::env::var(k).ok(), "CT_CHANNEL_OPERATOR_KEY", "64 hex; from `channel operator-init`")
+}
+
+/// Parse a duration for `--interactive` grant expiry: `<N>d`/`<N>h`/`<N>m`/`<N>s`
+/// (case-insensitive), or bare digits meaning seconds. Deliberately relative-only
+/// (never an absolute timestamp) — the raw `CT_GRANT_EXPIRES` env interface makes an
+/// operator compute `now + N` by hand (a real `date -d ... +%s` error class; this is
+/// what wrapper scripts like `grantChannel.sh` exist to paper over), and a relative
+/// duration removes that arithmetic entirely rather than just hiding it in a script.
+pub(crate) fn parse_duration_secs(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration".to_string());
+    }
+    let (num, mult) = match s.chars().last().map(|c| c.to_ascii_lowercase()) {
+        Some('d') => (&s[..s.len() - 1], 86_400),
+        Some('h') => (&s[..s.len() - 1], 3_600),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('s') => (&s[..s.len() - 1], 1),
+        _ => (s, 1),
+    };
+    let n: u64 = num.trim().parse().map_err(|_| format!("{s:?} is not a valid duration (e.g. 30d, 24h, 90m, 3600, or 3600s)"))?;
+    n.checked_mul(mult).ok_or_else(|| format!("{s:?} overflows"))
+}
+
+/// Interactive, validated, self-verifying grant issuance for `ct-agent channel grant
+/// --interactive` (2026-09-01, operator ask relayed via a peer maintainer: the raw
+/// `CT_GRANT_*` env-var interface was error-prone enough by hand that a wrapper shell
+/// script (`grantChannel.sh`) grew up around it). `prompt` is injected so this is
+/// testable without real stdin — it receives the prompt text and returns the raw
+/// line, matching the `from_lookup(f: impl Fn...)` testability convention the rest of
+/// this module already uses for env parsing. Each field retries on invalid input
+/// instead of failing the whole flow on the first typo. After issuing, the grant is
+/// immediately verified against the operator's OWN public key
+/// ([`ct_common::channel::verify_stateless`]) before being handed back — catching a
+/// garbled/mistyped channel or holder value right here, rather than only when the
+/// member's own admission attempt fails later with an unhelpful signature error.
+pub fn issue_grant_interactively(
+    operator: SigningKey,
+    mut prompt: impl FnMut(&str) -> Result<String, String>,
+) -> Result<String, String> {
+    let channel = loop {
+        let raw = prompt("Channel id (64 hex, from `channel operator-init`'s registration): ")?;
+        match hex32(raw.trim()) {
+            Some(c) => break ct_common::channel::ChannelId(c),
+            None => eprintln!("  not 64 hex characters, try again"),
+        }
+    };
+    let member_holder = loop {
+        let raw = prompt("Member's holder pubkey (64 hex, from their `channel init`): ")?;
+        match hex32(raw.trim()) {
+            Some(h) => break h,
+            None => eprintln!("  not 64 hex characters, try again"),
+        }
+    };
+    let direction = loop {
+        let raw = prompt("Direction (initiate/accept): ")?;
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "initiate" | "initiator" => break ct_common::channel::Direction::Initiate,
+            "accept" | "responder" => break ct_common::channel::Direction::Accept,
+            _ => eprintln!("  must be \"initiate\" or \"accept\", try again"),
+        }
+    };
+    let expires_in = loop {
+        let raw = prompt("Expires in (e.g. 30d, 24h, 90m; bare number = seconds): ")?;
+        match parse_duration_secs(&raw) {
+            Ok(secs) => break secs,
+            Err(e) => eprintln!("  {e}"),
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let expires_at = now.saturating_add(expires_in);
+    let operator_pubkey = operator.verifying_key().to_bytes();
+    let req = OperatorGrantRequest { operator, channel, member_holder, direction, expires_at };
+    let grant_hex = req.issue();
+    let decoded = ct_common::channel::SignedChannelGrant::decode(&hex_bytes(&grant_hex).ok_or("internal: issued grant hex failed to decode")?)
+        .map_err(|e| format!("internal: issued grant failed to re-decode: {e}"))?;
+    ct_common::channel::verify_stateless(&operator_pubkey, &decoded, now)
+        .map_err(|e| format!("internal: issued grant failed self-verification ({e}) -- this should never happen, please report it"))?;
+    Ok(grant_hex)
+}
+
 /// scimbe/ct-agent#9 `ct-agent channel invite`: as the operator, sign an invitation for an
 /// **identity** key you don't otherwise coordinate holder/noise material with directly — the
 /// cross-account case `channel grant`/`provision-link-channel.sh` can't cover, since those
