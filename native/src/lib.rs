@@ -24,6 +24,7 @@ pub mod onboard;
 pub mod origin;
 pub mod p2p;
 pub mod reconnect;
+pub mod rest_server;
 pub mod secret_file;
 pub mod self_update;
 pub mod serve;

@@ -543,11 +543,26 @@ pub fn issue_grant_interactively(
             Err(e) => eprintln!("  {e}"),
         }
     };
+    issue_grant_core(operator, channel, member_holder, direction, expires_in)
+}
+
+/// The validated-fields tail shared by [`issue_grant_interactively`] (terminal prompt loop)
+/// and [`issue_grant_from_fields`] (structured/REST caller, 2026-09-01 llm2 proposal Phase
+/// 2): sign the grant, then self-verify it against the operator's OWN public key before
+/// handing it back — catching a garbled/mistyped value right here rather than only when the
+/// member's own admission attempt fails later with an unhelpful signature error.
+fn issue_grant_core(
+    operator: SigningKey,
+    channel: ct_common::channel::ChannelId,
+    member_holder: [u8; 32],
+    direction: ct_common::channel::Direction,
+    expires_in_secs: u64,
+) -> Result<String, String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let expires_at = now.saturating_add(expires_in);
+    let expires_at = now.saturating_add(expires_in_secs);
     let operator_pubkey = operator.verifying_key().to_bytes();
     let req = OperatorGrantRequest { operator, channel, member_holder, direction, expires_at };
     let grant_hex = req.issue();
@@ -556,6 +571,30 @@ pub fn issue_grant_interactively(
     ct_common::channel::verify_stateless(&operator_pubkey, &decoded, now)
         .map_err(|e| format!("internal: issued grant failed self-verification ({e}) -- this should never happen, please report it"))?;
     Ok(grant_hex)
+}
+
+/// Structured-field grant issuance (2026-09-01, llm2 proposal Phase 2: the REST management
+/// server's `POST /v1/channel/grants` handler calls this directly with the parsed JSON body).
+/// Same validated, self-verifying core as `--interactive`, minus the retry-in-place prompt
+/// loop -- a structured caller either sends valid fields or gets one clear error back.
+pub fn issue_grant_from_fields(
+    operator: SigningKey,
+    channel_hex: &str,
+    holder_hex: &str,
+    direction: &str,
+    expires_in: &str,
+) -> Result<String, String> {
+    let channel = ct_common::channel::ChannelId(
+        hex32(channel_hex.trim()).ok_or("channel must be 64 hex characters")?,
+    );
+    let member_holder = hex32(holder_hex.trim()).ok_or("holder must be 64 hex characters")?;
+    let direction = match direction.trim().to_ascii_lowercase().as_str() {
+        "initiate" | "initiator" => ct_common::channel::Direction::Initiate,
+        "accept" | "responder" => ct_common::channel::Direction::Accept,
+        other => return Err(format!("direction must be \"initiate\" or \"accept\", got {other:?}")),
+    };
+    let expires_in_secs = parse_duration_secs(expires_in)?;
+    issue_grant_core(operator, channel, member_holder, direction, expires_in_secs)
 }
 
 /// scimbe/ct-agent#9 `ct-agent channel invite`: as the operator, sign an invitation for an
