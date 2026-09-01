@@ -750,11 +750,135 @@ pub(crate) fn register_grant_tool(reg: &mut ct_common::mcp::ToolRegistry, operat
     );
 }
 
+/// Decode `CT_CHANNEL_BRIDGE_PEER`'s 64 lowercase-hex chars into the raw pubkey, or `None`.
+/// Chunks raw BYTES and `from_utf8`s each 2-byte chunk rather than slicing the `&str` by byte
+/// offset -- the established fix for the char-boundary panic family this codebase has hit
+/// repeatedly on malformed hex input (a naive `s[i..i+2]` slice panics if a multi-byte UTF-8
+/// char straddles the boundary; chunking bytes first can't ever split one).
+pub(crate) fn decode_hex_32_bridge_peer(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Register the "Agent bridges" tool tranche (2026-09-01, CADS-Tunnel portal remote-control
+/// design) on `reg`, each gated to `bridge_peer` — the ONE Noise pubkey this agent trusts as
+/// its bridge (`CT_CHANNEL_BRIDGE_PEER`; today, the deployment's single shared bridge identity,
+/// scimbe's explicit "simple, if secure" call over a per-account one). Every handler below is
+/// `register_ctx`, not `register`: it MUST check `ctx.peer == Some(bridge_peer)` and refuse
+/// otherwise, because `ChannelGrant`/`Direction`/`Rights` (crates/common/src/channel.rs) only
+/// gate the transport session, not which tool a caller may invoke -- ANY channel member
+/// admitted with a valid grant can otherwise call ANY registered tool (see `channel/grant`'s own
+/// tool above, deliberately open to every member; these tools must NOT be). Refusing a
+/// non-bridge caller is the entire security boundary "nur der richtig eingeloggte Nutzer darf
+/// den Agent steuern" rests on at the agent's own admission point, independent of whatever the
+/// portal itself checks. `bridge/status`, `bridge/manifest-list`, `bridge/manifest-install`
+/// ship in this pass; cert-status/channel-members/config (read-only) and allowlist-add/remove/
+/// channel-revoke (mutating, need an explicit-confirmation story on the portal side first) are
+/// the next increments, same list this feature's plan already scoped.
+pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, bridge_peer: [u8; 32]) {
+    reg.register_ctx(
+        "bridge/status",
+        "Agent bridge status: this agent's version and that the bridge gate is active. Callable \
+         only by this agent's configured bridge peer (CT_CHANNEL_BRIDGE_PEER) -- refused for any \
+         other channel member, even an otherwise-admitted one.",
+        move |ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
+            if ctx.peer != Some(bridge_peer) {
+                return Err("bridge/status: caller is not this agent's configured bridge peer".to_string());
+            }
+            Ok(serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "bridge_gated": true,
+            }))
+        },
+    );
+    reg.register_ctx(
+        "bridge/manifest-list",
+        "List manifests available from this agent's configured registry (CT_MANIFEST_REGISTRY_URL). \
+         Each entry's `installer_kind` is \"compose\" (sandboxed, Docker) or \"binary\" (raw, bare \
+         executable) -- the portal's picker surfaces this directly, no separate flag. No arguments.",
+        move |ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
+            if ctx.peer != Some(bridge_peer) {
+                return Err("bridge/manifest-list: caller is not this agent's configured bridge peer".to_string());
+            }
+            let registry_url = std::env::var("CT_MANIFEST_REGISTRY_URL")
+                .map_err(|_| "bridge/manifest-list: this agent has no CT_MANIFEST_REGISTRY_URL configured".to_string())?
+                .trim_end_matches('/')
+                .to_string();
+            let body = tokio::runtime::Handle::current()
+                .block_on(async {
+                    reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(30))
+                        .build()
+                        .map_err(|e| format!("building HTTP client: {e}"))?
+                        .get(format!("{registry_url}/manifests"))
+                        .send()
+                        .await
+                        .map_err(|e| format!("GET {registry_url}/manifests: {e}"))?
+                        .error_for_status()
+                        .map_err(|e| format!("GET {registry_url}/manifests: {e}"))?
+                        .json::<serde_json::Value>()
+                        .await
+                        .map_err(|e| format!("GET {registry_url}/manifests: invalid JSON response: {e}"))
+                })?;
+            Ok(body)
+        },
+    );
+    reg.register_ctx(
+        "bridge/manifest-install",
+        "Install a manifest from this agent's configured registry. Arguments: {manifest_location, \
+         project_name} (a URL/id from bridge/manifest-list's output, and an isolated project name \
+         for THIS install -- the same explicit, no-default choice `ct-agent manifest activate` \
+         itself always requires, so a second concurrent install can never collide with the first). \
+         Trust allowlist, work directory, and registry-ledger config all come from this agent's OWN \
+         configuration (CT_MANIFEST_TRUST_ALLOWLIST[_FILE]/CT_MANIFEST_WORK_DIR/CT_MANIFEST_*), \
+         never from the caller -- the portal picks WHICH manifest, never WHO is trusted to publish \
+         one. Returns the same structured InstallReport `ct-agent manifest activate` prints.",
+        move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
+            if ctx.peer != Some(bridge_peer) {
+                return Err("bridge/manifest-install: caller is not this agent's configured bridge peer".to_string());
+            }
+            let manifest_location = args
+                .get("manifest_location")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "bridge/manifest-install: missing string field `manifest_location`".to_string())?
+                .to_string();
+            let project_name = args
+                .get("project_name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "bridge/manifest-install: missing string field `project_name`".to_string())?
+                .to_string();
+            // Every OTHER field (trust allowlist, work dir, registry ledger config) still comes
+            // from this agent's own process environment, exactly like `ct-agent manifest activate`
+            // -- only which manifest and what to isolate it as are caller-supplied.
+            let cfg = crate::manifest_run::ActivateCliConfig::from_lookup(move |k| match k {
+                "CT_MANIFEST_URL" => Some(manifest_location.clone()),
+                "CT_MANIFEST_PROJECT_NAME" => Some(project_name.clone()),
+                other => std::env::var(other).ok(),
+            })?;
+            let report = tokio::runtime::Handle::current().block_on(crate::manifest_run::run_activate(cfg))?;
+            serde_json::to_value(&report).map_err(|e| format!("bridge/manifest-install: encoding result: {e}"))
+        },
+    );
+}
+
 /// Build the channel session's local app duplex from the environment (#135 L2.x). `CT_CHANNEL_CALL=<method>`
 /// → one-shot MCP **client** (invoke a peer's tool, print the reply, exit). `CT_CHANNEL_SERVE=1` → the
 /// persistent MCP **service** (JSON-RPC `tools/list`/`tools/call` via the tool registry). Neither → the
 /// historical stdin/stdout pipe.
-pub(crate) fn channel_local() -> ChannelLocal {
+/// `peer`: the channel-authenticated remote's Noise static public key, when already known at
+/// the call site (e.g. a resolved broker admission, or a direct-mode config's configured peer
+/// key) — threaded into the `--serve` registry's dispatch as a [`ct_common::mcp::CallContext`]
+/// so identity-aware tools (bridge tools, gated to one specific configured caller — see
+/// `register_bridge_tools`) can refuse anyone else. `None` when not yet known at this call site
+/// (pre-admission paths) or not applicable (`Pipe`/one-shot `--call` mode never dispatches
+/// through a registry at all) — identical to today's always-anonymous `dispatch()` behaviour.
+pub(crate) fn channel_local(peer: Option<[u8; 32]>) -> ChannelLocal {
     // #173 distributed crew: one-shot `service/<slug>` client. Reads the prompt on stdin, calls the
     // peer's service, prints the BARE output — the crew-bridge `CREW_*_CMD` contract. Checked before
     // the raw CT_CHANNEL_CALL below because it's the service-specific (and jq-free) path.
@@ -944,9 +1068,38 @@ pub(crate) fn channel_local() -> ChannelLocal {
                 );
             });
         }
+        // Agent bridges (2026-09-01): a curated, explicitly peer-gated tool tranche for the
+        // CADS-Tunnel portal's remote-control feature -- see `register_bridge_tools`'s own doc
+        // for why every handler there re-checks the caller's identity even though the channel
+        // itself already authenticated them. Silently absent unless CT_CHANNEL_BRIDGE_PEER is
+        // set to a valid 64-hex Noise pubkey, same "only exists if configured" posture as
+        // channel/grant and the auction tools above.
+        if let Ok(raw) = std::env::var("CT_CHANNEL_BRIDGE_PEER") {
+            match decode_hex_32_bridge_peer(raw.trim()) {
+                Some(bridge_peer) => {
+                    register_bridge_tools(&mut reg, bridge_peer);
+                    static BRIDGE_TOOLS_LINE: std::sync::Once = std::sync::Once::new();
+                    BRIDGE_TOOLS_LINE.call_once(|| {
+                        eprintln!(
+                            "ct-agent channel: --serve configured to expose Agent-bridge tools \
+                             (CT_CHANNEL_BRIDGE_PEER set) -- served only to that one configured \
+                             peer, refused for every other admitted channel member"
+                        );
+                    });
+                }
+                None => {
+                    eprintln!(
+                        "ct-agent channel: CT_CHANNEL_BRIDGE_PEER is set but not valid 64-hex -- \
+                         Agent-bridge tools NOT registered"
+                    );
+                }
+            }
+        }
         let registry = std::sync::Arc::new(reg);
+        let ctx = ct_common::mcp::CallContext { peer };
         ChannelLocal::Serve(serve_local(move |req: Vec<u8>| {
             let registry = registry.clone();
+            let ctx = ctx;
             // #248-follow: `ToolRegistry::dispatch` is synchronous, and when a
             // `CT_AGENT_SERVICE_HANDLER_CMD` service tool is registered it can block this
             // call for real wall-clock time (`run_service_handler`'s
@@ -964,7 +1117,7 @@ pub(crate) fn channel_local() -> ChannelLocal {
             // the async worker stays free to keep pumping bytes and servicing other
             // connections while the handler subprocess runs.
             async move {
-                tokio::task::spawn_blocking(move || registry.dispatch(&req))
+                tokio::task::spawn_blocking(move || registry.dispatch_ctx(&ctx, &req))
                     .await
                     .unwrap_or_default()
             }
