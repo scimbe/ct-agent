@@ -777,10 +777,12 @@ pub(crate) fn decode_hex_32_bridge_peer(s: &str) -> Option<[u8; 32]> {
 /// tool above, deliberately open to every member; these tools must NOT be). Refusing a
 /// non-bridge caller is the entire security boundary "nur der richtig eingeloggte Nutzer darf
 /// den Agent steuern" rests on at the agent's own admission point, independent of whatever the
-/// portal itself checks. `bridge/status`, `bridge/manifest-list`, `bridge/manifest-install`
-/// ship in this pass; cert-status/channel-members/config (read-only) and allowlist-add/remove/
-/// channel-revoke (mutating, need an explicit-confirmation story on the portal side first) are
-/// the next increments, same list this feature's plan already scoped.
+/// portal itself checks. `bridge/status`, `bridge/config`, `bridge/manifest-list`,
+/// `bridge/manifest-install` ship in this pass; cert-status/channel-members (read-only,
+/// cert-status needs cross-process state -- the `channel --serve` process and the `certificate`
+/// renewal daemon are separate processes, not yet wired to share tier state) and
+/// allowlist-add/remove/channel-revoke (mutating, need an explicit-confirmation story on the
+/// portal side first) are the next increments, same list this feature's plan already scoped.
 pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, bridge_peer: [u8; 32]) {
     reg.register_ctx(
         "bridge/status",
@@ -794,6 +796,30 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
             Ok(serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "bridge_gated": true,
+            }))
+        },
+    );
+    reg.register_ctx(
+        "bridge/config",
+        "This agent's own non-secret configuration summary: role, broker/relay addresses, \
+         whether MASQUE fallback and channel/grant issuance are configured. Never returns actual \
+         key/token/secret VALUES, only which optional features are turned on. No arguments.",
+        move |ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
+            if ctx.peer != Some(bridge_peer) {
+                return Err("bridge/config: caller is not this agent's configured bridge peer".to_string());
+            }
+            let env = |k: &str| std::env::var(k).ok();
+            let masque_configured = ["CT_AGENT_MASQUE_PROXY", "CT_AGENT_MASQUE_SNI_HOST", "CT_AGENT_MASQUE_TARGET", "CT_AGENT_MASQUE_TOKEN"]
+                .iter()
+                .all(|k| env(k).is_some());
+            Ok(serde_json::json!({
+                "role": env("CT_CHANNEL_ROLE"),
+                "broker": env("CT_CHANNEL_BROKER"),
+                "relay": env("CT_CHANNEL_RELAY"),
+                "direct_upgrade": env("CT_CHANNEL_DIRECT_UPGRADE").is_some(),
+                "masque_fallback_configured": masque_configured,
+                "grant_issuance_configured": env("CT_CHANNEL_OPERATOR_KEY").is_some(),
+                "manifest_registry_configured": env("CT_MANIFEST_REGISTRY_URL").is_some(),
             }))
         },
     );
