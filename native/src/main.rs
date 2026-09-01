@@ -34,6 +34,9 @@ USAGE:
                                  the stored `login` token; prints CT_AGENT_TOKEN for the next run
     ct-agent update             Check for and install the latest release in place (host-native
                                  installs only -- Docker installs update via a fresh image build)
+                                 Set CT_AGENT_AUTO_UPDATE=1 to do this automatically in the
+                                 background while serving (see below) -- requires a process
+                                 supervisor to actually restart into a newer build after a swap
     ct-agent local-auth set <user> <password>   Set the local-auth gate credential explicitly
     ct-agent local-auth reset   Generate a fresh local-auth gate credential, printed once
     ct-agent local-auth rotate  Alias for `reset` -- same operation, the name an operator
@@ -73,6 +76,16 @@ $HOME/.ct-agent/oidc-token.json with neither set). `channel register`/`channel a
 this automatically whenever CT_OIDC_TOKEN is NOT set in the environment, refreshing it
 transparently when it is close to expiry -- CT_OIDC_TOKEN explicitly set always takes priority,
 so no existing script/CI usage changes.
+
+`CT_AGENT_AUTO_UPDATE` (2026-09-01, operator ask -- see ct_agent::self_update's module doc for
+the full rationale): set to 1/true to background-check for a newer release every
+CT_AGENT_AUTO_UPDATE_INTERVAL_SECS (default 86400 = daily, floored at 300 to protect the
+releases API from a misconfigured near-zero value) while the default (no-subcommand) serve
+path is running. On finding one, downloads it and swaps the on-disk binary, then exits(0) --
+this ONLY results in the new build actually running if something restarts the process on
+exit (ct-agent-supervisor, systemd Restart=always, Docker --restart=always). Off by default;
+enabling it without a supervisor trades \"silently stale forever\" for \"silently stopped
+after the next release,\" so pair it with one.
 
 `channel rest-server` (2026-09-01, llm2 proposal Phase 2 -- local tier only, see the module doc
 on ct_agent::rest_server for the full design rationale) reads CT_CHANNEL_OPERATOR_KEY (same as
@@ -862,6 +875,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .map_err(|e| format!("ct-agent: CT_AGENT_LOCAL_AUTH config error: {e}"))?;
     if let Some(notice) = &local_auth_notice {
         eprintln!("{notice}");
+    }
+
+    // Auto-update (2026-09-01 operator ask): opt-in only -- see
+    // ct_agent::self_update's module doc for why the exit it performs on a
+    // successful swap needs a process supervisor to mean anything.
+    if let Some(auto_update_config) = ct_agent::self_update::AutoUpdateConfig::from_env() {
+        eprintln!(
+            "ct-agent: auto-update enabled, checking every {:?} -- requires a process \
+             supervisor (ct-agent-supervisor, systemd Restart=always, Docker \
+             --restart=always) to actually restart into a newer build after a swap",
+            auto_update_config.interval
+        );
+        tokio::spawn(ct_agent::self_update::run_auto_update_loop(
+            auto_update_config,
+            env!("CARGO_PKG_VERSION").to_string(),
+        ));
     }
 
     run_agent(

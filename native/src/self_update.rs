@@ -8,8 +8,24 @@
 //! independently. This is the other half: an already-running, host-native
 //! (non-Docker) install updating itself in place, without the operator
 //! having to re-run the installer.
+//!
+//! **Auto-update** (`CT_AGENT_AUTO_UPDATE`, 2026-09-01 operator ask): the
+//! manual `update` subcommand above has a real gap it can't close on its
+//! own -- an operator has to already know it exists AND remember to run it,
+//! and a binary old enough to predate this whole module has no way to
+//! discover either (a live incident: a peer maintainer's install had sat so
+//! far behind that `update` itself wasn't in that binary's `--help` output).
+//! [`run_auto_update_loop`] closes that gap for anyone who opts in: it
+//! periodically re-checks and, on finding a newer release, swaps the binary
+//! then exits(0) cleanly -- it does NOT re-exec itself. That exit is only
+//! useful paired with a process supervisor that restarts on any exit
+//! (`ct-agent-supervisor`, systemd `Restart=always`, Docker
+//! `--restart=always`); without one, enabling this trades "silently stale
+//! forever" for "silently stopped after the next update" -- also bad, just
+//! differently. Off by default, and its own startup notice says so.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// The GitHub API endpoint this checks against. A plain, unauthenticated GET
 /// -- no token needed, same rate limits any anonymous release-checker has.
@@ -181,6 +197,90 @@ pub async fn run_update(current_version: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Default check interval when `CT_AGENT_AUTO_UPDATE` is on but
+/// `CT_AGENT_AUTO_UPDATE_INTERVAL_SECS` isn't set: once a day. Frequent enough that a
+/// release doesn't sit unnoticed for weeks, infrequent enough that a fleet of agents
+/// checking in never looks like anything but background noise to GitHub's API.
+const DEFAULT_AUTO_UPDATE_INTERVAL_SECS: u64 = 86_400;
+
+/// Floor on the configured interval -- protects the (unauthenticated, rate-limited)
+/// releases API from a misconfigured near-zero value (a typo'd "5" meaning hours, taken
+/// as seconds) turning into every deployed agent hammering it in a tight loop.
+const MIN_AUTO_UPDATE_INTERVAL_SECS: u64 = 300;
+
+/// Opt-in periodic auto-update config -- `None` (the default) means the feature is
+/// entirely off; nothing here runs unless `CT_AGENT_AUTO_UPDATE` is explicitly truthy.
+pub struct AutoUpdateConfig {
+    pub interval: Duration,
+}
+
+impl AutoUpdateConfig {
+    /// Read from the process environment. `None` when `CT_AGENT_AUTO_UPDATE` is unset
+    /// or falsy -- the caller simply doesn't spawn [`run_auto_update_loop`] in that case.
+    pub fn from_env() -> Option<Self> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// Parse from a variable lookup (testable without touching the real env).
+    pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        let enabled = f("CT_AGENT_AUTO_UPDATE")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+        let interval_secs = f("CT_AGENT_AUTO_UPDATE_INTERVAL_SECS")
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_AUTO_UPDATE_INTERVAL_SECS)
+            .max(MIN_AUTO_UPDATE_INTERVAL_SECS);
+        Some(Self { interval: Duration::from_secs(interval_secs) })
+    }
+}
+
+/// Run forever: sleep [`AutoUpdateConfig::interval`], check for a newer release, and on
+/// finding one, download+swap the binary ([`perform_update`]) then `exit(0)` so a
+/// supervising process restarts into it -- see this module's doc comment for why a
+/// supervisor is required for that exit to actually mean anything. A failed check or
+/// swap is logged and retried next interval, never fatal on its own (auto-update must
+/// never be the reason a working tunnel goes down). Spawn as a background task
+/// (`tokio::spawn`) alongside the real serve loop -- this never returns on its own.
+pub async fn run_auto_update_loop(config: AutoUpdateConfig, current_version: String) -> ! {
+    loop {
+        tokio::time::sleep(config.interval).await;
+        let check = match check_latest(&current_version).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("ct-agent: auto-update check failed, will retry next interval: {e}");
+                continue;
+            }
+        };
+        if !check.update_available {
+            continue;
+        }
+        eprintln!(
+            "ct-agent: auto-update found {} -> {} ({}) -- downloading",
+            check.current_version, check.latest_version, check.asset_name
+        );
+        match perform_update(&check).await {
+            Ok(path) => {
+                eprintln!(
+                    "ct-agent: auto-updated to {} at {path:?} -- exiting so a process \
+                     supervisor restarts into the new build (this exit is only useful \
+                     paired with one -- see CT_AGENT_AUTO_UPDATE's own docs)",
+                    check.latest_version
+                );
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("ct-agent: auto-update download/swap failed, will retry next interval: {e}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +336,52 @@ mod tests {
     fn asset_name_for_platform_rejects_unknown_platforms() {
         assert!(asset_name_for_platform("freebsd", "x86_64").is_err());
         assert!(asset_name_for_platform("linux", "mips").is_err());
+    }
+
+    fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: std::collections::HashMap<String, String> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |k: &str| m.get(k).cloned()
+    }
+
+    #[test]
+    fn auto_update_config_is_off_unless_explicitly_enabled() {
+        assert!(AutoUpdateConfig::from_lookup(lookup(&[])).is_none());
+        assert!(AutoUpdateConfig::from_lookup(lookup(&[("CT_AGENT_AUTO_UPDATE", "0")])).is_none());
+        assert!(AutoUpdateConfig::from_lookup(lookup(&[("CT_AGENT_AUTO_UPDATE", "false")])).is_none());
+        assert!(AutoUpdateConfig::from_lookup(lookup(&[("CT_AGENT_AUTO_UPDATE", "garbage")])).is_none());
+    }
+
+    #[test]
+    fn auto_update_config_enabled_defaults_to_daily() {
+        let cfg = AutoUpdateConfig::from_lookup(lookup(&[("CT_AGENT_AUTO_UPDATE", "1")]))
+            .expect("explicitly enabled");
+        assert_eq!(cfg.interval, Duration::from_secs(DEFAULT_AUTO_UPDATE_INTERVAL_SECS));
+        let cfg = AutoUpdateConfig::from_lookup(lookup(&[("CT_AGENT_AUTO_UPDATE", "true")]))
+            .expect("\"true\" also enables it");
+        assert_eq!(cfg.interval, Duration::from_secs(DEFAULT_AUTO_UPDATE_INTERVAL_SECS));
+    }
+
+    #[test]
+    fn auto_update_config_respects_a_custom_interval_above_the_floor() {
+        let cfg = AutoUpdateConfig::from_lookup(lookup(&[
+            ("CT_AGENT_AUTO_UPDATE", "1"),
+            ("CT_AGENT_AUTO_UPDATE_INTERVAL_SECS", "3600"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.interval, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn auto_update_config_floors_a_dangerously_small_interval() {
+        // A typo'd "5" (meant as hours) taken literally as seconds must not turn into
+        // every deployed agent hammering the releases API in a tight loop.
+        let cfg = AutoUpdateConfig::from_lookup(lookup(&[
+            ("CT_AGENT_AUTO_UPDATE", "1"),
+            ("CT_AGENT_AUTO_UPDATE_INTERVAL_SECS", "5"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.interval, Duration::from_secs(MIN_AUTO_UPDATE_INTERVAL_SECS));
     }
 
     #[cfg(unix)]
