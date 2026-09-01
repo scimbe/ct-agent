@@ -55,7 +55,6 @@ USAGE:
     ct-agent channel agent-card           Write (and optionally register) this agent's card
     ct-agent channel agent-card --verify <file>  Verify a card file's signature/expiry
     ct-agent channel super-peer           Run as an opt-in LAN-local relay for same-network members
-    ct-agent channel rest-server          Run the local REST management server (CT_REST_SERVER=local)
     ct-agent channel                      Join a channel (CT_CHANNEL_* env config)
     ct-agent manifest create              Print an UNSIGNED service manifest skeleton
     ct-agent manifest sign                Sign a manifest skeleton with the holder key
@@ -86,17 +85,6 @@ this ONLY results in the new build actually running if something restarts the pr
 exit (ct-agent-supervisor, systemd Restart=always, Docker --restart=always). Off by default;
 enabling it without a supervisor trades \"silently stale forever\" for \"silently stopped
 after the next release,\" so pair it with one.
-
-`channel rest-server` (2026-09-01, llm2 proposal Phase 2 -- local tier only, see the module doc
-on ct_agent::rest_server for the full design rationale) reads CT_CHANNEL_OPERATOR_KEY (same as
-`channel grant`), CT_REST_SERVER (must be \"local\" -- any other value, including a future
-remote/tunneled tier, fails loudly rather than silently degrading), CT_REST_SERVER_ADDR
-(default 127.0.0.1:8765 -- MUST be a loopback address, refused otherwise) and
-CT_AGENT_STATE_DIR (where its own, separate-from-the-tunnel-gate credential is generated and
-stored; printed ONCE to stderr on first run). Exposes one endpoint, `POST
-/v1/channel/grants` with JSON body `{channel, holder, direction, expires_in}` (same fields
-`channel grant --interactive` prompts for), HTTP Basic-Auth-gated with that generated
-credential. Blocks until killed.
 
 `manifest` (CADS-agent-marketplace: Compose services since Phase 1, Binary executables since
 Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
@@ -383,21 +371,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("{}", req.issue());
             return Ok(());
         }
-        // `ct-agent channel rest-server` (2026-09-01, llm2 proposal Phase 2): the local-tier
-        // REST management server -- see ct_agent::rest_server's module doc for the design
-        // rationale (loopback-only, mandatory own credential, deliberately narrow scope).
-        if std::env::args().nth(2).as_deref() == Some("rest-server") {
-            let operator = ct_agent::channel_run::operator_key_from_env()
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-            let config = ct_agent::rest_server::RestServerConfig::from_env()
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?
-                .ok_or("CT_REST_SERVER must be set to \"local\" to run `channel rest-server`")?;
-            let state_dir = std::env::var("CT_AGENT_STATE_DIR").ok().map(std::path::PathBuf::from);
-            ct_agent::rest_server::run(config, operator, state_dir.as_deref())
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-            return Ok(());
-        }
         // scimbe/ct-agent#9 `ct-agent channel invite`: as the operator, sign an invitation for
         // an identity you don't already have holder/noise material for (the cross-account case
         // `channel grant` can't cover). Reads CT_CHANNEL_OPERATOR_KEY + CT_INVITE_*, pure local
@@ -587,7 +560,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             const KNOWN: &[&str] = &[
                 "init", "operator-init", "member-material", "join-pipeline-role", "grant",
                 "invite", "bind-topology", "super-peer", "register", "allowlist", "agent-card",
-                "rest-server",
             ];
             if !KNOWN.contains(&sub.as_str()) {
                 eprintln!("ct-agent: unrecognized channel subcommand '{sub}'\n");
