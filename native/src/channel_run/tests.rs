@@ -1293,6 +1293,9 @@ fn bridge_manifest_tools_refuse_every_caller_that_is_not_the_configured_bridge_p
     for (name, arguments) in [
         ("bridge/config", serde_json::json!({})),
         ("bridge/channel-members", serde_json::json!({})),
+        ("bridge/allowlist-list", serde_json::json!({})),
+        ("bridge/allowlist-add", serde_json::json!({ "email": "someone@example.com" })),
+        ("bridge/allowlist-remove", serde_json::json!({ "email": "someone@example.com" })),
         ("bridge/manifest-list", serde_json::json!({})),
         (
             "bridge/manifest-install",
@@ -1367,6 +1370,25 @@ fn bridge_manifest_install_rejects_missing_fields_without_panicking() {
     let response = decode_response(&reg.dispatch_ctx(&ctx, &request)).expect("valid JSON-RPC response");
     assert!(response.result.is_none(), "missing project_name must not return a result");
     assert!(response.error.is_some(), "missing project_name must be a JSON-RPC error");
+}
+
+#[test]
+fn bridge_allowlist_add_and_remove_reject_a_missing_email_without_panicking() {
+    // Same ordering as manifest-install -- args validated before env/network -- so no env-var
+    // setup needed here either.
+    use ct_common::mcp::{decode_response, encode_request, CallContext, ToolRegistry};
+
+    let bridge_peer = [0x99u8; 32];
+    let mut reg = ToolRegistry::new();
+    register_bridge_tools(&mut reg, bridge_peer);
+    let ctx = CallContext::authenticated(bridge_peer);
+
+    for name in ["bridge/allowlist-add", "bridge/allowlist-remove"] {
+        let request = encode_request(1, "tools/call", serde_json::json!({ "name": name, "arguments": {} }));
+        let response = decode_response(&reg.dispatch_ctx(&ctx, &request)).expect("valid JSON-RPC response");
+        assert!(response.result.is_none(), "{name}: missing email must not return a result");
+        assert!(response.error.is_some(), "{name}: missing email must be a JSON-RPC error");
+    }
 }
 
 #[test]

@@ -778,11 +778,14 @@ pub(crate) fn decode_hex_32_bridge_peer(s: &str) -> Option<[u8; 32]> {
 /// non-bridge caller is the entire security boundary "nur der richtig eingeloggte Nutzer darf
 /// den Agent steuern" rests on at the agent's own admission point, independent of whatever the
 /// portal itself checks. `bridge/status`, `bridge/config`, `bridge/channel-members`,
-/// `bridge/manifest-list`, `bridge/manifest-install` ship in this pass; `bridge/cert-status`
-/// (needs cross-process state -- the `channel --serve` process and the `certificate` renewal
-/// daemon are separate processes, not yet wired to share tier state) and
-/// allowlist-add/remove/channel-revoke (mutating, need an explicit-confirmation story on the
-/// portal side first) are the next increments, same list this feature's plan already scoped.
+/// `bridge/allowlist-list`, `bridge/allowlist-add`, `bridge/allowlist-remove`,
+/// `bridge/manifest-list`, `bridge/manifest-install` ship in this pass. The mutating
+/// allowlist-add/remove tools ARE gated (bridge-peer-only, same as everything else here) but
+/// the portal's own confirmation-before-calling UX is separate, not-yet-built work -- this
+/// tool existing safely does not mean the portal should call it without one yet. Only
+/// `bridge/cert-status` (needs cross-process state -- the `channel --serve` process and the
+/// `certificate` renewal daemon are separate processes, not yet wired to share tier state) and
+/// `bridge/channel-revoke` remain, same list this feature's plan already scoped.
 pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, bridge_peer: [u8; 32]) {
     reg.register_ctx(
         "bridge/status",
@@ -859,6 +862,82 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
                     .map_err(|e| format!("GET .../channels/{channel_hex}/members: invalid JSON response: {e}"))
             })?;
             Ok(body)
+        },
+    );
+    reg.register_ctx(
+        "bridge/allowlist-list",
+        "List the e-mails allow-listed for self-service claim on this agent's own channel \
+         (ChannelAllowlistRequest/ControlPlaneClient::channel_allowlist_list -- the exact \
+         already-shipped call `ct-agent channel allowlist list` itself makes). No arguments.",
+        move |ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
+            if ctx.peer != Some(bridge_peer) {
+                return Err("bridge/allowlist-list: caller is not this agent's configured bridge peer".to_string());
+            }
+            let env = |k: &str| std::env::var(k).ok();
+            let emails = tokio::runtime::Handle::current().block_on(async {
+                let token = crate::login::resolve_oidc_token().await?;
+                let req = ChannelAllowlistRequest::from_lookup_with_token(env, token)?;
+                ct_control_plane::client::ControlPlaneClient::new(req.cp_url.clone())
+                    .channel_allowlist_list(&req.channel_hex, &req.token)
+                    .await
+                    .map_err(|e| e.to_string())
+            })?;
+            Ok(serde_json::json!({ "emails": emails }))
+        },
+    );
+    reg.register_ctx(
+        "bridge/allowlist-add",
+        "Allow-list an e-mail for self-service claim on this agent's own channel. Arguments: \
+         {email}. Same call `ct-agent channel allowlist add <email>` already makes \
+         (ControlPlaneClient::channel_allowlist_add) -- owner-scoped by the resolved OIDC \
+         bearer token, not by anything the caller supplies.",
+        move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
+            if ctx.peer != Some(bridge_peer) {
+                return Err("bridge/allowlist-add: caller is not this agent's configured bridge peer".to_string());
+            }
+            let email = args
+                .get("email")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "bridge/allowlist-add: missing string field `email`".to_string())?
+                .to_string();
+            let env = |k: &str| std::env::var(k).ok();
+            tokio::runtime::Handle::current().block_on(async {
+                let token = crate::login::resolve_oidc_token().await?;
+                let req = ChannelAllowlistRequest::from_lookup_with_token(env, token)?;
+                ct_control_plane::client::ControlPlaneClient::new(req.cp_url.clone())
+                    .channel_allowlist_add(&req.channel_hex, &email, &req.token)
+                    .await
+                    .map_err(|e| e.to_string())
+            })?;
+            Ok(serde_json::json!({ "allow_listed": email }))
+        },
+    );
+    reg.register_ctx(
+        "bridge/allowlist-remove",
+        "Remove an e-mail from this agent's own channel's self-service allow-list. Arguments: \
+         {email}. Same call `ct-agent channel allowlist remove <email>` already makes \
+         (ControlPlaneClient::channel_allowlist_remove) -- owner-scoped by the resolved OIDC \
+         bearer token, not by anything the caller supplies. Does NOT revoke an already-claimed \
+         membership -- only stops a NEW claim of that e-mail going forward.",
+        move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
+            if ctx.peer != Some(bridge_peer) {
+                return Err("bridge/allowlist-remove: caller is not this agent's configured bridge peer".to_string());
+            }
+            let email = args
+                .get("email")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "bridge/allowlist-remove: missing string field `email`".to_string())?
+                .to_string();
+            let env = |k: &str| std::env::var(k).ok();
+            tokio::runtime::Handle::current().block_on(async {
+                let token = crate::login::resolve_oidc_token().await?;
+                let req = ChannelAllowlistRequest::from_lookup_with_token(env, token)?;
+                ct_control_plane::client::ControlPlaneClient::new(req.cp_url.clone())
+                    .channel_allowlist_remove(&req.channel_hex, &email, &req.token)
+                    .await
+                    .map_err(|e| e.to_string())
+            })?;
+            Ok(serde_json::json!({ "removed": email }))
         },
     );
     reg.register_ctx(
