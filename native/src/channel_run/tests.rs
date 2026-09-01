@@ -1291,6 +1291,7 @@ fn bridge_manifest_tools_refuse_every_caller_that_is_not_the_configured_bridge_p
     register_bridge_tools(&mut reg, bridge_peer);
 
     for (name, arguments) in [
+        ("bridge/config", serde_json::json!({})),
         ("bridge/manifest-list", serde_json::json!({})),
         (
             "bridge/manifest-install",
@@ -1305,6 +1306,35 @@ fn bridge_manifest_tools_refuse_every_caller_that_is_not_the_configured_bridge_p
         let response = decode_response(&reg.dispatch(&request)).expect("valid JSON-RPC response");
         assert!(response.result.is_none(), "{name}: an anonymous caller must not get a result");
         assert!(response.error.is_some(), "{name}: an anonymous caller must be a JSON-RPC error, not a silent failure");
+    }
+}
+
+#[test]
+fn bridge_config_tool_answers_the_configured_bridge_peer_with_only_non_secret_fields() {
+    // Doesn't assert specific env-dependent VALUES (role/broker/etc. are read from the real
+    // process environment, which parallel tests share and this file deliberately never sets --
+    // see the sibling tests' own comments on that). Asserts the response shape instead, and
+    // that no field name here could plausibly hold a secret value.
+    use ct_common::mcp::{decode_response, encode_request, CallContext, ToolRegistry};
+
+    let bridge_peer = [0x99u8; 32];
+    let mut reg = ToolRegistry::new();
+    register_bridge_tools(&mut reg, bridge_peer);
+    let ctx = CallContext::authenticated(bridge_peer);
+
+    let request = encode_request(1, "tools/call", serde_json::json!({ "name": "bridge/config", "arguments": {} }));
+    let response = decode_response(&reg.dispatch_ctx(&ctx, &request)).expect("valid JSON-RPC response");
+    assert!(response.error.is_none(), "the configured bridge peer must be answered: {:?}", response.error);
+    let result = response.result.expect("result present");
+    let obj = result.as_object().expect("object result");
+    for key in ["role", "broker", "relay", "direct_upgrade", "masque_fallback_configured", "grant_issuance_configured", "manifest_registry_configured"] {
+        assert!(obj.contains_key(key), "missing expected field `{key}`");
+    }
+    for key in obj.keys() {
+        assert!(
+            !key.to_lowercase().contains("key") && !key.to_lowercase().contains("token") && !key.to_lowercase().contains("secret"),
+            "field `{key}` name suggests it might hold a secret value -- bridge/config must only ever report booleans/non-secret summaries"
+        );
     }
 }
 
