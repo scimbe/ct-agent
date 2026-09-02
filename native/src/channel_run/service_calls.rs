@@ -823,6 +823,7 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
                 "masque_fallback_configured": masque_configured,
                 "grant_issuance_configured": env("CT_CHANNEL_OPERATOR_KEY").is_some(),
                 "manifest_registry_configured": env("CT_MANIFEST_REGISTRY_URL").is_some(),
+                "manifest_install_disabled": env("CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL").is_some(),
             }))
         },
     );
@@ -981,10 +982,20 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
          Trust allowlist, work directory, and registry-ledger config all come from this agent's OWN \
          configuration (CT_MANIFEST_TRUST_ALLOWLIST[_FILE]/CT_MANIFEST_WORK_DIR/CT_MANIFEST_*), \
          never from the caller -- the portal picks WHICH manifest, never WHO is trusted to publish \
-         one. Returns the same structured InstallReport `ct-agent manifest activate` prints.",
+         one. Returns the same structured InstallReport `ct-agent manifest activate` prints. Refused \
+         unconditionally, for every caller including the bridge peer, when this agent's own \
+         CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL is set -- the owner's own opt-out, independent of \
+         who the bridge peer or trust allowlist otherwise trust.",
         move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
             if ctx.peer != Some(bridge_peer) {
                 return Err("bridge/manifest-install: caller is not this agent's configured bridge peer".to_string());
+            }
+            if std::env::var("CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL").is_ok() {
+                return Err(
+                    "bridge/manifest-install: disabled on this agent (CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL \
+                     is set) -- unset it locally to allow remote manifest installs again"
+                        .to_string(),
+                );
             }
             let manifest_location = args
                 .get("manifest_location")
