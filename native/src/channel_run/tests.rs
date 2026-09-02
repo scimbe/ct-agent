@@ -1331,7 +1331,16 @@ fn bridge_config_tool_answers_the_configured_bridge_peer_with_only_non_secret_fi
     assert!(response.error.is_none(), "the configured bridge peer must be answered: {:?}", response.error);
     let result = response.result.expect("result present");
     let obj = result.as_object().expect("object result");
-    for key in ["role", "broker", "relay", "direct_upgrade", "masque_fallback_configured", "grant_issuance_configured", "manifest_registry_configured"] {
+    for key in [
+        "role",
+        "broker",
+        "relay",
+        "direct_upgrade",
+        "masque_fallback_configured",
+        "grant_issuance_configured",
+        "manifest_registry_configured",
+        "manifest_install_disabled",
+    ] {
         assert!(obj.contains_key(key), "missing expected field `{key}`");
     }
     for key in obj.keys() {
