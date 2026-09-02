@@ -431,6 +431,18 @@ fn holder_sign_inner(holder_private_hex: &str, message: &[u8]) -> Result<Vec<u8>
     Ok(sk.sign(message).to_bytes().to_vec())
 }
 
+// The pure, testable core behind holder_verify below -- same native-test reason
+// as holder_sign_inner: plain `Result<_, String>`, no JsError construction.
+fn holder_verify_inner(holder_public_hex: &str, message: &[u8], signature: &[u8]) -> Result<bool, String> {
+    use ed25519_dalek::Verifier;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&hex32(holder_public_hex)?)
+        .map_err(|_| "invalid public key: not a valid ed25519 point".to_string())?;
+    let sig_bytes: [u8; 64] =
+        signature.try_into().map_err(|_| "expected 64-byte signature".to_string())?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    Ok(vk.verify(message, &sig).is_ok())
+}
+
 fn build_channel_join_request_inner(grant_hex: &str, endpoint: &str) -> Result<Vec<u8>, String> {
     let grant_bytes = from_hex(grant_hex)?;
     let grant = ct_common::channel::SignedChannelGrant::decode(&grant_bytes).map_err(|e| e.to_string())?;
@@ -447,6 +459,20 @@ fn build_channel_join_request_inner(grant_hex: &str, endpoint: &str) -> Result<V
 #[wasm_bindgen(js_name = holderSign)]
 pub fn holder_sign(holder_private_hex: &str, message: &[u8]) -> Result<Vec<u8>, JsError> {
     holder_sign_inner(holder_private_hex, message).map_err(|e| JsError::new(&e))
+}
+
+/// Verify an ed25519 signature produced by [`holder_sign`] (or by any other
+/// ed25519 signer over the same holder key), against a holder's PUBLIC key --
+/// the counterpart JS callers need to check a signature without ever handling
+/// the corresponding private key (e.g. verifying a peer's manifest/possession
+/// proof client-side). Returns `Ok(false)` for a mismatched key, tampered
+/// message, or tampered signature -- never panics or throws on those; the
+/// `Err`/`JsError` path is reserved for malformed *input encoding* (bad hex,
+/// wrong-length signature), i.e. "the caller couldn't even ask the question",
+/// not "the answer is no".
+#[wasm_bindgen(js_name = holderVerify)]
+pub fn holder_verify(holder_public_hex: &str, message: &[u8], signature: &[u8]) -> Result<bool, JsError> {
+    holder_verify_inner(holder_public_hex, message, signature).map_err(|e| JsError::new(&e))
 }
 
 /// Build the exact bytes a browser member sends to join a channel, from a
@@ -679,5 +705,54 @@ mod tests {
     fn holder_sign_rejects_a_malformed_private_key_hex() {
         assert!(holder_sign_inner("nothex", b"msg").is_err());
         assert!(holder_sign_inner("aa", b"msg").is_err(), "too short to be 32 bytes");
+    }
+
+    #[test]
+    fn holder_sign_then_holder_verify_round_trips_over_arbitrary_bytes() {
+        let holder = generate_holder_identity();
+        let message = b"an arbitrary caller-supplied message, not a fixed 32-byte challenge";
+
+        let sig = holder_sign_inner(&holder.private_hex(), message).unwrap();
+        assert!(holder_verify_inner(&holder.public_hex(), message, &sig).unwrap());
+    }
+
+    #[test]
+    fn holder_verify_rejects_a_tampered_message() {
+        let holder = generate_holder_identity();
+        let message = b"the original message";
+        let sig = holder_sign_inner(&holder.private_hex(), message).unwrap();
+
+        assert!(!holder_verify_inner(&holder.public_hex(), b"a different message", &sig).unwrap());
+    }
+
+    #[test]
+    fn holder_verify_rejects_a_tampered_signature() {
+        let holder = generate_holder_identity();
+        let message = b"the original message";
+        let mut sig = holder_sign_inner(&holder.private_hex(), message).unwrap();
+        sig[0] ^= 0xFF; // flip a bit in the signature itself
+
+        assert!(!holder_verify_inner(&holder.public_hex(), message, &sig).unwrap());
+    }
+
+    #[test]
+    fn holder_verify_rejects_a_signature_from_a_different_key() {
+        let holder = generate_holder_identity();
+        let other = generate_holder_identity();
+        let message = b"the original message";
+        let sig = holder_sign_inner(&holder.private_hex(), message).unwrap();
+
+        assert!(!holder_verify_inner(&other.public_hex(), message, &sig).unwrap());
+    }
+
+    #[test]
+    fn holder_verify_rejects_malformed_input_encoding() {
+        assert!(holder_verify_inner("nothex", b"msg", &[0u8; 64]).is_err());
+        assert!(holder_verify_inner("aa", b"msg", &[0u8; 64]).is_err(), "too short to be 32 bytes");
+        let holder = generate_holder_identity();
+        assert!(
+            holder_verify_inner(&holder.public_hex(), b"msg", &[0u8; 10]).is_err(),
+            "too short to be a 64-byte signature"
+        );
     }
 }
