@@ -1582,6 +1582,7 @@ fn channel_register_request_parses_env_and_derives_the_operator_pubkey() {
     assert_eq!(req.cp_url, "http://cp:8090");
     assert_eq!(req.channel_hex, hex_encode(&channel), "channel id round-trips as canonical hex");
     assert_eq!(req.token, "the-bearer-token");
+    assert!(!req.rekey, "#747: an operator rotation is never implied -- only --rekey / CT_CHANNEL_REKEY=1 sets it");
     // The operator PRIVATE key is never surfaced — only its derived public key is sent.
     assert_eq!(req.operator_pubkey_hex, op.pubkey_hex(), "derives the operator public key");
     assert_ne!(req.operator_pubkey_hex, op.key_hex(), "the private key is not sent to the CP");
@@ -1605,6 +1606,38 @@ fn channel_register_request_parses_env_and_derives_the_operator_pubkey() {
         let pruned: Vec<(&str, String)> = base.iter().filter(|(k, _)| *k != drop_key).cloned().collect();
         assert!(lookup(&pruned).is_err(), "missing {drop_key} must be rejected");
     }
+}
+
+#[test]
+fn channel_register_request_parses_the_rekey_flag_747() {
+    // CADS-Tunnel#747: registering a channel you already own with a DIFFERENT operator key
+    // is refused (409) unless the rotation is confirmed. `CT_CHANNEL_REKEY` is the env
+    // spelling of `--rekey`: off by default, on for the usual truthy values, and a
+    // garbage value is an error -- never a silent "off" (a typo must not turn an intended
+    // rotation into a puzzling 409).
+    let op = OperatorIdentity::generate();
+    let channel = [0x92u8; 32];
+    let with = |rekey: Option<&str>| {
+        let mut pairs: Vec<(&str, String)> = vec![
+            ("CT_AGENT_CP_URL", "http://cp:8090".into()),
+            ("CT_CHANNEL_ID", hex_encode(&channel)),
+            ("CT_CHANNEL_OPERATOR_KEY", op.key_hex()),
+            ("CT_OIDC_TOKEN", "tok".into()),
+        ];
+        if let Some(v) = rekey {
+            pairs.push(("CT_CHANNEL_REKEY", v.to_string()));
+        }
+        let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        ChannelRegisterRequest::from_lookup(move |k| m.get(k).cloned())
+    };
+    assert!(!with(None).expect("parses").rekey, "unset -> no rotation");
+    for v in ["1", "true", "TRUE", " yes "] {
+        assert!(with(Some(v)).expect("parses").rekey, "{v:?} -> rotation confirmed");
+    }
+    for v in ["0", "false", "", "no"] {
+        assert!(!with(Some(v)).expect("parses").rekey, "{v:?} -> no rotation");
+    }
+    assert!(with(Some("maybe")).is_err(), "an unrecognised value is rejected, not silently off");
 }
 
 #[test]

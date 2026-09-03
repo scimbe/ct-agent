@@ -777,6 +777,11 @@ fn decode_hex_64(s: &str) -> Option<[u8; 64]> {
     Some(out)
 }
 
+/// Phase-2 consolidation PR4: proves this module's join protocol and ct_common's
+/// `channel_wire`/`channel_quic` port of it behave byte-identically (see the file).
+#[cfg(test)]
+mod parity_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -328,7 +328,7 @@ impl OperatorIdentity {
     pub fn operator_env_block(&self) -> String {
         format!(
             "# Agent-Fabric channel OPERATOR identity — generated locally, keep the key secret.\n\
-             # Register this PUBLIC key as the channel authority (POST /channel/register):\n\
+             # Register this PUBLIC key as the channel authority (`ct-agent channel register`, POST /me/channels):\n\
              #   operator_pubkey = {op_pub}\n\
              export CT_CHANNEL_OPERATOR_KEY={op_priv}\n",
             op_pub = self.pubkey_hex(),
@@ -776,6 +776,13 @@ pub struct ChannelRegisterRequest {
     pub operator_pubkey_hex: String,
     /// The OIDC bearer token identifying the owner (the verified subject).
     pub token: String,
+    /// CADS-Tunnel#747: confirm an operator-key ROTATION. Re-registering a channel you
+    /// already own with the SAME operator key is an idempotent 200; with a DIFFERENT key
+    /// the control plane refuses (409) unless this is set, because every grant the previous
+    /// operator signed stops verifying the moment the authority changes. `true` from the
+    /// `--rekey` flag or `CT_CHANNEL_REKEY=1`; never implied. Sent as `confirm_rekey` on
+    /// the wire only when set (older control planes see the unchanged request shape).
+    pub rekey: bool,
 }
 
 impl ChannelRegisterRequest {
@@ -815,7 +822,15 @@ impl ChannelRegisterRequest {
                     .to_string(),
             );
         };
-        Ok(Self { cp_url, channel_hex, operator_pubkey_hex, token })
+        // #747: rotation is opt-in and explicit. Only the usual truthy spellings turn it on;
+        // an unrecognised value is an error rather than a silent "off", so a typo can never
+        // turn an intended rotation into a confusing 409 (or, worse, the reverse).
+        let rekey = match f("CT_CHANNEL_REKEY").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("0") | Some("false") | Some("no") => false,
+            Some("1") | Some("true") | Some("yes") => true,
+            Some(other) => return Err(format!("CT_CHANNEL_REKEY must be 1/true or 0/false, got {other:?}")),
+        };
+        Ok(Self { cp_url, channel_hex, operator_pubkey_hex, token, rekey })
     }
 }
 

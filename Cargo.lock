@@ -584,7 +584,7 @@ dependencies = [
 [[package]]
 name = "ct-client"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.18#cc6edcd0f958f5fd9c5ee29941f58fcac95def37"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.19#ce2979c237fea6ed860422694f8617d5b346e1b1"
 dependencies = [
  "ct-common",
  "futures-util",
@@ -597,11 +597,13 @@ dependencies = [
 [[package]]
 name = "ct-common"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.18#cc6edcd0f958f5fd9c5ee29941f58fcac95def37"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.19#ce2979c237fea6ed860422694f8617d5b346e1b1"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
+ "quinn",
  "rand 0.8.8",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -614,7 +616,7 @@ dependencies = [
 [[package]]
 name = "ct-control-plane"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.18#cc6edcd0f958f5fd9c5ee29941f58fcac95def37"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.19#ce2979c237fea6ed860422694f8617d5b346e1b1"
 dependencies = [
  "axum",
  "base64",
@@ -633,13 +635,14 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "x25519-dalek",
  "x509-parser",
 ]
 
 [[package]]
 name = "ct-dns"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.18#cc6edcd0f958f5fd9c5ee29941f58fcac95def37"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.19#ce2979c237fea6ed860422694f8617d5b346e1b1"
 dependencies = [
  "axum",
  "hickory-resolver 0.26.1",
@@ -651,7 +654,7 @@ dependencies = [
 [[package]]
 name = "ct-edge"
 version = "0.0.0"
-source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.18#cc6edcd0f958f5fd9c5ee29941f58fcac95def37"
+source = "git+https://github.com/scimbe/CADS-Tunnel?tag=v0.4.19#ce2979c237fea6ed860422694f8617d5b346e1b1"
 dependencies = [
  "axum",
  "ct-common",
@@ -666,6 +669,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "serde",
+ "sha2",
  "socket2 0.5.10",
  "time",
  "tokio",
@@ -3580,7 +3584,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

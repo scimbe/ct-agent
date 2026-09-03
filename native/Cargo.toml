@@ -14,10 +14,10 @@ repository = "https://github.com/scimbe/ct-agent"
 # native-only (never needed by the wasm build) so they keep their own explicit
 # pins here, bumped in lockstep with the shared one by convention.
 ct-common.workspace = true
-ct-control-plane = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.18" }
+ct-control-plane = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.19" }
 # ACME (ADR-0003): Dns01Provider (SelfHosted ct-dns / deSEC) publishes the
 # _acme-challenge TXT record the DNS-01 validation reads.
-ct-dns = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.18" }
+ct-dns = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.19" }
 # ct-control-plane/ct-dns above; bumped by tag, never floating. v0.4.0-phase5 adds the
 # installer_kind Binary executor (K8s stays schema-only) on top of Phase 1's Compose executor.
 # v0.4.1-phase5 fixes a path-traversal gap found in review of this repo's #72: installer-engine's
@@ -126,6 +126,13 @@ libc = "0.2"
 nat-lab = []
 
 [dev-dependencies]
+# Phase-2 consolidation PR4: the channel join protocol's client half now lives in ct-common
+# (`channel_wire`/`channel_quic`, a verbatim port of this crate's channel.rs). Its
+# `test-support` feature exposes the grant/operator fixtures and the `ScriptedBroker` the
+# parity test (`channel/parity_tests.rs`) drives BOTH implementations against, before
+# PR5 replaces the local bodies with re-exports. Same pinned workspace dependency as the
+# runtime dep above -- the feature is test-only and never enabled in a release build.
+ct-common = { workspace = true, features = ["test-support"] }
 # test-util enables `#[tokio::test(start_paused = true)]` for deterministic timeout tests (#126).
 tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
@@ -133,8 +140,8 @@ http-body-util = "0.1"
 # Cross-crate integration tests (channel.rs, transport.rs, serve.rs, channel_run.rs) drive
 # a real ct-edge relay / ct-client dialer end-to-end. Same pinned-tag git dependency as the
 # runtime deps above -- these are dev-only, never shipped in a release binary.
-ct-edge = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.18" }
-ct-client = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.18" }
+ct-edge = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.19" }
+ct-client = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.19" }
 # harness_run's manifest-trust regression tests need real temp directories/files (a signed
 # manifest/task pair on disk, containment-check escapes) -- same "3" pin `installer-engine`/
 # `harness-core` already use for the same purpose.
