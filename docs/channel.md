@@ -105,6 +105,18 @@ QUIC pairer.
 
 ## Wire sequence — the big picture
 
+> **Normative source.** Since the Phase-2 consolidation (ADR-0020 amendment; ct-agent PR5) the
+> channel join wire protocol's client half — the outcome type, the `OK`-line grammar and ack
+> parser, refusal-category decoding, park-expiry classification, the stream-generic admission
+> exchange for the rendezvous and relay legs, and the QUIC channel dialer — lives in CADS-Tunnel's
+> `ct_common::channel_wire` / `channel_wire::io` / `channel_quic`, a verbatim port of this crate's
+> former `channel.rs`/`transport.rs` bodies together with their guard tests. `ct-agent` re-exports
+> it (`native/src/channel.rs`) and keeps only its policy: the `CT_CHANNEL_PHASE_MARKER` switch,
+> the `:443` marker gate, `present_channel_join_marked`, the dial ladders and everything under
+> `channel_run/`. A wire-behaviour question is answered by ct-common's source; a wire change lands
+> there first and reaches this crate through the pinned tag (all five CADS-Tunnel pins move
+> together — CI's lockfile guard enforces it).
+
 The full first-contact message sequence over the `:443` front door (both members
 `FRONT_DOOR_ONLY`, acceptor in `--serve`), every hop of which was packet-verified in
 production on 2026-08-14. Two independent phases ride separate TLS connections: the
