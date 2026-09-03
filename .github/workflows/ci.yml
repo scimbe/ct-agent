@@ -21,6 +21,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Lockfile guard -- exactly one ct-common and one ct-control-plane
+        # Phase-2 consolidation (CADS-Tunnel/ct-agent, design §4): this crate pins FIVE
+        # CADS-Tunnel crates by tag -- ct-common (root workspace dep), ct-control-plane and
+        # ct-dns (native/Cargo.toml), and the dev-deps ct-edge and ct-client. They must be
+        # bumped TOGETHER: with mixed tags, ct-edge's (and ct-control-plane's) own
+        # path-dependency on ct-common resolves to a SECOND ct-common package. The
+        # ct_edge-driven tests then stop unifying types (loud), but the production binary
+        # can silently carry TWO ct-common copies via ct-control-plane -- two copies of the
+        # wire-protocol constants and parsers. Cargo.lock lists every resolved package
+        # exactly once per version, so "one `name = ...` line" is the whole check.
+        run: |
+          for pkg in ct-common ct-control-plane; do
+            n="$(grep -c "^name = \"$pkg\"$" Cargo.lock || true)"
+            if [ "$n" != "1" ]; then
+              echo "::error::Cargo.lock carries $n copies of $pkg (expected exactly 1):" \
+                   "mixed CADS-Tunnel tag pins. Bump ct-common, ct-control-plane, ct-dns," \
+                   "ct-edge and ct-client to the SAME tag in one commit."
+              grep -n -A2 "^name = \"$pkg\"$" Cargo.lock || true
+              exit 1
+            fi
+          done
+          echo "lockfile guard: exactly one ct-common and one ct-control-plane resolved."
+
       - name: Build (-D warnings)
         run: cargo build --locked --all-targets
 

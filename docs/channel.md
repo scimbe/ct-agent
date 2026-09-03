@@ -59,6 +59,22 @@ onboarding/#141 already uses), else `$HOME/.ct-agent/oidc-token.json`. Written v
 create-at-`0600` helper every other on-disk secret in this codebase uses (`secret_file.rs`) — it
 is never world- or group-readable, even for an instant.
 
+## Registering the channel authority (`ct-agent channel register`)
+
+`ct-agent channel register` binds the channel id (`CT_CHANNEL_ID`, or the older `CT_GRANT_CHANNEL`)
+to the operator **public** key (derived from `CT_CHANNEL_OPERATOR_KEY`, or supplied as
+`CT_CHANNEL_OPERATOR_PUBKEY`) under your OIDC subject via `POST /me/channels`. Re-registering the
+**same** operator key is idempotent (a plain 200, nothing changes). Registering a **different**
+operator key for a channel you already own is refused with `409 Conflict` ([CADS-Tunnel#747]) — the
+control plane never rotates a channel's authority silently, because every grant the previous operator
+signed stops verifying the moment the authority changes. To rotate on purpose, pass `--rekey`
+(`ct-agent channel register --rekey`) or set `CT_CHANNEL_REKEY=1`: the rotation is audit-logged on the
+control plane, the command confirms it (`operator rotated; every grant signed by the previous operator
+stops verifying`), and you must then re-issue every member's `CT_CHANNEL_GRANT` with the new key
+(`ct-agent channel grant`). A 409 without the flag prints the control plane's own explanation verbatim.
+
+[CADS-Tunnel#747]: https://github.com/scimbe/CADS-Tunnel/issues/747
+
 ## Transport selection (the dial ladders)
 
 Broker and relay each get a ladder: **direct QUIC** (`CT_CHANNEL_BROKER` :4435 / `CT_CHANNEL_RELAY`
@@ -252,6 +268,7 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_CHANNEL_REFLEXIVE_EDGE` | `host:port` of the edge's QUIC "whoami" listener (its `'W'` reflexive-address echo, #248/#238). Defaults to the relay-gate host on port `4433`; override only when the edge's QUIC listener is somewhere else. |
 | `CT_CHANNEL_SUPER_PEER_LISTEN` / `CT_CHANNEL_SUPER_PEER_UPSTREAM` | LAN super-peer mode (both required): `CT_CHANNEL_SUPER_PEER_LISTEN` is the `host:port` that LAN-local members point their own `CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY` at **instead of the real edge**; `CT_CHANNEL_SUPER_PEER_UPSTREAM` is this super-peer's real edge. One WAN hop plus N−1 local ones. |
 | `CT_OIDC_TOKEN` | `channel register`/`channel allowlist` only: the OIDC bearer token identifying the channel owner. Explicit env value always wins; unset ⇒ falls back to the token `ct-agent login` stored locally (see [Getting the OIDC bearer token](#getting-the-oidc-bearer-token-ct-agent-login) above) |
+| `CT_CHANNEL_REKEY` | `channel register` only: `1`/`true` confirms an operator-key **rotation** for a channel you already registered with a different key (otherwise the control plane refuses with 409, [CADS-Tunnel#747]); the env spelling of `--rekey`. Every grant signed by the previous operator stops verifying. |
 | `CT_OIDC_ISSUER` | `ct-agent login` only: the Keycloak realm URL (e.g. `https://auth.bunsenbrenner.org/realms/ct-demo`) — same knob CADS-Tunnel's own portal login already reads |
 | `CT_OIDC_CLI_CLIENT_ID` | `ct-agent login` only: overrides the realm's public device-grant CLI client id (default `ct-agent-cli`) |
 | `CT_AGENT_LOGIN_TOKEN_FILE` | overrides where `ct-agent login` stores (and `channel register`/`allowlist` read) the token; default `<CT_AGENT_STATE_DIR>/oidc-token.json`, else `$HOME/.ct-agent/oidc-token.json` |

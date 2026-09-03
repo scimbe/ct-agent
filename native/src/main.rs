@@ -50,7 +50,7 @@ USAGE:
     ct-agent channel grant                As operator, sign a member's channel grant
     ct-agent channel invite               As operator, sign a cross-account channel invitation
     ct-agent channel bind-topology        As operator, sign a Topology Editor operator-binding proof
-    ct-agent channel register             Register a channel authority with the CP
+    ct-agent channel register [--rekey]   Register a channel authority with the CP (--rekey: rotate it)
     ct-agent channel allowlist add|remove|list   Manage a channel's self-service allow-list
     ct-agent channel agent-card           Write (and optionally register) this agent's card
     ct-agent channel agent-card --verify <file>  Verify a card file's signature/expiry
@@ -422,16 +422,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let token = ct_agent::login::resolve_oidc_token()
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-            let req = ct_agent::channel_run::ChannelRegisterRequest::from_lookup_with_token(
+            let mut req = ct_agent::channel_run::ChannelRegisterRequest::from_lookup_with_token(
                 |k| std::env::var(k).ok(),
                 token,
             )
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            // CADS-Tunnel#747: `--rekey` is the CLI spelling of CT_CHANNEL_REKEY=1 -- confirm
+            // an operator-key ROTATION for a channel this subject already registered with a
+            // different key. Without it the control plane answers 409 and says why; the
+            // 409's body is printed verbatim below (it rides in the client error's Display).
+            // Any other third argument is refused outright (#239 discipline): a mistyped
+            // flag must not silently degrade into a plain re-register.
+            match std::env::args().nth(3).as_deref() {
+                None => {}
+                Some("--rekey") => req.rekey = true,
+                Some(other) => {
+                    return Err(format!(
+                        "ct-agent channel register: unrecognized argument '{other}' (the only flag is --rekey)"
+                    )
+                    .into())
+                }
+            }
             ct_control_plane::client::ControlPlaneClient::new(req.cp_url.clone())
-                .register_channel(&req.channel_hex, &req.operator_pubkey_hex, &req.token)
+                .register_channel(&req.channel_hex, &req.operator_pubkey_hex, &req.token, req.rekey)
                 .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+                // `main` reports its error with `Debug`; wrapping the client error's Display
+                // text keeps the control plane's plain-text reason (the #747 409 hint) readable.
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("ct-agent channel register: {e}").into()
+                })?;
             eprintln!("registered channel {} with the control plane", req.channel_hex);
+            if req.rekey {
+                eprintln!("operator rotated; every grant signed by the previous operator stops verifying");
+            }
             return Ok(());
         }
         // #248-follow `ct-agent channel allowlist add|remove|list`: manage a channel's
