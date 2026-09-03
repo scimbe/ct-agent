@@ -7,7 +7,7 @@
 //! actual TCP fallback transport (P1.2c) and reconnect-on-drop (P1.2b) follow.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use std::path::Path;
@@ -49,95 +49,14 @@ pub fn build_direct_listener() -> Result<(Endpoint, CertificateDer<'static>), Bo
     build_direct_listener_at(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
 }
 
-/// A rustls verifier that accepts **any** server certificate but still checks the
-/// handshake signature is internally consistent (the peer holds the key for the cert
-/// it presented). This is intentional for the Agent-Fabric A2A channel dialer
-/// (#72/#100): the QUIC/TLS layer is only transport, and the *real* mutual
-/// authentication is the Noise_IK session keyed on the members' pinned static keys —
-/// a transport-layer MITM cannot complete the Noise handshake without the peer's
-/// private key. So the initiator needs no pre-shared transport cert (only the peer's
-/// Noise key), which is what lets the A2A one-liner stay self-contained.
-#[derive(Debug)]
-struct AcceptAnyServerCert(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
-    }
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-/// Build the Agent-Fabric A2A channel **dialer** (#72/#100): a QUIC client endpoint
-/// that trusts any responder transport cert (see [`AcceptAnyServerCert`]), so the
-/// initiator can dial a paired peer without a pre-shared cert. Authentication is the
-/// Noise_IK session run over the connection, not the QUIC cert.
-pub fn build_channel_dialer() -> Result<Endpoint, BoxError> {
-    // #114 #4: cache the runtime-independent rustls/QUIC client config so it is built
-    // ONCE, not rebuilt (rustls builder + cert verifier + QUIC crypto) on every channel
-    // dial (broker, relay, and each direct-peer / ladder rung). The UDP socket is still
-    // bound per call: a quinn `Endpoint`'s driver is tied to its creating tokio runtime,
-    // so it cannot be safely memoized process-wide (that would break across runtimes);
-    // reusing one `Endpoint` per join flow is a separate, localized follow.
-    static CLIENT_CONFIG: OnceLock<quinn::ClientConfig> = OnceLock::new();
-    let cfg = match CLIENT_CONFIG.get() {
-        Some(c) => c.clone(),
-        None => {
-            install_crypto_provider();
-            let provider = Arc::new(rustls::crypto::ring::default_provider());
-            let crypto = rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(provider)))
-                .with_no_client_auth();
-            let mut cfg = quinn::ClientConfig::new(Arc::new(
-                quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
-            ));
-            // #139: bound a dead-but-connected direct link at the transport level. Without a
-            // max_idle_timeout a QUIC connection that handshakes then goes silent (asymmetric NAT, a
-            // middlebox dropping post-handshake packets) never dies, so an await on it — `open_bi`,
-            // the Noise_IK handshake, the pump — can hang forever with no relay fallback. A ~20s idle
-            // timeout kills such a connection so those awaits error and the direct path can fall
-            // back; a 5s keepalive (< the idle timeout) holds a *live* but idle data session open so
-            // the timeout only ever fires on a genuinely dead path.
-            let mut transport = quinn::TransportConfig::default();
-            transport.max_idle_timeout(Some(
-                quinn::IdleTimeout::try_from(std::time::Duration::from_secs(20)).expect("20s < quinn max idle"),
-            ));
-            transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-            cfg.transport_config(Arc::new(transport));
-            // A concurrent racer may win the set(); either config is equivalent.
-            let _ = CLIENT_CONFIG.set(cfg.clone());
-            cfg
-        }
-    };
-    let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
-    endpoint.set_default_client_config(cfg);
-    Ok(endpoint)
-}
+/// The Agent-Fabric A2A channel **dialer** (#72/#100): a QUIC client endpoint that trusts any
+/// responder transport cert (the real authentication is the Noise_IK session, not the QUIC
+/// cert), with the #114 once-built client config and the #139 idle/keepalive bounds.
+/// Phase-2 PR5: the verifier and the builder moved VERBATIM to ct_common's `channel_quic`
+/// (their normative home now); re-exported here so every `transport::build_channel_dialer`
+/// call site is unchanged. The cert-PINNED tunnel dialer below (`quic_client_config`,
+/// `dial_quic`) is a different thing and stays in this crate.
+pub use ct_common::channel_quic::build_channel_dialer;
 
 /// Advertise the Agent's direct-path listener to the Edge (M11.4b-ii): send a
 /// `'D'` message — `token(32) | addr_len(1) | addr | cert_len(2 BE) | cert` — so
@@ -937,20 +856,6 @@ mod tests {
              (which would mean the connect itself failed for an unrelated reason) and not \
              later (which would mean something is still unbounded)"
         );
-    }
-
-    #[tokio::test]
-    async fn build_channel_dialer_reuses_config_but_binds_its_own_socket() {
-        // #114 #4 (frozen): the client config is now built once and reused across dials,
-        // but each dialer still binds its OWN UDP socket (a quinn Endpoint's driver is
-        // tied to its creating runtime, so it can't be shared process-wide). Both calls
-        // must yield working, independently-bound client endpoints.
-        let a = build_channel_dialer().expect("first dialer builds");
-        let b = build_channel_dialer().expect("second dialer builds (config cache hit)");
-        let la = a.local_addr().expect("a is bound");
-        let lb = b.local_addr().expect("b is bound");
-        assert_ne!(la, lb, "each dialer binds its own socket (endpoints are not shared)");
-        assert!(la.port() != 0 && lb.port() != 0, "both endpoints are bound to a real port");
     }
 
     #[tokio::test]

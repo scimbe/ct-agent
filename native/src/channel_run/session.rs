@@ -14,6 +14,7 @@ use quinn::Connection;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use ct_common::a2a::{a2a_initiate, a2a_respond_verified};
+use ct_common::channel_quic::DIRECT_STREAM_SETUP_TIMEOUT;
 use ct_common::noise::noise_pump;
 
 /// Which side of the A2A session this agent drives. Selected from the channel
@@ -149,32 +150,21 @@ impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
     }
 }
 
-/// #139: how long a channel's QUIC stream setup (`open_bi`/`accept_bi`) may take past a successful
-/// `dial_peer_direct` connect before the direct path is treated as dead. A healthy connection sets
-/// the stream up sub-second; a conn that handshaked then went silent would otherwise hang here
-/// forever (the Noise handshake beyond this is already bounded, #126). Sits below the dialer's 20s
-/// idle-timeout (#139) so this tight bound fires first on the direct path.
-const DIRECT_STREAM_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
 /// Open (Initiate) or accept (Accept) the channel bi-stream on `conn`, **bounded** by `setup_timeout`
 /// (#139) so a stalled direct link fails fast (`io::ErrorKind::TimedOut`) instead of hanging — the
 /// exact `open_bi`/`accept_bi` gap central traced. The timeout is a parameter so tests can drive it
 /// deterministically without waiting the production bound.
+///
+/// Phase-2 PR5: the body (and [`DIRECT_STREAM_SETUP_TIMEOUT`]'s #139 rationale) moved VERBATIM to
+/// ct_common's `channel_quic::open_channel_streams`, which takes `initiator: bool` because
+/// [`ChannelRole`] is this crate's session-level notion; this is the one-line adapter, signature
+/// unchanged for every caller.
 pub(crate) async fn open_channel_streams(
     conn: &Connection,
     role: ChannelRole,
     setup_timeout: std::time::Duration,
 ) -> io::Result<(quinn::SendStream, quinn::RecvStream)> {
-    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::other(e.to_string());
-    let open = async {
-        match role {
-            ChannelRole::Initiate => conn.open_bi().await.map_err(|e| map_err(Box::new(e))),
-            ChannelRole::Accept => conn.accept_bi().await.map_err(|e| map_err(Box::new(e))),
-        }
-    };
-    tokio::time::timeout(setup_timeout, open)
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "direct channel stream setup stalled after connect (#139)"))?
+    ct_common::channel_quic::open_channel_streams(conn, matches!(role, ChannelRole::Initiate), setup_timeout).await
 }
 
 /// Run one side of an A2A channel session over the established `conn`, then pump
