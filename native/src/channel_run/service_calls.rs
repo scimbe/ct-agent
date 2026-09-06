@@ -844,6 +844,14 @@ pub(crate) fn decode_hex_32_bridge_peer(s: &str) -> Option<[u8; 32]> {
 /// `bridge/cert-status` (needs cross-process state -- the `channel --serve` process and the
 /// `certificate` renewal daemon are separate processes, not yet wired to share tier state) and
 /// `bridge/channel-revoke` remain, same list this feature's plan already scoped.
+///
+/// What the read-only tools return (CADS-Tunnel#763, the portal renders these directly):
+/// `bridge/config` is the non-secret summary from [`bridge_config_summary`] -- role/broker/relay
+/// plus `*_configured` readiness booleans and the `oidc_credential` kind, so the portal can show
+/// a readiness table and grey out the tools whose prerequisites are missing BEFORE the owner
+/// clicks them into an error. `bridge/manifest-list` is `{registry_url, manifests: [...]}` from
+/// [`enrich_manifest_list`], each registry entry carrying an added `manifest_url` the portal can
+/// hand straight back to `bridge/manifest-install` as `manifest_location`.
 pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, bridge_peer: [u8; 32]) {
     reg.register_ctx(
         "bridge/status",
@@ -863,26 +871,22 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
     reg.register_ctx(
         "bridge/config",
         "This agent's own non-secret configuration summary: role, broker/relay addresses, \
-         whether MASQUE fallback and channel/grant issuance are configured. Never returns actual \
-         key/token/secret VALUES, only which optional features are turned on. No arguments.",
+         whether MASQUE fallback and channel/grant issuance are configured, plus readiness flags \
+         saying which bridge tools can work from here: channel-members and allowlist-* need \
+         cp_url_configured + channel_id_configured + an oidc_credential (\"env\" or \"stored\", not \
+         \"none\"); manifest-list needs manifest_registry_configured; manifest-install additionally \
+         needs manifest_trust_allowlist_configured + manifest_work_dir_configured, and \
+         docker_available for compose-kind manifests. Never returns actual key/token/secret VALUES, \
+         only which optional features are turned on. No arguments.",
         move |ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
             if ctx.peer != Some(bridge_peer) {
                 return Err("bridge/config: caller is not this agent's configured bridge peer".to_string());
             }
-            let env = |k: &str| std::env::var(k).ok();
-            let masque_configured = ["CT_AGENT_MASQUE_PROXY", "CT_AGENT_MASQUE_SNI_HOST", "CT_AGENT_MASQUE_TARGET", "CT_AGENT_MASQUE_TOKEN"]
-                .iter()
-                .all(|k| env(k).is_some());
-            Ok(serde_json::json!({
-                "role": env("CT_CHANNEL_ROLE"),
-                "broker": env("CT_CHANNEL_BROKER"),
-                "relay": env("CT_CHANNEL_RELAY"),
-                "direct_upgrade": env("CT_CHANNEL_DIRECT_UPGRADE").is_some(),
-                "masque_fallback_configured": masque_configured,
-                "grant_issuance_configured": env("CT_CHANNEL_OPERATOR_KEY").is_some(),
-                "manifest_registry_configured": env("CT_MANIFEST_REGISTRY_URL").is_some(),
-                "manifest_install_disabled": env("CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL").is_some(),
-            }))
+            Ok(bridge_config_summary(
+                |k| std::env::var(k).ok(),
+                crate::login::stored_login_present(),
+                docker_on_path(),
+            ))
         },
     );
     reg.register_ctx(
@@ -1002,8 +1006,12 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
     reg.register_ctx(
         "bridge/manifest-list",
         "List manifests available from this agent's configured registry (CT_MANIFEST_REGISTRY_URL). \
-         Each entry's `installer_kind` is \"compose\" (sandboxed, Docker) or \"binary\" (raw, bare \
-         executable) -- the portal's picker surfaces this directly, no separate flag. No arguments.",
+         Returns {registry_url, manifests: [...]}: the registry's own entries (manifest_id, \
+         publisher_pubkey, name, version, guardrail_verdict, published_at) each with an added \
+         `manifest_url` ({registry_url}/manifests/{manifest_id}) that bridge/manifest-install accepts \
+         as `manifest_location` verbatim. An entry's `installer_kind`, where the registry reports one, \
+         is \"compose\" (sandboxed, Docker) or \"binary\" (raw, bare executable) -- the portal's picker \
+         surfaces this directly, no separate flag. No arguments.",
         move |ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
             if ctx.peer != Some(bridge_peer) {
                 return Err("bridge/manifest-list: caller is not this agent's configured bridge peer".to_string());
@@ -1028,7 +1036,7 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
                         .await
                         .map_err(|e| format!("GET {registry_url}/manifests: invalid JSON response: {e}"))
                 })?;
-            Ok(body)
+            Ok(enrich_manifest_list(&registry_url, body))
         },
     );
     reg.register_ctx(
@@ -1077,6 +1085,104 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
             serde_json::to_value(&report).map_err(|e| format!("bridge/manifest-install: encoding result: {e}"))
         },
     );
+}
+
+/// The `bridge/config` tool's whole answer, built purely from `env` (a `CT_*` lookup), whether a
+/// stored `ct-agent login` exists, and whether `docker` is on PATH -- so the readiness logic is
+/// unit-testable without touching the process environment (CADS-Tunnel#763). Only ever reports
+/// non-secret values: addresses/role as-is, everything else as a presence boolean or, for the
+/// OIDC credential, WHICH kind (`"env"` = `CT_OIDC_TOKEN`, `"stored"` = a prior login on disk,
+/// `"none"`) -- the same precedence `crate::login::resolve_oidc_token` applies. The `*_configured`
+/// flags mirror exactly what each bridge tool checks before it can work: `bridge/channel-members`
+/// and `bridge/allowlist-*` need `cp_url_configured` + `channel_id_configured` + a credential;
+/// `bridge/manifest-list` needs `manifest_registry_configured`; `bridge/manifest-install` also
+/// needs `manifest_trust_allowlist_configured` + `manifest_work_dir_configured`, and
+/// `docker_available` for compose-kind manifests. A `bool` can't leak a secret, so the portal may
+/// render this table freely.
+pub(crate) fn bridge_config_summary(
+    env: impl Fn(&str) -> Option<String>,
+    stored_login: bool,
+    docker_on_path: bool,
+) -> serde_json::Value {
+    let set = |k: &str| env(k).is_some_and(|v| !v.trim().is_empty());
+    let masque_configured = [
+        "CT_AGENT_MASQUE_PROXY",
+        "CT_AGENT_MASQUE_SNI_HOST",
+        "CT_AGENT_MASQUE_TARGET",
+        "CT_AGENT_MASQUE_TOKEN",
+    ]
+    .iter()
+    .all(|&k| env(k).is_some());
+    let oidc_credential = if set("CT_OIDC_TOKEN") {
+        "env"
+    } else if stored_login {
+        "stored"
+    } else {
+        "none"
+    };
+    serde_json::json!({
+        "role": env("CT_CHANNEL_ROLE"),
+        "broker": env("CT_CHANNEL_BROKER"),
+        "relay": env("CT_CHANNEL_RELAY"),
+        "direct_upgrade": env("CT_CHANNEL_DIRECT_UPGRADE").is_some(),
+        "masque_fallback_configured": masque_configured,
+        "grant_issuance_configured": env("CT_CHANNEL_OPERATOR_KEY").is_some(),
+        "manifest_registry_configured": env("CT_MANIFEST_REGISTRY_URL").is_some(),
+        "manifest_install_disabled": env("CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL").is_some(),
+        "cp_url_configured": set("CT_AGENT_CP_URL"),
+        "channel_id_configured": env("CT_CHANNEL_ID").is_some() || env("CT_GRANT_CHANNEL").is_some(),
+        "oidc_credential": oidc_credential,
+        "manifest_trust_allowlist_configured": env("CT_MANIFEST_TRUST_ALLOWLIST").is_some()
+            || env("CT_MANIFEST_TRUST_ALLOWLIST_FILE").is_some(),
+        "manifest_work_dir_configured": env("CT_MANIFEST_WORK_DIR").is_some(),
+        "docker_available": docker_on_path,
+    })
+}
+
+/// Whether a `docker` executable sits in one of this process's `PATH` directories -- i.e. whether
+/// a compose-kind manifest could be installed from here at all (CADS-Tunnel#763). A pure
+/// filesystem probe, deliberately NOT a `docker version` subprocess: `bridge/config` is a cheap
+/// read-only status call and must not spawn anything (or hang on a wedged daemon socket).
+fn docker_on_path() -> bool {
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|dir| dir.join("docker").is_file()))
+        .unwrap_or(false)
+}
+
+/// Shape the registry's `GET {registry_url}/manifests` answer into `bridge/manifest-list`'s
+/// result (CADS-Tunnel#763): `{registry_url, manifests}`. When `body` is the registry's JSON
+/// array, every object entry with a string `manifest_id` gains a `manifest_url` of
+/// `{registry_url}/manifests/{manifest_id}` -- the exact `manifest_location`
+/// `bridge/manifest-install` (and `ct-agent manifest activate`) accept -- unless the registry
+/// already supplied one, which is then left untouched; non-object elements pass through as-is. A
+/// non-array `body` (an older/other registry shape) is wrapped under `manifests` unchanged
+/// rather than dropped, so the portal always sees the same envelope.
+pub(crate) fn enrich_manifest_list(registry_url: &str, body: serde_json::Value) -> serde_json::Value {
+    let manifests = match body {
+        serde_json::Value::Array(entries) => serde_json::Value::Array(
+            entries
+                .into_iter()
+                .map(|entry| match entry {
+                    serde_json::Value::Object(mut obj) => {
+                        let id = obj.get("manifest_id").and_then(|v| v.as_str()).map(str::to_string);
+                        if let Some(id) = id.filter(|_| !obj.contains_key("manifest_url")) {
+                            obj.insert(
+                                "manifest_url".to_string(),
+                                serde_json::Value::String(format!("{registry_url}/manifests/{id}")),
+                            );
+                        }
+                        serde_json::Value::Object(obj)
+                    }
+                    other => other,
+                })
+                .collect(),
+        ),
+        other => other,
+    };
+    serde_json::json!({
+        "registry_url": registry_url,
+        "manifests": manifests,
+    })
 }
 
 /// Build the channel session's local app duplex from the environment (#135 L2.x). `CT_CHANNEL_CALL=<method>`
