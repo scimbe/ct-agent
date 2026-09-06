@@ -767,6 +767,11 @@ pub async fn run_activate(cfg: ActivateCliConfig) -> Result<Activation, String> 
     let report = tokio::task::spawn_blocking(move || installer_engine::activate(opts))
         .await
         .map_err(|e| format!("activation task failed: {e}"))?;
+    // ct-agent#178: one structured line per activation, whatever its verdict.
+    crate::events::emit(
+        crate::events::MANIFEST_INSTALL,
+        serde_json::json!({ "status": report_status_str(&report) }),
+    );
 
     // The marker is part of the activation, not an afterthought: it is the only thing that binds
     // the unpacked bytes to the manifest they were verified against (the tarball hash cannot be
@@ -820,6 +825,15 @@ async fn post_activation_ledger_event(registry: &RegistryActivationConfig, manif
         return Err(format!("HTTP {status}{}", if detail.is_empty() { String::new() } else { format!(" -- {detail}") }));
     }
     Ok(())
+}
+
+/// The report's verdict as the same lowercase word its JSON `status` field carries.
+pub fn report_status_str(report: &InstallReport) -> &'static str {
+    match report {
+        InstallReport::Ok { .. } => "ok",
+        InstallReport::Rejected { .. } => "rejected",
+        InstallReport::Failed { .. } => "failed",
+    }
 }
 
 /// Whether the install actually succeeded -- the caller exits non-zero when it did not, so that

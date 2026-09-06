@@ -468,14 +468,22 @@ pub(crate) async fn perform_update_into(
 /// [`perform_update`] together with the user-facing messages, so the CLI
 /// dispatch stays a thin call like every other subcommand there.
 pub async fn run_update(current_version: &str) -> Result<(), String> {
-    let check = check_latest(current_version).await?;
+    let check = match check_latest(current_version).await {
+        Ok(c) => c,
+        Err(e) => {
+            emit_update_check(&format!("error: {e}"));
+            return Err(e);
+        }
+    };
     if !check.update_available {
         eprintln!(
             "ct-agent: already on the latest release ({} == {})",
             check.current_version, check.latest_version
         );
+        emit_update_check("up-to-date");
         return Ok(());
     }
+    emit_update_check(&format!("available: {}", check.latest_version));
     eprintln!(
         "ct-agent: updating {} -> {} ({})",
         check.current_version, check.latest_version, check.asset_name
@@ -485,7 +493,14 @@ pub async fn run_update(current_version: &str) -> Result<(), String> {
         "ct-agent: updated to {} at {path:?} -- restart the agent to run the new build",
         check.latest_version
     );
+    crate::events::emit(crate::events::UPDATE_APPLIED, serde_json::json!({ "version": check.latest_version }));
     Ok(())
+}
+
+/// ct-agent#178: one `update_check {result}` event per release check, from both
+/// the manual subcommand and the background loop.
+fn emit_update_check(result: &str) {
+    crate::events::emit(crate::events::UPDATE_CHECK, serde_json::json!({ "result": result }));
 }
 
 /// Default check interval when `CT_AGENT_AUTO_UPDATE` is on but
@@ -539,21 +554,30 @@ impl AutoUpdateConfig {
 /// alongside the real serve loop -- this never returns on its own.
 pub async fn run_auto_update_loop(config: AutoUpdateConfig, current_version: String) -> ! {
     loop {
+        // ct-agent#178: every step of the loop is visible on /status as `update_state`.
+        crate::status::set_update_state(format!("scheduled: next check in {}s", config.interval.as_secs()));
         tokio::time::sleep(config.interval).await;
+        crate::status::set_update_state("checking");
         let check = match check_latest(&current_version).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("ct-agent: auto-update check failed, will retry next interval: {e}");
+                crate::status::set_update_state(format!("check failed: {e}"));
+                emit_update_check(&format!("error: {e}"));
                 continue;
             }
         };
         if !check.update_available {
+            crate::status::set_update_state(format!("up-to-date ({})", check.current_version));
+            emit_update_check("up-to-date");
             continue;
         }
         eprintln!(
             "ct-agent: auto-update found {} -> {} ({}) -- downloading",
             check.current_version, check.latest_version, check.asset_name
         );
+        emit_update_check(&format!("available: {}", check.latest_version));
+        crate::status::set_update_state(format!("downloading {}", check.latest_version));
         match perform_update(&check).await {
             Ok(path) => {
                 eprintln!(
@@ -562,10 +586,20 @@ pub async fn run_auto_update_loop(config: AutoUpdateConfig, current_version: Str
                      paired with one -- see CT_AGENT_AUTO_UPDATE's own docs)",
                     check.latest_version
                 );
+                crate::status::set_update_state(format!(
+                    "applied {}, exiting for the supervisor",
+                    check.latest_version
+                ));
+                crate::events::emit(
+                    crate::events::UPDATE_APPLIED,
+                    serde_json::json!({ "version": check.latest_version }),
+                );
                 std::process::exit(0);
             }
             Err(e) => {
                 eprintln!("ct-agent: auto-update download/swap failed, will retry next interval: {e}");
+                crate::status::set_update_state(format!("apply failed: {e}"));
+                emit_update_check(&format!("apply failed: {e}"));
             }
         }
     }

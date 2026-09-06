@@ -197,7 +197,11 @@ where
             w.keepalive_ack(c).await?;
             *last_write = tokio::time::Instant::now();
         }
-        EdgeWrite::AckReceived(c) => tracker.ack(c),
+        EdgeWrite::AckReceived(c) => {
+            tracker.ack(c);
+            // ct-agent#178: the edge answered our keepalive -- feeds /healthz.
+            crate::status::note_keepalive();
+        }
         EdgeWrite::Fin => {
             w.fin().await?;
             *last_write = tokio::time::Instant::now();
@@ -1140,6 +1144,7 @@ fn check_direct_token(
     let decision = policy.decide(&parse_direct_handshake_payload(payload));
     if let Some(line) = decision.refusal_line() {
         eprintln!("{line}");
+        crate::events::emit(crate::events::DIRECT_REFUSED, serde_json::json!({ "reason": line }));
         return Err(DirectConnectRefused(decision));
     }
     if decision == DirectTokenDecision::ServeLegacy && policy.debug {
@@ -1610,6 +1615,7 @@ pub async fn run_agent(
         eprintln!(
             "ct-agent: CT_AGENT_REGISTER_TCP_ONLY set — registering over TLS-TCP exclusively (no QUIC)"
         );
+        switch_transport("tcp-fallback");
         return run_agent_tcp_fallback_with_revocation(
             config, edge_cert, token, origin_keys, gate, revocation,
         )
@@ -1628,20 +1634,33 @@ pub async fn run_agent(
         let conn = match dial_quic_or_blocked_error(config.edge, edge_cert.clone(), Duration::from_secs(5))
             .await
         {
-            Ok(conn) => conn,
+            Ok(conn) => {
+                switch_transport("quic");
+                conn
+            }
             Err(e) => {
+                // ct-agent#178: the dial is the first step of a registration attempt;
+                // its failure is what an operator wants on the timeline, whichever
+                // transport ends up carrying the tunnel.
+                crate::status::set_last_error(format!("edge dial failed: {e}"));
+                crate::events::emit(
+                    crate::events::REGISTRATION_FAILED,
+                    serde_json::json!({ "error": format!("edge dial failed: {e}") }),
+                );
                 match try_dial_via_masque(config, edge_cert.clone()).await {
                     Some(conn) => {
                         eprintln!(
                             "ct-agent: edge dial failed ({e}); reached the edge instead through the \
                              RFC 9298 CONNECT-UDP (MASQUE) tunnel"
                         );
+                        switch_transport("masque");
                         conn
                     }
                     None => {
                         eprintln!(
                             "ct-agent: edge dial failed ({e}); serving over the TLS-TCP fallback until UDP/QUIC recovers (#16)"
                         );
+                        switch_transport("tcp-fallback");
                         match run_agent_tcp_fallback_until_quic_recovers(
                             config,
                             edge_cert.clone(),
@@ -1656,6 +1675,7 @@ pub async fn run_agent(
                                 // A QUIC probe answered — start over with a fresh budget and
                                 // dial it for real.
                                 backoff.reset();
+                                crate::status::note_reconnect();
                                 continue;
                             }
                             FallbackExit::AllWorkersGaveUp => {
@@ -1668,6 +1688,9 @@ pub async fn run_agent(
                                     "ct-agent: every TLS-TCP fallback worker exhausted its reconnect budget; \
                                      re-entering the reconnect loop (#180)"
                                 );
+                                crate::events::emit(crate::events::FALLBACK_EXHAUSTED, serde_json::json!({}));
+                                crate::status::set_registered(None);
+                                crate::status::note_reconnect();
                                 match backoff.next_delay_jittered(rand::random::<f64>()) {
                                     Some(d) => {
                                         tokio::time::sleep(d).await;
@@ -1685,11 +1708,21 @@ pub async fn run_agent(
                 }
             }
         };
+        // ct-agent#178: one connection id per registration attempt; every event
+        // until the next attempt carries it.
+        crate::events::next_conn_id();
         if let Err(e) = register_tunnel(&conn, &token).await {
             // #45 slice 3: a wire `NO` here means the token is revoked at the
             // plane; a dial/stream error means nothing about the token.
             revocation_tracker.note(RevocationTracker::classify_failure(&e, true));
             eprintln!("ct-agent: registration failed ({e}); will reconnect");
+            crate::status::set_registered(None);
+            crate::status::set_last_error(format!("registration failed: {e}"));
+            crate::events::emit(
+                crate::events::REGISTRATION_FAILED,
+                serde_json::json!({ "error": format!("registration failed: {e}") }),
+            );
+            crate::status::note_reconnect();
             match backoff.next_delay_jittered(rand::random::<f64>()) {
                 Some(d) => {
                     tokio::time::sleep(d).await;
@@ -1724,6 +1757,14 @@ pub async fn run_agent(
             _ => None,
         };
         eprintln!("ct-agent: registered with edge {} (serving)", config.edge);
+        crate::status::set_registered_now();
+        crate::events::emit(
+            crate::events::REGISTERED,
+            serde_json::json!({
+                "edge": config.edge.to_string(),
+                "transport": crate::status::STATUS.transport(),
+            }),
+        );
         serve_quic_connection(
             &conn,
             config.origin,
@@ -1735,10 +1776,28 @@ pub async fn run_agent(
         )
         .await;
         eprintln!("ct-agent: edge connection dropped; reconnecting");
+        let reason = conn
+            .close_reason()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "edge connection dropped".to_string());
+        crate::status::set_registered(None);
+        crate::status::set_last_error(reason.clone());
+        crate::events::emit(crate::events::DISCONNECTED, serde_json::json!({ "reason": reason }));
+        crate::status::note_reconnect();
         match backoff.next_delay_jittered(rand::random::<f64>()) {
             Some(d) => tokio::time::sleep(d).await,
             None => return Err("ct-agent: gave up reconnecting after the connection dropped".into()),
         }
+    }
+}
+
+/// ct-agent#178: record the serving transport on `/status` and emit one
+/// `transport_switch {from, to}` event when it actually changed (a fallback
+/// re-entered from the fallback is not a switch).
+fn switch_transport(to: &'static str) {
+    let from = crate::status::set_transport(to);
+    if from != to {
+        crate::events::emit(crate::events::TRANSPORT_SWITCH, serde_json::json!({ "from": from, "to": to }));
     }
 }
 
@@ -1765,6 +1824,9 @@ async fn try_dial_via_masque(
         Ok(conn) => Some(conn),
         Err(e) => {
             eprintln!("ct-agent: MASQUE dial to {} also failed ({e})", masque.proxy_addr);
+            let error = format!("MASQUE dial to {} failed: {e}", masque.proxy_addr);
+            crate::status::set_last_error(error.clone());
+            crate::events::emit(crate::events::REGISTRATION_FAILED, serde_json::json!({ "error": error }));
             None
         }
     }
@@ -1950,6 +2012,13 @@ async fn serve_quic_connection(
     gate: &Arc<local_auth::LocalAuthGate>,
 ) {
     let mut streams = tokio::task::JoinSet::new();
+    // ct-agent#178: QUIC keepalives are quinn's business (nothing here sees a PING
+    // or its ACK), so liveness is read off the connection's own counters: any new
+    // datagram from the edge since the last tick -- an ACK to our keepalive
+    // included -- refreshes /healthz's last-seen.
+    let mut liveness = tokio::time::interval(QUIC_LIVENESS_PROBE_INTERVAL);
+    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_rx_datagrams = conn.stats().udp_rx.datagrams;
     loop {
         let (send, recv) = tokio::select! {
             accepted = conn.accept_bi() => match accepted {
@@ -1957,7 +2026,17 @@ async fn serve_quic_connection(
                 Err(_) => return,
             },
             Some(_) = streams.join_next() => continue,
+            _ = liveness.tick() => {
+                let rx = conn.stats().udp_rx.datagrams;
+                if rx > last_rx_datagrams {
+                    last_rx_datagrams = rx;
+                    crate::status::note_keepalive();
+                }
+                continue;
+            }
         };
+        // A stream the edge relayed to us is the edge being alive, too.
+        crate::status::note_keepalive();
         // Browser Plane (#23): forward the relayed stream to the Origin verbatim
         // (raw TLS passthrough); the browser's TLS terminates at the Origin.
         // Out of scope for the local-auth gate -- see `local_auth`'s module doc.
@@ -2056,6 +2135,8 @@ async fn run_agent_tcp_fallback_with_revocation(
             None,
         )
         .await;
+        crate::events::emit(crate::events::FALLBACK_EXHAUSTED, serde_json::json!({}));
+        crate::status::set_registered(None);
         match outer.next_delay_jittered(rand::random::<f64>()) {
             Some(d) => {
                 eprintln!(
@@ -2063,6 +2144,7 @@ async fn run_agent_tcp_fallback_with_revocation(
                      spawning a fresh pool in {}ms (#180)",
                     d.as_millis()
                 );
+                crate::status::note_reconnect();
                 tokio::time::sleep(d).await;
             }
             None => {
@@ -2071,6 +2153,12 @@ async fn run_agent_tcp_fallback_with_revocation(
         }
     }
 }
+
+/// How often [`serve_quic_connection`] reads the connection's datagram counter
+/// for `/healthz`'s liveness (ct-agent#178). Well under `HEALTHZ_MAX_SILENCE_SECS`
+/// (90 s) and the agent's own keepalive cadence, so a healthy idle connection
+/// is seen alive several times per limit.
+const QUIC_LIVENESS_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// How often the TCP-fallback mode probes whether UDP/QUIC to the edge has
 /// recovered (#16). One cheap dial per interval: rare enough to cost nothing,
@@ -2218,6 +2306,8 @@ async fn run_tcp_fallback_pool(
                         "ct-agent: UDP/QUIC to {} recovered — leaving the TLS-TCP fallback (#16)",
                         config.edge
                     );
+                    // ct-agent#178: a probe the edge answered is a liveness observation.
+                    crate::status::note_keepalive();
                     return FallbackExit::QuicRecovered;
                 }
             }
@@ -2251,6 +2341,8 @@ async fn run_agent_tcp_fallback_worker(
         let mut served = false;
         let mut last_err: Option<BoxError> = None;
         for addr in &rungs {
+            // ct-agent#178: every rung is one registration attempt (see the QUIC loop).
+            crate::events::next_conn_id();
             match tcp_connect_register_serve(
                 config, *addr, &edge_cert, &token, &origin_keys, &metrics, &gate, &mut revocation,
             )
@@ -2273,6 +2365,15 @@ async fn run_agent_tcp_fallback_worker(
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "no TCP rung configured".to_string());
             eprintln!("ct-agent: all TLS-TCP rungs failed ({e}); will reconnect");
+            // ct-agent#178: with a pool larger than one, another worker may still be
+            // parked and registered, so `registered` is left alone here -- the pool's
+            // end (`fallback_exhausted`) is what clears it.
+            crate::status::set_last_error(format!("all TLS-TCP rungs failed: {e}"));
+            crate::events::emit(
+                crate::events::REGISTRATION_FAILED,
+                serde_json::json!({ "error": format!("all TLS-TCP rungs failed: {e}") }),
+            );
+            crate::status::note_reconnect();
             match backoff.next_delay_jittered(rand::random::<f64>()) {
                 Some(d) => tokio::time::sleep(d).await,
                 None => {
@@ -2370,6 +2471,11 @@ async fn tcp_connect_register_serve(
                 if framed { "framed" } else { "raw" },
                 config.origin
             );
+            crate::status::set_registered_now();
+            crate::events::emit(
+                crate::events::REGISTERED,
+                serde_json::json!({ "edge": target.to_string(), "transport": "tcp-fallback" }),
+            );
             if framed || ping_capable {
                 // Answer the Edge's PINGs until it writes STOP; the stream is then
                 // positioned exactly at the first relayed browser byte. Identical
@@ -2421,6 +2527,11 @@ async fn tcp_connect_register_serve(
         "ct-agent: registered over the TLS-TCP fallback (UDP blocked){}, serving one tunnel to {}",
         if ping_capable { ", ping-capable" } else { "" },
         config.origin
+    );
+    crate::status::set_registered_now();
+    crate::events::emit(
+        crate::events::REGISTERED,
+        serde_json::json!({ "edge": target.to_string(), "transport": "tcp-fallback" }),
     );
     // Answer the Edge's parked-connection PINGs until it signals STOP. Returns
     // with the stream byte-exactly at the first relayed byte, so the Noise
