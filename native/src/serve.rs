@@ -1878,6 +1878,11 @@ async fn serve_quic_connection(
 /// deployment to TCP outright) and for the e2e tests of the pool/worker
 /// mechanics (they need "fallback forever", deterministically, without a 30s
 /// probe racing the assertion).
+///
+/// #45 slice 3: production now enters through
+/// [`run_agent_tcp_fallback_with_revocation`] (it needs the shared revocation view);
+/// this argument-compatible wrapper stays for the e2e tests only.
+#[cfg(test)]
 async fn run_agent_tcp_fallback(
     config: &AgentConfig,
     edge_cert: CertificateDer<'static>,
