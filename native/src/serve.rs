@@ -41,7 +41,7 @@ use crate::transport::{
 use ct_common::fallback_framing;
 use ct_common::fallback_framing::{KEEPALIVE_DEAD_AFTER, KEEPALIVE_INTERVAL};
 use ct_common::metrics::{Metered, TunnelMetrics};
-use ct_common::noise::{frame, noise_pump, origin_handshake, origin_handshake_any};
+use ct_common::noise::{frame, noise_pump, origin_handshake};
 use ct_common::RoutingToken;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -713,14 +713,264 @@ fn trim_trailing_line_ending(bytes: &[u8]) -> &[u8] {
     bytes.strip_suffix(b"\r\n").or_else(|| bytes.strip_suffix(b"\n")).unwrap_or(bytes)
 }
 
+// ---------------------------------------------------------------------------
+// ct-agent#45 slice 1: the RoutingToken in the direct-connect Noise handshake
+// ---------------------------------------------------------------------------
+//
+// The relayed path is gated at the Edge (RoutingToken + PoW) before a stream
+// ever reaches `serve_noise_stream`; the direct-connect path (`serve_direct`)
+// bypasses the Edge entirely, so a token revoked at the control plane
+// (CADS-Tunnel#554) never cut a direct client off. Operator decision 23.08.:
+// the client carries its RoutingToken inside the Noise handshake and the agent
+// checks it. Slice 1 (this): agent side only, rollout-compatible. Slice 2:
+// CADS-Tunnel's client sends the payload. Slice 3: the agent consults a cached
+// copy of the control plane's live/revocation status at the check.
+
+/// Version tag of the direct-connect handshake payload: "a RoutingToken
+/// follows" (ct-agent#45 slice 1). See [`DirectHandshakePayload`] for the encoding.
+pub const DIRECT_HS_PAYLOAD_TOKEN_V1: u8 = 0x01;
+
+/// Exact length of a v1 payload: the tag byte plus the raw 32-byte token.
+pub const DIRECT_HS_PAYLOAD_TOKEN_V1_LEN: usize = 1 + 32;
+
+/// What the initiator's Noise_IK **message-1 payload** said on the
+/// direct-connect path (ct-agent#45 slice 1).
+///
+/// Wire encoding of that payload (it rides inside Noise message 1, which
+/// Noise_IK encrypts to the Origin's static key -- a passive observer never
+/// sees the token, and only the real Origin key can read it):
+///
+/// | payload bytes            | meaning                                                        |
+/// |--------------------------|----------------------------------------------------------------|
+/// | (empty)                  | pre-#45 client, no token -> [`Legacy`](Self::Legacy)            |
+/// | `0x01 ‖ token(32)`       | v1: the client's `RoutingToken.0`, raw -> [`Token`](Self::Token)|
+/// | `0x01 ‖ <not 32 bytes>`  | v1 tag with the wrong length -> [`Malformed`](Self::Malformed)  |
+/// | first byte != `0x01`     | unknown tag -> [`Legacy`](Self::Legacy), i.e. "no token"        |
+///
+/// The token's wire form is the same raw 32 bytes the relay path already puts
+/// on the wire in `register_tunnel`'s `role='A' | token(32)` control frame --
+/// no new serialization. Only the first byte is versioned: a future encoding
+/// picks a new tag rather than changing what `0x01` means. The relayed path
+/// never inspects this payload ([`serve_noise_stream`] passes no policy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectHandshakePayload {
+    /// Empty payload, or one that does not start with the v1 tag: a client
+    /// that predates #45 (or speaks a tag this agent does not know).
+    Legacy,
+    /// `0x01 ‖ token(32)`: the client claims this RoutingToken.
+    Token(RoutingToken),
+    /// Starts with the v1 tag but is not exactly [`DIRECT_HS_PAYLOAD_TOKEN_V1_LEN`] bytes.
+    Malformed,
+}
+
+/// Classify the initiator's handshake payload per the table on
+/// [`DirectHandshakePayload`].
+pub fn parse_direct_handshake_payload(payload: &[u8]) -> DirectHandshakePayload {
+    match payload.first() {
+        Some(&DIRECT_HS_PAYLOAD_TOKEN_V1) => {
+            if payload.len() != DIRECT_HS_PAYLOAD_TOKEN_V1_LEN {
+                return DirectHandshakePayload::Malformed;
+            }
+            let mut t = [0u8; 32];
+            t.copy_from_slice(&payload[1..]);
+            DirectHandshakePayload::Token(RoutingToken(t))
+        }
+        _ => DirectHandshakePayload::Legacy,
+    }
+}
+
+/// Encode `token` as the v1 direct-connect handshake payload -- the client half
+/// of the contract on [`DirectHandshakePayload`]. CADS-Tunnel's client sends
+/// exactly this (slice 2); the tests here use it to play a #45-aware client.
+pub fn encode_direct_handshake_payload(token: &RoutingToken) -> Vec<u8> {
+    let mut out = Vec::with_capacity(DIRECT_HS_PAYLOAD_TOKEN_V1_LEN);
+    out.push(DIRECT_HS_PAYLOAD_TOKEN_V1);
+    out.extend_from_slice(&token.0);
+    out
+}
+
+/// Named log line for a token mismatch (grep target, see ct-agent#45).
+pub const DIRECT_REFUSED_MISMATCH: &str =
+    "ct-agent: direct-connect refused: routing token does not match this tunnel (#45)";
+/// Named log line for a token-less handshake under `CT_DIRECT_REQUIRE_TOKEN`.
+pub const DIRECT_REFUSED_MISSING: &str = "ct-agent: direct-connect refused: handshake carried no \
+     routing token and CT_DIRECT_REQUIRE_TOKEN is set (#45)";
+/// Named log line for a v1-tagged payload of the wrong length.
+pub const DIRECT_REFUSED_MALFORMED: &str =
+    "ct-agent: direct-connect refused: malformed routing-token handshake payload (#45)";
+
+/// Outcome of [`DirectTokenPolicy::decide`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectTokenDecision {
+    /// The client presented this tunnel's token.
+    Serve,
+    /// No token (pre-#45 client) and the policy tolerates that during rollout.
+    ServeLegacy,
+    /// A token was presented, but it is not this tunnel's.
+    RefuseMismatch,
+    /// No token, and the policy requires one (`CT_DIRECT_REQUIRE_TOKEN`).
+    RefuseMissing,
+    /// A v1-tagged payload that is not `0x01 ‖ token(32)`.
+    RefuseMalformed,
+}
+
+impl DirectTokenDecision {
+    /// The refusal's log line (and error text); `None` when the client is served.
+    pub fn refusal_line(self) -> Option<&'static str> {
+        match self {
+            DirectTokenDecision::Serve | DirectTokenDecision::ServeLegacy => None,
+            DirectTokenDecision::RefuseMismatch => Some(DIRECT_REFUSED_MISMATCH),
+            DirectTokenDecision::RefuseMissing => Some(DIRECT_REFUSED_MISSING),
+            DirectTokenDecision::RefuseMalformed => Some(DIRECT_REFUSED_MALFORMED),
+        }
+    }
+}
+
+/// The typed error a token refusal returns, so [`serve_direct`] can tell it from
+/// an ordinary serve failure (origin down, client hung up) and close the QUIC
+/// connection itself instead of waiting for the refused client to go away.
+#[derive(Debug)]
+pub struct DirectConnectRefused(pub DirectTokenDecision);
+
+impl std::fmt::Display for DirectConnectRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.refusal_line().unwrap_or("ct-agent: direct-connect refused (#45)"))
+    }
+}
+
+impl std::error::Error for DirectConnectRefused {}
+
+/// QUIC application close code [`serve_direct`] uses for a refused client.
+pub const DIRECT_REFUSED_CLOSE_CODE: u32 = 1;
+
+/// Agent-side policy for the direct-connect token check (ct-agent#45 slice 1).
+/// Built once per agent in [`run_agent`] from the tunnel's own token and
+/// `CT_DIRECT_REQUIRE_TOKEN`; shared by every direct connection.
+#[derive(Debug, Clone)]
+pub struct DirectTokenPolicy {
+    /// The RoutingToken this agent registered its tunnel under at the Edge --
+    /// [`run_agent`]'s `token`, i.e. the capability's token (`CT_AGENT_TOKEN`
+    /// when the portal supplied it, otherwise the one minted into the
+    /// capability file). A direct client presenting a token must present this one.
+    pub own_token: RoutingToken,
+    /// `CT_DIRECT_REQUIRE_TOKEN` truthy ([`AgentConfig::direct_require_token`]):
+    /// a token-less (pre-#45) handshake is refused too. Default off = rollout mode.
+    pub require_token: bool,
+    /// `CT_DEBUG_DIRECT_TOKEN` set: log each accepted token-less handshake
+    /// (once per connection). Off by default -- a fleet of pre-#45 clients
+    /// would otherwise flood the log during rollout.
+    pub debug: bool,
+}
+
+impl DirectTokenPolicy {
+    pub fn new(own_token: RoutingToken, require_token: bool) -> Self {
+        DirectTokenPolicy { own_token, require_token, debug: false }
+    }
+
+    /// The one-line startup notice [`run_agent`] prints when the direct listener
+    /// comes up, stating which mode the check runs in.
+    pub fn startup_line(&self) -> String {
+        if self.require_token {
+            "ct-agent: direct-connect routing-token check: REQUIRED \
+             (CT_DIRECT_REQUIRE_TOKEN set) -- clients that send no token are refused (#45)"
+                .to_string()
+        } else {
+            "ct-agent: direct-connect routing-token check: rollout mode -- a presented token \
+             must match this tunnel, clients that send no token are still accepted; set \
+             CT_DIRECT_REQUIRE_TOKEN=1 to require it (#45)"
+                .to_string()
+        }
+    }
+
+    /// Pure decision: what to do with a direct handshake whose payload parsed to
+    /// `payload`. No I/O, no logging -- [`check_direct_token`] does those.
+    pub fn decide(&self, payload: &DirectHandshakePayload) -> DirectTokenDecision {
+        match payload {
+            DirectHandshakePayload::Token(t) => {
+                if routing_token_eq_ct(t, &self.own_token) {
+                    // TODO(#45 slice 3): consult the cached revocation status here
+                    // (periodic control-plane poll) -- a token that matches this
+                    // tunnel but has been revoked upstream must be refused too.
+                    DirectTokenDecision::Serve
+                } else {
+                    DirectTokenDecision::RefuseMismatch
+                }
+            }
+            DirectHandshakePayload::Legacy => {
+                if self.require_token {
+                    DirectTokenDecision::RefuseMissing
+                } else {
+                    DirectTokenDecision::ServeLegacy
+                }
+            }
+            DirectHandshakePayload::Malformed => DirectTokenDecision::RefuseMalformed,
+        }
+    }
+}
+
+/// Constant-time equality over the two 32-byte tokens: the token is the secret
+/// that gates the tunnel, so its comparison must not leak how many leading
+/// bytes a guess got right (`RoutingToken`'s derived `PartialEq` short-circuits).
+fn routing_token_eq_ct(a: &RoutingToken, b: &RoutingToken) -> bool {
+    a.0.iter().zip(b.0.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Apply `policy` to the payload the initiator put into Noise message 1 and
+/// log the outcome. `None` (the relayed path, where the Edge already checked
+/// the token) skips the check entirely. Called BEFORE message 2 is written, so
+/// a refused client never completes a session, let alone reaches the Origin.
+fn check_direct_token(
+    policy: Option<&DirectTokenPolicy>,
+    payload: &[u8],
+) -> Result<(), DirectConnectRefused> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    let decision = policy.decide(&parse_direct_handshake_payload(payload));
+    if let Some(line) = decision.refusal_line() {
+        eprintln!("{line}");
+        return Err(DirectConnectRefused(decision));
+    }
+    if decision == DirectTokenDecision::ServeLegacy && policy.debug {
+        eprintln!(
+            "ct-agent: direct-connect: handshake carried no routing token (pre-#45 client); \
+             accepted because CT_DIRECT_REQUIRE_TOKEN is off (#45)"
+        );
+    }
+    Ok(())
+}
+
+/// `ct_common::noise::origin_handshake_any` plus the initiator's message-1
+/// **payload**, which the ct-common helper decrypts into a scratch buffer and
+/// drops (#45 needs it). Same key-selection semantics: in Noise_IK only the
+/// Origin key the client pinned authenticates `msg1`, so during a rotation
+/// window (#12) the candidates are tried in order and the first that decrypts
+/// wins. `None` when no candidate matches.
+fn origin_handshake_any_with_payload(
+    candidates: &[[u8; 32]],
+    msg1: &[u8],
+) -> Option<(snow::HandshakeState, Vec<u8>)> {
+    // The payload can never be longer than the message that carried it.
+    let mut payload = vec![0u8; msg1.len()];
+    for key in candidates {
+        if let Ok(mut hs) = origin_handshake(key) {
+            if let Ok(n) = hs.read_message(msg1, &mut payload) {
+                payload.truncate(n);
+                return Some((hs, payload));
+            }
+        }
+    }
+    None
+}
+
 /// Serve one relayed stream as the Origin's Noise responder with a **full-duplex
 /// streaming** bridge (M9.2): terminate the `Noise_IK` handshake, then
 /// [`noise_pump`] between the decrypted Client stream and the local Origin TCP
 /// socket — arbitrary bidirectional, multi-message traffic, not a single
 /// request/response. Generic over the byte transport (QUIC live, duplex in tests).
 pub async fn serve_noise_stream<S, R>(
-    mut send: S,
-    mut recv: R,
+    send: S,
+    recv: R,
     origin: SocketAddr,
     origin_keys: &[[u8; 32]],
     metrics: Arc<TunnelMetrics>,
@@ -730,13 +980,36 @@ where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    serve_noise_stream_with_policy(send, recv, origin, origin_keys, metrics, gate, None).await
+}
+
+/// [`serve_noise_stream`] with the direct-connect routing-token check
+/// (ct-agent#45 slice 1). `direct_policy = Some(..)` is the direct path
+/// ([`serve_direct`]): the initiator's handshake payload is parsed as a
+/// [`DirectHandshakePayload`] and judged by [`DirectTokenPolicy::decide`]
+/// before message 2 is written; a refusal returns [`DirectConnectRefused`]
+/// without ever dialing the Origin. `None` is the relayed path, where the Edge
+/// has already checked the token: the payload is ignored, exactly as before.
+pub async fn serve_noise_stream_with_policy<S, R>(
+    mut send: S,
+    mut recv: R,
+    origin: SocketAddr,
+    origin_keys: &[[u8; 32]],
+    metrics: Arc<TunnelMetrics>,
+    gate: &local_auth::LocalAuthGate,
+    direct_policy: Option<&DirectTokenPolicy>,
+) -> Result<(), BoxError>
+where
+    S: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
     let mut buf = vec![0u8; 65535];
 
     // <- handshake message 1, -> handshake message 2. Time it and count the
     // outcome for observability (M14.1b). During a key rotation (#12) the Agent
-    // may hold several Origin keys; `origin_handshake_any` selects whichever one
-    // the Client pinned. A completed handshake is an opened tunnel; a failed one
-    // increments the failure counter.
+    // may hold several Origin keys; `origin_handshake_any_with_payload` selects
+    // whichever one the Client pinned. A completed handshake is an opened
+    // tunnel; a failed one increments the failure counter.
     let started = Instant::now();
     let m1 = match read_frame(&mut recv).await {
         Ok(m) => m,
@@ -745,13 +1018,21 @@ where
             return Err(e);
         }
     };
-    let mut hs = match origin_handshake_any(origin_keys, &m1) {
-        Some(hs) => hs,
+    let (mut hs, hs_payload) = match origin_handshake_any_with_payload(origin_keys, &m1) {
+        Some(x) => x,
         None => {
             metrics.tunnels_failed.inc();
             return Err("no origin identity matched the client handshake".into());
         }
     };
+    // #45 slice 1: on the direct path the message-1 payload must name this
+    // tunnel's RoutingToken (a token-less pre-#45 client is accepted unless
+    // CT_DIRECT_REQUIRE_TOKEN is set). Decided before message 2 goes out, so a
+    // refused client gets no session and the Origin is never dialed.
+    if let Err(refused) = check_direct_token(direct_policy, &hs_payload) {
+        metrics.tunnels_failed.inc();
+        return Err(refused.into());
+    }
     let write_msg2 = async {
         let n = hs.write_message(&[], &mut buf)?;
         send.write_all(&frame(&buf[..n])).await?;
@@ -809,8 +1090,8 @@ where
 /// as a datagram to the Origin, and each datagram `recv`d from the Origin is
 /// encrypted back as one frame. Runs until the Client closes the tunnel.
 pub async fn serve_noise_udp<S, R>(
-    mut send: S,
-    mut recv: R,
+    send: S,
+    recv: R,
     origin: SocketAddr,
     origin_keys: &[[u8; 32]],
 ) -> Result<(), BoxError>
@@ -818,10 +1099,30 @@ where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    serve_noise_udp_with_policy(send, recv, origin, origin_keys, None).await
+}
+
+/// [`serve_noise_udp`] with the direct-connect routing-token check (ct-agent#45
+/// slice 1) -- same contract as [`serve_noise_stream_with_policy`]: `Some(..)`
+/// on the direct path judges the handshake payload before message 2, `None`
+/// (relayed) ignores it.
+pub async fn serve_noise_udp_with_policy<S, R>(
+    mut send: S,
+    mut recv: R,
+    origin: SocketAddr,
+    origin_keys: &[[u8; 32]],
+    direct_policy: Option<&DirectTokenPolicy>,
+) -> Result<(), BoxError>
+where
+    S: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
     let mut hbuf = vec![0u8; 65535];
     let m1 = read_frame(&mut recv).await?;
-    let mut hs = origin_handshake_any(origin_keys, &m1)
+    let (mut hs, hs_payload) = origin_handshake_any_with_payload(origin_keys, &m1)
         .ok_or("no origin identity matched the client handshake")?;
+    // #45 slice 1: see serve_noise_stream_with_policy -- refused before message 2.
+    check_direct_token(direct_policy, &hs_payload)?;
     let n = hs.write_message(&[], &mut hbuf)?;
     send.write_all(&frame(&hbuf[..n])).await?;
     send.flush().await?;
@@ -876,6 +1177,12 @@ where
 /// connections (which bypass the Edge relay) and serve each one as the Origin's
 /// Noise responder — streaming for TCP, datagram-preserving for UDP. Loops until
 /// the listener closes.
+///
+/// ct-agent#45 slice 1: every connection is judged by `token_policy` (the
+/// tunnel's own RoutingToken + `CT_DIRECT_REQUIRE_TOKEN`) during the Noise
+/// handshake -- see [`DirectHandshakePayload`] for what the client sends. A
+/// refused client's QUIC connection is closed by the agent (code
+/// [`DIRECT_REFUSED_CLOSE_CODE`]) rather than left open until the client gives up.
 pub async fn serve_direct(
     listener: Endpoint,
     origin: SocketAddr,
@@ -883,20 +1190,42 @@ pub async fn serve_direct(
     proto: OriginProto,
     metrics: Arc<TunnelMetrics>,
     gate: Arc<local_auth::LocalAuthGate>,
+    token_policy: Arc<DirectTokenPolicy>,
 ) -> Result<(), BoxError> {
     while let Some(incoming) = listener.accept().await {
         let metrics = Arc::clone(&metrics);
         let keys = Arc::clone(&origin_keys);
         let gate = Arc::clone(&gate);
+        let policy = Arc::clone(&token_policy);
         tokio::spawn(async move {
             if let Ok(conn) = incoming.await {
                 if let Ok((send, recv)) = conn.accept_bi().await {
-                    let _ = match proto {
+                    let served = match proto {
                         OriginProto::Tcp => {
-                            serve_noise_stream(send, recv, origin, &keys, metrics, &gate).await
+                            serve_noise_stream_with_policy(
+                                send,
+                                recv,
+                                origin,
+                                &keys,
+                                metrics,
+                                &gate,
+                                Some(&policy),
+                            )
+                            .await
                         }
-                        OriginProto::Udp => serve_noise_udp(send, recv, origin, &keys).await,
+                        OriginProto::Udp => {
+                            serve_noise_udp_with_policy(send, recv, origin, &keys, Some(&policy))
+                                .await
+                        }
                     };
+                    if let Err(e) = &served {
+                        if e.downcast_ref::<DirectConnectRefused>().is_some() {
+                            conn.close(
+                                DIRECT_REFUSED_CLOSE_CODE.into(),
+                                b"direct-connect refused (#45)",
+                            );
+                        }
+                    }
                 }
                 conn.closed().await;
             }
@@ -947,8 +1276,21 @@ pub async fn run_agent(
                 let dmetrics = Arc::clone(&metrics);
                 let dkeys = Arc::clone(&origin_keys);
                 let dgate = Arc::clone(&gate);
+                // #45 slice 1: direct clients must present THIS tunnel's token
+                // (the one registered at the edge below). Mode stated once at
+                // startup so an operator can see whether pre-#45 clients are
+                // still tolerated. CT_DEBUG_DIRECT_TOKEN is presence-based like
+                // CT_DEBUG_A2A_TIMING.
+                let mut dpolicy =
+                    DirectTokenPolicy::new(token.clone(), config.direct_require_token);
+                dpolicy.debug = std::env::var_os("CT_DEBUG_DIRECT_TOKEN").is_some();
+                eprintln!("{}", dpolicy.startup_line());
+                let dpolicy = Arc::new(dpolicy);
                 tokio::spawn(async move {
-                    let _ = serve_direct(listener, origin, dkeys, proto, dmetrics, dgate).await;
+                    let _ = serve_direct(
+                        listener, origin, dkeys, proto, dmetrics, dgate, dpolicy,
+                    )
+                    .await;
                 });
             }
         }
@@ -2460,6 +2802,8 @@ mod tests {
                 OriginProto::Tcp,
                 dmetrics,
                 std::sync::Arc::new(gate),
+                // #45: rollout mode -- this pre-#45 client sends no token and is still served.
+                std::sync::Arc::new(DirectTokenPolicy::new(RoutingToken([0u8; 32]), false)),
             )
             .await;
         });
@@ -2485,6 +2829,486 @@ mod tests {
         conn.close(0u32.into(), b"done");
         srv.abort();
         let _ = origin.await;
+    }
+
+    // ---- ct-agent#45 slice 1: the RoutingToken in the direct-connect handshake ----
+
+    #[test]
+    fn direct_handshake_payload_encoding_is_tag_plus_raw_token() {
+        // The wire contract on `DirectHandshakePayload`: `0x01 ‖ token(32)`, the
+        // token as the same raw 32 bytes the relay path's register frame carries,
+        // plus the classification table (empty/unknown = legacy, bad v1 = malformed).
+        let token = RoutingToken([0xab; 32]);
+        let enc = encode_direct_handshake_payload(&token);
+        assert_eq!(enc.len(), DIRECT_HS_PAYLOAD_TOKEN_V1_LEN, "1 tag byte + 32 token bytes");
+        assert_eq!(enc[0], DIRECT_HS_PAYLOAD_TOKEN_V1);
+        assert_eq!(&enc[1..], &token.0[..], "raw token bytes, no extra serialization");
+        assert_eq!(
+            parse_direct_handshake_payload(&enc),
+            DirectHandshakePayload::Token(token.clone()),
+            "round-trips"
+        );
+        assert_eq!(
+            parse_direct_handshake_payload(&[]),
+            DirectHandshakePayload::Legacy,
+            "empty payload = pre-#45 client"
+        );
+        assert_eq!(
+            parse_direct_handshake_payload(&[0x02; 33]),
+            DirectHandshakePayload::Legacy,
+            "unknown tag = treated like no token, never like a wrong one"
+        );
+        assert_eq!(
+            parse_direct_handshake_payload(&enc[..20]),
+            DirectHandshakePayload::Malformed,
+            "v1 tag but short"
+        );
+        let mut long = enc.clone();
+        long.push(0);
+        assert_eq!(
+            parse_direct_handshake_payload(&long),
+            DirectHandshakePayload::Malformed,
+            "v1 tag but trailing bytes"
+        );
+    }
+
+    #[test]
+    fn direct_token_policy_rollout_mode_accepts_missing_and_refuses_foreign_tokens() {
+        // Default (CT_DIRECT_REQUIRE_TOKEN unset): a token must match if present,
+        // a pre-#45 client without one is still served.
+        let own = RoutingToken([0x45; 32]);
+        let policy = DirectTokenPolicy::new(own.clone(), false);
+        assert_eq!(
+            policy.decide(&DirectHandshakePayload::Legacy),
+            DirectTokenDecision::ServeLegacy
+        );
+        assert_eq!(
+            policy.decide(&DirectHandshakePayload::Token(own.clone())),
+            DirectTokenDecision::Serve
+        );
+        assert_eq!(
+            policy.decide(&DirectHandshakePayload::Token(RoutingToken([0x46; 32]))),
+            DirectTokenDecision::RefuseMismatch
+        );
+        assert_eq!(
+            policy.decide(&DirectHandshakePayload::Malformed),
+            DirectTokenDecision::RefuseMalformed
+        );
+        assert!(policy.startup_line().contains("rollout mode"), "{}", policy.startup_line());
+        assert_eq!(DirectTokenDecision::Serve.refusal_line(), None);
+        assert_eq!(DirectTokenDecision::ServeLegacy.refusal_line(), None);
+        assert_eq!(
+            DirectTokenDecision::RefuseMismatch.refusal_line(),
+            Some(DIRECT_REFUSED_MISMATCH)
+        );
+        assert_eq!(
+            DirectTokenDecision::RefuseMalformed.refusal_line(),
+            Some(DIRECT_REFUSED_MALFORMED)
+        );
+    }
+
+    #[test]
+    fn direct_token_policy_required_mode_refuses_a_missing_token() {
+        // (d) CT_DIRECT_REQUIRE_TOKEN=1, tested on the pure decision helper so no
+        // test mutates the process environment. The right token is still served;
+        // no token is now a refusal with its own named line.
+        let own = RoutingToken([0x45; 32]);
+        let policy = DirectTokenPolicy::new(own.clone(), true);
+        assert_eq!(
+            policy.decide(&DirectHandshakePayload::Legacy),
+            DirectTokenDecision::RefuseMissing
+        );
+        assert_eq!(
+            DirectTokenDecision::RefuseMissing.refusal_line(),
+            Some(DIRECT_REFUSED_MISSING)
+        );
+        assert_eq!(
+            policy.decide(&DirectHandshakePayload::Token(own.clone())),
+            DirectTokenDecision::Serve,
+            "the tunnel's own token is served in required mode too"
+        );
+        // Off by one bit in the LAST byte: the constant-time compare must still
+        // report a plain mismatch.
+        let mut near = own.0;
+        near[31] ^= 1;
+        assert_eq!(
+            policy.decide(&DirectHandshakePayload::Token(RoutingToken(near))),
+            DirectTokenDecision::RefuseMismatch
+        );
+        assert!(policy.startup_line().contains("REQUIRED"), "{}", policy.startup_line());
+    }
+
+    /// #45 scaffolding for the stream path: an agent serving ONE in-memory
+    /// stream under `policy` (`None` = the relayed path), a TCP echo origin that
+    /// records whether it was EVER dialed (the thing a refusal must prevent),
+    /// and a client that has already sent Noise message 1 carrying `payload`.
+    struct DirectTokenRig {
+        origin_dialed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        metrics: std::sync::Arc<ct_common::metrics::TunnelMetrics>,
+        agent: tokio::task::JoinHandle<Result<(), BoxError>>,
+        hs: snow::HandshakeState,
+        c_read: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        c_write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    }
+
+    async fn direct_token_rig(
+        policy: Option<DirectTokenPolicy>,
+        payload: Vec<u8>,
+    ) -> DirectTokenRig {
+        use ct_common::noise::{client_handshake_for, generate_static_keypair};
+        use ct_common::{Capability, OriginIdentity};
+        use tokio::net::TcpListener;
+
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: RoutingToken([0u8; 32]),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "edge:443".into(),
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = listener.local_addr().unwrap();
+        let origin_dialed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dialed = std::sync::Arc::clone(&origin_dialed);
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                dialed.store(true, std::sync::atomic::Ordering::SeqCst);
+                let (mut r, mut w) = sock.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+                let _ = w.shutdown().await;
+            }
+        });
+
+        let (ini_cipher, agent_cipher) = tokio::io::duplex(64 * 1024);
+        let metrics = std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new());
+        let m = std::sync::Arc::clone(&metrics);
+        let (a_read, a_write) = tokio::io::split(agent_cipher);
+        let origin_priv = origin_kp.private;
+        let agent = tokio::spawn(async move {
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            serve_noise_stream_with_policy(
+                a_write,
+                a_read,
+                origin_addr,
+                &[origin_priv],
+                m,
+                &gate,
+                policy.as_ref(),
+            )
+            .await
+        });
+
+        let (c_read, mut c_write) = tokio::io::split(ini_cipher);
+        let mut hs = client_handshake_for(&client_kp.private, &cap).unwrap();
+        let mut buf = vec![0u8; 65535];
+        let n = hs.write_message(&payload, &mut buf).unwrap();
+        c_write.write_all(&frame(&buf[..n])).await.unwrap();
+        DirectTokenRig { origin_dialed, metrics, agent, hs, c_read, c_write }
+    }
+
+    /// The client was served: message 2 arrives, and `msg` echoes through the
+    /// origin. Returns (origin dialed?, metrics) for the caller's assertions.
+    async fn direct_token_rig_expect_served(
+        rig: DirectTokenRig,
+        msg: &[u8],
+    ) -> (bool, std::sync::Arc<ct_common::metrics::TunnelMetrics>) {
+        let DirectTokenRig {
+            origin_dialed,
+            metrics,
+            agent,
+            mut hs,
+            mut c_read,
+            mut c_write,
+        } = rig;
+        let mut buf = vec![0u8; 65535];
+        let mut tmp = vec![0u8; 65535];
+        let m2 = read_frame(&mut c_read).await.expect("message 2 -- the agent served this client");
+        hs.read_message(&m2, &mut tmp).unwrap();
+        let mut transport = hs.into_transport_mode().unwrap();
+        let n = transport.write_message(msg, &mut buf).unwrap();
+        c_write.write_all(&frame(&buf[..n])).await.unwrap();
+        let echo = read_frame(&mut c_read).await.expect("echo frame back from the origin");
+        let n = transport.read_message(&echo, &mut tmp).unwrap();
+        assert_eq!(&tmp[..n], msg, "round-trip through the origin");
+        agent.abort();
+        (origin_dialed.load(std::sync::atomic::Ordering::SeqCst), metrics)
+    }
+
+    /// The client was refused: the serve task returned the named refusal (typed,
+    /// so `serve_direct` can close the connection), message 2 never arrives, the
+    /// origin was never dialed, and the failure was counted.
+    async fn direct_token_rig_expect_refused(rig: DirectTokenRig, expected_line: &str) {
+        let DirectTokenRig {
+            origin_dialed,
+            metrics,
+            agent,
+            hs: _hs,
+            mut c_read,
+            c_write: _w,
+        } = rig;
+        let result = tokio::time::timeout(Duration::from_secs(5), agent)
+            .await
+            .expect("the serve task returns promptly on a refusal")
+            .unwrap();
+        let err = result.expect_err("refused, not served");
+        assert_eq!(err.to_string(), expected_line, "the named refusal line is the error text");
+        assert!(
+            err.downcast_ref::<DirectConnectRefused>().is_some(),
+            "typed refusal so serve_direct can tell it from an ordinary serve failure"
+        );
+        assert!(read_frame(&mut c_read).await.is_err(), "no message 2 for a refused client");
+        assert!(
+            !origin_dialed.load(std::sync::atomic::Ordering::SeqCst),
+            "the origin must never be dialed for a refused client"
+        );
+        assert_eq!(metrics.tunnels_opened.get(), 0, "no tunnel opened");
+        assert_eq!(metrics.tunnels_failed.get(), 1, "the refusal counts as a failed handshake");
+    }
+
+    #[tokio::test]
+    async fn direct_pre_45_client_with_an_empty_payload_is_still_served() {
+        // (a) rollout compatibility: a client that predates #45 sends an empty
+        // handshake payload and is served exactly as before.
+        let policy = DirectTokenPolicy::new(RoutingToken([0x45; 32]), false);
+        let rig = direct_token_rig(Some(policy), Vec::new()).await;
+        let (dialed, metrics) = direct_token_rig_expect_served(rig, b"legacy-direct").await;
+        assert!(dialed, "origin dialed for the legacy client");
+        assert_eq!(metrics.tunnels_opened.get(), 1);
+        assert_eq!(metrics.tunnels_failed.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn direct_client_presenting_the_tunnels_token_is_served() {
+        // (b) a #45-aware client sends `0x01 ‖ token`, and it is this tunnel's token.
+        let own = RoutingToken([0x45; 32]);
+        let policy = DirectTokenPolicy::new(own.clone(), false);
+        let rig = direct_token_rig(Some(policy), encode_direct_handshake_payload(&own)).await;
+        let (dialed, metrics) = direct_token_rig_expect_served(rig, b"tokened-direct").await;
+        assert!(dialed, "origin dialed for the matching token");
+        assert_eq!(metrics.tunnels_opened.get(), 1);
+        assert_eq!(metrics.tunnels_failed.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn direct_client_with_a_foreign_token_is_refused_before_any_origin_byte() {
+        // (c) a token for SOME OTHER tunnel: refused during the handshake, with
+        // the named log line, and the origin is never dialed. Fails against the
+        // pre-#45 code, which served every client that knew the origin key.
+        let policy = DirectTokenPolicy::new(RoutingToken([0x45; 32]), false);
+        let foreign = RoutingToken([0x99; 32]);
+        let rig = direct_token_rig(Some(policy), encode_direct_handshake_payload(&foreign)).await;
+        direct_token_rig_expect_refused(rig, DIRECT_REFUSED_MISMATCH).await;
+    }
+
+    #[tokio::test]
+    async fn direct_client_without_a_token_is_refused_when_the_policy_requires_one() {
+        // (d) end to end: CT_DIRECT_REQUIRE_TOKEN=1 modelled as the policy flag
+        // (no process env), an empty payload is now a refusal.
+        let policy = DirectTokenPolicy::new(RoutingToken([0x45; 32]), true);
+        let rig = direct_token_rig(Some(policy), Vec::new()).await;
+        direct_token_rig_expect_refused(rig, DIRECT_REFUSED_MISSING).await;
+    }
+
+    #[tokio::test]
+    async fn direct_client_with_a_malformed_v1_payload_is_refused() {
+        // A v1 tag that is not followed by exactly 32 bytes is neither "no
+        // token" nor a token: refused, so a truncated token can never pass as legacy.
+        let policy = DirectTokenPolicy::new(RoutingToken([0x45; 32]), false);
+        let truncated = vec![DIRECT_HS_PAYLOAD_TOKEN_V1, 0x45, 0x45];
+        let rig = direct_token_rig(Some(policy), truncated).await;
+        direct_token_rig_expect_refused(rig, DIRECT_REFUSED_MALFORMED).await;
+    }
+
+    #[tokio::test]
+    async fn relayed_path_without_direct_policy_ignores_the_handshake_payload() {
+        // The relayed path (`serve_noise_stream`, no policy) is untouched by #45:
+        // the Edge already checked the token there, so even a payload naming a
+        // foreign token is simply not looked at.
+        let foreign = RoutingToken([0x99; 32]);
+        let rig = direct_token_rig(None, encode_direct_handshake_payload(&foreign)).await;
+        let (dialed, metrics) = direct_token_rig_expect_served(rig, b"relayed").await;
+        assert!(dialed);
+        assert_eq!(metrics.tunnels_opened.get(), 1);
+    }
+
+    /// #45 scaffolding for the UDP path: `serve_noise_udp_with_policy` bridging
+    /// to a UDP echo origin that records whether a datagram ever reached it.
+    /// The client has already sent message 1 carrying `payload`.
+    struct DirectTokenUdpRig {
+        origin_reached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        agent: tokio::task::JoinHandle<Result<(), BoxError>>,
+        hs: snow::HandshakeState,
+        c_read: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        c_write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    }
+
+    async fn direct_token_udp_rig(
+        policy: DirectTokenPolicy,
+        payload: Vec<u8>,
+    ) -> DirectTokenUdpRig {
+        use ct_common::noise::{client_handshake_for, generate_static_keypair};
+        use ct_common::{Capability, OriginIdentity};
+        use tokio::net::UdpSocket;
+
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: RoutingToken([0u8; 32]),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "edge:443".into(),
+        };
+
+        let origin_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_sock.local_addr().unwrap();
+        let origin_reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reached = std::sync::Arc::clone(&origin_reached);
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 65535];
+            while let Ok((n, peer)) = origin_sock.recv_from(&mut b).await {
+                reached.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = origin_sock.send_to(&b[..n], peer).await;
+            }
+        });
+
+        let (ini_cipher, agent_cipher) = tokio::io::duplex(64 * 1024);
+        let (a_read, a_write) = tokio::io::split(agent_cipher);
+        let origin_priv = origin_kp.private;
+        let agent = tokio::spawn(async move {
+            serve_noise_udp_with_policy(a_write, a_read, origin_addr, &[origin_priv], Some(&policy))
+                .await
+        });
+
+        let (c_read, mut c_write) = tokio::io::split(ini_cipher);
+        let mut hs = client_handshake_for(&client_kp.private, &cap).unwrap();
+        let mut buf = vec![0u8; 65535];
+        let n = hs.write_message(&payload, &mut buf).unwrap();
+        c_write.write_all(&frame(&buf[..n])).await.unwrap();
+        DirectTokenUdpRig { origin_reached, agent, hs, c_read, c_write }
+    }
+
+    #[tokio::test]
+    async fn direct_udp_client_presenting_the_tunnels_token_is_served() {
+        // (b) on the datagram path: matching token -> one datagram echoes through.
+        let own = RoutingToken([0x45; 32]);
+        let policy = DirectTokenPolicy::new(own.clone(), false);
+        let rig = direct_token_udp_rig(policy, encode_direct_handshake_payload(&own)).await;
+        let DirectTokenUdpRig { origin_reached, agent, mut hs, mut c_read, mut c_write } = rig;
+        let mut buf = vec![0u8; 65535];
+        let mut tmp = vec![0u8; 65535];
+        let m2 = read_frame(&mut c_read).await.expect("message 2 -- served");
+        hs.read_message(&m2, &mut tmp).unwrap();
+        let mut transport = hs.into_transport_mode().unwrap();
+        let n = transport.write_message(b"udp-tokened", &mut buf).unwrap();
+        c_write.write_all(&frame(&buf[..n])).await.unwrap();
+        let echo = read_frame(&mut c_read).await.expect("echoed datagram");
+        let n = transport.read_message(&echo, &mut tmp).unwrap();
+        assert_eq!(&tmp[..n], b"udp-tokened");
+        assert!(origin_reached.load(std::sync::atomic::Ordering::SeqCst));
+        // Explicit shutdown: dropping the write half alone does not EOF a duplex.
+        c_write.shutdown().await.unwrap();
+        agent.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_udp_client_with_a_foreign_token_is_refused_before_any_datagram() {
+        // (c) on the datagram path: refused during the handshake, the origin
+        // never sees a datagram, the named line is the error.
+        let policy = DirectTokenPolicy::new(RoutingToken([0x45; 32]), false);
+        let foreign = RoutingToken([0x99; 32]);
+        let rig = direct_token_udp_rig(policy, encode_direct_handshake_payload(&foreign)).await;
+        let DirectTokenUdpRig { origin_reached, agent, hs: _hs, mut c_read, c_write: _w } = rig;
+        let err = tokio::time::timeout(Duration::from_secs(5), agent)
+            .await
+            .expect("returns promptly")
+            .unwrap()
+            .expect_err("refused");
+        assert_eq!(err.to_string(), DIRECT_REFUSED_MISMATCH);
+        assert!(err.downcast_ref::<DirectConnectRefused>().is_some());
+        assert!(read_frame(&mut c_read).await.is_err(), "no message 2 for a refused client");
+        assert!(
+            !origin_reached.load(std::sync::atomic::Ordering::SeqCst),
+            "no datagram reached the origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_direct_closes_the_quic_connection_on_a_foreign_token() {
+        // The real listener: a refused client gets no message 2 AND the agent
+        // closes the QUIC connection itself (application close, code 1), instead
+        // of leaving it open until the client gives up.
+        use crate::transport::build_direct_listener_at;
+        use ct_common::noise::{client_handshake_for, generate_static_keypair};
+        use ct_common::{Capability, OriginIdentity};
+        use std::net::Ipv4Addr;
+
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: RoutingToken([0u8; 32]),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "edge:443".into(),
+        };
+
+        // An origin that must never be reached.
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin_dialed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dialed = std::sync::Arc::clone(&origin_dialed);
+        tokio::spawn(async move {
+            if origin_listener.accept().await.is_ok() {
+                dialed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        let (listener, cert) =
+            build_direct_listener_at((Ipv4Addr::LOCALHOST, 0).into()).expect("listener");
+        let laddr = listener.local_addr().expect("laddr");
+        let opriv = origin_kp.private;
+        let dmetrics = std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new());
+        let mcheck = std::sync::Arc::clone(&dmetrics);
+        let srv = tokio::spawn(async move {
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ = serve_direct(
+                listener,
+                origin_addr,
+                std::sync::Arc::new(vec![opriv]),
+                OriginProto::Tcp,
+                dmetrics,
+                std::sync::Arc::new(gate),
+                std::sync::Arc::new(DirectTokenPolicy::new(RoutingToken([0x45; 32]), false)),
+            )
+            .await;
+        });
+
+        let client = ct_edge::transport::build_client_endpoint(cert).expect("client");
+        let conn = client.connect(laddr, "localhost").expect("cfg").await.expect("conn");
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let mut hs = client_handshake_for(&client_kp.private, &cap).unwrap();
+        let mut buf = vec![0u8; 65535];
+        let foreign = RoutingToken([0x99; 32]);
+        let n = hs.write_message(&encode_direct_handshake_payload(&foreign), &mut buf).unwrap();
+        send.write_all(&frame(&buf[..n])).await.unwrap();
+
+        assert!(read_frame(&mut recv).await.is_err(), "no message 2 for a refused client");
+        let reason = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("the agent closes a refused connection itself");
+        match reason {
+            quinn::ConnectionError::ApplicationClosed(close) => assert_eq!(
+                close.error_code,
+                quinn::VarInt::from(DIRECT_REFUSED_CLOSE_CODE),
+                "closed with the #45 refusal code"
+            ),
+            other => panic!("expected an application close by the agent, got {other:?}"),
+        }
+        assert!(
+            !origin_dialed.load(std::sync::atomic::Ordering::SeqCst),
+            "origin never dialed"
+        );
+        assert_eq!(mcheck.tunnels_failed.get(), 1);
+        assert_eq!(mcheck.tunnels_opened.get(), 0);
+        srv.abort();
     }
 
     #[tokio::test]
@@ -3839,6 +4663,7 @@ mod tests {
             framed_fallback: false,
             register_tcp_only: false,
             masque_fallback: None,
+            direct_require_token: false,
         };
         let token_a = token.clone();
         let origin_priv = origin_kp.private;
