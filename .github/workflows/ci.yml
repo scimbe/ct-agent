@@ -122,6 +122,27 @@ jobs:
       - name: Clippy (panic-free gate, -D warnings)
         run: cargo clippy --locked --all-targets -- -D warnings
 
+  soak:
+    # ct-agent#179: the paused-time soak harness (native/src/soak.rs, a
+    # `#[cfg(test)]` module). Each test drives one long-running state machine --
+    # the reconnect policy, the TLS-TCP fallback pool, the event ring, /healthz,
+    # the stored OIDC credential, the MASQUE pumps, ACME renewal -- through
+    # simulated hours to months under tokio's paused clock and asserts bounded
+    # resources and no permanent exit. `gate` already runs these tests inside the
+    # full suite; this job runs them ALONE and single-threaded, so the sampled
+    # invariants (a task gauge, a drop counter) are never skewed by another
+    # test's tasks, and so a soak regression is named by its own job. Paused time
+    # keeps the whole job well under two minutes of wall clock.
+    needs: gate
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Soak (simulated weeks under paused time)
+        run: cargo test --locked -p ct-agent --lib -- soak:: --test-threads=1
+
   wasm:
     # ct-agent-wasm IS ct-agent for the browser (workspace restructure, see the
     # root Cargo.toml) -- the `gate` job above builds/tests it NATIVELY (which

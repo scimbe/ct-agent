@@ -47,7 +47,7 @@ use tokio::sync::mpsc::error::TrySendError;
 
 /// How many datagrams each pump (outbound to the proxy, inbound from it) may hold
 /// before further ones are dropped (ct-agent#177).
-pub(super) const PUMP_CAPACITY: usize = 256;
+pub(crate) const PUMP_CAPACITY: usize = 256;
 
 /// Log one line per this many drops in one direction of one socket -- a rate limit,
 /// so a sustained overload never turns into a per-datagram log flood.
@@ -86,7 +86,7 @@ impl Direction {
 /// Per-socket drop counters, shared between the socket handle (outbound drops happen
 /// in `try_send`) and the inbound pump task (inbound drops happen there).
 #[derive(Debug, Default)]
-pub(super) struct DropCounters {
+pub(crate) struct DropCounters {
     outbound: AtomicU64,
     inbound: AtomicU64,
 }
@@ -139,7 +139,7 @@ pub(super) fn offer(
     }
 }
 
-pub(super) struct MasqueUdpSocket {
+pub(crate) struct MasqueUdpSocket {
     to_send: mpsc::Sender<Vec<u8>>,
     recv_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     drops: Arc<DropCounters>,
@@ -245,7 +245,7 @@ impl MasqueUdpSocket {
     /// Assemble a socket over already-created pump channels. `spawn` is the only
     /// production caller; tests use it to drive the bounded pumps directly, without
     /// an h2 tunnel behind them.
-    pub(super) fn from_parts(
+    pub(crate) fn from_parts(
         to_send: mpsc::Sender<Vec<u8>>,
         recv_rx: mpsc::Receiver<Vec<u8>>,
         drops: Arc<DropCounters>,
@@ -257,7 +257,7 @@ impl MasqueUdpSocket {
 
     /// `(outbound, inbound)` datagrams this socket dropped because the respective
     /// pump was full (ct-agent#177). Monotonic for the socket's lifetime.
-    pub(super) fn dropped_datagrams(&self) -> (u64, u64) {
+    pub(crate) fn dropped_datagrams(&self) -> (u64, u64) {
         self.drops.get()
     }
 }

@@ -29,12 +29,12 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Renew once the existing cert file is older than this many days (90-day
 /// Let's Encrypt certs, renewing with ~30 days of margin left).
-const RENEW_AFTER_DAYS: u64 = 60;
+pub(crate) const RENEW_AFTER_DAYS: u64 = 60;
 
 /// How often [`run_renewal_loop`] re-checks whether renewal is due. Cheap (a
 /// file-mtime check), so this can be frequent without hammering anything —
 /// the ACME server itself is only ever contacted when renewal is actually due.
-const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+pub(crate) const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// How often to poll the admission broker (#233) while a hostname hasn't
 /// reached `gruen` yet — the 48h claim window needs a much tighter loop than
@@ -253,7 +253,14 @@ fn needs_renewal(path: &Path) -> bool {
     let Ok(modified) = meta.modified() else {
         return true; // can't tell how old it is -- renew to be safe
     };
-    let age = SystemTime::now().duration_since(modified).unwrap_or(Duration::MAX);
+    renewal_due(modified, SystemTime::now())
+}
+
+/// Pure core of [`needs_renewal`] (ct-agent#179): a cert written at `issued_at`
+/// is due at `now` once it is [`RENEW_AFTER_DAYS`] old. A `now` before `issued_at`
+/// (the clock stepped back) counts as due, as before -- renew to be safe.
+pub(crate) fn renewal_due(issued_at: SystemTime, now: SystemTime) -> bool {
+    let age = now.duration_since(issued_at).unwrap_or(Duration::MAX);
     age >= Duration::from_secs(RENEW_AFTER_DAYS * 24 * 60 * 60)
 }
 

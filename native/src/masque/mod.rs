@@ -13,7 +13,8 @@
 //! this lands as a real, independently testable unit first.
 
 mod capsule;
-mod socket;
+// ct-agent#179: `pub(crate)` so the soak harness drives the bounded pumps directly.
+pub(crate) mod socket;
 #[cfg(test)]
 mod tests;
 mod varint;
