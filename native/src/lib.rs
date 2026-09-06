@@ -1,6 +1,22 @@
 //! CADS Tunnel Agent — customer-run, outbound-only. Custodian of the Origin
 //! key; mints Capabilities. See ADR-0004 (transport), ADR-0005 (identity).
 
+// ct-agent#176: the data plane is panic-free by construction. Every `unwrap`/`expect`/
+// `panic!`/`unreachable!`/`todo!`/`unimplemented!` in NON-test code is a build error
+// (CI runs clippy with -D warnings); a provably-infallible site may carry a scoped
+// `#[allow(clippy::expect_used)]` with a one-line proof. Tests keep their unwraps.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 pub mod acme;
 pub mod acme_ca;
 pub mod acme_client;

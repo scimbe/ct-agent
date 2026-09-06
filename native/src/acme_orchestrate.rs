@@ -272,7 +272,7 @@ fn load_or_generate_account_key(path: &Path) -> Result<AccountKey, BoxError> {
     // to the CA — whoever reads it can issue and revoke certificates for the hostnames this
     // account is authorized for. `write_private` was already sitting in this file and this
     // one call was simply missing it.
-    write_private(path, &key.pkcs8_der())?;
+    write_private(path, key.pkcs8_der())?;
     Ok(key)
 }
 
@@ -790,11 +790,12 @@ mod tests {
         // The DNS-01 publish call the mock control plane received carries the
         // routing token + bare hostname -- proving the RemoteAgent wiring
         // (not a direct DesecClient) is what obtain_or_renew actually uses.
-        let hits = mock.dns01_hits.lock().unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0]["token"], "deadbeef");
-        assert_eq!(hits[0]["hostname"], "app.example.com");
-        drop(hits);
+        {
+            let hits = mock.dns01_hits.lock().unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0]["token"], "deadbeef");
+            assert_eq!(hits[0]["hostname"], "app.example.com");
+        }
 
         // A second call with the just-written (fresh) cert is a no-op --
         // proving the file-age renewal check actually gates re-issuance.

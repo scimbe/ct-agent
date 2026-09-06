@@ -2689,7 +2689,7 @@ async fn persistent_call_mode_fails_closed_with_a_structured_error_envelope_19()
         serde_json::from_str(String::from_utf8(out).unwrap().lines().last().expect("an envelope was written"))
             .expect("the last line is a JSON envelope");
     assert_eq!(last["ok"], false);
-    assert!(last["error"].as_str().unwrap().len() > 0, "the error is named, not swallowed");
+    assert!(!last["error"].as_str().unwrap().is_empty(), "the error is named, not swallowed");
 }
 
 #[test]
@@ -5315,7 +5315,7 @@ fn split_offered_candidates_recovers_the_optional_local_half() {
     assert_eq!(split_offered_candidates("203.0.113.7:4433"), ("203.0.113.7:4433", None));
     // The new compound format recovers both halves.
     assert_eq!(
-        split_offered_candidates("203.0.113.7:4433\0192.168.1.42:5000"),
+        split_offered_candidates("203.0.113.7:4433\x00192.168.1.42:5000"),
         ("203.0.113.7:4433", Some("192.168.1.42:5000"))
     );
     // A malformed (empty) local segment degrades to "no local candidate", not a parse
@@ -5353,7 +5353,7 @@ fn select_upgrade_candidate_refuses_an_off_subnet_local_candidate_and_falls_back
     // #276 piece 1's safety property, exercised end-to-end through select_upgrade_candidate:
     // a local candidate that is NOT in our own subnet must never be dialed, regardless of
     // how plausible-looking it is -- the reflexive candidate is used instead.
-    let ep = "203.0.113.7:4433\0192.168.250.250:5000";
+    let ep = "203.0.113.7:4433\x00192.168.250.250:5000";
     let chosen = select_upgrade_candidate(ep).expect("falls back to the reflexive candidate");
     assert_eq!(chosen, "203.0.113.7:4433".parse::<SocketAddr>().unwrap(), "off-subnet local candidate refused, reflexive used instead");
 }
@@ -5719,7 +5719,7 @@ fn der_certificate_shape_catches_the_transcription_damage_agent26() {
     assert!(der_certificate_shape(&[0x30, 0x03, 0x01, 0x02, 0x03]).is_ok());
     // Long form: 0x82 = two length bytes, 0x0100 = 256 content bytes.
     let mut long = vec![0x30, 0x82, 0x01, 0x00];
-    long.extend(std::iter::repeat(0x00).take(256));
+    long.extend(std::iter::repeat_n(0x00, 256));
     assert!(der_certificate_shape(&long).is_ok(), "long-form length is normal for a real cert");
 
     // THE reported case (ct-agent#26): the leading 0x30 lost at a line wrap. Still valid

@@ -160,7 +160,9 @@ mod tests {
     /// Serializes tests that mutate process env vars -- same reasoning as
     /// `login.rs`'s own `ENV_MUTEX` (a separate lock, not shared: cross-file env
     /// races are a pre-existing, accepted risk in this codebase's test suite).
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// A tokio mutex for the same reason as login.rs's: the guard must span the
+    /// awaited call that reads the env (clippy `await_holding_lock` on a std guard).
+    static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn clear_env() {
         for k in ["CT_OIDC_TOKEN", "CT_AGENT_LOGIN_TOKEN_FILE", "CT_AGENT_STATE_DIR", "CT_OIDC_ISSUER", "CT_OIDC_CLI_CLIENT_ID"] {
@@ -178,7 +180,7 @@ mod tests {
     /// `resolve_oidc_token` tests, not duplicated here.
     #[tokio::test]
     async fn run_signup_fails_loudly_with_no_stored_login_and_no_oidc_config() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock().await;
         clear_env();
         std::env::set_var("CT_AGENT_LOGIN_TOKEN_FILE", "/nonexistent/dir/oidc-token.json");
 

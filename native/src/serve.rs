@@ -44,6 +44,7 @@ use ct_common::fallback_framing;
 use ct_common::fallback_framing::{KEEPALIVE_DEAD_AFTER, KEEPALIVE_INTERVAL};
 use ct_common::metrics::{Metered, TunnelMetrics};
 use ct_common::noise::{frame, noise_pump, origin_handshake};
+use ct_common::sync::MutexExt;
 use ct_common::RoutingToken;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -310,9 +311,13 @@ where
                         Some(w) => w,
                         None => {
                             let (r, w) = connect_origin(origin).await?.into_split();
+                            // `origin_w` is only ever `None` before the first dial, so
+                            // the oneshot is still here; a missing sender would be a
+                            // logic error -- reported, not panicked on (ct-agent#176).
                             // A send error means the writer half already ended, so
                             // this relay is over regardless.
-                            let _ = origin_r_tx.take().expect("dial happens once").send(r);
+                            let dial_tx = origin_r_tx.take().ok_or("origin dialed twice on one relay")?;
+                            let _ = dial_tx.send(r);
                             origin_w.insert(w)
                         }
                     };
@@ -1336,6 +1341,9 @@ where
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
     udp.connect(origin).await?;
 
+    // Locked with ct_common's poison-tolerant `lock_safe` (ct-agent#176): a panic
+    // inside one pump's critical section must not turn the other pump's next
+    // `lock()` into a second panic that takes the whole tunnel task down.
     let ts = Mutex::new(transport);
     // `e` is inferred as snow::Error from the map_err call sites (naming it would
     // need snow as a direct dep, which ct-agent gets only transitively).
@@ -1349,7 +1357,7 @@ where
                 Ok(f) => f,
                 Err(_) => break, // tunnel closed
             };
-            let len = ts.lock().unwrap().read_message(&fr, &mut tmp).map_err(noise_err)?;
+            let len = ts.lock_safe().read_message(&fr, &mut tmp).map_err(noise_err)?;
             udp.send(&tmp[..len]).await?;
         }
         Ok::<(), io::Error>(())
@@ -1361,7 +1369,7 @@ where
         let mut ct = vec![0u8; 65535 + 256];
         loop {
             let n = udp.recv(&mut dgram).await?;
-            let len = ts.lock().unwrap().write_message(&dgram[..n], &mut ct).map_err(noise_err)?;
+            let len = ts.lock_safe().write_message(&dgram[..n], &mut ct).map_err(noise_err)?;
             send.write_all(&frame(&ct[..len])).await?;
             send.flush().await?;
         }
@@ -2071,6 +2079,8 @@ async fn run_agent_tcp_fallback_worker(
 /// an accepted registration (any role) clears it, the Edge's typed `NO` to the
 /// final `'A'` counts as an AMBIGUOUS refusal (on this path the same bytes also
 /// mean "#410 sub-cap full"), and every other failure is transient.
+// pre-existing signature; refactor tracked separately
+#[allow(clippy::too_many_arguments)]
 async fn tcp_connect_register_serve(
     config: &AgentConfig,
     target: SocketAddr,
@@ -2838,14 +2848,9 @@ mod tests {
         // that the gate returned "ok".
         let mut tmp = vec![0u8; 65535];
         let mut echoed = Vec::new();
-        loop {
-            match read_frame(&mut rig.c_read).await {
-                Ok(ct) => {
-                    let n = rig.transport.read_message(&ct, &mut tmp).unwrap();
-                    echoed.extend_from_slice(&tmp[..n]);
-                }
-                Err(_) => break,
-            }
+        while let Ok(ct) = read_frame(&mut rig.c_read).await {
+            let n = rig.transport.read_message(&ct, &mut tmp).unwrap();
+            echoed.extend_from_slice(&tmp[..n]);
         }
         assert_eq!(echoed, req.as_bytes(), "the gated request reached the origin unmodified");
         assert!(
@@ -2902,14 +2907,9 @@ mod tests {
         rig.c_write.shutdown().await.unwrap();
 
         let mut echoed = Vec::new();
-        loop {
-            match read_frame(&mut rig.c_read).await {
-                Ok(ct) => {
-                    let n = rig.transport.read_message(&ct, &mut tmp).unwrap();
-                    echoed.extend_from_slice(&tmp[..n]);
-                }
-                Err(_) => break,
-            }
+        while let Ok(ct) = read_frame(&mut rig.c_read).await {
+            let n = rig.transport.read_message(&ct, &mut tmp).unwrap();
+            echoed.extend_from_slice(&tmp[..n]);
         }
         assert_eq!(echoed, b"post-auth-payload", "no gate bytes leaked into the origin stream");
         assert!(rig.origin_dialed.load(std::sync::atomic::Ordering::SeqCst));
@@ -5291,5 +5291,35 @@ mod tests {
             !err.to_string().contains("ct-agent#58"),
             "a real connection refusal must not be misreported as the timeout firing: {err}"
         );
+    }
+}
+
+/// ct-agent#176: the UDP Noise pump's `TransportState` mutex is locked with
+/// ct_common's poison-tolerant `lock_safe` (see `serve_noise_udp_with_policy`).
+/// This pins the property the pump relies on -- a poisoned `std::sync::Mutex`
+/// yields a usable guard instead of a second panic -- against the ct-common
+/// version this crate actually pins, so a future ct-common bump that changed the
+/// helper's semantics would fail here, not in a live tunnel.
+#[cfg(test)]
+mod lock_safe_tests {
+    use ct_common::sync::MutexExt;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_poisoned_transport_mutex_is_recovered_instead_of_panicking_the_pump() {
+        let ts = Arc::new(Mutex::new(0u32));
+        let poisoner = Arc::clone(&ts);
+        let _ = std::thread::spawn(move || {
+            let mut g = poisoner.lock().unwrap();
+            *g = 7;
+            panic!("panic while holding the transport lock");
+        })
+        .join();
+        assert!(ts.lock().is_err(), "std's lock() reports the poison");
+        let mut g = ts.lock_safe();
+        assert_eq!(*g, 7, "the guard is usable and the last write survived");
+        *g += 1;
+        drop(g);
+        assert_eq!(*ts.lock_safe(), 8, "the recovered mutex keeps working for every later lock");
     }
 }

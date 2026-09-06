@@ -331,8 +331,9 @@ fn persist_stored_token(path: &Path, tok: &StoredToken) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_vec_pretty(tok)
-        .expect("StoredToken has no non-serializable fields (all String/Option<u64>)");
+    // StoredToken has no non-serializable fields (all String/Option<u64>), so this
+    // cannot fail in practice; surfaced as an io error rather than a panic (ct-agent#176).
+    let json = serde_json::to_vec_pretty(tok).map_err(std::io::Error::other)?;
     crate::secret_file::write_private(path, &json)
 }
 
@@ -670,7 +671,10 @@ mod tests {
         // interval=base_interval+backoff. Lower bound is exact (the loop never
         // sleeps less); upper bound leaves headroom for scheduler jitter.
         let gap = |a: usize, b: usize| times[b].duration_since(times[a]);
-        let slack = Duration::from_millis(150);
+        // Upper bounds only guard against a runaway sleep: a loaded CI runner has
+        // shown a 1 s stall on the first HTTP round-trip (PR #187), so the slack is
+        // generous; the exact lower bounds are what prove the backoff.
+        let slack = Duration::from_secs(3);
         assert!(gap(0, 1) >= base_interval && gap(0, 1) < base_interval + slack, "pre-slow_down gap ~{base_interval:?}: got {:?}", gap(0, 1));
         let backed_off = base_interval + backoff;
         assert!(gap(1, 2) >= backed_off && gap(1, 2) < backed_off + slack, "post-slow_down gap ~{backed_off:?}: got {:?}", gap(1, 2));
@@ -756,8 +760,11 @@ mod tests {
     /// Serializes every test that mutates process env vars (`CT_OIDC_TOKEN`,
     /// `CT_AGENT_LOGIN_TOKEN_FILE`, `CT_AGENT_STATE_DIR`, `HOME`) — `std::env::set_var`
     /// is process-global, so concurrent `cargo test` threads touching the same
-    /// vars would otherwise race each other's assertions.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    /// vars would otherwise race each other's assertions. A tokio mutex, not a
+    /// std one, because every holder is an async test that must keep the guard
+    /// across its `.await`s (the env is read inside the awaited call) -- exactly the
+    /// case clippy's `await_holding_lock` rejects for a std guard.
+    static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn clear_env() {
         for k in ["CT_OIDC_TOKEN", "CT_AGENT_LOGIN_TOKEN_FILE", "CT_AGENT_STATE_DIR"] {
@@ -767,7 +774,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_oidc_token_prefers_the_explicit_env_var() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock().await;
         clear_env();
         std::env::set_var("CT_OIDC_TOKEN", "explicit-env-token");
         // No stored file exists at all -- must not even be consulted.
@@ -780,7 +787,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_oidc_token_falls_back_to_a_stored_unexpired_token() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock().await;
         clear_env();
         let dir = scratch("resolve-valid");
         let path = dir.join("oidc-token.json");
@@ -802,7 +809,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_oidc_token_refreshes_an_expired_stored_token() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock().await;
         clear_env();
         let (base, _state) =
             spawn_mock_idp(vec![MockTokenReply::Success { access_token: "refreshed-at", refresh_token: Some("refreshed-rt"), expires_in: 300 }])
@@ -832,7 +839,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_oidc_token_fails_loudly_with_no_refresh_token_available() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock().await;
         clear_env();
         let dir = scratch("resolve-no-refresh");
         let path = dir.join("oidc-token.json");
@@ -854,7 +861,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_oidc_token_fails_loudly_when_nothing_is_configured_at_all() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock().await;
         clear_env();
         // No CT_OIDC_TOKEN, and no stored file at the (deliberately bogus) explicit path.
         std::env::set_var("CT_AGENT_LOGIN_TOKEN_FILE", "/nonexistent/dir/oidc-token.json");

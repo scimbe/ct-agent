@@ -130,7 +130,10 @@ async fn spawn_fake_masque_proxy(cert: CertificateDer<'static>, key: PrivateKeyD
                                 }
                                 recv = udp.recv(&mut udp_read_buf) => {
                                     let Ok(n) = recv else { break };
-                                    let framed = capsule::encode_datagram(&capsule::udp_datagram_payload::encode(&udp_read_buf[..n]));
+                                    let framed = capsule::encode_datagram(
+                                        &capsule::udp_datagram_payload::encode(&udp_read_buf[..n]).unwrap(),
+                                    )
+                                    .unwrap();
                                     if send_stream.send_data(bytes::Bytes::from(framed), false).is_err() { break; }
                                 }
                             }
@@ -271,4 +274,124 @@ async fn abort_on_drop_disarm_lets_the_task_run_to_completion() {
         "disarm() must let the task keep running -- the real tunnel's connection \
          must stay driven for its whole life once it's actually established"
     );
+}
+
+// ---- ct-agent#177: bounded pumps drop-and-count instead of growing without bound.
+
+fn bounded_pump_socket() -> (socket::MasqueUdpSocket, tokio::sync::mpsc::Receiver<Vec<u8>>, tokio::sync::mpsc::Sender<Vec<u8>>) {
+    let (to_send_tx, to_send_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(socket::PUMP_CAPACITY);
+    let (recv_tx, recv_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(socket::PUMP_CAPACITY);
+    let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 4433);
+    let sock = socket::MasqueUdpSocket::from_parts(
+        to_send_tx,
+        recv_rx,
+        std::sync::Arc::new(socket::DropCounters::default()),
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+        addr,
+    );
+    (sock, to_send_rx, recv_tx)
+}
+
+fn transmit_to(destination: SocketAddr, contents: &[u8]) -> quinn::udp::Transmit<'_> {
+    quinn::udp::Transmit { destination, ecn: None, contents, segment_size: None, src_ip: None }
+}
+
+#[tokio::test]
+async fn outbound_pump_drops_and_counts_beyond_capacity_instead_of_growing() {
+    use quinn::AsyncUdpSocket;
+    let (sock, mut to_send_rx, _recv_tx) = bounded_pump_socket();
+    let peer = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 4433);
+    let overflow = 44u64;
+    let offered = socket::PUMP_CAPACITY as u64 + overflow;
+
+    // Nothing drains the pump: every try_send past the capacity must be dropped,
+    // never block the (quinn) caller, and never report an error -- UDP semantics.
+    for i in 0..offered {
+        let payload = i.to_be_bytes();
+        sock.try_send(&transmit_to(peer, &payload)).expect("try_send never fails on a full pump");
+    }
+    assert_eq!(sock.dropped_datagrams(), (overflow, 0), "exactly the overflow is dropped, outbound only");
+
+    // What did get queued is the FIRST `PUMP_CAPACITY` datagrams, in order (drop-newest).
+    let mut queued = 0u64;
+    while let Ok(payload) = to_send_rx.try_recv() {
+        assert_eq!(payload, queued.to_be_bytes(), "queued datagrams are the earliest, in order");
+        queued += 1;
+    }
+    assert_eq!(queued as usize, socket::PUMP_CAPACITY, "the pump held exactly its capacity, no more");
+
+    // Once drained, sending works again without further drops.
+    sock.try_send(&transmit_to(peer, b"after drain")).unwrap();
+    assert_eq!(sock.dropped_datagrams(), (overflow, 0));
+    assert_eq!(to_send_rx.try_recv().unwrap(), b"after drain");
+}
+
+#[tokio::test]
+async fn outbound_try_send_reports_a_closed_pump_as_broken_pipe() {
+    use quinn::AsyncUdpSocket;
+    let (sock, to_send_rx, _recv_tx) = bounded_pump_socket();
+    drop(to_send_rx); // the outbound pump task is gone (tunnel closed)
+    let peer = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 4433);
+    let err = sock.try_send(&transmit_to(peer, b"x")).expect_err("closed pump is an error, not a drop");
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    assert_eq!(sock.dropped_datagrams(), (0, 0), "a closed pump is not counted as a drop");
+}
+
+#[tokio::test]
+async fn inbound_pump_drops_and_counts_beyond_capacity_and_reports_a_gone_socket() {
+    let (recv_tx, mut recv_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(socket::PUMP_CAPACITY);
+    let counters = socket::DropCounters::default();
+    let overflow = 7u64;
+    let offered = socket::PUMP_CAPACITY as u64 + overflow;
+
+    // The inbound pump task offers every decoded datagram with `offer`; with nobody
+    // polling the socket the channel fills and the rest is dropped and counted.
+    for i in 0..offered {
+        socket::offer(&recv_tx, &counters, socket::Direction::Inbound, i.to_be_bytes().to_vec())
+            .expect("a full pump is a drop, not an error");
+    }
+    let mut queued = 0usize;
+    while recv_rx.try_recv().is_ok() {
+        queued += 1;
+    }
+    assert_eq!(queued, socket::PUMP_CAPACITY, "the inbound pump held exactly its capacity");
+
+    let sock = socket::MasqueUdpSocket::from_parts(
+        tokio::sync::mpsc::channel::<Vec<u8>>(1).0,
+        recv_rx,
+        std::sync::Arc::new(counters),
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 4433),
+    );
+    assert_eq!(sock.dropped_datagrams(), (0, overflow), "exactly the overflow is dropped, inbound only");
+
+    // Once the socket (the receiver) is gone the pump must learn it and stop.
+    let counters = std::sync::Arc::new(socket::DropCounters::default());
+    drop(sock);
+    assert_eq!(
+        socket::offer(&recv_tx, &counters, socket::Direction::Inbound, b"late".to_vec()),
+        Err(socket::PumpClosed),
+        "a dropped MasqueUdpSocket ends the inbound pump"
+    );
+}
+
+#[test]
+fn process_wide_drop_totals_render_as_one_labeled_prometheus_counter() {
+    let (outbound_before, inbound_before) = dropped_datagrams_total();
+    let counters = socket::DropCounters::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    socket::offer(&tx, &counters, socket::Direction::Outbound, vec![1]).unwrap(); // queued
+    socket::offer(&tx, &counters, socket::Direction::Outbound, vec![2]).unwrap(); // dropped
+    socket::offer(&tx, &counters, socket::Direction::Outbound, vec![3]).unwrap(); // dropped
+    let (outbound_after, inbound_after) = dropped_datagrams_total();
+    // Other tests in this process bump the same statics, so assert on deltas.
+    assert!(outbound_after >= outbound_before + 2, "process-wide outbound total moved by at least our 2 drops");
+    assert!(inbound_after >= inbound_before);
+
+    let text = render_dropped_datagrams_prometheus();
+    assert!(text.starts_with("# HELP ct_agent_masque_dropped_datagrams_total "), "{text}");
+    assert!(text.contains("\n# TYPE ct_agent_masque_dropped_datagrams_total counter\n"), "{text}");
+    assert!(text.contains("\nct_agent_masque_dropped_datagrams_total{direction=\"outbound\"} "), "{text}");
+    assert!(text.contains("\nct_agent_masque_dropped_datagrams_total{direction=\"inbound\"} "), "{text}");
+    assert!(text.ends_with('\n'), "exposition block is newline-terminated so the next series starts on its own line");
 }

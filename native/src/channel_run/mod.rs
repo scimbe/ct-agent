@@ -281,6 +281,8 @@ where
 /// same already-admitted, already-Noise-authenticated relay stream** and opportunistically
 /// upgrade to it, falling back to the relay transparently on failure. `None` (the default)
 /// is byte-for-byte the pre-existing behavior.
+// pre-existing signature; refactor tracked separately
+#[allow(clippy::too_many_arguments)]
 pub async fn join_via_relay<P>(
     relay_conn: &Connection,
     request: &ChannelJoinRequest,

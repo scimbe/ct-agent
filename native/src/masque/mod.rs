@@ -30,6 +30,26 @@ use tokio_rustls::TlsConnector;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// `(outbound, inbound)` datagrams dropped on full MASQUE pumps, summed over every
+/// tunnel this process has opened (ct-agent#177) -- see `socket.rs` for the bound.
+pub fn dropped_datagrams_total() -> (u64, u64) {
+    socket::dropped_datagrams_total()
+}
+
+/// The Prometheus text-exposition block for [`dropped_datagrams_total`], appended to
+/// the agent's `/metrics` scrape by `crate::observe` (ct-agent#177). One counter,
+/// labeled by `direction`.
+pub fn render_dropped_datagrams_prometheus() -> String {
+    let (outbound, inbound) = dropped_datagrams_total();
+    format!(
+        "# HELP ct_agent_masque_dropped_datagrams_total Datagrams dropped on a full MASQUE tunnel pump \
+         (bounded, ct-agent#177).\n\
+         # TYPE ct_agent_masque_dropped_datagrams_total counter\n\
+         ct_agent_masque_dropped_datagrams_total{{direction=\"outbound\"}} {outbound}\n\
+         ct_agent_masque_dropped_datagrams_total{{direction=\"inbound\"}} {inbound}\n"
+    )
+}
+
 /// Aborts the wrapped task when dropped, unless [`AbortOnDrop::disarm`] was called
 /// first. `JoinHandle`'s own `Drop` impl only DETACHES a task -- it keeps running
 /// to completion in the background regardless -- so a bare `tokio::spawn(...)`

@@ -28,12 +28,29 @@
 //! ships the core supervision mechanism first; either integration is a follow-on that only
 //! needs to read the same [`CrashHistory`] this binary already maintains.
 
+// ct-agent#176: the data plane is panic-free by construction. Every `unwrap`/`expect`/
+// `panic!`/`unreachable!`/`todo!`/`unimplemented!` in NON-test code is a build error
+// (CI runs clippy with -D warnings); a provably-infallible site may carry a scoped
+// `#[allow(clippy::expect_used)]` with a one-line proof. Tests keep their unwraps.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ct_agent::reconnect::Backoff;
+use ct_common::sync::MutexExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
@@ -160,7 +177,10 @@ async fn main() {
 
         eprintln!("ct-agent-supervisor: {child_bin} exited after {uptime:?} -- {reason}");
         {
-            let mut h = history.lock().expect("history mutex poisoned");
+            // Poison-tolerant (ct-agent#176): the crash history is diagnostic state --
+            // a panic while it was held must not stop the supervisor from restarting
+            // the child, which is its one job.
+            let mut h = history.lock_safe();
             h.restart_count += 1;
             if h.records.len() >= HISTORY_LEN {
                 h.records.pop_front();
@@ -197,7 +217,9 @@ async fn run_once(bin: &str, args: &[String]) -> std::io::Result<CrashReason> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let stderr = child.stderr.take().expect("stderr was piped");
+    // `.stderr(Stdio::piped())` above guarantees the handle; an absent one is
+    // reported as a spawn error rather than panicking the supervisor (ct-agent#176).
+    let stderr = child.stderr.take().ok_or_else(|| std::io::Error::other("child stderr was not piped"))?;
     let mut ring: VecDeque<String> = VecDeque::with_capacity(STDERR_RING_LINES);
     let mut lines = BufReader::new(stderr).lines();
     let mut stderr_out = tokio::io::stderr();
@@ -317,7 +339,7 @@ async fn crashes_handler(
     if !bearer_token_matches(&headers, &state.token) {
         return Err(axum::http::StatusCode::UNAUTHORIZED);
     }
-    let h = state.history.lock().expect("history mutex poisoned");
+    let h = state.history.lock_safe();
     Ok(axum::Json(StatusResp { restart_count: h.restart_count, crashes: h.records.iter().cloned().collect() }))
 }
 

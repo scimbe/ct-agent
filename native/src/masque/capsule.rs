@@ -17,20 +17,26 @@ const DATAGRAM_CAPSULE_TYPE: u64 = 0x00;
 const MAX_CAPSULE_VALUE_LEN: u64 = 65_527 + 8;
 
 /// Encodes one DATAGRAM capsule wrapping `payload` (an already-encoded HTTP Datagram
-/// payload, e.g. from [`udp_datagram_payload::encode`]).
-pub(crate) fn encode_datagram(payload: &[u8]) -> Vec<u8> {
+/// payload, e.g. from [`udp_datagram_payload::encode`]). `Err` only if the payload
+/// length cannot be expressed as a QUIC varint (ct-agent#176: a typed error, never a
+/// panic, on the data plane) -- unreachable for any real UDP payload, which is
+/// bounded far below 2^62 bytes.
+pub(crate) fn encode_datagram(payload: &[u8]) -> Result<Vec<u8>, varint::VarintRangeError> {
     let mut out = Vec::new();
-    varint::encode(DATAGRAM_CAPSULE_TYPE, &mut out);
-    varint::encode(payload.len() as u64, &mut out);
+    varint::encode(DATAGRAM_CAPSULE_TYPE, &mut out)?;
+    varint::encode(payload.len() as u64, &mut out)?;
     out.extend_from_slice(payload);
-    out
+    Ok(out)
 }
+
+/// One decoded capsule: `(capsule_type, value, bytes_consumed)`; `None` while it is still arriving.
+pub(crate) type DecodedCapsule<'a> = Option<(u64, &'a [u8], usize)>;
 
 /// Decodes one capsule from the front of `buf`. Returns `(capsule_type, value, bytes_consumed)`,
 /// or `Ok(None)` if `buf` doesn't yet contain a complete capsule. `Err` only for a declared
 /// length too large to ever be a legitimate DATAGRAM capsule -- a protocol violation the
 /// caller should tear the stream down for, not keep buffering toward.
-pub(crate) fn decode(buf: &[u8]) -> Result<Option<(u64, &[u8], usize)>, &'static str> {
+pub(crate) fn decode(buf: &[u8]) -> Result<DecodedCapsule<'_>, &'static str> {
     let Some((cap_type, type_len)) = varint::decode(buf) else {
         return Ok(None);
     };
@@ -55,11 +61,14 @@ pub(crate) mod udp_datagram_payload {
 
     const CONTEXT_ID_RAW_UDP: u64 = 0;
 
-    pub(crate) fn encode(udp_payload: &[u8]) -> Vec<u8> {
+    /// `Err` only if the context ID cannot be varint-encoded -- it is the constant 0,
+    /// so this never fails; the `Result` keeps the panic-free contract (ct-agent#176)
+    /// uniform across the framing layer.
+    pub(crate) fn encode(udp_payload: &[u8]) -> Result<Vec<u8>, varint::VarintRangeError> {
         let mut out = Vec::new();
-        varint::encode(CONTEXT_ID_RAW_UDP, &mut out);
+        varint::encode(CONTEXT_ID_RAW_UDP, &mut out)?;
         out.extend_from_slice(udp_payload);
-        out
+        Ok(out)
     }
 
     pub(crate) fn decode(buf: &[u8]) -> Option<&[u8]> {
@@ -78,8 +87,8 @@ mod tests {
     #[test]
     fn a_udp_packet_round_trips_through_capsule_and_datagram_framing() {
         let udp_payload = b"hello over connect-udp";
-        let datagram_payload = udp_datagram_payload::encode(udp_payload);
-        let capsule = encode_datagram(&datagram_payload);
+        let datagram_payload = udp_datagram_payload::encode(udp_payload).unwrap();
+        let capsule = encode_datagram(&datagram_payload).unwrap();
 
         let (cap_type, value, consumed) = decode(&capsule).unwrap().expect("decodes the capsule we just built");
         assert_eq!(cap_type, DATAGRAM_CAPSULE_TYPE);
@@ -92,8 +101,8 @@ mod tests {
     #[test]
     fn decode_rejects_a_declared_length_too_large_to_ever_be_legitimate() {
         let mut malicious = Vec::new();
-        varint::encode(0x00, &mut malicious);
-        varint::encode(10_000_000_000, &mut malicious);
+        varint::encode(0x00, &mut malicious).unwrap();
+        varint::encode(10_000_000_000, &mut malicious).unwrap();
         malicious.extend_from_slice(b"only a few real bytes follow");
         assert!(decode(&malicious).unwrap_err().contains("exceeds"));
     }

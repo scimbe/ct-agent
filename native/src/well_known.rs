@@ -16,19 +16,25 @@ pub const AGENT_CARD_WELL_KNOWN_PATH: &str = "/.well-known/agent-card.json";
 
 /// The canonical `application/json` body served at [`AGENT_CARD_WELL_KNOWN_PATH`] — the card as
 /// its JSON profile (hex-string byte fields). Trust is the signature, not the transport.
-pub fn agent_card_well_known_body(card: &AgentCard) -> String {
-    serde_json::to_string(card).expect("AgentCard serializes to JSON")
+/// `Err` cannot happen for an [`AgentCard`] (plain strings, byte arrays and integers), but it
+/// is a `Result` rather than an `expect` so no caller can be taken down by it (ct-agent#176).
+pub fn agent_card_well_known_body(card: &AgentCard) -> Result<String, serde_json::Error> {
+    serde_json::to_string(card)
 }
 
 /// The HTTP response an origin serves at [`AGENT_CARD_WELL_KNOWN_PATH`]: `200 OK`,
 /// `content-type: application/json`, body = the signed card's JSON. Axum-handler-shaped so the
-/// browser-mode origin can mount it directly.
+/// browser-mode origin can mount it directly. A card that fails to serialize (see
+/// [`agent_card_well_known_body`]) answers `500` instead of panicking the handler.
 pub fn agent_card_response(card: &AgentCard) -> Response {
-    (
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        agent_card_well_known_body(card),
-    )
-        .into_response()
+    match agent_card_well_known_body(card) {
+        Ok(body) => ([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("agent card failed to serialize: {e}"),
+        )
+            .into_response(),
+    }
 }
 
 /// An axum [`Router`](axum::Router) that serves the agent's holder-signed card at
@@ -70,7 +76,7 @@ pub fn write_agent_card_for_origin(
     let wk_dir = out_dir.join(".well-known");
     std::fs::create_dir_all(&wk_dir)?;
     let path = wk_dir.join("agent-card.json");
-    std::fs::write(&path, agent_card_well_known_body(card))?;
+    std::fs::write(&path, agent_card_well_known_body(card).map_err(std::io::Error::other)?)?;
     Ok(path)
 }
 
@@ -140,7 +146,7 @@ mod tests {
         // #144 ①: the served body round-trips into a card whose holder signature STILL verifies —
         // a discovering peer trusts the SIGNATURE it fetched, not the origin that served it.
         let card = signed_card();
-        let body = agent_card_well_known_body(&card);
+        let body = agent_card_well_known_body(&card).unwrap();
         assert!(body.contains("\"holder_pubkey\":\""), "hex-string JSON profile fields");
         let back: AgentCard = serde_json::from_str(&body).expect("well-known body parses back");
         assert_eq!(back, card, "the served body is the exact signed card (lossless)");
@@ -225,6 +231,7 @@ mod tests {
 
         // Tampered but still-valid JSON (edit a signed field) → signature check fails.
         let tampered = agent_card_well_known_body(&card)
+            .unwrap()
             .replace("trigger a live A2A transfer", "do something else entirely");
         std::fs::write(&path, tampered).unwrap();
         assert!(read_and_verify_agent_card(&path, 1_000).is_err(), "tampered card rejected");
