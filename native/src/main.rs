@@ -84,7 +84,11 @@ path is running. On finding one, downloads it and swaps the on-disk binary, then
 this ONLY results in the new build actually running if something restarts the process on
 exit (ct-agent-supervisor, systemd Restart=always, Docker --restart=always). Off by default;
 enabling it without a supervisor trades \"silently stale forever\" for \"silently stopped
-after the next release,\" so pair it with one.
+after the next release,\" so pair it with one. Every download (manual `update` too) is checked
+against the release's published <asset>.sha256 before it is written, under a 60 s timeout and a
+256 MiB size cap; a mismatch or a missing checksum file refuses the update. Set
+CT_AGENT_UPDATE_SKIP_VERIFY=1 to skip ONLY the checksum check for a private build that has
+none -- never on a fleet.
 
 `manifest` (CADS-agent-marketplace: Compose services since Phase 1, Binary executables since
 Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
