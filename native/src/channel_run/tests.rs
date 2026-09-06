@@ -3393,6 +3393,61 @@ fn run_service_handler_errors_instead_of_silently_succeeding_on_empty_stdout() {
 }
 
 #[test]
+fn service_handler_stderr_is_forwarded_to_the_diagnostic_sink_on_success_and_failure_105() {
+    // ct-agent#105 (frozen): a `--serve` container's `docker logs` never showed one handler-level
+    // line, because a SUCCESSFUL handler's stderr was captured and dropped (only a failed run's
+    // stderr survived, inside the error string). That blind spot is what let a caller-side
+    // envelope mismatch masquerade as serve-side corruption for two weeks. Now every finished
+    // run's stderr reaches the diagnostic sink, prefixed and attributed to the service slug, on
+    // BOTH outcomes; a silent handler adds nothing; the tail is bounded and the cut announced.
+    use ct_common::channel::ServiceType::{SafetyCheck, TextGeneration};
+    let t = std::time::Duration::from_secs(10);
+
+    // success: stdout is the result as before, stderr lines land in the sink with the prefix
+    let mut sink = Vec::new();
+    let out = run_service_handler_with_timeout_to(
+        "echo 'model: loading' >&2; echo 'verdict: ok' >&2; printf '{\"gravity\":1800}'",
+        TextGeneration,
+        "x",
+        t,
+        &mut sink,
+    )
+    .unwrap();
+    assert_eq!(out, "{\"gravity\":1800}", "the result contract is unchanged by the passthrough");
+    let diag = String::from_utf8(sink).unwrap();
+    assert_eq!(
+        diag,
+        "service handler[text_generation] stderr: model: loading\nservice handler[text_generation] stderr: verdict: ok\n",
+        "each stderr line is forwarded once, attributed to the slug: {diag:?}"
+    );
+
+    // failure: the error string still carries stderr (unchanged) AND the sink got it too
+    let mut sink = Vec::new();
+    let err = run_service_handler_with_timeout_to("echo 'boom' >&2; exit 3", SafetyCheck, "x", t, &mut sink)
+        .unwrap_err();
+    assert!(err.contains("exited") && err.contains("boom"), "the caller-facing error keeps stderr: {err}");
+    assert_eq!(String::from_utf8(sink).unwrap(), "service handler[safety_check] stderr: boom\n");
+
+    // a quiet handler writes nothing to the sink (no blank line per call)
+    let mut sink = Vec::new();
+    run_service_handler_with_timeout_to("echo quiet", TextGeneration, "x", t, &mut sink).unwrap();
+    assert!(sink.is_empty(), "no stderr -> nothing forwarded, got {:?}", String::from_utf8_lossy(&sink));
+
+    // bounded: only the tail survives and the cut is announced, so a chatty handler cannot
+    // flood the serve process's log through this path
+    let mut sink = Vec::new();
+    let big = HANDLER_STDERR_PASSTHROUGH_MAX * 2;
+    // the filler is one newline-free line; a newline separates it from the final line so the
+    // last LINE (not the last bytes of the filler) is what must survive the cut
+    let cmd = format!("head -c {big} /dev/zero | tr '\\0' 'a' >&2; echo >&2; echo 'LAST' >&2; echo out");
+    run_service_handler_with_timeout_to(&cmd, TextGeneration, "x", t, &mut sink).unwrap();
+    let diag = String::from_utf8(sink).unwrap();
+    assert!(diag.starts_with("service handler[text_generation] stderr: [... "), "the cut is announced first: {}", &diag[..80]);
+    assert!(diag.ends_with("service handler[text_generation] stderr: LAST\n"), "the tail (last line) survives");
+    assert!(diag.len() < HANDLER_STDERR_PASSTHROUGH_MAX + 512, "forwarded volume is bounded: {}", diag.len());
+}
+
+#[test]
 fn timeout_kills_the_whole_process_group_not_just_the_immediate_child() {
     // #183 Finding 1 (frozen): the handler scripts shell out to a real LLM CLI as a GRANDCHILD of
     // the `sh -c`. Killing only the `sh` pid on timeout leaves a backgrounded grandchild running
