@@ -550,6 +550,8 @@ fn note_degraded() {
             "ct-agent: oidc credential expired and not refreshable — bridge tools needing a plane login \
              will fail until re-login or CT_OIDC_TOKEN_FILE is provided"
         );
+        // ct-agent#178: the same once-per-process fact as a structured event.
+        crate::events::emit(crate::events::CREDENTIAL_DEGRADED, serde_json::json!({}));
     }
 }
 

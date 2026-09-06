@@ -475,6 +475,8 @@ where
                 pong[1..].copy_from_slice(&counter);
                 stream.write_all(&pong).await?;
                 stream.flush().await?;
+                // ct-agent#178: a PING the edge sent is proof it is alive -- feeds /healthz.
+                crate::status::note_keepalive();
             }
             TCP_PING_STOP => return Ok(()),
             other => {

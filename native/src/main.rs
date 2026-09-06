@@ -53,6 +53,9 @@ USAGE:
                                  Set CT_AGENT_AUTO_UPDATE=1 to do this automatically in the
                                  background while serving (see below) -- requires a process
                                  supervisor to actually restart into a newer build after a swap
+    ct-agent status             Show a running agent's live status (needs CT_AGENT_METRICS_LISTEN
+                                 set to the same value the agent serves on), else the last 20
+                                 recorded events from the state dir's events.jsonl ring (see below)
     ct-agent local-auth set <user> <password>   Set the local-auth gate credential explicitly
     ct-agent local-auth reset   Generate a fresh local-auth gate credential, printed once
     ct-agent local-auth rotate  Alias for `reset` -- same operation, the name an operator
@@ -96,6 +99,26 @@ credential): it takes priority over the stored login, is re-read on every use so
 is picked up without a restart, and an empty file counts as unset. `bridge/config` reports the
 stored login's state as oidc_credential (env | stored | stored-expired-refreshable |
 stored-expired | none); once it is expired and not refreshable the agent logs one line saying so.
+
+Operator forensics (ct-agent#178): the agent emits one structured event per state change
+that matters on call -- registered {edge, transport}, registration_failed {error},
+disconnected {reason}, transport_switch {from, to}, fallback_exhausted, direct_refused
+{reason}, channel_session {state, peer}, bridge_call {tool, ok}, manifest_install {status},
+update_check {result}, update_applied {version}, credential_degraded -- each stamped with
+ts, a per-process session id and a per-connection counter (conn). On stderr an event is one
+`ct-agent event: <kind> k=v ...` line next to the usual human line, or, with
+CT_AGENT_LOG_FORMAT=json, one JSON object per line (for a log shipper). Independently of the
+stderr format every event is appended as a JSON line to the ring file
+<CT_AGENT_STATE_DIR>/events.jsonl ($HOME/.ct-agent/events.jsonl with no state dir; no file
+with neither), mode 0600, rotated to events.jsonl.1 at 1 MiB -- so `ct-agent status` can show
+what happened after the fact. With CT_AGENT_METRICS_LISTEN set the metrics listener also
+serves GET /status (JSON: version, session, uptime_secs, transport, registered,
+registered_since, last_seen_secs_ago, reconnects, last_error, tasks_live, update_state,
+oidc_credential, masque_dropped_datagrams), GET /healthz (200 `ok` when registered and the
+edge was heard from within 90 s, else 503 with the reason -- a container/systemd probe
+target) and GET /events?n=100 (the last n ring lines as NDJSON, n in 1..=1000); /metrics
+gains ct_agent_registered, ct_agent_reconnects_total, ct_agent_transport{transport} and
+ct_agent_events_total{kind}.
 
 `CT_AGENT_AUTO_UPDATE` (2026-09-01, operator ask -- see ct_agent::self_update's module doc for
 the full rationale): set to 1/true to background-check for a newer release every
@@ -257,6 +280,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // counterpart for an already-running install updating itself in place.
     if std::env::args().nth(1).as_deref() == Some("update") {
         ct_agent::self_update::run_update(env!("CARGO_PKG_VERSION")).await?;
+        return Ok(());
+    }
+
+    // `status` (ct-agent#178): the live /status document from a running agent's metrics
+    // listener, or -- without one configured -- the tail of the on-disk event ring.
+    if std::env::args().nth(1).as_deref() == Some("status") {
+        ct_agent::status::run_status_command().await?;
         return Ok(());
     }
 

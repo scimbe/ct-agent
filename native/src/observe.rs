@@ -1,45 +1,170 @@
-//! Agent observability endpoint (M14.2, ADR-0016).
+//! Agent observability endpoint (M14.2, ADR-0016; ct-agent#178).
 //!
 //! Serves the Agent's [`TunnelMetrics`] over HTTP in the Prometheus text
 //! exposition format so a scraper (compose target) can read `/metrics`. The
 //! metrics themselves are populated on the data path (M14.1b); this module only
 //! exposes the already-shared `Arc<TunnelMetrics>`.
+//!
+//! ct-agent#178 adds three operator routes on the same listener
+//! (`CT_AGENT_METRICS_LISTEN`):
+//!
+//! * `GET /status` -- the [`crate::status`] snapshot as JSON (what
+//!   `ct-agent status` prints).
+//! * `GET /healthz` -- `200 ok` when registered and the edge was heard from
+//!   within `HEALTHZ_MAX_SILENCE_SECS`, else `503` with the reason as the body;
+//!   the shape a container/systemd/load-balancer probe wants.
+//! * `GET /events?n=100` -- the last `n` (1..=1000) lines of the
+//!   [`crate::events`] ring as `application/x-ndjson`.
+//!
+//! Every route reads through an [`ObserveState`] so a test can serve a private
+//! status/counter/ring instance instead of the process-wide ones.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{RawQuery, State};
 use axum::http::header::CONTENT_TYPE;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 
 use ct_common::metrics::TunnelMetrics;
 
+use crate::events::{EventCounters, Ring, EVENT_COUNTS};
+use crate::status::{AgentStatus, ProcessFacts, STATUS};
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Build the metrics router: `GET /metrics` renders the current counters.
+/// Default and upper bound for `GET /events?n=`.
+pub const EVENTS_DEFAULT_N: usize = 100;
+pub const EVENTS_MAX_N: usize = 1000;
+
+/// What the routes read. [`ObserveState::live`] wires the process-wide
+/// instances; tests build one from their own.
+#[derive(Clone)]
+pub struct ObserveState {
+    metrics: Arc<TunnelMetrics>,
+    status: &'static AgentStatus,
+    events: &'static EventCounters,
+    /// `None` = the process-wide ring (resolved from the environment).
+    ring: Option<Arc<Ring>>,
+    /// `None` = [`ProcessFacts::live`] at request time.
+    facts: Option<ProcessFacts>,
+}
+
+impl ObserveState {
+    /// The production wiring: `metrics` plus the process-wide status, counters
+    /// and ring.
+    pub fn live(metrics: Arc<TunnelMetrics>) -> Self {
+        Self { metrics, status: &STATUS, events: &EVENT_COUNTS, ring: None, facts: None }
+    }
+
+    /// Per-instance wiring (tests): a private status, counters, ring and facts.
+    pub fn with_parts(
+        metrics: Arc<TunnelMetrics>,
+        status: &'static AgentStatus,
+        events: &'static EventCounters,
+        ring: Arc<Ring>,
+        facts: ProcessFacts,
+    ) -> Self {
+        Self { metrics, status, events, ring: Some(ring), facts: Some(facts) }
+    }
+
+    fn facts(&self) -> ProcessFacts {
+        self.facts.clone().unwrap_or_else(ProcessFacts::live)
+    }
+
+    fn recent_events(&self, n: usize) -> Vec<String> {
+        match &self.ring {
+            Some(r) => r.recent(n),
+            None => crate::events::recent(n),
+        }
+    }
+}
+
+/// Build the metrics router over the process-wide status/events: `GET /metrics`
+/// renders the current counters, plus `/status`, `/healthz` and `/events`.
 pub fn metrics_router(metrics: Arc<TunnelMetrics>) -> Router {
+    observe_router(ObserveState::live(metrics))
+}
+
+/// [`metrics_router`] over an explicit [`ObserveState`].
+pub fn observe_router(state: ObserveState) -> Router {
     Router::new()
         .route("/metrics", get(render))
-        .with_state(metrics)
+        .route("/status", get(status_json))
+        .route("/healthz", get(healthz))
+        .route("/events", get(events_ndjson))
+        .with_state(state)
 }
 
 /// Render the counters in the Prometheus text exposition format, with the
 /// content type Prometheus expects (`text/plain; version=0.0.4`). The shared
 /// [`TunnelMetrics`] block is followed by this crate's own process-wide series:
-/// the MASQUE pump drop counter (ct-agent#177) and the live-task gauge
-/// (ct-agent#180).
-async fn render(State(metrics): State<Arc<TunnelMetrics>>) -> impl IntoResponse {
-    ([(CONTENT_TYPE, "text/plain; version=0.0.4")], render_text(&metrics))
+/// the status gauges and event counters (ct-agent#178), the MASQUE pump drop
+/// counter (ct-agent#177) and the live-task gauge (ct-agent#180).
+async fn render(State(state): State<ObserveState>) -> impl IntoResponse {
+    ([(CONTENT_TYPE, "text/plain; version=0.0.4")], render_text_with(&state.metrics, state.status, state.events))
 }
 
-/// The full `/metrics` body: ct_common's tunnel counters plus ct-agent's own series.
+/// The full `/metrics` body over the process-wide status and event counters
+/// (the handler goes through [`render_text_with`]; this shape is what the tail-order test pins).
+#[cfg(test)]
 fn render_text(metrics: &TunnelMetrics) -> String {
+    render_text_with(metrics, &STATUS, &EVENT_COUNTS)
+}
+
+/// The full `/metrics` body: ct_common's tunnel counters, then ct-agent's own
+/// series. Order: status gauges, event counters, MASQUE drops, live tasks -- the
+/// last two keep their pre-#178 tail position (a test pins it).
+fn render_text_with(metrics: &TunnelMetrics, status: &AgentStatus, events: &EventCounters) -> String {
     let mut text = metrics.render_prometheus();
+    text.push_str(&status.render_prometheus());
+    text.push_str(&events.render_prometheus());
     text.push_str(&crate::masque::render_dropped_datagrams_prometheus());
     text.push_str(&crate::task_guard::render_prometheus());
     text
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+async fn status_json(State(state): State<ObserveState>) -> impl IntoResponse {
+    let body = state.status.snapshot_at(now_unix(), &state.facts()).to_string();
+    ([(CONTENT_TYPE, "application/json")], body)
+}
+
+async fn healthz(State(state): State<ObserveState>) -> impl IntoResponse {
+    match state.status.healthz_at(now_unix()) {
+        Ok(()) => (StatusCode::OK, "ok".to_string()),
+        Err(reason) => (StatusCode::SERVICE_UNAVAILABLE, reason),
+    }
+}
+
+/// `n` from a raw query string like `n=50&x=y`: default [`EVENTS_DEFAULT_N`],
+/// clamped to `1..=EVENTS_MAX_N`; an unparsable value is the default.
+fn events_n(query: Option<&str>) -> usize {
+    query
+        .into_iter()
+        .flat_map(|q| q.split('&'))
+        .find_map(|kv| kv.strip_prefix("n=").and_then(|v| v.trim().parse::<usize>().ok()))
+        .unwrap_or(EVENTS_DEFAULT_N)
+        .clamp(1, EVENTS_MAX_N)
+}
+
+async fn events_ndjson(State(state): State<ObserveState>, RawQuery(query): RawQuery) -> impl IntoResponse {
+    let lines = state.recent_events(events_n(query.as_deref()));
+    let mut body = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
+    for l in lines {
+        body.push_str(&l);
+        body.push('\n');
+    }
+    ([(CONTENT_TYPE, "application/x-ndjson")], body)
 }
 
 /// Bind `listen` and serve the metrics endpoint until the process exits.
@@ -106,6 +231,15 @@ mod tests {
         // other tests spawn guarded tasks in parallel, so only the shape is pinned.
         assert!(text.contains("# TYPE ct_agent_tasks_live gauge"), "live-task gauge header");
         assert!(text.contains("\nct_agent_tasks_live "), "live-task gauge value line");
+        // ct-agent#178: the status gauges and the per-kind event counters. Process-wide
+        // statics again, so shape only.
+        assert!(text.contains("# TYPE ct_agent_registered gauge\nct_agent_registered "), "registered gauge");
+        assert!(text.contains("# TYPE ct_agent_reconnects_total counter\nct_agent_reconnects_total "));
+        assert!(text.contains("\nct_agent_transport{transport=\"quic\"} "));
+        assert!(text.contains("\nct_agent_transport{transport=\"none\"} "));
+        assert!(text.contains("# TYPE ct_agent_events_total counter\n"));
+        assert!(text.contains("\nct_agent_events_total{kind=\"registered\"} "));
+        assert!(text.contains("\nct_agent_events_total{kind=\"credential_degraded\"} "));
     }
 
     #[test]
@@ -195,5 +329,144 @@ mod tests {
             resp.contains("ct_tunnels_opened_total 5"),
             "serve_metrics served the scrape: {resp:.60}"
         );
+    }
+
+    // ---- ct-agent#178: /status, /healthz, /events over a PRIVATE state ----------------
+
+    /// A per-test [`ObserveState`]: leaked status/counters (the router wants
+    /// `'static`, and a test process is fine with a few dozen bytes leaking) plus
+    /// a ring in a tempdir the test keeps alive.
+    struct Private {
+        state: ObserveState,
+        status: &'static AgentStatus,
+        events: &'static EventCounters,
+        ring: Arc<Ring>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn private_state() -> Private {
+        let dir = tempfile::tempdir().unwrap();
+        let status: &'static AgentStatus = Box::leak(Box::new(AgentStatus::new()));
+        let events: &'static EventCounters = Box::leak(Box::new(EventCounters::new()));
+        let ring = Arc::new(Ring::new(dir.path()));
+        let facts = ProcessFacts {
+            uptime_secs: 7,
+            session: "feedfacefeedface".to_string(),
+            conn: Some(2),
+            tasks_live: 0,
+            oidc_credential: "none",
+            masque_dropped_datagrams: (0, 0),
+            events_ring_write_errors: 0,
+        };
+        let state = ObserveState::with_parts(Arc::new(TunnelMetrics::new()), status, events, Arc::clone(&ring), facts);
+        Private { state, status, events, ring, _dir: dir }
+    }
+
+    async fn fetch(app: Router, uri: &str) -> (StatusCode, String, String) {
+        let resp = app.oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, ct, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn status_route_serves_the_json_snapshot_with_the_version() {
+        let p = private_state();
+        p.status.set_transport("quic");
+        let (code, ct, body) = fetch(observe_router(p.state.clone()), "/status").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(ct, "application/json");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["version"], serde_json::json!(env!("CARGO_PKG_VERSION")));
+        assert_eq!(v["transport"], serde_json::json!("quic"));
+        assert_eq!(v["session"], serde_json::json!("feedfacefeedface"));
+        assert_eq!(v["uptime_secs"], serde_json::json!(7));
+        assert_eq!(v["registered"], serde_json::json!(false));
+        assert_eq!(v["oidc_credential"], serde_json::json!("none"));
+    }
+
+    #[tokio::test]
+    async fn healthz_is_503_before_registration_and_200_after_registered_and_seen() {
+        let p = private_state();
+        let (code, _, body) = fetch(observe_router(p.state.clone()), "/healthz").await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("not registered"), "{body}");
+
+        p.status.set_registered(Some(now_unix()));
+        p.status.note_keepalive();
+        let (code, _, body) = fetch(observe_router(p.state.clone()), "/healthz").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body, "ok");
+
+        // A registration whose edge went silent for longer than the limit is unhealthy again.
+        p.status.note_keepalive_at(now_unix().saturating_sub(crate::status::HEALTHZ_MAX_SILENCE_SECS + 5));
+        let (code, _, body) = fetch(observe_router(p.state.clone()), "/healthz").await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("nothing heard"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn events_route_serves_the_last_n_ring_lines_as_ndjson() {
+        let p = private_state();
+        let (code, ct, body) = fetch(observe_router(p.state.clone()), "/events").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(ct, "application/x-ndjson");
+        assert_eq!(body, "", "empty ring -> empty body");
+
+        for i in 0..5 {
+            p.ring.append(&format!("{{\"kind\":\"registered\",\"n\":{i}}}"));
+        }
+        let (_, _, body) = fetch(observe_router(p.state.clone()), "/events?n=2").await;
+        assert_eq!(body, "{\"kind\":\"registered\",\"n\":3}\n{\"kind\":\"registered\",\"n\":4}\n");
+        let (_, _, body) = fetch(observe_router(p.state.clone()), "/events").await;
+        assert_eq!(body.lines().count(), 5, "default n covers everything here");
+        // Out-of-range / garbage n is clamped or defaulted, never an error.
+        let (code, _, body) = fetch(observe_router(p.state.clone()), "/events?n=0").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body.lines().count(), 1, "n=0 clamps to 1");
+        let (code, _, body) = fetch(observe_router(p.state.clone()), "/events?n=zebra&x=1").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body.lines().count(), 5);
+    }
+
+    #[test]
+    fn events_n_parses_defaults_and_clamps() {
+        assert_eq!(events_n(None), EVENTS_DEFAULT_N);
+        assert_eq!(events_n(Some("n=7")), 7);
+        assert_eq!(events_n(Some("a=b&n=7")), 7);
+        assert_eq!(events_n(Some("n=0")), 1);
+        assert_eq!(events_n(Some("n=99999")), EVENTS_MAX_N);
+        assert_eq!(events_n(Some("n=")), EVENTS_DEFAULT_N);
+        assert_eq!(events_n(Some("n=-1")), EVENTS_DEFAULT_N);
+    }
+
+    #[tokio::test]
+    async fn metrics_route_carries_the_private_status_and_event_series() {
+        let p = private_state();
+        p.status.set_transport("tcp-fallback");
+        p.status.set_registered(Some(1));
+        p.status.note_reconnect();
+        p.status.note_reconnect();
+        p.status.note_reconnect();
+        p.events.bump(crate::events::REGISTERED);
+        p.events.bump(crate::events::DISCONNECTED);
+        p.events.bump(crate::events::DISCONNECTED);
+        let (code, _, text) = fetch(observe_router(p.state.clone()), "/metrics").await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(text.contains("\nct_agent_registered 1\n"), "{text}");
+        assert!(text.contains("\nct_agent_reconnects_total 3\n"));
+        assert!(text.contains("\nct_agent_transport{transport=\"tcp-fallback\"} 1\n"));
+        assert!(text.contains("\nct_agent_transport{transport=\"quic\"} 0\n"));
+        assert!(text.contains("\nct_agent_events_total{kind=\"registered\"} 1\n"));
+        assert!(text.contains("\nct_agent_events_total{kind=\"disconnected\"} 2\n"));
+        assert!(text.contains("\nct_agent_events_total{kind=\"update_applied\"} 0\n"));
+        // The pre-#178 tail order is unchanged: masque drops, then the live-task gauge last.
+        let last_value_line = text.lines().rev().find(|l| !l.starts_with('#')).unwrap();
+        assert!(last_value_line.starts_with("ct_agent_tasks_live "), "{last_value_line}");
     }
 }

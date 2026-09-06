@@ -85,7 +85,9 @@ pub fn mark_process_start() {
     let _ = PROCESS_START.set(std::time::Instant::now());
 }
 
-fn process_uptime_secs() -> u64 {
+/// Seconds since [`mark_process_start`] (or, if that was never called, since the
+/// first call here); also `/status`'s `uptime_secs` (ct-agent#178).
+pub fn process_uptime_secs() -> u64 {
     PROCESS_START.get_or_init(std::time::Instant::now).elapsed().as_secs()
 }
 
@@ -291,6 +293,13 @@ where
     }
 
     eprintln!("{}", traffic_status_line());
+    // ct-agent#178: one structured open/close pair per session, keyed by the peer's
+    // (attestation-verified) Noise static key.
+    let peer_hex = super::cli_config::hex_encode(peer_noise_public);
+    crate::events::emit(
+        crate::events::CHANNEL_SESSION,
+        serde_json::json!({ "state": "open", "peer": peer_hex }),
+    );
     // #248: unconditional (no debug flag) periodic status while this session's pump runs —
     // aborted the moment the pump finishes, one way or another, via the handle drop below.
     let ticker = tokio::spawn(async {
@@ -310,5 +319,9 @@ where
     ticker.abort();
     graceful_stream_drain(&mut send, &mut recv, RELAY_DRAIN_TIMEOUT).await;
     eprintln!("{}", traffic_status_line());
+    crate::events::emit(
+        crate::events::CHANNEL_SESSION,
+        serde_json::json!({ "state": "close", "peer": peer_hex, "ok": pumped.is_ok() }),
+    );
     pumped
 }
