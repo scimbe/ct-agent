@@ -108,22 +108,30 @@ Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
               (comma-separated 64-hex publisher pubkeys) / CT_MANIFEST_TRUST_ALLOWLIST_FILE
               (one per line); optional CT_MANIFEST_ENV_FILE (KEY=value secrets, supplied
               locally, never from the manifest) and CT_MANIFEST_PROTECTED_NAMES (comma-
-              separated substrings this install must never collide with). Writes the install
-              report JSON to stdout and exits non-zero unless the status is \"ok\". Optional
-              Phase 3 registry ledger mode: if CT_MANIFEST_REGISTRY_URL is set, a successful
-              activation additionally POSTs a ledger-only activation event (also needs
+              separated substrings this install must never collide with).
+              CT_MANIFEST_WORK_DIR is the PARENT directory: each activation unpacks into
+              <CT_MANIFEST_WORK_DIR>/<CT_MANIFEST_PROJECT_NAME>, which must not exist yet or
+              must be empty -- a bundle is never unpacked over existing files (#165) -- and
+              a successful activation leaves a .ct-agent-activation.json marker there naming
+              the manifest it came from. Writes the install report JSON (plus install_dir) to
+              stdout and exits non-zero unless the status is \"ok\". Optional Phase 3 registry
+              ledger mode: if CT_MANIFEST_REGISTRY_URL is set, a successful activation
+              additionally POSTs a ledger-only activation event (also needs
               CT_MANIFEST_REGISTRY_WRITE_TOKEN and CT_MANIFEST_ACTIVATOR_PUBKEY, this agent's
               own 64-hex holder pubkey).
 
 `harness run` (CADS-agent-marketplace Phase 2, bounded local-LLM bundle maintenance) reads:
     CT_HARNESS_TASK_URL_OR_PATH, CT_HARNESS_MANIFEST_URL_OR_PATH (the same manifest reference
-    used at `manifest activate` time), CT_HARNESS_BUNDLE_DIR (that manifest's already-activated
-    work_dir), CT_HARNESS_LITELLM_URL, CT_HARNESS_LITELLM_KEY_FILE (a budget-capped LiteLLM
-    virtual key, in a file, never inline), CT_HARNESS_ALLOWED_MODELS (comma-separated), and
-    exactly one of CT_HARNESS_TRUST_ALLOWLIST / CT_HARNESS_TRUST_ALLOWLIST_FILE. The harness may
-    only read/write files inside CT_HARNESS_BUNDLE_DIR and rebuild that bundle's own compose file
-    -- no shell access, no host-wide filesystem access. Writes the run report JSON to stdout and
-    exits non-zero unless the status is \"ok\".
+    used at `manifest activate` time), CT_HARNESS_BUNDLE_DIR (that manifest's activation
+    directory, <CT_MANIFEST_WORK_DIR>/<project_name>; its .ct-agent-activation.json marker
+    must name this manifest -- an unmarked directory is refused unless
+    CT_HARNESS_ALLOW_UNMARKED_BUNDLE=1, #165), CT_HARNESS_LITELLM_URL,
+    CT_HARNESS_LITELLM_KEY_FILE (a budget-capped LiteLLM virtual key, in a file, never inline),
+    CT_HARNESS_ALLOWED_MODELS (comma-separated), and exactly one of CT_HARNESS_TRUST_ALLOWLIST /
+    CT_HARNESS_TRUST_ALLOWLIST_FILE. The harness may only read/write files inside
+    CT_HARNESS_BUNDLE_DIR and rebuild that bundle's own compose file -- no shell access, no
+    host-wide filesystem access. Writes the run report JSON to stdout and exits non-zero unless
+    the status is \"ok\".
 ";
 
 #[tokio::main]
@@ -640,13 +648,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Some("activate") => {
                 let cfg = ct_agent::manifest_run::ActivateCliConfig::from_env()
                     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-                let report = ct_agent::manifest_run::run_activate(cfg)
+                let activation = ct_agent::manifest_run::run_activate(cfg)
                     .await
                     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-                // The report is the product of the command -- print it either way, then let the
-                // exit code carry the verdict so `manifest activate && …` scripts correctly.
-                println!("{}", report.to_json());
-                if !ct_agent::manifest_run::report_is_ok(&report) {
+                // The report is the product of the command -- print it either way (with the
+                // per-activation install_dir added, #165), then let the exit code carry the
+                // verdict so `manifest activate && …` scripts correctly.
+                let json = ct_agent::manifest_run::report_json_with_install_dir(&activation);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json)
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?
+                );
+                if !ct_agent::manifest_run::report_is_ok(&activation.report) {
                     std::process::exit(1);
                 }
                 return Ok(());
