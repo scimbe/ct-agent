@@ -8,6 +8,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,8 +22,9 @@ use tokio::net::{TcpStream, UdpSocket};
 use crate::config::{AgentConfig, OriginProto};
 use crate::local_auth;
 use crate::transport::{
-    await_ping_phase_end, bind_hostname, dial_quic, dial_quic_or_blocked_error, register_tunnel,
-    register_tunnel_stream, register_tunnel_stream_browser,
+    await_ping_phase_end, bind_hostname, dial_quic, dial_quic_or_blocked_error,
+    is_registration_refusal, register_tunnel, register_tunnel_stream,
+    register_tunnel_stream_browser,
     register_tunnel_stream_browser_framed_capable, register_tunnel_stream_browser_ping_capable,
     register_tunnel_stream_ping_capable,
     tcp_tls_connect,
@@ -722,9 +724,19 @@ fn trim_trailing_line_ending(bytes: &[u8]) -> &[u8] {
 // bypasses the Edge entirely, so a token revoked at the control plane
 // (CADS-Tunnel#554) never cut a direct client off. Operator decision 23.08.:
 // the client carries its RoutingToken inside the Noise handshake and the agent
-// checks it. Slice 1 (this): agent side only, rollout-compatible. Slice 2:
-// CADS-Tunnel's client sends the payload. Slice 3: the agent consults a cached
-// copy of the control plane's live/revocation status at the check.
+// checks it. Slice 1: agent side only, rollout-compatible. Slice 2:
+// CADS-Tunnel's client sends the payload. Slice 3 (below, `RevocationView`):
+// the agent consults its cached revocation status at the check.
+//
+// Slice 3 design note -- why there is no control-plane poll. The plane's only
+// revocation list (`GET /internal/revoked-tokens`) is gated by the edge<->plane
+// admin token, which an agent does not hold. The agent DOES already receive the
+// revocation from the one place that enforces it: the Edge. `revoke_token`
+// (CADS-Tunnel #27/#421/#554) tears the live registration down and then refuses
+// every re-registration of that token with a wire `NO` -- and this agent's
+// reconnect loop re-registers on every drop. So the cached status is fed by the
+// registration path (`RevocationTracker`), with no new wire contract and no new
+// credential.
 
 /// Version tag of the direct-connect handshake payload: "a RoutingToken
 /// follows" (ct-agent#45 slice 1). See [`DirectHandshakePayload`] for the encoding.
@@ -798,6 +810,10 @@ pub const DIRECT_REFUSED_MISSING: &str = "ct-agent: direct-connect refused: hand
 /// Named log line for a v1-tagged payload of the wrong length.
 pub const DIRECT_REFUSED_MALFORMED: &str =
     "ct-agent: direct-connect refused: malformed routing-token handshake payload (#45)";
+/// Named log line for ANY direct handshake while the tunnel's token is revoked
+/// at the plane (ct-agent#45 slice 3) -- token or not, matching or not.
+pub const DIRECT_REFUSED_REVOKED: &str =
+    "ct-agent: direct-connect refused: this tunnel's token is revoked at the plane (#45)";
 
 /// Outcome of [`DirectTokenPolicy::decide`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -812,6 +828,9 @@ pub enum DirectTokenDecision {
     RefuseMissing,
     /// A v1-tagged payload that is not `0x01 ‖ token(32)`.
     RefuseMalformed,
+    /// The tunnel's own token is revoked at the plane ([`RevocationView`]):
+    /// refused regardless of what the handshake carried (slice 3).
+    RefuseRevoked,
 }
 
 impl DirectTokenDecision {
@@ -822,6 +841,7 @@ impl DirectTokenDecision {
             DirectTokenDecision::RefuseMismatch => Some(DIRECT_REFUSED_MISMATCH),
             DirectTokenDecision::RefuseMissing => Some(DIRECT_REFUSED_MISSING),
             DirectTokenDecision::RefuseMalformed => Some(DIRECT_REFUSED_MALFORMED),
+            DirectTokenDecision::RefuseRevoked => Some(DIRECT_REFUSED_REVOKED),
         }
     }
 }
@@ -843,6 +863,167 @@ impl std::error::Error for DirectConnectRefused {}
 /// QUIC application close code [`serve_direct`] uses for a refused client.
 pub const DIRECT_REFUSED_CLOSE_CODE: u32 = 1;
 
+/// Named log line for the not-revoked -> revoked transition (slice 3).
+pub const REVOCATION_LOG_REVOKED: &str = "ct-agent: this tunnel's routing token is REVOKED at \
+     the plane (the edge refuses its registration) -- direct-connect handshakes are refused \
+     until a registration is accepted again (#45)";
+/// Named log line for the revoked -> not-revoked transition (slice 3).
+pub const REVOCATION_LOG_RESTORED: &str = "ct-agent: this tunnel's routing token registered \
+     at the edge again -- direct-connect handshakes resume (#45)";
+
+/// The agent's cached answer to "is this tunnel's token revoked at the plane?"
+/// (ct-agent#45 slice 3). One per agent, shared between the edge registration
+/// loop that learns the answer ([`RevocationTracker`]) and the
+/// [`DirectTokenPolicy`] that acts on it for every direct-connect handshake.
+///
+/// Cached, not polled: the agent holds no credential for the plane's
+/// revocation list, but the Edge refuses a revoked token's registration with a
+/// wire `NO` on every reconnect (see the module note above), so the freshest
+/// status the agent can have is "what the last registration attempt said".
+/// Staleness is therefore bounded by the reconnect loop: a live registration
+/// is cut by the Edge at revoke time (#554), the very next attempt is refused,
+/// and the flag is set -- one dial+register round trip after the cut.
+#[derive(Debug, Default)]
+pub struct RevocationView {
+    revoked: AtomicBool,
+}
+
+impl RevocationView {
+    /// Whether the token is currently believed revoked.
+    pub fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
+
+    /// Set the flag; `true` if it was clear before (the caller logs transitions).
+    fn set(&self) -> bool {
+        !self.revoked.swap(true, Ordering::AcqRel)
+    }
+
+    /// Clear the flag; `true` if it was set before.
+    fn clear(&self) -> bool {
+        self.revoked.swap(false, Ordering::AcqRel)
+    }
+}
+
+/// What one edge registration attempt told the agent about its token
+/// (ct-agent#45 slice 3), as classified by the registration loop that made it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationOutcome {
+    /// The Edge acked `OK`: the token is live at the plane.
+    Succeeded,
+    /// The Edge acked `NO` on a path where that has exactly one meaning -- the
+    /// token is revoked. Today: the QUIC role-`'A'` registration
+    /// ([`crate::transport::register_tunnel`], CADS-Tunnel `serve_connection`).
+    RefusedDefinitive,
+    /// The Edge acked `NO` on a path where the same bytes also mean "try again
+    /// later" -- the TLS-TCP fallback's `'A'`/`'K'` admission, whose `NO` is
+    /// also its #410 sub-cap-full reply. Counted, not trusted alone.
+    RefusedAmbiguous,
+    /// No verdict from the Edge at all: dial failure, reset, timeout, ack-less
+    /// drop, a serve failure after a registration that had already succeeded.
+    /// Never moves the flag in either direction.
+    Transient,
+}
+
+/// How many consecutive [`RegistrationOutcome::RefusedAmbiguous`] verdicts one
+/// registration loop must see before the view flips to revoked.
+///
+/// Why 3: on the TLS-TCP fallback the only other cause of a bare `NO` is the
+/// Edge's per-listener agent sub-cap being full (#410) -- a momentary
+/// condition that clears as parked registrations are consumed or time out,
+/// while a revoked token is refused on every attempt forever. Three refusals in
+/// a row, each separated by the loop's own backoff (`CT_AGENT_RECONNECT_BASE_MS`
+/// upwards, jittered), is beyond what a full cap plausibly produces for one
+/// worker; and a false positive costs little -- direct-connect is refused only
+/// while this agent cannot register at the edge either, and the first accepted
+/// registration clears it. One (the definitive path's threshold) would turn a
+/// cap-full edge into a spurious "revoked" on the very first `NO`.
+pub const AMBIGUOUS_REFUSALS_BEFORE_REVOKED: u32 = 3;
+
+/// The flag's observable transitions, so the loop logs each exactly once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevocationTransition {
+    /// Not revoked -> revoked.
+    Revoked,
+    /// Revoked -> not revoked.
+    Restored,
+}
+
+impl RevocationTransition {
+    /// The named log line for this transition.
+    pub fn log_line(self) -> &'static str {
+        match self {
+            RevocationTransition::Revoked => REVOCATION_LOG_REVOKED,
+            RevocationTransition::Restored => REVOCATION_LOG_RESTORED,
+        }
+    }
+}
+
+/// One registration loop's feed into the shared [`RevocationView`]
+/// (ct-agent#45 slice 3). Each loop -- the QUIC reconnect loop, every TLS-TCP
+/// fallback pool worker -- owns its own tracker, so the ambiguous-refusal count
+/// is "consecutive refusals as seen by ONE loop": a pool of N workers all
+/// bouncing off a full sub-cap in the same second must not add up to N.
+#[derive(Debug)]
+pub struct RevocationTracker {
+    view: Arc<RevocationView>,
+    /// Consecutive ambiguous refusals since the last success. Untouched by
+    /// transients (a network blip neither confirms nor disproves a revocation).
+    ambiguous_refusals: u32,
+}
+
+impl RevocationTracker {
+    pub fn new(view: Arc<RevocationView>) -> Self {
+        RevocationTracker { view, ambiguous_refusals: 0 }
+    }
+
+    /// Pure transition helper: fold one registration outcome into the view and
+    /// report the flag's transition, if it moved. No I/O, no logging --
+    /// [`note`](Self::note) does the logging.
+    pub fn apply(&mut self, outcome: RegistrationOutcome) -> Option<RevocationTransition> {
+        match outcome {
+            RegistrationOutcome::Succeeded => {
+                self.ambiguous_refusals = 0;
+                self.view.clear().then_some(RevocationTransition::Restored)
+            }
+            RegistrationOutcome::RefusedDefinitive => {
+                self.ambiguous_refusals = 0;
+                self.view.set().then_some(RevocationTransition::Revoked)
+            }
+            RegistrationOutcome::RefusedAmbiguous => {
+                self.ambiguous_refusals = self.ambiguous_refusals.saturating_add(1);
+                if self.ambiguous_refusals >= AMBIGUOUS_REFUSALS_BEFORE_REVOKED {
+                    self.view.set().then_some(RevocationTransition::Revoked)
+                } else {
+                    None
+                }
+            }
+            RegistrationOutcome::Transient => None,
+        }
+    }
+
+    /// [`apply`](Self::apply) plus the one log line per transition.
+    pub fn note(&mut self, outcome: RegistrationOutcome) {
+        if let Some(t) = self.apply(outcome) {
+            eprintln!("{}", t.log_line());
+        }
+    }
+
+    /// Classify a failed registration by its error: the typed wire `NO`
+    /// ([`crate::transport::RegistrationRefused`]) is a refusal -- definitive or
+    /// ambiguous per the path, the caller's `definitive` -- and anything else
+    /// (dial, reset, timeout, ack-less drop) is transient.
+    pub fn classify_failure(e: &BoxError, definitive: bool) -> RegistrationOutcome {
+        if !is_registration_refusal(e) {
+            RegistrationOutcome::Transient
+        } else if definitive {
+            RegistrationOutcome::RefusedDefinitive
+        } else {
+            RegistrationOutcome::RefusedAmbiguous
+        }
+    }
+}
+
 /// Agent-side policy for the direct-connect token check (ct-agent#45 slice 1).
 /// Built once per agent in [`run_agent`] from the tunnel's own token and
 /// `CT_DIRECT_REQUIRE_TOKEN`; shared by every direct connection.
@@ -860,11 +1041,28 @@ pub struct DirectTokenPolicy {
     /// (once per connection). Off by default -- a fleet of pre-#45 clients
     /// would otherwise flood the log during rollout.
     pub debug: bool,
+    /// Slice 3: the cached "revoked at the plane" status, fed by the edge
+    /// registration loop ([`RevocationTracker`]). While set, EVERY direct
+    /// handshake is refused -- see [`decide`](Self::decide).
+    pub revocation: Arc<RevocationView>,
 }
 
 impl DirectTokenPolicy {
+    /// A policy with its own, initially clear, [`RevocationView`] -- for a
+    /// process whose registration loop does not feed one (tests, harnesses).
+    /// [`run_agent`] uses [`with_revocation`](Self::with_revocation) instead so
+    /// the loop and the policy share the view.
     pub fn new(own_token: RoutingToken, require_token: bool) -> Self {
-        DirectTokenPolicy { own_token, require_token, debug: false }
+        Self::with_revocation(own_token, require_token, Arc::new(RevocationView::default()))
+    }
+
+    /// [`new`](Self::new) sharing `revocation` with the registration loop.
+    pub fn with_revocation(
+        own_token: RoutingToken,
+        require_token: bool,
+        revocation: Arc<RevocationView>,
+    ) -> Self {
+        DirectTokenPolicy { own_token, require_token, debug: false, revocation }
     }
 
     /// The one-line startup notice [`run_agent`] prints when the direct listener
@@ -885,12 +1083,19 @@ impl DirectTokenPolicy {
     /// Pure decision: what to do with a direct handshake whose payload parsed to
     /// `payload`. No I/O, no logging -- [`check_direct_token`] does those.
     pub fn decide(&self, payload: &DirectHandshakePayload) -> DirectTokenDecision {
+        // Slice 3: a revoked tunnel serves nobody on the direct path -- not the
+        // client presenting the (now revoked) matching token, and not a pre-#45
+        // client sending none, which is exactly the client a revoke is meant to
+        // cut off. Checked first so the rollout-mode legacy tolerance below can
+        // never outrank a revocation.
+        if self.revocation.is_revoked() {
+            return DirectTokenDecision::RefuseRevoked;
+        }
         match payload {
             DirectHandshakePayload::Token(t) => {
                 if routing_token_eq_ct(t, &self.own_token) {
-                    // TODO(#45 slice 3): consult the cached revocation status here
-                    // (periodic control-plane poll) -- a token that matches this
-                    // tunnel but has been revoked upstream must be refused too.
+                    // Matches this tunnel, and the revocation view above says
+                    // the tunnel is live at the plane: serve.
                     DirectTokenDecision::Serve
                 } else {
                     DirectTokenDecision::RefuseMismatch
@@ -1263,6 +1468,10 @@ pub async fn run_agent(
             }
         });
     }
+    // #45 slice 3: the cached revocation status. Fed by whichever registration
+    // loop below is active (QUIC, or the TLS-TCP fallback's pool workers), read
+    // by the direct-connect policy. Created unconditionally -- it is one bool.
+    let revocation = Arc::new(RevocationView::default());
     if let Some(ip) = config.direct_advertise_ip {
         if let Ok((listener, cert)) = crate::transport::build_direct_listener() {
             if let Ok(bound) = listener.local_addr() {
@@ -1281,8 +1490,11 @@ pub async fn run_agent(
                 // startup so an operator can see whether pre-#45 clients are
                 // still tolerated. CT_DEBUG_DIRECT_TOKEN is presence-based like
                 // CT_DEBUG_A2A_TIMING.
-                let mut dpolicy =
-                    DirectTokenPolicy::new(token.clone(), config.direct_require_token);
+                let mut dpolicy = DirectTokenPolicy::with_revocation(
+                    token.clone(),
+                    config.direct_require_token,
+                    Arc::clone(&revocation),
+                );
                 dpolicy.debug = std::env::var_os("CT_DEBUG_DIRECT_TOKEN").is_some();
                 eprintln!("{}", dpolicy.startup_line());
                 let dpolicy = Arc::new(dpolicy);
@@ -1319,10 +1531,17 @@ pub async fn run_agent(
         eprintln!(
             "ct-agent: CT_AGENT_REGISTER_TCP_ONLY set — registering over TLS-TCP exclusively (no QUIC)"
         );
-        return run_agent_tcp_fallback(config, edge_cert, token, origin_keys, gate).await;
+        return run_agent_tcp_fallback_with_revocation(
+            config, edge_cert, token, origin_keys, gate, revocation,
+        )
+        .await;
     }
     let (reconnect_base, reconnect_max) = reconnect_backoff_bounds();
     let mut backoff = Backoff::new(reconnect_base, reconnect_max, reconnect_max_attempts());
+    // #45 slice 3: this loop's feed into the revocation view. Over QUIC the
+    // edge's `NO` to a role-'A' registration is definitive (see
+    // `RegistrationRefused`), so one refusal flips the view.
+    let mut revocation_tracker = RevocationTracker::new(Arc::clone(&revocation));
     loop {
         let conn = match dial_quic_or_blocked_error(config.edge, edge_cert.clone(), Duration::from_secs(5))
             .await
@@ -1347,6 +1566,7 @@ pub async fn run_agent(
                             token.clone(),
                             Arc::clone(&origin_keys),
                             Arc::clone(&gate),
+                            Arc::clone(&revocation),
                         )
                         .await?;
                         // A QUIC probe answered — start over with a fresh budget and
@@ -1358,6 +1578,9 @@ pub async fn run_agent(
             }
         };
         if let Err(e) = register_tunnel(&conn, &token).await {
+            // #45 slice 3: a wire `NO` here means the token is revoked at the
+            // plane; a dial/stream error means nothing about the token.
+            revocation_tracker.note(RevocationTracker::classify_failure(&e, true));
             eprintln!("ct-agent: registration failed ({e}); will reconnect");
             match backoff.next_delay_jittered(rand::random::<f64>()) {
                 Some(d) => {
@@ -1367,6 +1590,7 @@ pub async fn run_agent(
                 None => return Err("ct-agent: gave up re-registering with the edge".into()),
             }
         }
+        revocation_tracker.note(RegistrationOutcome::Succeeded);
         backoff.reset();
         // Browser Plane (#23 BP3b): bind the public hostname to this token so an
         // SNI-routed browser reaches this tunnel. Re-bound on every reconnect.
@@ -1654,12 +1878,39 @@ async fn serve_quic_connection(
 /// deployment to TCP outright) and for the e2e tests of the pool/worker
 /// mechanics (they need "fallback forever", deterministically, without a 30s
 /// probe racing the assertion).
+///
+/// #45 slice 3: production now enters through
+/// [`run_agent_tcp_fallback_with_revocation`] (it needs the shared revocation view);
+/// this argument-compatible wrapper stays for the e2e tests only.
+#[cfg(test)]
 async fn run_agent_tcp_fallback(
     config: &AgentConfig,
     edge_cert: CertificateDer<'static>,
     token: RoutingToken,
     origin_keys: Arc<Vec<[u8; 32]>>,
     gate: Arc<local_auth::LocalAuthGate>,
+) -> Result<(), BoxError> {
+    run_agent_tcp_fallback_with_revocation(
+        config,
+        edge_cert,
+        token,
+        origin_keys,
+        gate,
+        Arc::new(RevocationView::default()),
+    )
+    .await
+}
+
+/// [`run_agent_tcp_fallback`] sharing `revocation` with [`run_agent`]'s
+/// direct-connect policy (#45 slice 3): each pool worker owns one
+/// [`RevocationTracker`] over it.
+async fn run_agent_tcp_fallback_with_revocation(
+    config: &AgentConfig,
+    edge_cert: CertificateDer<'static>,
+    token: RoutingToken,
+    origin_keys: Arc<Vec<[u8; 32]>>,
+    gate: Arc<local_auth::LocalAuthGate>,
+    revocation: Arc<RevocationView>,
 ) -> Result<(), BoxError> {
     let n = config.tcp_fallback_pool_size.max(1);
     let mut workers = Vec::with_capacity(n);
@@ -1669,8 +1920,10 @@ async fn run_agent_tcp_fallback(
         let token = token.clone();
         let origin_keys = Arc::clone(&origin_keys);
         let gate = Arc::clone(&gate);
+        let tracker = RevocationTracker::new(Arc::clone(&revocation));
         workers.push(tokio::spawn(async move {
-            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys, gate).await
+            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys, gate, tracker)
+                .await
         }));
     }
     // If any one worker gives up (its own backoff exhausted), that's fatal to
@@ -1705,6 +1958,7 @@ async fn run_agent_tcp_fallback_until_quic_recovers(
     token: RoutingToken,
     origin_keys: Arc<Vec<[u8; 32]>>,
     gate: Arc<local_auth::LocalAuthGate>,
+    revocation: Arc<RevocationView>,
 ) -> Result<(), BoxError> {
     let n = config.tcp_fallback_pool_size.max(1);
     let mut workers = tokio::task::JoinSet::new();
@@ -1714,8 +1968,10 @@ async fn run_agent_tcp_fallback_until_quic_recovers(
         let token = token.clone();
         let origin_keys = Arc::clone(&origin_keys);
         let gate = Arc::clone(&gate);
+        let tracker = RevocationTracker::new(Arc::clone(&revocation));
         workers.spawn(async move {
-            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys, gate).await
+            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys, gate, tracker)
+                .await
         });
     }
     loop {
@@ -1757,6 +2013,7 @@ async fn run_agent_tcp_fallback_worker(
     token: RoutingToken,
     origin_keys: Arc<Vec<[u8; 32]>>,
     gate: Arc<local_auth::LocalAuthGate>,
+    mut revocation: RevocationTracker,
 ) -> Result<(), BoxError> {
     let metrics = Arc::new(TunnelMetrics::new());
     // Reconnect loop (issue #5 / P1.2b): re-register and serve again after each
@@ -1775,7 +2032,7 @@ async fn run_agent_tcp_fallback_worker(
         let mut last_err: Option<BoxError> = None;
         for addr in &rungs {
             match tcp_connect_register_serve(
-                config, *addr, &edge_cert, &token, &origin_keys, &metrics, &gate,
+                config, *addr, &edge_cert, &token, &origin_keys, &metrics, &gate, &mut revocation,
             )
             .await
             {
@@ -1809,6 +2066,11 @@ async fn run_agent_tcp_fallback_worker(
 /// Connect over TLS-TCP to `target`, register the tunnel over the stream, and
 /// serve one Client's Noise tunnel over it — the single-shot body of the
 /// TCP-fallback reconnect loop (issue #5 / P1.2b), one rung of the #46 ladder.
+///
+/// #45 slice 3: `revocation` is this worker's feed into the revocation view --
+/// an accepted registration (any role) clears it, the Edge's typed `NO` to the
+/// final `'A'` counts as an AMBIGUOUS refusal (on this path the same bytes also
+/// mean "#410 sub-cap full"), and every other failure is transient.
 async fn tcp_connect_register_serve(
     config: &AgentConfig,
     target: SocketAddr,
@@ -1817,6 +2079,7 @@ async fn tcp_connect_register_serve(
     origin_keys: &[[u8; 32]],
     metrics: &Arc<TunnelMetrics>,
     gate: &local_auth::LocalAuthGate,
+    revocation: &mut RevocationTracker,
 ) -> Result<(), BoxError> {
     let mut stream = tcp_tls_connect(target, edge_cert.clone()).await?;
     // Browser Plane over the TCP fallback (#41 FB3): register+bind the public
@@ -1871,6 +2134,9 @@ async fn tcp_connect_register_serve(
                     ping_capable = false;
                 }
             }
+            // The edge admits 'B'/'L'/'F' only for a live token (#665), so an
+            // accepted browser registration clears the revocation view too.
+            revocation.note(RegistrationOutcome::Succeeded);
             eprintln!(
                 "ct-agent: browser-registered '{host}' over the TLS-TCP fallback (UDP blocked){}, \
                  {}-forwarding to {}",
@@ -1919,9 +2185,16 @@ async fn tcp_connect_register_serve(
              falling back to a plain 'A' registration on a fresh connection"
         );
         stream = tcp_tls_connect(target, edge_cert.clone()).await?;
-        register_tunnel_stream(&mut stream, token).await?;
+        // #45 slice 3: only the FINAL verdict of this attempt is counted (the
+        // 'K' failure above may just be a pre-'K' edge), and a `NO` here is the
+        // ambiguous kind -- see `tcp_connect_register_serve`'s doc.
+        if let Err(e) = register_tunnel_stream(&mut stream, token).await {
+            revocation.note(RevocationTracker::classify_failure(&e, false));
+            return Err(e);
+        }
         ping_capable = false;
     }
+    revocation.note(RegistrationOutcome::Succeeded);
     eprintln!(
         "ct-agent: registered over the TLS-TCP fallback (UDP blocked){}, serving one tunnel to {}",
         if ping_capable { ", ping-capable" } else { "" },
@@ -2938,6 +3211,154 @@ mod tests {
         assert!(policy.startup_line().contains("REQUIRED"), "{}", policy.startup_line());
     }
 
+    // ---- ct-agent#45 slice 3: revocation-aware direct-connect ----
+
+    #[test]
+    fn direct_token_policy_refuses_everything_while_revoked_and_resumes_after_clear() {
+        // While the view says "revoked", EVERY handshake is refused with the one
+        // named line -- the matching token, a foreign token, no token at all
+        // (rollout mode would otherwise serve it), a malformed payload. Once a
+        // registration is accepted again, the slice-1 decisions return unchanged.
+        let own = RoutingToken([0x45; 32]);
+        let view = Arc::new(RevocationView::default());
+        let policy = DirectTokenPolicy::with_revocation(own.clone(), false, Arc::clone(&view));
+        let mut tracker = RevocationTracker::new(Arc::clone(&view));
+        let foreign = RoutingToken([0x99; 32]);
+        let all = [
+            DirectHandshakePayload::Token(own.clone()),
+            DirectHandshakePayload::Token(foreign),
+            DirectHandshakePayload::Legacy,
+            DirectHandshakePayload::Malformed,
+        ];
+
+        assert!(!policy.revocation.is_revoked(), "a fresh policy starts live");
+        assert_eq!(policy.decide(&all[0]), DirectTokenDecision::Serve);
+
+        assert_eq!(
+            tracker.apply(RegistrationOutcome::RefusedDefinitive),
+            Some(RevocationTransition::Revoked)
+        );
+        assert!(policy.revocation.is_revoked(), "the policy sees the shared view");
+        for payload in &all {
+            assert_eq!(
+                policy.decide(payload),
+                DirectTokenDecision::RefuseRevoked,
+                "refused while revoked: {payload:?}"
+            );
+        }
+        assert_eq!(
+            DirectTokenDecision::RefuseRevoked.refusal_line(),
+            Some(DIRECT_REFUSED_REVOKED)
+        );
+        assert_eq!(
+            DIRECT_REFUSED_REVOKED,
+            "ct-agent: direct-connect refused: this tunnel's token is revoked at the plane (#45)"
+        );
+
+        assert_eq!(
+            tracker.apply(RegistrationOutcome::Succeeded),
+            Some(RevocationTransition::Restored)
+        );
+        assert!(!policy.revocation.is_revoked());
+        assert_eq!(policy.decide(&all[0]), DirectTokenDecision::Serve);
+        assert_eq!(policy.decide(&all[1]), DirectTokenDecision::RefuseMismatch);
+        assert_eq!(policy.decide(&all[2]), DirectTokenDecision::ServeLegacy);
+        assert_eq!(policy.decide(&all[3]), DirectTokenDecision::RefuseMalformed);
+
+        // A policy built with `new` owns a private, clear view -- slice-1 callers
+        // and tests are unaffected.
+        assert!(!DirectTokenPolicy::new(own, false).revocation.is_revoked());
+    }
+
+    #[test]
+    fn revocation_tracker_flips_only_on_definitive_refusals_and_clears_on_success() {
+        // Transient failures never move the flag in either direction; a
+        // definitive refusal flips it once (the transition is reported exactly
+        // once, so the log line prints once); a success clears it once.
+        let view = Arc::new(RevocationView::default());
+        let mut t = RevocationTracker::new(Arc::clone(&view));
+        for _ in 0..10 {
+            assert_eq!(t.apply(RegistrationOutcome::Transient), None);
+        }
+        assert!(!view.is_revoked(), "network errors are not revocations");
+        assert_eq!(t.apply(RegistrationOutcome::Succeeded), None, "already live: no transition");
+
+        assert_eq!(
+            t.apply(RegistrationOutcome::RefusedDefinitive),
+            Some(RevocationTransition::Revoked)
+        );
+        assert!(view.is_revoked());
+        assert_eq!(
+            t.apply(RegistrationOutcome::RefusedDefinitive),
+            None,
+            "still revoked: logged once"
+        );
+        assert_eq!(t.apply(RegistrationOutcome::Transient), None);
+        assert!(view.is_revoked(), "a transient while revoked does not clear it");
+
+        assert_eq!(t.apply(RegistrationOutcome::Succeeded), Some(RevocationTransition::Restored));
+        assert!(!view.is_revoked());
+        assert_eq!(t.apply(RegistrationOutcome::Succeeded), None);
+        assert_eq!(RevocationTransition::Revoked.log_line(), REVOCATION_LOG_REVOKED);
+        assert_eq!(RevocationTransition::Restored.log_line(), REVOCATION_LOG_RESTORED);
+    }
+
+    #[test]
+    fn revocation_tracker_needs_three_consecutive_ambiguous_refusals() {
+        // The TLS-TCP fallback's `NO` also means "#410 sub-cap full", so one is
+        // not enough: the flag flips on the Nth consecutive refusal of ONE loop,
+        // transients in between neither count nor reset, and a success resets
+        // the count so the next streak starts from zero.
+        assert_eq!(AMBIGUOUS_REFUSALS_BEFORE_REVOKED, 3);
+        let view = Arc::new(RevocationView::default());
+        let mut t = RevocationTracker::new(Arc::clone(&view));
+        assert_eq!(t.apply(RegistrationOutcome::RefusedAmbiguous), None);
+        assert_eq!(t.apply(RegistrationOutcome::Transient), None);
+        assert_eq!(t.apply(RegistrationOutcome::RefusedAmbiguous), None);
+        assert!(!view.is_revoked(), "two refusals: still live");
+        assert_eq!(
+            t.apply(RegistrationOutcome::RefusedAmbiguous),
+            Some(RevocationTransition::Revoked),
+            "the third consecutive refusal flips it"
+        );
+        assert_eq!(t.apply(RegistrationOutcome::RefusedAmbiguous), None, "logged once");
+
+        assert_eq!(t.apply(RegistrationOutcome::Succeeded), Some(RevocationTransition::Restored));
+        assert_eq!(t.apply(RegistrationOutcome::RefusedAmbiguous), None);
+        assert_eq!(t.apply(RegistrationOutcome::RefusedAmbiguous), None);
+        assert!(!view.is_revoked(), "the streak restarted after the success");
+
+        // Two loops (a pool of workers) over one view do not pool their counts.
+        let mut other = RevocationTracker::new(Arc::clone(&view));
+        assert_eq!(other.apply(RegistrationOutcome::RefusedAmbiguous), None);
+        assert!(!view.is_revoked(), "2 + 1 across two trackers is not 3");
+    }
+
+    #[test]
+    fn revocation_tracker_classifies_the_typed_no_and_never_a_transport_error() {
+        // The bridge from the registration helpers' errors: only the Edge's typed
+        // wire `NO` is a refusal -- definitive on the QUIC path, ambiguous on the
+        // TLS-TCP one -- and any other error (dial, reset, timeout) is transient.
+        let no: BoxError = crate::transport::RegistrationRefused::boxed();
+        assert_eq!(
+            RevocationTracker::classify_failure(&no, true),
+            RegistrationOutcome::RefusedDefinitive
+        );
+        assert_eq!(
+            RevocationTracker::classify_failure(&no, false),
+            RegistrationOutcome::RefusedAmbiguous
+        );
+        assert_eq!(no.to_string(), "edge rejected tunnel registration", "historical text kept");
+        let io: BoxError = Box::new(io::Error::new(io::ErrorKind::ConnectionReset, "reset"));
+        assert_eq!(RevocationTracker::classify_failure(&io, true), RegistrationOutcome::Transient);
+        let text: BoxError = "edge rejected tunnel registration".into();
+        assert_eq!(
+            RevocationTracker::classify_failure(&text, true),
+            RegistrationOutcome::Transient,
+            "a same-text untyped error is NOT a refusal: classification is a downcast"
+        );
+    }
+
     /// #45 scaffolding for the stream path: an agent serving ONE in-memory
     /// stream under `policy` (`None` = the relayed path), a TCP echo origin that
     /// records whether it was EVER dialed (the thing a refusal must prevent),
@@ -3088,6 +3509,32 @@ mod tests {
         assert!(dialed, "origin dialed for the matching token");
         assert_eq!(metrics.tunnels_opened.get(), 1);
         assert_eq!(metrics.tunnels_failed.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn direct_client_presenting_the_tunnels_token_is_refused_while_the_token_is_revoked() {
+        // Slice 3, end to end: the SAME client as
+        // `direct_client_presenting_the_tunnels_token_is_served`, but the
+        // registration loop has seen the edge's definitive `NO` -- refused before
+        // message 2, before any origin byte, counted as a failed handshake, typed
+        // so serve_direct closes the QUIC connection (code 1).
+        let own = RoutingToken([0x45; 32]);
+        let view = Arc::new(RevocationView::default());
+        RevocationTracker::new(Arc::clone(&view)).note(RegistrationOutcome::RefusedDefinitive);
+        let policy = DirectTokenPolicy::with_revocation(own.clone(), false, view);
+        let rig = direct_token_rig(Some(policy), encode_direct_handshake_payload(&own)).await;
+        direct_token_rig_expect_refused(rig, DIRECT_REFUSED_REVOKED).await;
+    }
+
+    #[tokio::test]
+    async fn direct_pre_45_client_is_refused_too_while_the_token_is_revoked() {
+        // The revoke must also cut the client a revoke is really aimed at: one
+        // that never sends a token. Rollout tolerance does not outrank revocation.
+        let view = Arc::new(RevocationView::default());
+        RevocationTracker::new(Arc::clone(&view)).note(RegistrationOutcome::RefusedDefinitive);
+        let policy = DirectTokenPolicy::with_revocation(RoutingToken([0x45; 32]), false, view);
+        let rig = direct_token_rig(Some(policy), Vec::new()).await;
+        direct_token_rig_expect_refused(rig, DIRECT_REFUSED_REVOKED).await;
     }
 
     #[tokio::test]

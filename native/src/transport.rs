@@ -239,8 +239,58 @@ pub async fn present_credential(
     }
 }
 
+/// The Edge's wire `NO` to a tunnel registration, typed (ct-agent#45 slice 3).
+///
+/// `Display` is the exact historical string ("edge rejected tunnel
+/// registration") -- operators grep it and the reconnect loop prints it
+/// unchanged -- but in-process classification is a downcast
+/// ([`is_registration_refusal`]), never a substring search, the same pattern as
+/// `channel_run::errors::AdmissionRefused` (#20/#524). What it means depends on
+/// the path that produced it:
+///
+/// * over QUIC ([`register_tunnel`]) the Edge's role-`'A'` arm writes `NO` for
+///   exactly one reason: `register_with_candidate_unless_revoked` refused the
+///   token, i.e. it is REVOKED at the plane (CADS-Tunnel `serve_connection`,
+///   #27/#421). Every other failure on that path -- dial, stream, a reset or
+///   ack-less drop -- is an I/O error, not this type;
+/// * over the TLS-TCP fallback (`'A'`/`'K'`, [`register_tunnel_stream`] and
+///   its ping-capable sibling) the Edge's `admit_tcp_agent_a` also writes a
+///   bare `NO` when its per-listener agent sub-cap is momentarily full (#410),
+///   so ONE refusal there is not proof of revocation -- the caller counts.
+#[derive(Debug)]
+pub struct RegistrationRefused;
+
+impl std::fmt::Display for RegistrationRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("edge rejected tunnel registration")
+    }
+}
+
+impl std::error::Error for RegistrationRefused {}
+
+impl RegistrationRefused {
+    /// Boxed, ready to return from a `Result<_, BoxError>`.
+    pub fn boxed() -> BoxError {
+        Box::new(RegistrationRefused)
+    }
+}
+
+/// Whether `e` is the Edge's wire `NO` to a tunnel registration
+/// ([`RegistrationRefused`]) rather than a transport/I-O failure. The
+/// reconnect loops use this to feed the direct-connect revocation view
+/// (ct-agent#45 slice 3) -- a network error must never count as a refusal.
+pub fn is_registration_refusal(e: &BoxError) -> bool {
+    e.downcast_ref::<RegistrationRefused>().is_some()
+}
+
 /// Register this Agent's tunnel for `token` with the Edge over `conn`: open a
 /// control stream, send `role='A' | token(32)`, and await the Edge's `OK`.
+///
+/// A `NO` ack surfaces as the typed [`RegistrationRefused`]; on this (QUIC)
+/// path that is a definitive "revoked at the plane" (see that type's doc).
+/// Any other non-`OK` ack (an ack-less finish, an unknown reply) stays an
+/// untyped error, so only the Edge's literal refusal vocabulary is ever
+/// classified as a refusal.
 pub async fn register_tunnel(conn: &Connection, token: &RoutingToken) -> Result<(), BoxError> {
     let (mut send, mut recv) = conn.open_bi().await?;
     let mut msg = vec![b'A'];
@@ -250,6 +300,8 @@ pub async fn register_tunnel(conn: &Connection, token: &RoutingToken) -> Result<
     let ack = recv.read_to_end(8).await?;
     if ack == b"OK" {
         Ok(())
+    } else if ack.starts_with(b"NO") {
+        Err(RegistrationRefused::boxed())
     } else {
         Err("edge rejected tunnel registration".into())
     }
@@ -376,6 +428,11 @@ where
     .and_then(|ack| {
         if &ack == b"OK" {
             Ok(())
+        } else if &ack == b"NO" {
+            // Typed (ct-agent#45 slice 3) so the fallback worker can count it
+            // toward the revocation view; on THIS path a single `NO` is still
+            // ambiguous (#410 sub-cap vs. revoked) -- see `RegistrationRefused`.
+            Err(RegistrationRefused::boxed())
         } else {
             Err("edge rejected tunnel registration".into())
         }
@@ -1616,9 +1673,11 @@ mod tests {
         });
         let mut stream = TcpStream::connect(addr).await.unwrap();
         let r = register_tunnel_stream_ping_capable(&mut stream, &RoutingToken([0x11; 32])).await;
+        let err = r.expect_err("a legacy Edge's ack-less drop surfaces as a registration error");
         assert!(
-            r.is_err(),
-            "a legacy Edge's ack-less drop surfaces as a registration error"
+            !is_registration_refusal(&err),
+            "#45 slice 3: an ack-less drop is a transport failure, never the Edge's `NO` -- \
+             it must not count toward the revocation view: {err}"
         );
         edge.await.unwrap();
     }
@@ -1634,7 +1693,31 @@ mod tests {
             edge_side.flush().await.unwrap();
         });
         let r = register_tunnel_stream(&mut agent_side, &token).await;
-        assert!(r.is_err(), "a non-OK ack is a rejection");
+        let err = r.expect_err("a non-OK ack is a rejection");
+        assert!(err.to_string().contains("rejected tunnel registration"), "{err}");
+        assert!(
+            is_registration_refusal(&err),
+            "#45 slice 3: the Edge's wire `NO` is the typed RegistrationRefused"
+        );
+        edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn register_tunnel_stream_treats_only_the_edges_no_as_a_typed_refusal_for_revocation() {
+        // #45 slice 3: the revocation view must only ever be fed by the Edge's
+        // literal refusal vocabulary. An unknown 2-byte reply is still an error
+        // (the stream is unusable), but NOT a RegistrationRefused.
+        let (mut agent_side, mut edge_side) = tokio::io::duplex(1024);
+        let edge = tokio::spawn(async move {
+            let mut hdr = [0u8; 33];
+            edge_side.read_exact(&mut hdr).await.unwrap();
+            edge_side.write_all(b"??").await.unwrap();
+            edge_side.flush().await.unwrap();
+        });
+        let err = register_tunnel_stream(&mut agent_side, &RoutingToken([0x01; 32]))
+            .await
+            .expect_err("an unknown ack is still a failed registration");
+        assert!(!is_registration_refusal(&err), "unknown ack is not the Edge's `NO`: {err}");
         edge.await.unwrap();
     }
 
@@ -1914,9 +1997,27 @@ mod tests {
         let conn = dial_quic(addr, cert).await.expect("dial");
         let err = register_tunnel(&conn, &RoutingToken([3u8; 32]))
             .await
-            .expect_err("non-OK ack must error")
-            .to_string();
-        assert!(err.contains("rejected tunnel registration"), "{err}");
+            .expect_err("non-OK ack must error");
+        assert!(err.to_string().contains("rejected tunnel registration"), "{err}");
+        // #45 slice 3: over QUIC the Edge's role-'A' `NO` has exactly one cause
+        // (the token is revoked), so it is the typed refusal the reconnect loop
+        // feeds straight into the direct-connect revocation view.
+        assert!(is_registration_refusal(&err), "the wire `NO` is typed: {err}");
+        conn.close(0u32.into(), b"done");
+        let _ = edge.await;
+    }
+
+    #[tokio::test]
+    async fn register_tunnel_over_quic_types_only_a_no_ack_as_a_refusal_for_revocation() {
+        // #45 slice 3: an ack that is neither OK nor NO (a future Edge, a garbled
+        // reply) still fails the registration but must not be mistaken for the
+        // definitive revocation signal.
+        let (addr, cert, edge) = mock_edge_replying(b"??").await;
+        let conn = dial_quic(addr, cert).await.expect("dial");
+        let err = register_tunnel(&conn, &RoutingToken([3u8; 32]))
+            .await
+            .expect_err("non-OK ack must error");
+        assert!(!is_registration_refusal(&err), "not the Edge's `NO`: {err}");
         conn.close(0u32.into(), b"done");
         let _ = edge.await;
     }
