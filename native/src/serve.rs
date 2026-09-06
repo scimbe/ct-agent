@@ -21,6 +21,7 @@ use tokio::net::{TcpStream, UdpSocket};
 
 use crate::config::{AgentConfig, OriginProto};
 use crate::local_auth;
+use crate::task_guard::{tracked, TaskGuard};
 use crate::transport::{
     await_ping_phase_end, bind_hostname, dial_quic, dial_quic_or_blocked_error,
     is_registration_refusal, register_tunnel, register_tunnel_stream,
@@ -1396,6 +1397,10 @@ where
 /// handshake -- see [`DirectHandshakePayload`] for what the client sends. A
 /// refused client's QUIC connection is closed by the agent (code
 /// [`DIRECT_REFUSED_CLOSE_CODE`]) rather than left open until the client gives up.
+///
+/// ct-agent#180: every accepted connection's task lives in a `JoinSet` owned by this
+/// accept loop, so aborting the loop (see [`DirectListener`]) aborts the connections
+/// it accepted, and finished tasks are reaped as they end rather than accumulating.
 pub async fn serve_direct(
     listener: Endpoint,
     origin: SocketAddr,
@@ -1405,12 +1410,22 @@ pub async fn serve_direct(
     gate: Arc<local_auth::LocalAuthGate>,
     token_policy: Arc<DirectTokenPolicy>,
 ) -> Result<(), BoxError> {
-    while let Some(incoming) = listener.accept().await {
+    let mut conns = tokio::task::JoinSet::new();
+    loop {
+        let incoming = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Some(incoming) => incoming,
+                None => break,
+            },
+            // Reap a finished connection task; when the set is empty this branch is
+            // simply disabled for the round (`accept` is what the loop waits on).
+            Some(_) = conns.join_next() => continue,
+        };
         let metrics = Arc::clone(&metrics);
         let keys = Arc::clone(&origin_keys);
         let gate = Arc::clone(&gate);
         let policy = Arc::clone(&token_policy);
-        tokio::spawn(async move {
+        conns.spawn(tracked(async move {
             if let Ok(conn) = incoming.await {
                 if let Ok((send, recv)) = conn.accept_bi().await {
                     let served = match proto {
@@ -1442,9 +1457,56 @@ pub async fn serve_direct(
                 }
                 conn.closed().await;
             }
-        });
+        }));
     }
     Ok(())
+}
+
+/// Everything the direct-connect accept loop needs, kept by [`run_agent`] so the
+/// loop can be (re)spawned deliberately (ct-agent#180).
+///
+/// Intended lifetime of the accept-loop task: **`run_agent`'s own**. The direct
+/// path bypasses the edge entirely, so it is deliberately NOT restarted per
+/// reconnect iteration or transport switch (that would cut every in-flight direct
+/// session each time the edge link flaps -- the one thing the direct path exists
+/// to be independent of). It is owned by a guard local to `run_agent`, so the
+/// task is aborted -- with every connection it accepted -- exactly when
+/// `run_agent` returns: shutdown, or a reconnect budget exhausted. Before #180
+/// the task was spawned with no handle and outlived all of that. If the accept
+/// loop ever ends on its own (the endpoint closed under it), the reconnect loop
+/// re-spawns it on its next iteration and says so.
+struct DirectListener {
+    listener: Endpoint,
+    origin: SocketAddr,
+    proto: OriginProto,
+    origin_keys: Arc<Vec<[u8; 32]>>,
+    metrics: Arc<TunnelMetrics>,
+    gate: Arc<local_auth::LocalAuthGate>,
+    policy: Arc<DirectTokenPolicy>,
+}
+
+impl DirectListener {
+    /// Spawn the accept loop; the returned guard aborts it when dropped.
+    fn spawn(&self) -> TaskGuard<()> {
+        let listener = self.listener.clone();
+        let (origin, proto) = (self.origin, self.proto);
+        let keys = Arc::clone(&self.origin_keys);
+        let metrics = Arc::clone(&self.metrics);
+        let gate = Arc::clone(&self.gate);
+        let policy = Arc::clone(&self.policy);
+        TaskGuard::spawn(async move {
+            let _ = serve_direct(listener, origin, keys, proto, metrics, gate, policy).await;
+        })
+    }
+
+    /// Re-spawn the loop if its task ended (ct-agent#180) -- called once per
+    /// reconnect iteration; a healthy task is left alone.
+    fn ensure_running(&self, task: &mut TaskGuard<()>) {
+        if task.is_finished() {
+            eprintln!("ct-agent: direct-connect accept loop had ended; re-spawning it (#180)");
+            *task = self.spawn();
+        }
+    }
 }
 
 /// Run the Agent: dial the Edge, register the tunnel for `token`, then serve each
@@ -1461,9 +1523,10 @@ pub async fn run_agent(
     // Shared tunnel metrics for this Agent (M14.1b), plus optional one-time
     // endpoints — set up once, outside the reconnect loop.
     let metrics = Arc::new(TunnelMetrics::new());
-    if let Some(addr) = config.metrics_listen {
+    // ct-agent#180: owned here, so the scrape endpoint ends with `run_agent`.
+    let _metrics_task = config.metrics_listen.map(|addr| {
         let mmetrics = Arc::clone(&metrics);
-        tokio::spawn(async move {
+        TaskGuard::spawn(async move {
             // Real gap found live 2026-08-24: serve_metrics's TcpListener::bind
             // can genuinely fail (port already in use, permission denied on a
             // privileged port) -- the failure was discarded with no log line
@@ -1474,12 +1537,15 @@ pub async fn run_agent(
             if let Err(e) = crate::observe::serve_metrics(addr, mmetrics).await {
                 eprintln!("ct-agent: metrics listener on {addr} failed: {e}");
             }
-        });
-    }
+        })
+    });
     // #45 slice 3: the cached revocation status. Fed by whichever registration
     // loop below is active (QUIC, or the TLS-TCP fallback's pool workers), read
     // by the direct-connect policy. Created unconditionally -- it is one bool.
     let revocation = Arc::new(RevocationView::default());
+    // ct-agent#180: the direct-connect listener and its accept-loop task are owned
+    // by THIS scope -- see `DirectListener` for the intended lifetime.
+    let mut direct: Option<(DirectListener, TaskGuard<()>)> = None;
     if let Some(ip) = config.direct_advertise_ip {
         if let Ok((listener, cert)) = crate::transport::build_direct_listener() {
             if let Ok(bound) = listener.local_addr() {
@@ -1506,12 +1572,17 @@ pub async fn run_agent(
                 dpolicy.debug = std::env::var_os("CT_DEBUG_DIRECT_TOKEN").is_some();
                 eprintln!("{}", dpolicy.startup_line());
                 let dpolicy = Arc::new(dpolicy);
-                tokio::spawn(async move {
-                    let _ = serve_direct(
-                        listener, origin, dkeys, proto, dmetrics, dgate, dpolicy,
-                    )
-                    .await;
-                });
+                let direct_listener = DirectListener {
+                    listener,
+                    origin,
+                    proto,
+                    origin_keys: dkeys,
+                    metrics: dmetrics,
+                    gate: dgate,
+                    policy: dpolicy,
+                };
+                let task = direct_listener.spawn();
+                direct = Some((direct_listener, task));
             }
         }
     }
@@ -1551,6 +1622,9 @@ pub async fn run_agent(
     // `RegistrationRefused`), so one refusal flips the view.
     let mut revocation_tracker = RevocationTracker::new(Arc::clone(&revocation));
     loop {
+        if let Some((listener, task)) = direct.as_mut() {
+            listener.ensure_running(task);
+        }
         let conn = match dial_quic_or_blocked_error(config.edge, edge_cert.clone(), Duration::from_secs(5))
             .await
         {
@@ -1568,7 +1642,7 @@ pub async fn run_agent(
                         eprintln!(
                             "ct-agent: edge dial failed ({e}); serving over the TLS-TCP fallback until UDP/QUIC recovers (#16)"
                         );
-                        run_agent_tcp_fallback_until_quic_recovers(
+                        match run_agent_tcp_fallback_until_quic_recovers(
                             config,
                             edge_cert.clone(),
                             token.clone(),
@@ -1576,11 +1650,37 @@ pub async fn run_agent(
                             Arc::clone(&gate),
                             Arc::clone(&revocation),
                         )
-                        .await?;
-                        // A QUIC probe answered — start over with a fresh budget and
-                        // dial it for real.
-                        backoff.reset();
-                        continue;
+                        .await
+                        {
+                            FallbackExit::QuicRecovered => {
+                                // A QUIC probe answered — start over with a fresh budget and
+                                // dial it for real.
+                                backoff.reset();
+                                continue;
+                            }
+                            FallbackExit::AllWorkersGaveUp => {
+                                // ct-agent#180: every pool worker burned its (finite,
+                                // configured) budget. That is this loop's own budget to
+                                // spend, not a reason to exit the process: back off one
+                                // step and go around again -- which re-dials QUIC and,
+                                // failing that, spawns a fresh pool.
+                                eprintln!(
+                                    "ct-agent: every TLS-TCP fallback worker exhausted its reconnect budget; \
+                                     re-entering the reconnect loop (#180)"
+                                );
+                                match backoff.next_delay_jittered(rand::random::<f64>()) {
+                                    Some(d) => {
+                                        tokio::time::sleep(d).await;
+                                        continue;
+                                    }
+                                    None => {
+                                        return Err("ct-agent: gave up: the TLS-TCP fallback pool and the \
+                                                    reconnect loop both exhausted their budgets"
+                                            .into())
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1605,21 +1705,24 @@ pub async fn run_agent(
         // Retried with backoff (#502): a fresh onboard's authorize-host call can
         // reach the edge a moment after this bind, and a one-shot bind then left
         // the agent serving without its hostname until a process restart.
-        if config.browser_forward {
-            if let Some(host) = &config.hostname {
+        // ct-agent#180: the bind task is owned by this iteration -- it is aborted when
+        // the connection it binds over is gone (it already gave up on its own then).
+        let _host_bind = match (&config.hostname, config.browser_forward) {
+            (Some(host), true) => {
                 let conn = conn.clone();
                 let token = token.clone();
                 let host = host.clone();
-                tokio::spawn(async move {
+                Some(TaskGuard::spawn(async move {
                     let backoff = Backoff::new(
                         HOST_BIND_RETRY_BASE,
                         HOST_BIND_RETRY_MAX,
                         HOST_BIND_RETRY_ATTEMPTS,
                     );
                     bind_hostname_with_retry(&conn, &token, &host, backoff).await;
-                });
+                }))
             }
-        }
+            _ => None,
+        };
         eprintln!("ct-agent: registered with edge {} (serving)", config.edge);
         serve_quic_connection(
             &conn,
@@ -1832,6 +1935,11 @@ fn parse_reconnect_max_attempts(raw: Option<String>) -> u32 {
 
 /// Serve Client tunnels over a live QUIC `conn` until it drops, then return so
 /// the caller can reconnect. Each accepted bi-stream is one Client's Noise tunnel.
+///
+/// ct-agent#180: the per-stream tasks live in a `JoinSet` owned by this call, so
+/// returning (the connection dropped) aborts whatever was still being served over
+/// it -- those streams are dead with the connection anyway -- and finished tasks
+/// are reaped as they end.
 async fn serve_quic_connection(
     conn: &Connection,
     origin: SocketAddr,
@@ -1841,29 +1949,33 @@ async fn serve_quic_connection(
     metrics: Arc<TunnelMetrics>,
     gate: &Arc<local_auth::LocalAuthGate>,
 ) {
+    let mut streams = tokio::task::JoinSet::new();
     loop {
-        let (send, recv) = match conn.accept_bi().await {
-            Ok(x) => x,
-            Err(_) => return,
+        let (send, recv) = tokio::select! {
+            accepted = conn.accept_bi() => match accepted {
+                Ok(x) => x,
+                Err(_) => return,
+            },
+            Some(_) = streams.join_next() => continue,
         };
         // Browser Plane (#23): forward the relayed stream to the Origin verbatim
         // (raw TLS passthrough); the browser's TLS terminates at the Origin.
         // Out of scope for the local-auth gate -- see `local_auth`'s module doc.
         if browser_forward {
-            tokio::spawn(async move {
+            streams.spawn(tracked(async move {
                 let _ = serve_stream_to_origin(send, recv, origin).await;
-            });
+            }));
             continue;
         }
         let keys = origin_keys.to_vec();
         let m = Arc::clone(&metrics);
         let gate = Arc::clone(gate);
-        tokio::spawn(async move {
+        streams.spawn(tracked(async move {
             let _ = match proto {
                 OriginProto::Tcp => serve_noise_stream(send, recv, origin, &keys, m, &gate).await,
                 OriginProto::Udp => serve_noise_udp(send, recv, origin, &keys).await,
             };
-        });
+        }));
     }
 }
 
@@ -1912,6 +2024,14 @@ async fn run_agent_tcp_fallback(
 /// [`run_agent_tcp_fallback`] sharing `revocation` with [`run_agent`]'s
 /// direct-connect policy (#45 slice 3): each pool worker owns one
 /// [`RevocationTracker`] over it.
+///
+/// ct-agent#180: a worker that gives up (its finite, configured
+/// `CT_AGENT_RECONNECT_MAX_ATTEMPTS` budget exhausted) ends THAT worker only --
+/// the remaining workers keep serving (see [`run_tcp_fallback_pool`]). Only once
+/// every worker is gone does this mode back off one step of its own reconnect
+/// budget and spawn a fresh pool; only that outer budget running out returns
+/// `Err`. With the default unbounded budget none of this ever ends. Before #180,
+/// ONE worker's exhaustion returned `Err` from here -- and exited the process.
 async fn run_agent_tcp_fallback_with_revocation(
     config: &AgentConfig,
     edge_cert: CertificateDer<'static>,
@@ -1920,28 +2040,36 @@ async fn run_agent_tcp_fallback_with_revocation(
     gate: Arc<local_auth::LocalAuthGate>,
     revocation: Arc<RevocationView>,
 ) -> Result<(), BoxError> {
-    let n = config.tcp_fallback_pool_size.max(1);
-    let mut workers = Vec::with_capacity(n);
-    for _ in 0..n {
-        let config = config.clone();
-        let edge_cert = edge_cert.clone();
-        let token = token.clone();
-        let origin_keys = Arc::clone(&origin_keys);
-        let gate = Arc::clone(&gate);
-        let tracker = RevocationTracker::new(Arc::clone(&revocation));
-        workers.push(tokio::spawn(async move {
-            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys, gate, tracker)
-                .await
-        }));
+    let (reconnect_base, reconnect_max) = reconnect_backoff_bounds();
+    let mut outer = Backoff::new(reconnect_base, reconnect_max, reconnect_max_attempts());
+    loop {
+        // No reprobe: this is the permanent (CT_AGENT_REGISTER_TCP_ONLY / e2e) mode,
+        // so the pool only ever ends with every worker gone.
+        let _exit = run_tcp_fallback_pool(
+            config,
+            edge_cert.clone(),
+            token.clone(),
+            Arc::clone(&origin_keys),
+            Arc::clone(&gate),
+            Arc::clone(&revocation),
+            FallbackBudget::from_env(),
+            None,
+        )
+        .await;
+        match outer.next_delay_jittered(rand::random::<f64>()) {
+            Some(d) => {
+                eprintln!(
+                    "ct-agent: every TLS-TCP fallback worker exhausted its reconnect budget; \
+                     spawning a fresh pool in {}ms (#180)",
+                    d.as_millis()
+                );
+                tokio::time::sleep(d).await;
+            }
+            None => {
+                return Err("ct-agent: gave up: the TLS-TCP fallback pool exhausted its reconnect budget".into())
+            }
+        }
     }
-    // If any one worker gives up (its own backoff exhausted), that's fatal to
-    // the whole fallback mode, matching the pre-pool single-worker behavior --
-    // a customer running with a pool > 1 should learn about a systemic outage
-    // as loudly as they would have with a pool of 1.
-    for w in workers {
-        w.await??;
-    }
-    Ok(())
 }
 
 /// How often the TCP-fallback mode probes whether UDP/QUIC to the edge has
@@ -1950,16 +2078,51 @@ async fn run_agent_tcp_fallback_with_revocation(
 /// its multiplexed, pooled-connection-free serving) within a minute.
 const QUIC_REPROBE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Why a TLS-TCP fallback pool run ended (ct-agent#180). Neither is an error:
+/// the caller decides what a whole pool giving up means for ITS loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackExit {
+    /// A QUIC probe dial answered -- the caller should re-dial QUIC for real.
+    QuicRecovered,
+    /// Every worker exhausted its reconnect budget (only possible with a finite
+    /// `CT_AGENT_RECONNECT_MAX_ATTEMPTS`); the pool is empty.
+    AllWorkersGaveUp,
+}
+
+/// One fallback worker's reconnect budget: the same `(base, max, attempts)` the
+/// QUIC loop reads from the environment, made a value so the pool tests can hand
+/// a worker a tiny finite budget without touching the process environment.
+#[derive(Debug, Clone, Copy)]
+struct FallbackBudget {
+    base: Duration,
+    max: Duration,
+    attempts: u32,
+}
+
+impl FallbackBudget {
+    /// The production budget: `CT_AGENT_RECONNECT_{BASE_MS,MAX_MS,MAX_ATTEMPTS}`.
+    /// Read here rather than once per worker so every worker of one pool sees the
+    /// same values (the fallback is the degraded path an operator most wants to
+    /// shorten, so a knob that stopped applying the moment UDP broke would go
+    /// quiet exactly when it matters).
+    fn from_env() -> Self {
+        let (base, max) = reconnect_backoff_bounds();
+        Self { base, max, attempts: reconnect_max_attempts() }
+    }
+}
+
 /// [`run_agent_tcp_fallback`], but temporary (#16): serve over the TLS-TCP
 /// fallback pool while probing UDP/QUIC every [`QUIC_REPROBE_INTERVAL`], and
-/// return `Ok(())` as soon as a probe dial succeeds — the caller
-/// ([`run_agent`]'s reconnect loop) then re-dials QUIC for real. The pool
+/// return [`FallbackExit::QuicRecovered`] as soon as a probe dial succeeds — the
+/// caller ([`run_agent`]'s reconnect loop) then re-dials QUIC for real. The pool
 /// workers are spawned on a [`tokio::task::JoinSet`], whose drop ABORTS them —
 /// so returning here (probe success) tears the whole pool down rather than
 /// leaking N workers that would keep re-registering over TCP alongside the
-/// revived QUIC registration. A worker that gives up (its bounded
-/// `CT_AGENT_RECONNECT_MAX_ATTEMPTS` budget exhausted) is fatal to the whole
-/// fallback, exactly as in [`run_agent_tcp_fallback`].
+/// revived QUIC registration.
+///
+/// ct-agent#180: a worker that gives up ends that worker only; the pool returns
+/// [`FallbackExit::AllWorkersGaveUp`] once none is left, and `run_agent` treats
+/// that as one step of ITS reconnect budget rather than a process exit.
 async fn run_agent_tcp_fallback_until_quic_recovers(
     config: &AgentConfig,
     edge_cert: CertificateDer<'static>,
@@ -1967,7 +2130,39 @@ async fn run_agent_tcp_fallback_until_quic_recovers(
     origin_keys: Arc<Vec<[u8; 32]>>,
     gate: Arc<local_auth::LocalAuthGate>,
     revocation: Arc<RevocationView>,
-) -> Result<(), BoxError> {
+) -> FallbackExit {
+    run_tcp_fallback_pool(
+        config,
+        edge_cert,
+        token,
+        origin_keys,
+        gate,
+        revocation,
+        FallbackBudget::from_env(),
+        Some(QUIC_REPROBE_INTERVAL),
+    )
+    .await
+}
+
+/// The TLS-TCP fallback pool itself (#229, ct-agent#180): `config.tcp_fallback_pool_size`
+/// workers on a `JoinSet` (dropped -- and so aborted -- with this future), each on
+/// `budget`. Ends with [`FallbackExit::AllWorkersGaveUp`] once every worker has
+/// returned, or -- when `reprobe` is set -- with [`FallbackExit::QuicRecovered`]
+/// as soon as a probe dial every `reprobe` succeeds. A single worker giving up is
+/// logged once, with how many are left, and is otherwise NOT an event: the mode
+/// stays up on the remaining workers (before #180 it was fatal to the whole mode).
+// pre-existing pool signature plus the two #180 parameters; refactor tracked separately
+#[allow(clippy::too_many_arguments)]
+async fn run_tcp_fallback_pool(
+    config: &AgentConfig,
+    edge_cert: CertificateDer<'static>,
+    token: RoutingToken,
+    origin_keys: Arc<Vec<[u8; 32]>>,
+    gate: Arc<local_auth::LocalAuthGate>,
+    revocation: Arc<RevocationView>,
+    budget: FallbackBudget,
+    reprobe: Option<Duration>,
+) -> FallbackExit {
     let n = config.tcp_fallback_pool_size.max(1);
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..n {
@@ -1977,22 +2172,41 @@ async fn run_agent_tcp_fallback_until_quic_recovers(
         let origin_keys = Arc::clone(&origin_keys);
         let gate = Arc::clone(&gate);
         let tracker = RevocationTracker::new(Arc::clone(&revocation));
-        workers.spawn(async move {
-            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys, gate, tracker)
-                .await
-        });
+        workers.spawn(tracked(async move {
+            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys, gate, tracker, budget).await
+        }));
     }
     loop {
-        tokio::select! {
-            // A worker only ever ends by giving up (backoff exhausted) — fatal to the
-            // whole fallback mode, matching `run_agent_tcp_fallback`'s posture.
-            Some(res) = workers.join_next() => {
-                return match res {
-                    Ok(r) => r,
-                    Err(join) => Err(join.into()),
-                };
+        // With no reprobe interval this arm never fires; the pool then only ends
+        // once every worker has.
+        let reprobe_due = async {
+            match reprobe {
+                Some(d) => tokio::time::sleep(d).await,
+                None => std::future::pending::<()>().await,
             }
-            _ = tokio::time::sleep(QUIC_REPROBE_INTERVAL) => {
+        };
+        tokio::select! {
+            ended = workers.join_next() => {
+                match ended {
+                    Some(Ok(Err(e))) => eprintln!(
+                        "ct-agent: a TLS-TCP fallback worker gave up ({e}); {} of {n} still serving (#180)",
+                        workers.len()
+                    ),
+                    Some(Ok(Ok(()))) => eprintln!(
+                        "ct-agent: a TLS-TCP fallback worker ended; {} of {n} still serving (#180)",
+                        workers.len()
+                    ),
+                    Some(Err(join)) => eprintln!(
+                        "ct-agent: a TLS-TCP fallback worker ended abnormally ({join}); {} of {n} still serving (#180)",
+                        workers.len()
+                    ),
+                    None => {}
+                }
+                if workers.is_empty() {
+                    return FallbackExit::AllWorkersGaveUp;
+                }
+            }
+            _ = reprobe_due => {
                 if let Ok(Ok(conn)) = tokio::time::timeout(
                     Duration::from_secs(5),
                     dial_quic(config.edge, edge_cert.clone()),
@@ -2004,7 +2218,7 @@ async fn run_agent_tcp_fallback_until_quic_recovers(
                         "ct-agent: UDP/QUIC to {} recovered — leaving the TLS-TCP fallback (#16)",
                         config.edge
                     );
-                    return Ok(());
+                    return FallbackExit::QuicRecovered;
                 }
             }
         }
@@ -2014,7 +2228,7 @@ async fn run_agent_tcp_fallback_until_quic_recovers(
 /// One TCP-fallback pool worker (#229): connect, register, serve one Client,
 /// repeat -- the body [`run_agent_tcp_fallback`] runs N of concurrently. Each
 /// registration is still single-use/single-Client; see that function's doc
-/// for why several of these run at once.
+/// for why several of these run at once. Returns only when `budget` is exhausted.
 async fn run_agent_tcp_fallback_worker(
     config: &AgentConfig,
     edge_cert: CertificateDer<'static>,
@@ -2022,15 +2236,13 @@ async fn run_agent_tcp_fallback_worker(
     origin_keys: Arc<Vec<[u8; 32]>>,
     gate: Arc<local_auth::LocalAuthGate>,
     mut revocation: RevocationTracker,
+    budget: FallbackBudget,
 ) -> Result<(), BoxError> {
     let metrics = Arc::new(TunnelMetrics::new());
     // Reconnect loop (issue #5 / P1.2b): re-register and serve again after each
-    // single tunnel ends or the connection drops, with backoff on failure. Reads
-    // the same env-configured bounds as the QUIC loop: the fallback is the
-    // degraded path an operator most wants to shorten, so a knob that stopped
-    // applying the moment UDP broke would go quiet exactly when it matters.
-    let (reconnect_base, reconnect_max) = reconnect_backoff_bounds();
-    let mut backoff = Backoff::new(reconnect_base, reconnect_max, reconnect_max_attempts());
+    // single tunnel ends or the connection drops, with backoff on failure. The
+    // budget is the pool's (`FallbackBudget::from_env` in production).
+    let mut backoff = Backoff::new(budget.base, budget.max, budget.attempts);
     // #46 FB-c: the TCP-fallback rungs to try in order — the configured edge port,
     // then the unified :443 front door when CT_AGENT_FALLBACK_443 is set. The first
     // rung that connects+registers serves the client; if all fail, back off.
@@ -5043,6 +5255,179 @@ mod tests {
         assert_eq!(reached, POOL, "all {POOL} registrations were parked concurrently, not one-at-a-time");
 
         agent.abort();
+        edge.abort();
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_pool_survives_one_worker_exhausting_its_budget_180() {
+        // ct-agent#180: a worker that burns its FINITE reconnect budget ends that
+        // worker only. Before, the pool returned the first worker's `Err` -- and the
+        // process exited -- while the other workers were serving perfectly well.
+        // Edge: acks + parks the FIRST registration, refuses (drops before TLS)
+        // every later connection until `admit_again`, then acks + parks again.
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use std::net::Ipv4Addr;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+
+        let ca = Ca::new("pool-180-ca").unwrap();
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let registered = Arc::new(AtomicUsize::new(0));
+        let refused = Arc::new(AtomicUsize::new(0));
+        let admit_again = Arc::new(AtomicBool::new(false));
+        let drop_parked = Arc::new(tokio::sync::Notify::new());
+
+        let registered_e = Arc::clone(&registered);
+        let refused_e = Arc::clone(&refused);
+        let admit_e = Arc::clone(&admit_again);
+        let drop_e = Arc::clone(&drop_parked);
+        let edge = tokio::spawn(async move {
+            let mut parked = Vec::new();
+            loop {
+                tokio::select! {
+                    accepted = tcp_listener.accept() => {
+                        let (tcp, _) = accepted.unwrap();
+                        let first = registered_e.load(SeqCst) == 0;
+                        if !first && !admit_e.load(SeqCst) {
+                            refused_e.fetch_add(1, SeqCst);
+                            drop(tcp); // before TLS: the worker's rung fails, it backs off
+                            continue;
+                        }
+                        let mut tls = acceptor.accept(tcp).await.unwrap();
+                        let mut hdr = [0u8; 33];
+                        tls.read_exact(&mut hdr).await.unwrap();
+                        assert_eq!(hdr[0], b'K', "agent prefers the ping-capable role");
+                        tls.write_all(b"OK").await.unwrap();
+                        tls.flush().await.unwrap();
+                        registered_e.fetch_add(1, SeqCst);
+                        parked.push(tls);
+                    }
+                    _ = drop_e.notified() => {
+                        // EOF for the parked worker -> it re-registers (issue #5).
+                        parked.clear();
+                    }
+                }
+            }
+        });
+
+        let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), "127.0.0.1:9").unwrap();
+        cfg.tcp_fallback_pool_size = 2;
+        // Two delays (20ms, 40ms), then the third failure gives up.
+        let budget = FallbackBudget {
+            base: Duration::from_millis(20),
+            max: Duration::from_millis(40),
+            attempts: 2,
+        };
+        let pool = tokio::spawn(async move {
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            run_tcp_fallback_pool(
+                &cfg,
+                ca_root,
+                RoutingToken([0x18u8; 32]),
+                Arc::new(vec![[0u8; 32]]),
+                Arc::new(gate),
+                Arc::new(RevocationView::default()),
+                budget,
+                None,
+            )
+            .await
+        });
+
+        // Worker A: the initial failure plus two retries = three refused connections.
+        for _ in 0..400 {
+            if refused.load(SeqCst) >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(registered.load(SeqCst), 1, "worker B is parked on the one accepted registration");
+        assert!(refused.load(SeqCst) >= 3, "worker A walked its whole budget");
+        // A stays gone (no further attempts) and the pool stays up on B alone.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let quiet = refused.load(SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(refused.load(SeqCst), quiet, "the exhausted worker does not come back");
+        assert!(!pool.is_finished(), "one worker giving up must not end the fallback mode (#180)");
+
+        // B is genuinely still serving: drop its parked registration and it re-registers.
+        admit_again.store(true, SeqCst);
+        drop_parked.notify_one();
+        for _ in 0..400 {
+            if registered.load(SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(registered.load(SeqCst), 2, "the surviving worker re-registered after its tunnel dropped");
+        assert!(!pool.is_finished());
+
+        pool.abort();
+        edge.abort();
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_pool_reports_all_workers_gone_instead_of_an_error_180() {
+        // ct-agent#180: with EVERY worker's budget exhausted the pool ends with
+        // `AllWorkersGaveUp` -- a value the caller feeds into its own reconnect
+        // budget -- not an `Err` that used to propagate straight out of `run_agent`.
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use std::net::Ipv4Addr;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        let ca = Ca::new("pool-180-refuse-ca").unwrap();
+        let (_ep, tcp_listener, _acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let refused = Arc::new(AtomicUsize::new(0));
+        let refused_e = Arc::clone(&refused);
+        // Edge: refuses everything (drops each connection before TLS).
+        let edge = tokio::spawn(async move {
+            loop {
+                let (tcp, _) = tcp_listener.accept().await.unwrap();
+                refused_e.fetch_add(1, SeqCst);
+                drop(tcp);
+            }
+        });
+
+        let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), "127.0.0.1:9").unwrap();
+        cfg.tcp_fallback_pool_size = 2;
+        let budget = FallbackBudget {
+            base: Duration::from_millis(10),
+            max: Duration::from_millis(20),
+            attempts: 1,
+        };
+        let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+        let exit = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_tcp_fallback_pool(
+                &cfg,
+                ca_root,
+                RoutingToken([0x19u8; 32]),
+                Arc::new(vec![[0u8; 32]]),
+                Arc::new(gate),
+                Arc::new(RevocationView::default()),
+                budget,
+                None,
+            ),
+        )
+        .await
+        .expect("the pool ends once every worker has given up");
+        assert_eq!(exit, FallbackExit::AllWorkersGaveUp);
+        // Each of the two workers: one initial failure + one retry.
+        assert!(refused.load(SeqCst) >= 4, "both workers walked their budgets: {}", refused.load(SeqCst));
         edge.abort();
     }
 

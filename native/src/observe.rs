@@ -27,8 +27,9 @@ pub fn metrics_router(metrics: Arc<TunnelMetrics>) -> Router {
 
 /// Render the counters in the Prometheus text exposition format, with the
 /// content type Prometheus expects (`text/plain; version=0.0.4`). The shared
-/// [`TunnelMetrics`] block is followed by this crate's own process-wide series
-/// (currently the MASQUE pump drop counter, ct-agent#177).
+/// [`TunnelMetrics`] block is followed by this crate's own process-wide series:
+/// the MASQUE pump drop counter (ct-agent#177) and the live-task gauge
+/// (ct-agent#180).
 async fn render(State(metrics): State<Arc<TunnelMetrics>>) -> impl IntoResponse {
     ([(CONTENT_TYPE, "text/plain; version=0.0.4")], render_text(&metrics))
 }
@@ -37,6 +38,7 @@ async fn render(State(metrics): State<Arc<TunnelMetrics>>) -> impl IntoResponse 
 fn render_text(metrics: &TunnelMetrics) -> String {
     let mut text = metrics.render_prometheus();
     text.push_str(&crate::masque::render_dropped_datagrams_prometheus());
+    text.push_str(&crate::task_guard::render_prometheus());
     text
 }
 
@@ -100,16 +102,28 @@ mod tests {
         assert!(text.contains("# TYPE ct_agent_masque_dropped_datagrams_total counter"), "masque drop counter header");
         assert!(text.contains("\nct_agent_masque_dropped_datagrams_total{direction=\"outbound\"} "));
         assert!(text.contains("\nct_agent_masque_dropped_datagrams_total{direction=\"inbound\"} "));
+        // ct-agent#180: the live-task gauge follows the masque block. Same caveat:
+        // other tests spawn guarded tasks in parallel, so only the shape is pinned.
+        assert!(text.contains("# TYPE ct_agent_tasks_live gauge"), "live-task gauge header");
+        assert!(text.contains("\nct_agent_tasks_live "), "live-task gauge value line");
     }
 
     #[test]
-    fn render_text_ends_with_the_masque_drop_series() {
+    fn render_text_ends_with_the_masque_drop_series_then_the_task_gauge() {
         // The masque tests bump the same process-wide statics in parallel, so the
         // rendered values are bracketed by a before/after read rather than pinned.
         let before = crate::masque::dropped_datagrams_total();
         let text = render_text(&TunnelMetrics::new());
         let after = crate::masque::dropped_datagrams_total();
-        let mut tail = text.lines().rev();
+        // HELP/TYPE comment lines precede each series; walk only value lines backwards.
+        let mut tail = text.lines().rev().filter(|l| !l.starts_with('#'));
+        // ct-agent#180: the very last series is the live-task gauge (a parseable u64).
+        let gauge = tail.next().unwrap();
+        let _live: u64 = gauge
+            .strip_prefix("ct_agent_tasks_live ")
+            .unwrap_or_else(|| panic!("unexpected last line {gauge:?}"))
+            .parse()
+            .unwrap();
         let inbound = tail.next().unwrap();
         let outbound = tail.next().unwrap();
         let value = |line: &str, prefix: &str| -> u64 {

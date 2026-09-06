@@ -90,7 +90,12 @@ token at CT_AGENT_LOGIN_TOKEN_FILE (default <CT_AGENT_STATE_DIR>/oidc-token.json
 $HOME/.ct-agent/oidc-token.json with neither set). `channel register`/`channel allowlist` use
 this automatically whenever CT_OIDC_TOKEN is NOT set in the environment, refreshing it
 transparently when it is close to expiry -- CT_OIDC_TOKEN explicitly set always takes priority,
-so no existing script/CI usage changes.
+so no existing script/CI usage changes. For an UNATTENDED agent (a sidecar nobody can re-login
+on), CT_OIDC_TOKEN_FILE names a file holding one long-lived bearer token (a service-account
+credential): it takes priority over the stored login, is re-read on every use so a rotated file
+is picked up without a restart, and an empty file counts as unset. `bridge/config` reports the
+stored login's state as oidc_credential (env | stored | stored-expired-refreshable |
+stored-expired | none); once it is expired and not refreshable the agent logs one line saying so.
 
 `CT_AGENT_AUTO_UPDATE` (2026-09-01, operator ask -- see ct_agent::self_update's module doc for
 the full rationale): set to 1/true to background-check for a newer release every

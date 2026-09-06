@@ -1363,7 +1363,8 @@ fn bridge_config_summary_reports_readiness_flags_without_any_secret_values_763()
     m.insert("CT_MANIFEST_TRUST_ALLOWLIST_FILE".to_string(), "/etc/ct-agent/trust.txt".to_string());
     m.insert("CT_MANIFEST_WORK_DIR".to_string(), "/var/lib/ct-agent/work".to_string());
 
-    let configured = bridge_config_summary(|k| m.get(k).cloned(), false, true);
+    use crate::login::OidcCredentialState;
+    let configured = bridge_config_summary(|k| m.get(k).cloned(), OidcCredentialState::Env, true);
     for key in [
         "cp_url_configured",
         "channel_id_configured",
@@ -1391,11 +1392,11 @@ fn bridge_config_summary_reports_readiness_flags_without_any_secret_values_763()
     }
 
     let empty: HashMap<String, String> = HashMap::new();
-    let stored = bridge_config_summary(|k| empty.get(k).cloned(), true, false);
+    let stored = bridge_config_summary(|k| empty.get(k).cloned(), OidcCredentialState::StoredFresh, false);
     assert_eq!(
         stored["oidc_credential"],
         serde_json::json!("stored"),
-        "no CT_OIDC_TOKEN but a login on disk -> `stored`"
+        "no CT_OIDC_TOKEN but a usable login on disk -> `stored`"
     );
     for key in [
         "cp_url_configured",
@@ -1407,17 +1408,21 @@ fn bridge_config_summary_reports_readiness_flags_without_any_secret_values_763()
         assert_eq!(stored[key], serde_json::json!(false), "`{key}` must be false for an empty lookup");
     }
 
-    let none = bridge_config_summary(|k| empty.get(k).cloned(), false, false);
+    let none = bridge_config_summary(|k| empty.get(k).cloned(), OidcCredentialState::None, false);
     assert_eq!(none["oidc_credential"], serde_json::json!("none"), "neither env token nor stored login -> `none`");
 
-    // A blank CT_OIDC_TOKEN counts as unset, exactly like `resolve_oidc_token` treats it.
-    let mut blank = HashMap::new();
-    blank.insert("CT_OIDC_TOKEN".to_string(), "   ".to_string());
-    let blank_token = bridge_config_summary(|k| blank.get(k).cloned(), true, false);
+    // ct-agent#181: the two degraded states of a stored login get their own spellings, so the
+    // portal can say "expired" BEFORE the owner clicks a tool into an error. (Which state applies
+    // -- including that a blank CT_OIDC_TOKEN does not count as `env` -- is `login`'s own
+    // lookup-driven test, `oidc_credential_state_classifies_each_variant`.)
+    let refreshable =
+        bridge_config_summary(|k| empty.get(k).cloned(), OidcCredentialState::StoredExpiredRefreshable, false);
+    assert_eq!(refreshable["oidc_credential"], serde_json::json!("stored-expired-refreshable"));
+    let expired = bridge_config_summary(|k| empty.get(k).cloned(), OidcCredentialState::StoredExpiredNoRefresh, false);
     assert_eq!(
-        blank_token["oidc_credential"],
-        serde_json::json!("stored"),
-        "a blank CT_OIDC_TOKEN must not count as `env`"
+        expired["oidc_credential"],
+        serde_json::json!("stored-expired"),
+        "an expired login with no usable refresh token -> `stored-expired`"
     );
 }
 
@@ -3361,7 +3366,7 @@ async fn crew_build_over_runs_the_crew_and_fails_closed() {
     // #171/#173 c2 driver (frozen): safety_check → physics → art over three role channels,
     // assembled by ct_common::crew. Exercised against in-process serve peers (local fakes).
     use ct_common::channel::ServiceType;
-    fn peer(services: &[ServiceType], out: &str) -> tokio::io::DuplexStream {
+    fn peer(services: &[ServiceType], out: &str) -> LocalDuplex {
         let mut reg = ct_common::mcp::default_registry();
         let out = out.to_string();
         ct_common::mcp::register_service_tools(&mut reg, services, move |_svc, _input| Ok(out.clone()));

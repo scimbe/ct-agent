@@ -50,28 +50,6 @@ pub fn render_dropped_datagrams_prometheus() -> String {
     )
 }
 
-/// Aborts the wrapped task when dropped, unless [`AbortOnDrop::disarm`] was called
-/// first. `JoinHandle`'s own `Drop` impl only DETACHES a task -- it keeps running
-/// to completion in the background regardless -- so a bare `tokio::spawn(...)`
-/// with no handle kept at all leaks exactly as much as one whose handle is simply
-/// dropped. See `dial_quic_via_masque_with_proxy_roots`'s own doc comment at its
-/// call site for the real outage this fixed.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl AbortOnDrop {
-    /// Called on the one path where the task must keep running: skips the abort
-    /// this guard would otherwise perform on drop.
-    fn disarm(self) {
-        std::mem::forget(self);
-    }
-}
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 const CONNECT_UDP_PATH_PREFIX: &str = "/.well-known/masque/udp";
 
 /// How long to wait for the MASQUE proxy's SETTINGS_ENABLE_CONNECT_PROTOCOL=1
@@ -181,13 +159,14 @@ async fn dial_quic_via_masque_with_proxy_roots(
     // attempts exhausted file descriptors within seconds, silently breaking the
     // UNRELATED TLS-TCP fallback's own real traffic (no crash, no error logged,
     // just "connection reset" once the process ran out of sockets to open).
-    // `AbortOnDrop` guarantees the abort on every `?`/early-return exit below
-    // via ordinary Rust drop semantics; only `success.disarm()` on the one
-    // actual success path skips it, since the connection must keep being
+    // The guard (`crate::task_guard`, ct-agent#180 -- formerly a private
+    // `AbortOnDrop` here) guarantees the abort on every `?`/early-return exit
+    // below via ordinary Rust drop semantics; only `connection_task.detach()` on
+    // the one actual success path skips it, since the connection must keep being
     // driven for the tunnel's whole lifetime once it's real.
-    let connection_task = AbortOnDrop(tokio::spawn(async move {
+    let connection_task = crate::task_guard::TaskGuard::spawn(async move {
         let _ = connection.await; // driven for its side effects, same as ADR-0024 M1's own client
-    }));
+    });
 
     let mut send_request = send_request.ready().await?;
     // ADR-0024 M1 finding: `ready()` resolving does not guarantee the proxy's
@@ -252,7 +231,8 @@ async fn dial_quic_via_masque_with_proxy_roots(
     // Real tunnel established -- the connection-driving task must now keep
     // running for the tunnel's whole life, not be aborted on this function
     // returning (every prior `?`/early-return above still aborts it correctly).
-    connection_task.disarm();
+    // Its lifetime is the h2 connection's own: it ends when the proxy hop closes.
+    connection_task.detach();
     Ok(conn)
 }
 

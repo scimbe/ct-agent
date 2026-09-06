@@ -53,7 +53,20 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
+use crate::task_guard::TaskGuard;
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// One LAN client's mapping: its dedicated upstream socket plus the return-path
+/// task that reads from it (ct-agent#180). The task is owned by the entry, so
+/// evicting the entry -- the idle timeout, or the task's own error exit -- aborts
+/// the task instead of leaving it blocked on a socket nobody else references.
+struct ClientEntry {
+    upstream: Arc<UdpSocket>,
+    _return_path: TaskGuard<()>,
+}
+
+type Clients = Arc<Mutex<HashMap<SocketAddr, ClientEntry>>>;
 
 /// How long a local client's dedicated upstream socket (and its forwarding task) stays
 /// alive with no traffic in either direction before being torn down. Generous relative to a
@@ -96,15 +109,15 @@ pub async fn run(listen: SocketAddr, upstream: SocketAddr) -> Result<(), BoxErro
 async fn run_with_cap(listen: SocketAddr, upstream: SocketAddr, max_clients: usize) -> Result<(), BoxError> {
     let front = Arc::new(UdpSocket::bind(listen).await?);
     eprintln!("ct-agent super-peer: relaying {listen} -> {upstream}");
-    let clients: Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
 
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
         let (n, from) = front.recv_from(&mut buf).await?;
         let upstream_sock = {
             let mut locked = clients.lock().await;
-            if let Some(sock) = locked.get(&from) {
-                sock.clone()
+            if let Some(entry) = locked.get(&from) {
+                Arc::clone(&entry.upstream)
             } else if locked.len() >= max_clients {
                 // #46: at the ceiling -- refuse to bind yet another real OS socket on this
                 // unauthenticated sender's behalf. Checked in the SAME critical section as
@@ -127,8 +140,8 @@ async fn run_with_cap(listen: SocketAddr, upstream: SocketAddr, max_clients: usi
                     }
                 };
                 eprintln!("ct-agent super-peer: new LAN client {from}");
-                locked.insert(from, sock.clone());
-                spawn_return_path(sock.clone(), front.clone(), from, clients.clone());
+                let return_path = spawn_return_path(sock.clone(), front.clone(), from, clients.clone());
+                locked.insert(from, ClientEntry { upstream: sock.clone(), _return_path: return_path });
                 sock
             }
         };
@@ -146,13 +159,17 @@ async fn run_with_cap(listen: SocketAddr, upstream: SocketAddr, max_clients: usi
 /// either way, the NEXT datagram this client sends transparently re-establishes a fresh
 /// mapping, so a torn-down mapping is never a hard failure for the client, only a brief
 /// re-registration.
+///
+/// Returns the task's guard for the caller to store in the client's [`ClientEntry`]
+/// (ct-agent#180). The task removes its own entry on exit, which drops its own guard;
+/// the resulting self-`abort()` lands on a task that has nothing left to do.
 fn spawn_return_path(
     upstream_sock: Arc<UdpSocket>,
     front: Arc<UdpSocket>,
     client_addr: SocketAddr,
-    clients: Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>>,
-) {
-    tokio::spawn(async move {
+    clients: Clients,
+) -> TaskGuard<()> {
+    TaskGuard::spawn(async move {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         loop {
             match tokio::time::timeout(IDLE_TIMEOUT, upstream_sock.recv_from(&mut buf)).await {
@@ -173,7 +190,7 @@ fn spawn_return_path(
             }
         }
         clients.lock().await.remove(&client_addr);
-    });
+    })
 }
 
 #[cfg(test)]
