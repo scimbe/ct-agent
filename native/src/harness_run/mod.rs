@@ -6,12 +6,15 @@
 //! `harness_core`, exactly the same layering as `manifest_run` keeping its logic in
 //! `installer_engine`. What stays here is env parsing (same fail-loudly, no-silent-default style
 //! as `manifest_run::ActivateCliConfig`) and the one defense-in-depth check that's specific to
-//! this CLI: confirming `CT_HARNESS_BUNDLE_DIR` really looks like it was installed from the
-//! manifest the task claims to be scoped to, before handing control to the agent loop.
+//! this CLI: confirming `CT_HARNESS_BUNDLE_DIR` really was installed from the manifest the task
+//! claims to be scoped to -- its compose file is where the manifest says, and its
+//! `.ct-agent-activation.json` marker (written by `manifest activate`, #165) names that same
+//! manifest -- before handing control to the agent loop.
 
+use crate::manifest_run::{read_activation_marker, ACTIVATION_MARKER_FILE};
 use installer_engine::allowlist::TrustAllowlist;
 use manifest_core::SignedTask;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn req<F: Fn(&str) -> Option<String>>(f: &F, key: &str, what: &str) -> Result<String, String> {
     match f(key).map(|v| v.trim().to_string()) {
@@ -46,6 +49,11 @@ pub struct HarnessCliConfig {
     /// `CT_HARNESS_ALLOWED_MODELS` -- comma-separated harness-side model allowlist, separate from
     /// the publisher trust allowlist: even a trusted task naming an unexpected model is refused.
     pub allowed_models: Vec<String>,
+    /// `CT_HARNESS_ALLOW_UNMARKED_BUNDLE=1` (exactly `1`) -- accept a `bundle_dir` that carries no
+    /// activation marker (activated by a ct-agent older than #165, or assembled by hand) with a
+    /// stderr warning instead of refusing it. A marker that IS present must still match; this
+    /// only relaxes the "must exist" half, never the "must name this manifest" half.
+    pub allow_unmarked_bundle: bool,
 }
 
 impl HarnessCliConfig {
@@ -93,7 +101,11 @@ impl HarnessCliConfig {
                 "the same manifest reference used at `manifest activate` time for this bundle",
             )?,
             allowlist,
-            bundle_dir: PathBuf::from(req(&f, "CT_HARNESS_BUNDLE_DIR", "the manifest's own already-activated work_dir")?),
+            bundle_dir: PathBuf::from(req(
+                &f,
+                "CT_HARNESS_BUNDLE_DIR",
+                "the manifest's own activation directory, <CT_MANIFEST_WORK_DIR>/<project_name>",
+            )?),
             litellm_base_url: req(&f, "CT_HARNESS_LITELLM_URL", "base URL of the operator's own LiteLLM proxy")?,
             litellm_key_file: PathBuf::from(req(
                 &f,
@@ -101,6 +113,7 @@ impl HarnessCliConfig {
                 "path to a file holding a budget-capped LiteLLM virtual key -- never inline",
             )?),
             allowed_models,
+            allow_unmarked_bundle: opt(&f, "CT_HARNESS_ALLOW_UNMARKED_BUNDLE").as_deref() == Some("1"),
         })
     }
 }
@@ -178,6 +191,11 @@ fn run_harness_blocking(cfg: HarnessCliConfig) -> Result<harness_core::HarnessRe
         ));
     }
 
+    // The compose file merely EXISTING says nothing about which bundle put it there (#165): the
+    // manifest's sha256 is of the tarball, so an unpacked directory cannot be re-hashed against
+    // it. The activation marker `manifest activate` leaves behind is the binding instead.
+    check_activation_marker(&cfg.bundle_dir, &hex32(&manifest.manifest_id), cfg.allow_unmarked_bundle)?;
+
     let api_key = std::fs::read_to_string(&cfg.litellm_key_file)
         .map_err(|e| format!("read CT_HARNESS_LITELLM_KEY_FILE {}: {e}", cfg.litellm_key_file.display()))?
         .trim()
@@ -195,6 +213,51 @@ fn run_harness_blocking(cfg: HarnessCliConfig) -> Result<harness_core::HarnessRe
         now,
     };
     Ok(harness_core::run_task(&task, &cfg.allowlist, opts))
+}
+
+/// The #165 pre-flight: `bundle_dir`'s activation marker must name `expected_manifest_id_hex`.
+///
+/// - Marker present, same id: ok.
+/// - Marker present, different id: refused, both ids named -- the directory holds some OTHER
+///   manifest's hash-verified bytes, and a task is only ever scoped to one manifest.
+/// - Marker absent: refused unless `allow_unmarked` (`CT_HARNESS_ALLOW_UNMARKED_BUNDLE=1`), in
+///   which case a one-line stderr warning is printed and the directory is accepted as-is.
+/// - Marker unreadable or not valid JSON: refused, always -- a corrupt marker is not "no marker".
+pub(crate) fn check_activation_marker(
+    bundle_dir: &Path,
+    expected_manifest_id_hex: &str,
+    allow_unmarked: bool,
+) -> Result<(), String> {
+    match read_activation_marker(bundle_dir) {
+        Ok(Some(marker)) if marker.manifest_id == expected_manifest_id_hex => Ok(()),
+        Ok(Some(marker)) => Err(format!(
+            "CT_HARNESS_BUNDLE_DIR {} was activated from manifest {}, not {} (its {ACTIVATION_MARKER_FILE} says \
+             so) -- refusing to run a task against a bundle installed from a different manifest (#165)",
+            bundle_dir.display(),
+            marker.manifest_id,
+            expected_manifest_id_hex
+        )),
+        Ok(None) if allow_unmarked => {
+            eprintln!(
+                "warning: CT_HARNESS_BUNDLE_DIR {} carries no {ACTIVATION_MARKER_FILE} activation marker -- accepting \
+                 it unverified because CT_HARNESS_ALLOW_UNMARKED_BUNDLE=1 (#165)",
+                bundle_dir.display()
+            );
+            Ok(())
+        }
+        Ok(None) => Err(format!(
+            "CT_HARNESS_BUNDLE_DIR {} carries no {ACTIVATION_MARKER_FILE} activation marker -- it was activated by \
+             an older ct-agent, or is not an activation directory at all, so nothing binds its contents to \
+             manifest {expected_manifest_id_hex}; re-activate it, or set CT_HARNESS_ALLOW_UNMARKED_BUNDLE=1 to \
+             accept it explicitly (#165)",
+            bundle_dir.display()
+        )),
+        Err(e) => Err(format!(
+            "CT_HARNESS_BUNDLE_DIR {}: {e} -- refusing to trust a bundle directory whose activation marker cannot \
+             be read (#165)",
+            bundle_dir.display()
+        )),
+    }
 }
 
 fn hex32(b: &[u8; 32]) -> String {
@@ -268,7 +331,100 @@ mod tests {
             litellm_base_url: "http://127.0.0.1:1".to_string(),
             litellm_key_file: dir.join("key"),
             allowed_models: vec!["local-devstral-small2".to_string()],
+            // Strict, as in production: the existing tests below all fail on an EARLIER check
+            // (signature/expiry, allowlist, containment), so they never reach the marker
+            // pre-flight; the #165 tests write a marker explicitly where they need one.
+            allow_unmarked_bundle: false,
         }
+    }
+
+    /// Writes the activation marker `manifest activate` would leave in `dir` for `manifest_id`.
+    fn write_marker(dir: &std::path::Path, manifest_id: [u8; 32]) {
+        let marker = crate::manifest_run::ActivationMarker {
+            manifest_id: hex32(&manifest_id),
+            publisher_pubkey: "cd".repeat(32),
+            project_name: "harness-proof".to_string(),
+            activated_at: 1_700_000_000,
+            ct_agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        crate::manifest_run::write_activation_marker(dir, &marker).unwrap();
+    }
+
+    #[test]
+    fn check_activation_marker_refuses_a_marker_naming_a_different_manifest_165() {
+        let dir = tempfile::tempdir().unwrap();
+        write_marker(dir.path(), [7u8; 32]);
+        let err = check_activation_marker(dir.path(), &hex32(&[8u8; 32]), false).unwrap_err();
+        assert!(err.contains("was activated from manifest"), "{err}");
+        assert!(err.contains(&hex32(&[7u8; 32])) && err.contains(&hex32(&[8u8; 32])), "both ids named: {err}");
+        // The allow flag only relaxes "must exist", never "must match".
+        assert!(check_activation_marker(dir.path(), &hex32(&[8u8; 32]), true).is_err());
+    }
+
+    #[test]
+    fn check_activation_marker_refuses_a_missing_marker_unless_explicitly_allowed_165() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = check_activation_marker(dir.path(), &hex32(&[7u8; 32]), false).unwrap_err();
+        assert!(err.contains("no ") && err.contains("activation marker"), "{err}");
+        assert!(err.contains("CT_HARNESS_ALLOW_UNMARKED_BUNDLE=1"), "the way out must be named: {err}");
+        check_activation_marker(dir.path(), &hex32(&[7u8; 32]), true).unwrap();
+    }
+
+    #[test]
+    fn check_activation_marker_accepts_a_matching_marker_and_refuses_a_corrupt_one_165() {
+        let dir = tempfile::tempdir().unwrap();
+        write_marker(dir.path(), [7u8; 32]);
+        check_activation_marker(dir.path(), &hex32(&[7u8; 32]), false).unwrap();
+
+        std::fs::write(dir.path().join(ACTIVATION_MARKER_FILE), b"{ not json").unwrap();
+        // Corrupt is not "unmarked": even the allow flag does not wave it through.
+        assert!(check_activation_marker(dir.path(), &hex32(&[7u8; 32]), false).is_err());
+        assert!(check_activation_marker(dir.path(), &hex32(&[7u8; 32]), true).is_err());
+    }
+
+    #[test]
+    fn run_harness_blocking_refuses_a_bundle_dir_activated_from_a_different_manifest_165() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("docker-compose.yml"), "services: {}").unwrap();
+
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let manifest_id = [7u8; 32];
+        let now = crate::manifest_run::unix_now().unwrap();
+        // Fully trusted manifest (valid, on the allowlist, compose file present and contained)
+        // -- only the marker can be the reason for refusal.
+        let manifest = signed_manifest(&key, manifest_id, now, now + 7_200);
+        let task = signed_task(&key, [9u8; 32], manifest_id, now, now + 7_200);
+        std::fs::write(dir.path().join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        std::fs::write(dir.path().join("task.json"), serde_json::to_vec(&task).unwrap()).unwrap();
+        // The compose file on disk came from some OTHER activation (#165's exact scenario).
+        write_marker(dir.path(), [8u8; 32]);
+
+        let allowlist = TrustAllowlist::parse(&hex32(&key.verifying_key().to_bytes())).unwrap();
+        let err = run_harness_blocking(cfg_for(dir.path(), allowlist)).unwrap_err();
+        assert!(err.contains("was activated from manifest"), "{err}");
+        assert!(err.contains(&hex32(&[8u8; 32])) && err.contains(&hex32(&manifest_id)), "{err}");
+    }
+
+    #[test]
+    fn run_harness_blocking_passes_the_marker_pre_flight_with_a_matching_marker_165() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("docker-compose.yml"), "services: {}").unwrap();
+
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let manifest_id = [7u8; 32];
+        let now = crate::manifest_run::unix_now().unwrap();
+        let manifest = signed_manifest(&key, manifest_id, now, now + 7_200);
+        let task = signed_task(&key, [9u8; 32], manifest_id, now, now + 7_200);
+        std::fs::write(dir.path().join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        std::fs::write(dir.path().join("task.json"), serde_json::to_vec(&task).unwrap()).unwrap();
+        write_marker(dir.path(), manifest_id);
+
+        // No LiteLLM key file on purpose: the very next step after the marker pre-flight is the
+        // key-file read, so failing THERE proves the marker check passed without needing docker.
+        let allowlist = TrustAllowlist::parse(&hex32(&key.verifying_key().to_bytes())).unwrap();
+        let err = run_harness_blocking(cfg_for(dir.path(), allowlist)).unwrap_err();
+        assert!(err.contains("CT_HARNESS_LITELLM_KEY_FILE"), "{err}");
+        assert!(!err.contains("activation marker"), "{err}");
     }
 
     #[test]
@@ -354,6 +510,17 @@ mod tests {
         let cfg = HarnessCliConfig::from_lookup(lookup(&full_env())).unwrap();
         assert_eq!(cfg.allowed_models, vec!["local-devstral-small2"]);
         assert!(cfg.allowlist.contains(&[0x99; 32]));
+        assert!(!cfg.allow_unmarked_bundle, "unmarked bundles are refused unless explicitly allowed (#165)");
+    }
+
+    #[test]
+    fn allow_unmarked_bundle_is_only_exactly_1_165() {
+        for (value, expected) in [("1", true), (" 1 ", true), ("true", false), ("yes", false), ("0", false), ("", false)] {
+            let mut env = full_env();
+            env.push(("CT_HARNESS_ALLOW_UNMARKED_BUNDLE", value));
+            let cfg = HarnessCliConfig::from_lookup(lookup(&env)).unwrap();
+            assert_eq!(cfg.allow_unmarked_bundle, expected, "CT_HARNESS_ALLOW_UNMARKED_BUNDLE={value:?}");
+        }
     }
 
     #[test]

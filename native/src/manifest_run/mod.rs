@@ -11,13 +11,23 @@
 //! The three-step split exists so the key is needed exactly once: `create` needs no key and no
 //! network, `sign` needs the holder key but no network, `publish` needs the network but no key.
 //! An operator can therefore review (and diff) the unsigned skeleton before anything signs it.
+//!
+//! `activate` never unpacks a bundle over existing files (#165). `CT_MANIFEST_WORK_DIR` is only
+//! the PARENT: each activation gets its own `<CT_MANIFEST_WORK_DIR>/<CT_MANIFEST_PROJECT_NAME>`,
+//! which must not exist yet or must be empty -- `installer-engine` writes tar entries without
+//! checking what is already there, so reusing one fixed directory would let a later bundle
+//! silently overwrite an earlier, hash-verified one. A successful activation then leaves an
+//! [`ActivationMarker`] (`.ct-agent-activation.json`) in that directory recording which manifest
+//! the bytes on disk came from; `harness run` refuses a bundle directory whose marker names a
+//! different manifest, so the fetch -> hash -> signature -> activate chain stays bound to the
+//! directory the harness later rebuilds from.
 
 use ed25519_dalek::SigningKey;
 use installer_engine::allowlist::TrustAllowlist;
 use installer_engine::{ActivateOptions, InstallReport};
 use manifest_core::{BundleRef, EnvVarSpec, InstallerKind, ServiceManifest, VerifySpec};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Default manifest lifetime when `CT_MANIFEST_EXPIRES_IN_SECS` is unset: one year.
 const DEFAULT_EXPIRES_IN_SECS: u64 = 31_536_000;
@@ -564,20 +574,186 @@ impl ActivateCliConfig {
             work_dir: PathBuf::from(req(
                 &f,
                 "CT_MANIFEST_WORK_DIR",
-                "a scratch directory to unpack the bundle into",
+                "the parent directory of per-activation bundle directories; this activation unpacks \
+                 into <CT_MANIFEST_WORK_DIR>/<CT_MANIFEST_PROJECT_NAME>, which must not exist yet or \
+                 must be empty",
             )?),
             registry,
         })
     }
 }
 
+/// File `run_activate` writes into the per-activation directory once `installer_engine::activate`
+/// reports `Ok` (#165): the [`ActivationMarker`] `harness run` later checks the directory against.
+pub const ACTIVATION_MARKER_FILE: &str = ".ct-agent-activation.json";
+
+/// What a successful activation leaves behind in its install directory: which manifest (and
+/// publisher) the bytes on disk were fetched, hash-verified and signature-checked from. The bundle
+/// sha256 in the manifest is of the TARBALL, so an unpacked directory can never be re-hashed
+/// against it -- this marker is what binds the directory to the manifest instead. It is built from
+/// the `InstallReport` alone (`installer-engine` fetches and parses the manifest internally and
+/// only hands back these string fields), which is exactly the set `harness run` needs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActivationMarker {
+    /// 64-hex `manifest_id`, as `installer-engine` reports it.
+    pub manifest_id: String,
+    /// 64-hex publisher pubkey the manifest's signature verified against.
+    pub publisher_pubkey: String,
+    /// The compose project name -- also the install directory's own name under
+    /// `CT_MANIFEST_WORK_DIR`.
+    pub project_name: String,
+    /// Seconds since the Unix epoch when `installer_engine::activate` returned `Ok`.
+    pub activated_at: u64,
+    /// `CARGO_PKG_VERSION` of the ct-agent that wrote the marker.
+    pub ct_agent_version: String,
+}
+
+/// The product of [`run_activate`]: `installer-engine`'s own report plus the directory the bundle
+/// was unpacked into, so both the CLI and `bridge/manifest-install` can tell the operator where
+/// the install lives (it is what `CT_HARNESS_BUNDLE_DIR` must later point at).
+#[derive(Debug)]
+pub struct Activation {
+    pub report: InstallReport,
+    pub install_dir: PathBuf,
+}
+
+/// The `InstallReport` as JSON with `install_dir` added next to its own fields -- one object, so
+/// a caller reading `status` keeps working and additionally learns where the bundle lives. The
+/// fallback object mirrors `InstallReport::to_json`'s own shape.
+pub fn report_json_with_install_dir(a: &Activation) -> serde_json::Value {
+    let mut value = serde_json::to_value(&a.report).unwrap_or_else(|e| {
+        serde_json::json!({ "status": "report_serialize_error", "detail": e.to_string() })
+    });
+    if let serde_json::Value::Object(map) = &mut value {
+        map.insert(
+            "install_dir".to_string(),
+            serde_json::Value::String(a.install_dir.to_string_lossy().into_owned()),
+        );
+    }
+    value
+}
+
+/// The project name doubles as a path component under `CT_MANIFEST_WORK_DIR` (#165), so only a
+/// plain single-segment name is accepted: 1..=64 characters of `[A-Za-z0-9._-]`, not starting
+/// with `-` (an option-lookalike to every tool that later receives the path) or `.` (hidden, and
+/// what rules out `.`/`..`). Anything else -- a separator, whitespace, non-ASCII -- is refused
+/// with the offending rule named, never normalised into some other name the operator did not
+/// choose. Returns the name unchanged when it is acceptable.
+pub(crate) fn activation_dir_name(project_name: &str) -> Result<String, String> {
+    let bad = |why: &str| {
+        format!("CT_MANIFEST_PROJECT_NAME '{project_name}' is not usable as a directory name: {why}")
+    };
+    if project_name.is_empty() {
+        return Err(bad("it is empty"));
+    }
+    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    if let Some(c) = project_name.chars().find(|&c| !allowed(c)) {
+        return Err(bad(&format!("character {c:?} is not one of [A-Za-z0-9._-]")));
+    }
+    if project_name.len() > 64 {
+        return Err(bad("it is longer than 64 characters"));
+    }
+    if project_name.starts_with('-') {
+        return Err(bad("it must not start with '-'"));
+    }
+    if project_name.starts_with('.') {
+        return Err(bad("it must not start with '.' (which also rules out '.' and '..')"));
+    }
+    Ok(project_name.to_string())
+}
+
+/// Resolve and claim `<work_dir>/<project_name>` for one activation (#165): create `work_dir`
+/// itself if needed, then create the per-activation directory if it is absent, or accept it only
+/// if it is an EMPTY real directory. A non-empty directory (a previous activation, or anything
+/// else) is refused with the path named -- nothing is ever deleted on the operator's behalf. A
+/// symlink at that path is refused outright (`symlink_metadata`, so it is never followed): it
+/// would let a stale link redirect a hash-verified bundle into some other directory entirely.
+pub(crate) fn prepare_activation_dir(work_dir: &Path, project_name: &str) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(work_dir)
+        .map_err(|e| format!("create CT_MANIFEST_WORK_DIR {}: {e}", work_dir.display()))?;
+    let install_dir = work_dir.join(activation_dir_name(project_name)?);
+    let meta = match std::fs::symlink_metadata(&install_dir) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // `create_dir`, not `create_dir_all`: if something races us into existence between
+            // the lookup and here, fail closed rather than adopt a directory we did not inspect.
+            std::fs::create_dir(&install_dir)
+                .map_err(|e| format!("create activation directory {}: {e}", install_dir.display()))?;
+            return Ok(install_dir);
+        }
+        Err(e) => return Err(format!("inspect activation directory {}: {e}", install_dir.display())),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "{} is a symlink -- refusing to unpack a bundle through it (#165); remove it, or choose a new \
+             CT_MANIFEST_PROJECT_NAME",
+            install_dir.display()
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(format!(
+            "{} exists and is not a directory -- refusing to unpack a bundle there (#165); remove it, or \
+             choose a new CT_MANIFEST_PROJECT_NAME",
+            install_dir.display()
+        ));
+    }
+    let mut entries = std::fs::read_dir(&install_dir)
+        .map_err(|e| format!("read activation directory {}: {e}", install_dir.display()))?;
+    if let Some(entry) = entries.next() {
+        let occupant = match entry {
+            Ok(entry) => entry.file_name().to_string_lossy().into_owned(),
+            Err(e) => format!("<unreadable entry: {e}>"),
+        };
+        // Name the earlier activation when there is one -- the operator most likely wants to
+        // know WHICH install they are about to tread on, not just that the directory is busy.
+        let prior = match read_activation_marker(&install_dir) {
+            Ok(Some(marker)) => format!(
+                " -- a previous activation (manifest {}, project '{}', at {}) already occupies it",
+                marker.manifest_id, marker.project_name, marker.activated_at
+            ),
+            _ => " -- a previous activation or unrelated files already occupy it".to_string(),
+        };
+        return Err(format!(
+            "{} is not empty (contains '{occupant}'){prior}; ct-agent never unpacks a bundle over existing \
+             files (#165). Remove that directory yourself, or choose a new CT_MANIFEST_PROJECT_NAME",
+            install_dir.display()
+        ));
+    }
+    Ok(install_dir)
+}
+
+/// Write `marker` as pretty JSON to `<install_dir>/ACTIVATION_MARKER_FILE`.
+pub(crate) fn write_activation_marker(install_dir: &Path, marker: &ActivationMarker) -> Result<(), String> {
+    let path = install_dir.join(ACTIVATION_MARKER_FILE);
+    let json = serde_json::to_string_pretty(marker).map_err(|e| format!("serialize activation marker: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| format!("write activation marker {}: {e}", path.display()))
+}
+
+/// Read `<dir>/ACTIVATION_MARKER_FILE`: `Ok(None)` when there is no marker at all, `Err` when
+/// there is one that cannot be read or parsed -- a corrupt marker is a reason to stop, not to
+/// treat the directory as unmarked.
+pub(crate) fn read_activation_marker(dir: &Path) -> Result<Option<ActivationMarker>, String> {
+    let path = dir.join(ACTIVATION_MARKER_FILE);
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read activation marker {}: {e}", path.display())),
+    };
+    serde_json::from_slice::<ActivationMarker>(&raw)
+        .map(Some)
+        .map_err(|e| format!("activation marker {} is not valid: {e}", path.display()))
+}
+
 /// Run the activation. `installer-engine` is entirely synchronous (blocking HTTP, `docker`
 /// subprocesses, `verify.sh`), so it goes on the blocking pool rather than stalling a runtime
 /// worker for the length of a `docker compose up --build`.
-pub async fn run_activate(cfg: ActivateCliConfig) -> Result<InstallReport, String> {
+///
+/// The per-activation directory is claimed FIRST (#165): a directory that is already occupied is
+/// an error before any manifest or bundle is fetched, so a refused activation has no side effect
+/// beyond (possibly) creating the empty parent.
+pub async fn run_activate(cfg: ActivateCliConfig) -> Result<Activation, String> {
     let now = unix_now()?;
-    std::fs::create_dir_all(&cfg.work_dir)
-        .map_err(|e| format!("create CT_MANIFEST_WORK_DIR {}: {e}", cfg.work_dir.display()))?;
+    let install_dir = prepare_activation_dir(&cfg.work_dir, &cfg.project_name)?;
     let registry = cfg.registry;
     let opts = ActivateOptions {
         manifest_location: cfg.manifest_location,
@@ -585,12 +761,34 @@ pub async fn run_activate(cfg: ActivateCliConfig) -> Result<InstallReport, Strin
         env_file: cfg.env_file,
         project_name: cfg.project_name,
         protected_name_substrings: cfg.protected_name_substrings,
-        work_dir: cfg.work_dir,
+        work_dir: install_dir.clone(),
         now,
     };
     let report = tokio::task::spawn_blocking(move || installer_engine::activate(opts))
         .await
         .map_err(|e| format!("activation task failed: {e}"))?;
+
+    // The marker is part of the activation, not an afterthought: it is the only thing that binds
+    // the unpacked bytes to the manifest they were verified against (the tarball hash cannot be
+    // re-checked on a directory), and `harness run` refuses an unmarked directory. So a marker
+    // that cannot be written is a failed activation, even though the service itself is up -- the
+    // operator gets the path and the reason, and decides.
+    if let InstallReport::Ok { manifest_id, publisher_pubkey, project_name, .. } = &report {
+        let marker = ActivationMarker {
+            manifest_id: manifest_id.clone(),
+            publisher_pubkey: publisher_pubkey.clone(),
+            project_name: project_name.clone(),
+            activated_at: unix_now().unwrap_or(now),
+            ct_agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        write_activation_marker(&install_dir, &marker).map_err(|e| {
+            format!(
+                "activation of manifest {manifest_id} into {} succeeded but its activation marker could not be \
+                 written: {e} -- the directory is not usable by `harness run` until it carries one",
+                install_dir.display()
+            )
+        })?;
+    }
 
     // Phase 3, opt-in: a ledger write only, and only after a REAL successful install -- a
     // Rejected/Failed activation must never be recorded as if it happened. A failure posting the
@@ -602,7 +800,7 @@ pub async fn run_activate(cfg: ActivateCliConfig) -> Result<InstallReport, Strin
             eprintln!("warning: activation succeeded but the registry ledger event failed: {e}");
         }
     }
-    Ok(report)
+    Ok(Activation { report, install_dir })
 }
 
 async fn post_activation_ledger_event(registry: &RegistryActivationConfig, manifest_id: &str) -> Result<(), String> {
@@ -927,5 +1125,107 @@ mod tests {
         assert_eq!(read_manifest_input_from(&f, &mut stdin).unwrap(), "{\"a\":1}");
         let mut empty = std::io::Cursor::new(Vec::new());
         assert!(read_manifest_input_from(&f, &mut empty).is_err(), "empty stdin must fail loudly");
+    }
+
+    #[test]
+    fn activation_dir_name_accepts_plain_names_and_rejects_path_tricks_165() {
+        assert_eq!(activation_dir_name("my-agent-tool").unwrap(), "my-agent-tool");
+        assert_eq!(activation_dir_name("svc_1.2").unwrap(), "svc_1.2");
+        let too_long = "a".repeat(65);
+        for bad in ["", ".", "..", "a/b", "a\\b", "-x", ".hidden", too_long.as_str(), "a b", "ü"] {
+            let err = activation_dir_name(bad)
+                .expect_err(&format!("{bad:?} must not become a path component under CT_MANIFEST_WORK_DIR"));
+            assert!(err.contains("CT_MANIFEST_PROJECT_NAME"), "{err}");
+        }
+    }
+
+    #[test]
+    fn prepare_activation_dir_creates_a_fresh_subdir_and_refuses_a_non_empty_one_165() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = tmp.path().join("work");
+
+        // Fresh: the parent is created too, and the install dir is a new empty directory.
+        let install_dir = prepare_activation_dir(&work_dir, "proj").unwrap();
+        assert_eq!(install_dir, work_dir.join("proj"));
+        assert!(install_dir.is_dir());
+        assert_eq!(std::fs::read_dir(&install_dir).unwrap().count(), 0);
+
+        // Existing but still empty is fine -- nothing to overwrite.
+        assert_eq!(prepare_activation_dir(&work_dir, "proj").unwrap(), install_dir);
+
+        // Anything inside (here: a previous activation's marker plus a compose file) is refused,
+        // with the path and the way out named, and nothing is deleted.
+        let marker = ActivationMarker {
+            manifest_id: "ab".repeat(32),
+            publisher_pubkey: "cd".repeat(32),
+            project_name: "proj".to_string(),
+            activated_at: 1_000,
+            ct_agent_version: "0.0.0".to_string(),
+        };
+        write_activation_marker(&install_dir, &marker).unwrap();
+        std::fs::write(install_dir.join("docker-compose.yml"), "services: {}").unwrap();
+        let err = prepare_activation_dir(&work_dir, "proj").unwrap_err();
+        assert!(err.contains(&install_dir.display().to_string()), "{err}");
+        assert!(err.contains("CT_MANIFEST_PROJECT_NAME"), "{err}");
+        assert!(err.contains(&"ab".repeat(32)), "the earlier activation's manifest must be named: {err}");
+        assert!(install_dir.join("docker-compose.yml").is_file(), "refusing must never delete anything");
+
+        // A regular file where the directory should be is refused too.
+        std::fs::write(work_dir.join("as-file"), b"x").unwrap();
+        let err = prepare_activation_dir(&work_dir, "as-file").unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+
+        // Two project names -> two distinct directories.
+        let other = prepare_activation_dir(&work_dir, "other").unwrap();
+        assert_ne!(other, install_dir);
+        assert!(other.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_activation_dir_refuses_a_symlink_at_the_install_path_165() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = tmp.path().join("work");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        // An empty target directory: only the symlink itself can be the reason for refusal.
+        std::os::unix::fs::symlink(&elsewhere, work_dir.join("proj")).unwrap();
+        let err = prepare_activation_dir(&work_dir, "proj").unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(err.contains("CT_MANIFEST_PROJECT_NAME"), "{err}");
+    }
+
+    #[test]
+    fn activation_marker_round_trips_and_is_absent_on_a_fresh_dir_165() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(read_activation_marker(tmp.path()).unwrap(), None);
+
+        let marker = ActivationMarker {
+            manifest_id: "ab".repeat(32),
+            publisher_pubkey: "cd".repeat(32),
+            project_name: "proj".to_string(),
+            activated_at: 1_700_000_000,
+            ct_agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        write_activation_marker(tmp.path(), &marker).unwrap();
+        assert!(tmp.path().join(ACTIVATION_MARKER_FILE).is_file());
+        assert_eq!(read_activation_marker(tmp.path()).unwrap(), Some(marker));
+
+        // A marker that exists but is not valid JSON is an error, never "unmarked".
+        std::fs::write(tmp.path().join(ACTIVATION_MARKER_FILE), b"{ not json").unwrap();
+        assert!(read_activation_marker(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn report_json_with_install_dir_adds_the_path_next_to_the_report_fields_165() {
+        let activation = Activation {
+            report: InstallReport::Rejected { reason: "fetch_manifest: nope".to_string(), manifest_id: None },
+            install_dir: PathBuf::from("/var/lib/ct-agent/work/proj"),
+        };
+        let json = report_json_with_install_dir(&activation);
+        assert_eq!(json["status"], serde_json::json!("rejected"));
+        assert_eq!(json["reason"], serde_json::json!("fetch_manifest: nope"));
+        assert_eq!(json["install_dir"], serde_json::json!("/var/lib/ct-agent/work/proj"));
     }
 }

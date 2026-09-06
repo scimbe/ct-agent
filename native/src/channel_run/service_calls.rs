@@ -1044,14 +1044,17 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
         "Install a manifest from this agent's configured registry. Arguments: {manifest_location, \
          project_name} (a URL/id from bridge/manifest-list's output, and an isolated project name \
          for THIS install -- the same explicit, no-default choice `ct-agent manifest activate` \
-         itself always requires, so a second concurrent install can never collide with the first). \
+         itself always requires). The project name isolates the docker compose project AND selects \
+         the per-activation directory <CT_MANIFEST_WORK_DIR>/<project_name> the bundle is unpacked \
+         into, which is refused unless it is absent or empty (#165) -- so a second install can never \
+         overwrite the first's files; reuse of a project name is an error, not a silent replace. \
          Trust allowlist, work directory, and registry-ledger config all come from this agent's OWN \
          configuration (CT_MANIFEST_TRUST_ALLOWLIST[_FILE]/CT_MANIFEST_WORK_DIR/CT_MANIFEST_*), \
          never from the caller -- the portal picks WHICH manifest, never WHO is trusted to publish \
-         one. Returns the same structured InstallReport `ct-agent manifest activate` prints. Refused \
-         unconditionally, for every caller including the bridge peer, when this agent's own \
-         CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL is set -- the owner's own opt-out, independent of \
-         who the bridge peer or trust allowlist otherwise trust.",
+         one. Returns the same structured InstallReport `ct-agent manifest activate` prints, plus \
+         `install_dir`. Refused unconditionally, for every caller including the bridge peer, when \
+         this agent's own CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL is set -- the owner's own \
+         opt-out, independent of who the bridge peer or trust allowlist otherwise trust.",
         move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
             if ctx.peer != Some(bridge_peer) {
                 return Err("bridge/manifest-install: caller is not this agent's configured bridge peer".to_string());
@@ -1081,8 +1084,8 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
                 "CT_MANIFEST_PROJECT_NAME" => Some(project_name.clone()),
                 other => std::env::var(other).ok(),
             })?;
-            let report = tokio::runtime::Handle::current().block_on(crate::manifest_run::run_activate(cfg))?;
-            serde_json::to_value(&report).map_err(|e| format!("bridge/manifest-install: encoding result: {e}"))
+            let activation = tokio::runtime::Handle::current().block_on(crate::manifest_run::run_activate(cfg))?;
+            Ok(crate::manifest_run::report_json_with_install_dir(&activation))
         },
     );
 }

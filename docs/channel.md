@@ -337,11 +337,12 @@ needed exactly once, at `sign`, so an operator can review the unsigned skeleton 
 | `activate` | `CT_MANIFEST_URL` | an `https://` URL or local file path of the signed manifest JSON |
 | `activate` | `CT_MANIFEST_TRUST_ALLOWLIST` / `CT_MANIFEST_TRUST_ALLOWLIST_FILE` | **exactly one** required: comma-separated 64-hex publisher pubkeys, or a file with one per line. An empty allowlist trusts nothing — activation rejects every manifest whose publisher isn't named here |
 | `activate` | `CT_MANIFEST_PROJECT_NAME` | required, no default: the isolated docker-compose project name, so an install can never collide with real infrastructure |
-| `activate` | `CT_MANIFEST_WORK_DIR` | scratch directory the bundle is unpacked into |
+| `activate` | `CT_MANIFEST_WORK_DIR` | parent directory of per-activation bundle directories: this activation unpacks into `<CT_MANIFEST_WORK_DIR>/<CT_MANIFEST_PROJECT_NAME>`, which must not exist yet or must be empty — a bundle is never unpacked over existing files ([#165]). A successful activation leaves a `.ct-agent-activation.json` marker there naming the manifest it came from; `harness run` checks it |
 | `activate` | `CT_MANIFEST_ENV_FILE` | optional; local `KEY=value` secrets file supplied to the installed service — never read from the manifest itself |
 | `activate` | `CT_MANIFEST_PROTECTED_NAMES` | optional, comma-separated substrings this install's resources must never collide with |
 
 [#16]: https://github.com/scimbe/ct-agent/issues/16
+[#165]: https://github.com/scimbe/ct-agent/issues/165
 [#18]: https://github.com/scimbe/ct-agent/issues/18
 [#140]: https://github.com/scimbe/ct-agent/issues/15
 [#200]: https://github.com/scimbe/ct-agent/issues/15
