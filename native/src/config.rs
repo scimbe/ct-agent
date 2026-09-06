@@ -96,6 +96,13 @@ pub struct AgentConfig {
     /// registered on the Edge, so it stays opt-in rather than probed on every
     /// agent in the fleet.
     pub masque_fallback: Option<MasqueFallbackConfig>,
+    /// ct-agent#45 slice 1: when true, a direct-connect handshake that carries
+    /// **no** routing token (a pre-#45 client) is refused, not just one that
+    /// carries the wrong token. `CT_DIRECT_REQUIRE_TOKEN`; default `false`
+    /// (rollout mode: token-less clients are still served until every client
+    /// sends the token, see `serve::DirectTokenPolicy`). Only consulted when
+    /// `direct_advertise_ip` is set -- the relayed path never reads it.
+    pub direct_require_token: bool,
 }
 
 /// The four values `dial_quic_via_masque` needs, read together (ADR-0024 M3-followup).
@@ -156,6 +163,7 @@ impl AgentConfig {
             framed_fallback: false,
             register_tcp_only: false,
             masque_fallback: None,
+            direct_require_token: false,
         })
     }
 
@@ -208,6 +216,11 @@ impl AgentConfig {
         // #528: CT_AGENT_FRAMED_FALLBACK truthy -> prefer the framed 'F' browser
         // registration over 'L'. Off by default, see the field's doc comment.
         cfg.framed_fallback = truthy(&get, "CT_AGENT_FRAMED_FALLBACK");
+        // ct-agent#45 slice 1: CT_DIRECT_REQUIRE_TOKEN truthy -> a direct-connect
+        // handshake without a routing token is refused. Off by default so that
+        // upgrading one agent never locks out the already-deployed clients that
+        // don't send the token yet.
+        cfg.direct_require_token = truthy(&get, "CT_DIRECT_REQUIRE_TOKEN");
         cfg.tcp_fallback_pool_size = match get("CT_AGENT_TCP_FALLBACK_POOL_SIZE") {
             Some(s) if !s.trim().is_empty() => s
                 .trim()
@@ -378,6 +391,29 @@ mod tests {
             .register_tcp_only
         };
         assert!(!base(None), "default off");
+        assert!(!base(Some("0")), "0 -> off");
+        assert!(!base(Some("false")), "false -> off");
+        assert!(!base(Some("")), "empty -> off");
+        assert!(base(Some("1")), "1 -> on");
+        assert!(base(Some("true")), "true -> on");
+    }
+
+    #[test]
+    fn direct_require_token_reads_the_env_flag() {
+        // ct-agent#45 slice 1: off by default (rollout mode, pre-#45 clients keep
+        // working); truthy values switch the direct listener to token-required.
+        // Same truthiness contract as the other CT_AGENT_* boolean flags.
+        let base = |v: Option<&str>| {
+            AgentConfig::from_env_with(|k| match k {
+                "CT_AGENT_EDGE" => Some("127.0.0.1:4433".into()),
+                "CT_AGENT_ORIGIN" => Some("127.0.0.1:8080".into()),
+                "CT_DIRECT_REQUIRE_TOKEN" => v.map(str::to_string),
+                _ => None,
+            })
+            .unwrap()
+            .direct_require_token
+        };
+        assert!(!base(None), "default off (rollout-compatible)");
         assert!(!base(Some("0")), "0 -> off");
         assert!(!base(Some("false")), "false -> off");
         assert!(!base(Some("")), "empty -> off");
