@@ -32,6 +32,8 @@ pub(crate) struct ServeSessionCtx {
     pub(crate) listener: Option<Endpoint>,
     /// #104, mirrors [`ChannelJoinCliConfig::direct_upgrade`] (`CT_CHANNEL_DIRECT_UPGRADE`).
     pub(crate) direct_upgrade: bool,
+    /// ct-agent#22 (b), mirrors [`ChannelJoinCliConfig::accept_race`] (`CT_CHANNEL_ACCEPT_RACE`).
+    pub(crate) accept_race: bool,
 }
 
 /// #200: present the grant to the broker and park until the edge pairs the NEXT peer, returning that
@@ -131,6 +133,7 @@ pub(crate) async fn serve_admitted_session(
         CHANNEL_ACCEPT_TIMEOUT,
         local,
         ctx.direct_upgrade,
+        ctx.accept_race,
     )
     .await
 }
@@ -512,6 +515,7 @@ where
         CHANNEL_ACCEPT_TIMEOUT,
         local,
         cfg.direct_upgrade,
+        cfg.accept_race,
     )
     .await
 }

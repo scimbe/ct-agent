@@ -88,6 +88,7 @@ where
         accept_timeout,
         local,
         false, // #104: this entry point predates the option and stays opt-out by default
+        false, // ct-agent#22 (b): same -- the accept-vs-relay race is opt-in (CT_CHANNEL_ACCEPT_RACE)
     )
     .await
 }
@@ -103,6 +104,9 @@ where
 /// direct-dial failure: [`RelayFallback::Quic`] (a pre-dialed QUIC relay connection) or —
 /// for a member whose relay port is also blocked — [`RelayFallback::Ladder`], which walks
 /// the relay ladder (direct QUIC → the `:443` front door) via [`join_via_relay_ladder`].
+/// `accept_race` (ct-agent#22 (b), opt-in) makes an `Accept` member with a bound listener
+/// race its accept window against the relay leg (`race_accept_against_relay`) instead of
+/// serialising the two; off, the accept-then-relay order is byte-for-byte unchanged.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_channel_join_with_admission<P>(
     admission: ChannelJoinOutcome,
@@ -119,6 +123,11 @@ pub async fn run_channel_join_with_admission<P>(
     // whether to attempt the in-band relay->direct upgrade if/when this session ends up
     // on the relay leg.
     direct_upgrade: bool,
+    // ct-agent#22 (b), opt-in via CT_CHANNEL_ACCEPT_RACE (default false -> unchanged
+    // behavior): whether an Accept member with a bound listener RACES its accept window
+    // against the relay leg ([`race_accept_against_relay`]) instead of waiting the full
+    // `accept_timeout` before it even dials the relay.
+    accept_race: bool,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
@@ -215,6 +224,27 @@ where
                     join_via_relay_fallback(relay, request, holder, ChannelRole::Accept, own_noise_private, &peer_noise, local, upgrade).await?;
                     return Ok(());
                 }
+                // ct-agent#22 (b): race the accept window against the relay leg instead of
+                // serialising them -- the 8 s vanish from the critical path for EVERY
+                // acceptor, not just a misconfigured one (part (a) above). Opt-in for now:
+                // the edge must detect an abandoned park on both transports before this can
+                // be the default (issue Befund 2, Vorschlag B).
+                // TODO(#22): auto-enable on the ack's cl=1 tag
+                if accept_race {
+                    race_accept_against_relay(
+                        ep,
+                        accept_timeout,
+                        relay,
+                        request,
+                        holder,
+                        own_noise_private,
+                        &peer_noise,
+                        local,
+                        upgrade,
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 let accept_started = std::time::Instant::now();
                 match tokio::time::timeout(accept_timeout, ep.accept()).await {
                     Ok(Some(incoming)) => {
@@ -264,39 +294,21 @@ pub async fn join_via_relay<P>(
 where
     P: AsyncRead + AsyncWrite + Unpin,
 {
-    // CADS-Tunnel#495 U2 (a'): relay_conn's own bi-stream carries the session below --
-    // PHASE_MARKER_RELAY, mirroring the :443 relay ladder's phase_marker_for(&stream,
-    // PHASE_MARKER_RELAY) call.
-    match present_channel_join_marked(relay_conn, request, holder, PHASE_MARKER_RELAY).await? {
-        ChannelJoinOutcome::Admitted { .. } => {}
-        ChannelJoinOutcome::Refused { category } => {
-            // #524: base string frozen, category appended when present.
-            return Err(AdmissionRefused::boxed_with_category(
-                "edge relay refused the channel join",
-                category.as_deref(),
-            ));
-        }
-        // #21: the relay park was reaped before a partner arrived -- retryable, not a refusal.
-        ChannelJoinOutcome::ParkExpired => {
-            return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
-        }
-    }
-    match upgrade {
-        Some((listener, own_direct_endpoint)) => run_channel_session_upgradable(
-            relay_conn,
-            role,
-            own_noise_private,
-            peer_noise_public,
-            local,
-            Some(listener),
-            Some(own_direct_endpoint),
-            DIRECT_DIAL_TIMEOUT,
-        )
-        .await,
-        None => run_channel_session(relay_conn, role, own_noise_private, peer_noise_public, local)
-            .await
-            .map_err(Into::into),
-    }
+    // ct-agent#22 (b): present-and-park (phase 1, `park_relay_leg`) and the Noise session
+    // (phase 2, `ParkedRelayLeg::run_session`) are the one shared implementation in
+    // `connectivity.rs`; this is the serial composition of the two. The typed
+    // Refused/ParkExpired errors and the PHASE_MARKER_RELAY preamble are unchanged.
+    join_via_relay_fallback(
+        RelayFallback::Quic(relay_conn),
+        request,
+        holder,
+        role,
+        own_noise_private,
+        peer_noise_public,
+        local,
+        upgrade,
+    )
+    .await
 }
 
 /// **#136 N-wire — DCUtR-upgradable relay join for a NAT-to-NAT (relay-only) member.** Like
@@ -665,6 +677,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
         front_door_cert: front_door_cert.clone(),
         listener: shared_listener,
         direct_upgrade: cfg.direct_upgrade,
+        accept_race: cfg.accept_race,
     });
     let max = serve_concurrency_from_env(std::env::var("CT_CHANNEL_SERVE_CONCURRENCY").ok().as_deref());
     eprintln!("ct-agent channel: persistent serve — up to {max} concurrent sessions (#200)");

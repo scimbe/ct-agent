@@ -3642,6 +3642,13 @@ fn channel_advertise_address_splits_bind_from_dial_target() {
     with_upgrade.push(("CT_CHANNEL_DIRECT_UPGRADE", "1".into()));
     let cfg = lookup(&with_upgrade).expect("direct-upgrade opt-in parses");
     assert!(cfg.direct_upgrade, "CT_CHANNEL_DIRECT_UPGRADE=1 opts in");
+
+    // ct-agent#22 (b): CT_CHANNEL_ACCEPT_RACE absent -> off, today's serial accept-then-relay.
+    assert!(!cfg.accept_race, "accept-vs-relay race defaults to off");
+    let mut with_race = base.clone();
+    with_race.push(("CT_CHANNEL_ACCEPT_RACE", "1".into()));
+    let cfg = lookup(&with_race).expect("accept-race opt-in parses");
+    assert!(cfg.accept_race, "CT_CHANNEL_ACCEPT_RACE=1 opts in");
 }
 
 #[test]
@@ -4079,6 +4086,7 @@ async fn run_channel_join_with_admission_runs_the_direct_session_from_a_443_ladd
             std::time::Duration::from_secs(5),
             a_local_run,
             false,
+            false, // ct-agent#22 (b): accept_race off (serial)
         )
         .await
     });
@@ -4698,6 +4706,7 @@ async fn quic_lazy_relay_dials_only_on_fallback_and_forms_the_tunnel() {
             std::time::Duration::from_secs(2),
             a_local_run,
             false,
+            false, // ct-agent#22 (b): accept_race off (serial)
         )
         .await
     });
@@ -5331,6 +5340,7 @@ async fn two_relay_only_members_join_without_a_dialable_address_and_relay_splice
             std::time::Duration::from_secs(5),
             a_local,
             false,
+            false, // ct-agent#22 (b): accept_race off (serial)
         )
         .await
     });
@@ -5361,6 +5371,7 @@ async fn two_relay_only_members_join_without_a_dialable_address_and_relay_splice
             std::time::Duration::from_secs(5),
             b_local,
             false,
+            false, // ct-agent#22 (b): accept_race off (serial)
         )
         .await
     });
@@ -5473,6 +5484,7 @@ async fn direct_upgrade_opt_in_still_completes_over_the_relay_when_the_candidate
             std::time::Duration::from_secs(5),
             a_local,
             true, // #104 direct_upgrade opt-in
+            false, // ct-agent#22 (b): accept_race off (serial)
         )
         .await
     });
@@ -5502,6 +5514,7 @@ async fn direct_upgrade_opt_in_still_completes_over_the_relay_when_the_candidate
             std::time::Duration::from_secs(5),
             b_local,
             true, // #104 direct_upgrade opt-in
+            false, // ct-agent#22 (b): accept_race off (serial)
         )
         .await
     });
@@ -5770,4 +5783,373 @@ async fn admit_one_shot_with_retry_gives_a_named_error_when_the_window_closes_95
     assert!(msg.contains("ct-agent#95"), "must reference the issue for a searchable error: {msg}");
     assert!(msg.contains("park windows (#21)"), "must name the #21 park-window explanation an agent can act on: {msg}");
     assert!(msg.contains(&hex_encode(&channel.0)), "must name the channel: {msg}");
+}
+
+#[test]
+fn accept_race_flag_is_opt_in_22() {
+    // ct-agent#22 (b) (frozen): the race is OPT-IN until the edge advertises abandoned-park
+    // detection on both transports (the `cl=1` ack tag). Unset/empty/typo must all keep
+    // today's serial accept-then-relay -- a typo can never silently enable a race the edge
+    // cannot yet police.
+    assert!(!accept_race_enabled_from(None), "unset: off (serial accept-then-relay)");
+    assert!(!accept_race_enabled_from(Some("")), "empty: off");
+    assert!(!accept_race_enabled_from(Some("0")), "0: off");
+    assert!(!accept_race_enabled_from(Some("ture")), "a typo never silently enables the race");
+    assert!(accept_race_enabled_from(Some("1")), "1 opts in");
+    assert!(accept_race_enabled_from(Some(" Yes ")), "yes (trimmed, any case) opts in");
+    assert!(accept_race_enabled_from(Some("true")), "true opts in");
+}
+
+#[tokio::test]
+async fn accept_race_direct_wins_and_closes_the_parked_relay_leg_22() {
+    // ct-agent#22 (b) (frozen): with the race ON, the acceptor parks its relay leg on the
+    // `:443` front door WHILE its direct listener is open. A direct dial then arrives, the
+    // direct path wins, the session runs over it -- and the relay leg is NOT merely dropped:
+    // the mock edge must read a CLEAN close_notify EOF (`Ok(0)`) on the parked leg shortly
+    // after, which is exactly what the edge's park pump needs to mark the park dead at once
+    // (issue Nachtrag: a bare drop is indistinguishable from a legacy half-close until the
+    // next 10 s tick, and a corpse park can win a pairing in that window). The relay leg is
+    // admitted by the PRODUCTION `:443` admission gate (`admit_channel_join_on_duplex`) and
+    // then simply never acked, i.e. parked with no partner -- the reported first-contact shape.
+    use ct_common::channel::{
+        member_noise_attest_bytes, ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant,
+    };
+    use ct_edge::channel_broker::admit_channel_join_on_duplex;
+    use ct_edge::transport::build_tcp_tls_listener_at;
+    use ed25519_dalek::Signer;
+    use std::time::Instant;
+    use tokio::io::duplex;
+
+    let op = SigningKey::from_bytes(&[7u8; 32]);
+    let op_pub = op.verifying_key().to_bytes();
+    let holder_a = SigningKey::from_bytes(&[0x2Au8; 32]);
+    let holder_b = SigningKey::from_bytes(&[0x2Bu8; 32]);
+    let channel = [0x22u8; 32];
+    let noise_a = generate_static_keypair();
+    let noise_b = generate_static_keypair();
+    let signed = |h: &SigningKey, dir| {
+        let g = ChannelGrant {
+            channel: ChannelId(channel),
+            holder: SigningKey::verifying_key(h).to_bytes(),
+            direction: dir,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }
+    };
+    // The acceptor advertises a public address (passes the admission gate); the direct dial in
+    // this test goes to its real loopback listener instead.
+    let req_b = ChannelJoinRequest { grant: signed(&holder_b, Direction::Accept), endpoint: "203.0.113.2:7002".to_string() };
+    let ha_pub = holder_a.verifying_key().to_bytes();
+    let a_att = holder_a.sign(&member_noise_attest_bytes(&ChannelId(channel), &ha_pub, &noise_a.public)).to_bytes();
+
+    // The acceptor's REAL direct listener -- the initiator dials it.
+    let (listener, _cert) =
+        crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("direct listener");
+    let direct_addr = listener.local_addr().expect("direct addr");
+
+    // Mock `:443` relay edge: admit the acceptor's relay leg with the production gate, PARK it
+    // (never ack), tell the initiator it may dial now, then read the parked leg until the
+    // acceptor closes it -- recording when and HOW it closed.
+    let (fd_listener, acceptor, edge_cert) =
+        build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap()).await.expect("tls-tcp listener");
+    let fd_addr = fd_listener.local_addr().expect("front-door addr");
+    let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+    let started = Instant::now();
+    let relay = tokio::spawn(async move {
+        let (tcp, peer) = fd_listener.accept().await.expect("the acceptor's relay leg connects");
+        let tls = acceptor.accept(tcp).await.expect("tls accept");
+        let (mut stream, _req, _op, _noise, _attest, _observed) = admit_channel_join_on_duplex(
+            tls,
+            peer,
+            500u64, // now < expires_at (1_000)
+            Duration::from_secs(5),
+            &move |c: ChannelId, _h: [u8; 32]| {
+                let ok = c.0 == channel;
+                async move { ok.then_some((op_pub, None, None)) }
+            },
+        )
+        .await
+        .expect("admit the acceptor's relay leg over :443");
+        let parked_at = started.elapsed();
+        let _ = parked_tx.send(());
+        // Parked: no ack ever. Read until the acceptor closes the leg.
+        let mut buf = [0u8; 64];
+        let close = loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => break Ok(()),
+                Ok(_) => continue,
+                Err(e) => break Err(e),
+            }
+        };
+        (parked_at, started.elapsed(), close)
+    });
+
+    // Acceptor B: race ON; the relay ladder is ONLY the `:443` front door (the mock).
+    let (mut b_app, b_local) = duplex(8192);
+    let (nb, napub) = (noise_b.private, noise_a.public);
+    let b = tokio::spawn(async move {
+        let rungs = vec![ChannelDialRung { endpoint: fd_addr, kind: ChannelDialKind::FrontDoor }];
+        let admission = ChannelJoinOutcome::Admitted {
+            peer_endpoint: "203.0.113.1:7001".to_string(),
+            peer_noise_pubkey: Some(napub),
+            peer_holder: Some(ha_pub),
+            peer_attestation: Some(a_att),
+            observed_reflexive: None, // no `r=` evidence -> part (a) stays silent, the accept window applies
+        };
+        run_channel_join_with_admission(
+            admission,
+            RelayFallback::Ladder { rungs: &rungs, edge_cert, direct_timeout: Duration::from_millis(400) },
+            &req_b,
+            &holder_b,
+            ChannelRole::Accept,
+            &nb,
+            Some(listener),
+            Duration::from_secs(5),
+            Duration::from_secs(8),
+            b_local,
+            false,
+            true, // ct-agent#22 (b): accept-vs-relay race ON
+        )
+        .await
+    });
+
+    // Initiator A: dials the acceptor DIRECTLY once its relay leg is known to be parked.
+    let (mut a_app, a_local) = duplex(8192);
+    let (na, nbpub) = (noise_a.private, noise_b.public);
+    let a = tokio::spawn(async move {
+        parked_rx.await.expect("the mock relay reports the acceptor's leg parked");
+        let conn = dial_peer_direct(direct_addr, Duration::from_secs(5)).await.expect("direct dial to the acceptor");
+        run_channel_session(&conn, ChannelRole::Initiate, &na, &nbpub, a_local).await
+    });
+
+    // Data both ways over the DIRECT session (the relay leg carried nothing).
+    a_app.write_all(b"ping-A-to-B").await.expect("a writes");
+    let mut got = [0u8; 11];
+    b_app.read_exact(&mut got).await.expect("b reads A's bytes");
+    assert_eq!(&got, b"ping-A-to-B", "A's plaintext arrives at B over the direct session that won the race");
+    b_app.write_all(b"pong-B-to-A").await.expect("b writes");
+    let mut got2 = [0u8; 11];
+    a_app.read_exact(&mut got2).await.expect("a reads B's bytes");
+    assert_eq!(&got2, b"pong-B-to-A", "full duplex over the direct session");
+
+    // The mock relay saw the acceptor's parked leg CLOSED -- cleanly, and shortly after.
+    let (parked_at, closed_at, close) = tokio::time::timeout(Duration::from_secs(3), relay)
+        .await
+        .expect("the parked relay leg is closed promptly, not left to the park TTL")
+        .expect("relay task");
+    assert!(close.is_ok(), "a clean close_notify EOF (explicit shutdown), not a bare drop: {close:?}");
+    assert!(closed_at >= parked_at, "the leg was parked before it was closed");
+    assert!(closed_at < Duration::from_secs(3), "closed within the race's close bound, took {closed_at:?}");
+
+    drop(a_app);
+    drop(b_app);
+    let _ = a.await;
+    let _ = b.await;
+}
+
+#[tokio::test]
+async fn accept_race_relay_wins_far_below_the_accept_window_when_no_direct_dial_arrives_22() {
+    // ct-agent#22 (b) (frozen): the payoff. The acceptor advertises a listener nobody can
+    // reach (the reported public-but-filtered shape; here: bound and simply never dialed).
+    // Serially, it would sit out the full accept window (8 s) before even dialing the relay.
+    // With the race ON its relay leg is parked at once, the initiator -- arriving at the
+    // PRODUCTION QUIC relay ~300 ms later, after its own direct dial "failed" -- pairs it, and
+    // the session is up far below accept_timeout/2. The direct accept future is dropped.
+    use ct_common::channel::{
+        member_noise_attest_bytes, ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant,
+    };
+    use ct_edge::channel_broker::broker_channel_relay;
+    use ed25519_dalek::Signer;
+    use std::time::Instant;
+    use tokio::io::duplex;
+
+    let op = SigningKey::from_bytes(&[7u8; 32]);
+    let op_pub = op.verifying_key().to_bytes();
+    let holder_a = SigningKey::from_bytes(&[0x2Cu8; 32]);
+    let holder_b = SigningKey::from_bytes(&[0x2Du8; 32]);
+    let channel = [0x2Bu8; 32];
+    let noise_a = generate_static_keypair();
+    let noise_b = generate_static_keypair();
+    let signed = |h: &SigningKey, dir| {
+        let g = ChannelGrant {
+            channel: ChannelId(channel),
+            holder: SigningKey::verifying_key(h).to_bytes(),
+            direction: dir,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }
+    };
+    let req_a = ChannelJoinRequest { grant: signed(&holder_a, Direction::Initiate), endpoint: "203.0.113.1:7001".to_string() };
+    let req_b = ChannelJoinRequest { grant: signed(&holder_b, Direction::Accept), endpoint: "203.0.113.2:7002".to_string() };
+    let ha_pub = holder_a.verifying_key().to_bytes();
+    let a_att = holder_a.sign(&member_noise_attest_bytes(&ChannelId(channel), &ha_pub, &noise_a.public)).to_bytes();
+
+    // The acceptor's listener: bound and advertised, never dialed.
+    let (listener, _cert) =
+        crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("direct listener");
+
+    // The PRODUCTION QUIC relay pairs + splices the two members.
+    let (relay_ep, relay_cert) = build_server_endpoint_with_cert().expect("relay ep");
+    let relay_addr = relay_ep.local_addr().expect("relay addr");
+    let relay_task = tokio::spawn(async move {
+        broker_channel_relay(&relay_ep, 500, move |c, _h| async move {
+            (c.0 == channel).then_some((op_pub, None, None))
+        })
+        .await
+        .map(|_| ())
+    });
+
+    let accept_timeout = Duration::from_secs(8);
+    let started = Instant::now();
+
+    // Acceptor B: race ON, lazily-dialed QUIC relay, the full 8 s accept window.
+    let (mut b_app, b_local) = duplex(8192);
+    let (nb, napub) = (noise_b.private, noise_a.public);
+    let b = tokio::spawn(async move {
+        let admission = ChannelJoinOutcome::Admitted {
+            peer_endpoint: "203.0.113.1:7001".to_string(),
+            peer_noise_pubkey: Some(napub),
+            peer_holder: Some(ha_pub),
+            peer_attestation: Some(a_att),
+            observed_reflexive: None,
+        };
+        run_channel_join_with_admission(
+            admission,
+            RelayFallback::QuicLazy(relay_addr),
+            &req_b,
+            &holder_b,
+            ChannelRole::Accept,
+            &nb,
+            Some(listener),
+            Duration::from_secs(5),
+            accept_timeout,
+            b_local,
+            false,
+            true, // ct-agent#22 (b): accept-vs-relay race ON
+        )
+        .await
+    });
+
+    // Initiator A: reaches the relay ~300 ms in (its direct dial came back Unreachable).
+    let (mut a_app, a_local) = duplex(8192);
+    let (na, nbpub) = (noise_a.private, noise_b.public);
+    let a = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let rc = build_client_endpoint(relay_cert).expect("rc a");
+        let relay_conn = rc.connect(relay_addr, "localhost").expect("cfg").await.expect("rconn a");
+        join_via_relay(&relay_conn, &req_a, &holder_a, ChannelRole::Initiate, &na, &nbpub, a_local, None).await
+    });
+
+    a_app.write_all(b"ping-A-to-B").await.expect("a writes");
+    let mut got = [0u8; 11];
+    b_app.read_exact(&mut got).await.expect("b reads A's bytes");
+    assert_eq!(&got, b"ping-A-to-B", "A's plaintext arrives at B over the relay leg that won the race");
+    b_app.write_all(b"pong-B-to-A").await.expect("b writes");
+    let mut got2 = [0u8; 11];
+    a_app.read_exact(&mut got2).await.expect("a reads B's bytes");
+    assert_eq!(&got2, b"pong-B-to-A", "full duplex over the relay session");
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < accept_timeout / 2,
+        "the relay session must be up far below the {accept_timeout:?} accept window (serially it could \
+         not start before it), took {elapsed:?}"
+    );
+
+    a.abort();
+    b.abort();
+    relay_task.abort();
+}
+
+#[tokio::test]
+async fn accept_race_off_does_not_dial_the_relay_before_the_accept_window_expires_22() {
+    // ct-agent#22 (b) (frozen): the DEFAULT is today's serial accept-then-relay, byte-for-byte.
+    // With the race OFF, the acceptor must not even DIAL the relay until its accept window
+    // has expired -- proven by a mock relay that records when the first connection arrives.
+    // (Its counterpart above shows the race ON parks the relay leg within the first ~300 ms.)
+    use ct_common::channel::{
+        member_noise_attest_bytes, ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant,
+    };
+    use ed25519_dalek::Signer;
+    use std::time::Instant;
+    use tokio::io::duplex;
+
+    let op = SigningKey::from_bytes(&[7u8; 32]);
+    let holder_a = SigningKey::from_bytes(&[0x2Eu8; 32]);
+    let holder_b = SigningKey::from_bytes(&[0x2Fu8; 32]);
+    let channel = [0x2Cu8; 32];
+    let noise_a = generate_static_keypair();
+    let noise_b = generate_static_keypair();
+    let g = ChannelGrant {
+        channel: ChannelId(channel),
+        holder: holder_b.verifying_key().to_bytes(),
+        direction: Direction::Accept,
+        rights: Rights::ReadWrite,
+        delegable: false,
+        expires_at: 1_000,
+    };
+    let req_b = ChannelJoinRequest {
+        grant: SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() },
+        endpoint: "203.0.113.2:7002".to_string(),
+    };
+    let ha_pub = holder_a.verifying_key().to_bytes();
+    let a_att = holder_a.sign(&member_noise_attest_bytes(&ChannelId(channel), &ha_pub, &noise_a.public)).to_bytes();
+
+    // The acceptor's listener: bound and advertised, never dialed.
+    let (listener, _cert) =
+        crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("direct listener");
+
+    // A mock relay that only records WHEN the acceptor's relay leg first connects.
+    let (relay_ep, _relay_cert) = build_server_endpoint_with_cert().expect("relay ep");
+    let relay_addr = relay_ep.local_addr().expect("relay addr");
+    let started = Instant::now();
+    let relay = tokio::spawn(async move {
+        let incoming = relay_ep.accept().await.expect("the acceptor eventually dials the relay");
+        let connected_at = started.elapsed();
+        let _conn = incoming.await; // complete the handshake; nothing is acked, the test ends here
+        connected_at
+    });
+
+    let accept_timeout = Duration::from_millis(600);
+    let (_b_app, b_local) = duplex(8192);
+    let (nb, napub) = (noise_b.private, noise_a.public);
+    let b = tokio::spawn(async move {
+        let admission = ChannelJoinOutcome::Admitted {
+            peer_endpoint: "203.0.113.1:7001".to_string(),
+            peer_noise_pubkey: Some(napub),
+            peer_holder: Some(ha_pub),
+            peer_attestation: Some(a_att),
+            observed_reflexive: None,
+        };
+        run_channel_join_with_admission(
+            admission,
+            RelayFallback::QuicLazy(relay_addr),
+            &req_b,
+            &holder_b,
+            ChannelRole::Accept,
+            &nb,
+            Some(listener),
+            Duration::from_secs(5),
+            accept_timeout,
+            b_local,
+            false,
+            false, // ct-agent#22 (b): race OFF -- the default, today's serial order
+        )
+        .await
+    });
+
+    let connected_at = tokio::time::timeout(Duration::from_secs(5), relay)
+        .await
+        .expect("the serial fallback dials the relay once the accept window expired")
+        .expect("relay task");
+    assert!(
+        connected_at >= accept_timeout,
+        "race off: the relay is dialed only AFTER the {accept_timeout:?} accept window expired, was {connected_at:?}"
+    );
+
+    b.abort();
 }
