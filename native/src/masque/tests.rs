@@ -235,7 +235,7 @@ async fn dial_quic_via_masque_rejects_a_proxy_cert_the_public_ca_set_does_not_tr
 // failure) leaked one socket + one zombie task per dial attempt. Dormant before
 // the outer-TLS trust-anchor fix (every attempt failed at the TLS handshake,
 // before this point was ever reached); live once TLS started succeeding. These
-// two tests prove `AbortOnDrop` itself, the actual fix, rather than trying to
+// two tests prove the guard (now `task_guard::TaskGuard`, #180) itself, the actual fix, rather than trying to
 // reproduce file-descriptor exhaustion directly.
 
 #[tokio::test]
@@ -247,13 +247,13 @@ async fn abort_on_drop_aborts_the_task_when_not_disarmed() {
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
     });
     {
-        let _guard = AbortOnDrop(handle);
+        let _guard = crate::task_guard::TaskGuard::from_handle(handle);
         // guard drops here, before the sleep above finishes -- must abort the task
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(
         !ran_to_completion.load(std::sync::atomic::Ordering::SeqCst),
-        "an un-disarmed AbortOnDrop must abort its task on drop, not leave it running \
+        "an un-detached TaskGuard must abort its task on drop, not leave it running \
          (this is the exact leak that took kali.bunsenbrenner.org down)"
     );
 }
@@ -266,12 +266,12 @@ async fn abort_on_drop_disarm_lets_the_task_run_to_completion() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
     });
-    let guard = AbortOnDrop(handle);
-    guard.disarm();
+    let guard = crate::task_guard::TaskGuard::from_handle(handle);
+    guard.detach();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert!(
         ran_to_completion.load(std::sync::atomic::Ordering::SeqCst),
-        "disarm() must let the task keep running -- the real tunnel's connection \
+        "detach() must let the task keep running -- the real tunnel's connection \
          must stay driven for its whole life once it's actually established"
     );
 }

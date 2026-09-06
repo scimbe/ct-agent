@@ -25,15 +25,34 @@
 //!    for an interactive/dev machine with no state dir configured.
 //! 3. [`resolve_oidc_token`]: what every `CT_OIDC_TOKEN` consumer now calls instead
 //!    of reading the env var directly. `CT_OIDC_TOKEN` explicitly set in the
-//!    environment always wins (existing scripts/CI keep working unchanged); only
-//!    when it is UNSET does this fall back to the stored token, transparently
-//!    refreshing it first if it is expired (or within [`ACCESS_TOKEN_EXPIRY_SKEW`]
-//!    of expiring) and a refresh token was stored. No refresh token, or a refresh
-//!    that fails, is a loud error telling the operator to run `ct-agent login`
-//!    again — never a silent fall-through to a token that is probably already
-//!    rejected server-side.
+//!    environment always wins (existing scripts/CI keep working unchanged); then
+//!    `CT_OIDC_TOKEN_FILE` (piece 4); only when neither is set does this fall back
+//!    to the stored token, transparently refreshing it first if it is expired (or
+//!    within [`ACCESS_TOKEN_EXPIRY_SKEW_SECS`] of expiring) and a refresh token was
+//!    stored. No refresh token, or a refresh the IdP REJECTS, is a loud error
+//!    telling the operator to run `ct-agent login` again or to provide
+//!    `CT_OIDC_TOKEN_FILE` — never a silent fall-through to a token that is
+//!    probably already rejected server-side.
+//! 4. Unattended operation (ct-agent#181). A sidecar that runs for months cannot
+//!    answer "run `ct-agent login`", so three things degrade that case gracefully
+//!    instead of silently breaking `channel register` and the `bridge/*` tools:
+//!    * **`CT_OIDC_TOKEN_FILE`** -- a path to a file holding one bearer token (a
+//!      long-lived service-account credential), read on EVERY resolve call so a
+//!      rotated file is picked up without a restart. Trimmed; an empty file means
+//!      "not configured" and the stored login is used. Precedence: `CT_OIDC_TOKEN`
+//!      > `CT_OIDC_TOKEN_FILE` > the stored login.
+//!    * **[`OidcCredentialState`]** / [`oidc_credential_state`]: what the stored
+//!      credential looks like WITHOUT refreshing it -- `bridge/config` reports it as
+//!      `oidc_credential` so the portal can say "expired" before an owner clicks a
+//!      tool into an error.
+//!    * **[`resolve_oidc_token_with_retry`]**: the bridge tools' entry point. A
+//!      TRANSIENT refresh failure (the IdP unreachable, a 5xx) is retried with
+//!      backoff; only a DEFINITIVE one (no refresh token, `invalid_grant`) surfaces
+//!      the actionable message. The first time the credential is found expired and
+//!      not refreshable, one structured line goes to stderr (once per process).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -257,8 +276,19 @@ async fn refresh_access_token(
         .send()
         .await
         .map_err(|e| LoginError::Http(e.to_string()))?;
-    if !resp.status().is_success() {
-        let body: TokenErrorResponse = resp.json().await.unwrap_or_default();
+    let status = resp.status();
+    // ct-agent#181: only an OAuth error the IdP actually pronounced (`invalid_grant`
+    // on a dead refresh token, RFC 6749 §5.2) is `Other` -- definitive to the retry
+    // wrapper. A 5xx, or a non-JSON body from whatever answered in the IdP's place,
+    // is `Http`: transient, worth retrying, never "run ct-agent login".
+    if status.is_server_error() {
+        return Err(LoginError::Http(format!("token endpoint answered {status}")));
+    }
+    if !status.is_success() {
+        let body: TokenErrorResponse = resp
+            .json()
+            .await
+            .map_err(|e| LoginError::Http(format!("token endpoint answered {status} with an unparseable body: {e}")))?;
         return Err(LoginError::Other(body.error_description.unwrap_or(body.error)));
     }
     resp.json().await.map_err(|e| LoginError::Http(e.to_string()))
@@ -293,6 +323,24 @@ impl StoredToken {
             client_id: client_id.to_string(),
         }
     }
+
+    /// Expired, or within [`ACCESS_TOKEN_EXPIRY_SKEW_SECS`] of it, at `now`. An
+    /// unknown expiry is stale (see the field's doc comment).
+    fn is_stale(&self, now: u64) -> bool {
+        match self.access_expires_at {
+            Some(exp) => now + ACCESS_TOKEN_EXPIRY_SKEW_SECS >= exp,
+            None => true,
+        }
+    }
+
+    /// The stored refresh token, if there is one and -- when the IdP said how long
+    /// it lives -- it has not expired itself at `now`.
+    fn usable_refresh_token(&self, now: u64) -> Option<&str> {
+        self.refresh_token
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .filter(|_| self.refresh_expires_at.is_none_or(|exp| now < exp))
+    }
 }
 
 /// Where the stored login lives: an explicit `CT_AGENT_LOGIN_TOKEN_FILE`, else
@@ -315,16 +363,6 @@ fn token_store_path(f: impl Fn(&str) -> Option<String>) -> Result<PathBuf, Strin
          (an explicit file path), CT_AGENT_STATE_DIR (a persistent state directory), or HOME"
             .to_string(),
     )
-}
-
-/// Whether a stored `ct-agent login` exists on disk -- resolved via [`token_store_path`] from the
-/// process environment -- WITHOUT reading, parsing, or returning it. A presence-only probe for the
-/// `bridge/config` readiness summary (CADS-Tunnel#763): the portal needs to know whether the
-/// CP-backed bridge tools have an OIDC credential to use at all, never what it is. Deliberately
-/// says nothing about the stored token's validity or expiry -- `resolve_oidc_token` is the only
-/// path that reads it, and it fails loudly on its own if the login is stale.
-pub(crate) fn stored_login_present() -> bool {
-    token_store_path(|k| std::env::var(k).ok()).map(|path| path.is_file()).unwrap_or(false)
 }
 
 fn persist_stored_token(path: &Path, tok: &StoredToken) -> std::io::Result<()> {
@@ -404,48 +442,253 @@ pub async fn run_login(cfg: LoginConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// What the stored/env OIDC credential looks like right now, WITHOUT refreshing
+/// anything (ct-agent#181). Reported by `bridge/config` as `oidc_credential`
+/// (see [`OidcCredentialState::as_str`]); the fresh cases keep their pre-#181
+/// spellings so the portal's hint mapping is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OidcCredentialState {
+    /// `CT_OIDC_TOKEN` is set, or `CT_OIDC_TOKEN_FILE` names a non-empty file --
+    /// either way the environment supplies the bearer and the stored login is moot.
+    Env,
+    /// A stored login whose access token is not (about to be) expired.
+    StoredFresh,
+    /// A stored login whose access token is expired but whose refresh token is
+    /// present and, as far as its recorded expiry says, still good: the next
+    /// resolve will refresh it. Working as designed, but worth showing.
+    StoredExpiredRefreshable,
+    /// A stored login that is expired AND cannot be refreshed (no refresh token,
+    /// or the refresh token's own recorded expiry has passed). Every tool that
+    /// needs a plane login will fail until a re-login or `CT_OIDC_TOKEN_FILE`.
+    StoredExpiredNoRefresh,
+    /// No credential of any kind (no env token, no readable stored login).
+    None,
+}
+
+impl OidcCredentialState {
+    /// The `oidc_credential` value `bridge/config` reports.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            OidcCredentialState::Env => "env",
+            OidcCredentialState::StoredFresh => "stored",
+            OidcCredentialState::StoredExpiredRefreshable => "stored-expired-refreshable",
+            OidcCredentialState::StoredExpiredNoRefresh => "stored-expired",
+            OidcCredentialState::None => "none",
+        }
+    }
+}
+
+/// [`OidcCredentialState`] from the process environment and the stored login on
+/// disk, judged against the wall clock. Never refreshes and never touches the
+/// network. Emits the once-per-process degraded line (see [`note_degraded`]) when
+/// it finds the credential expired and not refreshable.
+pub(crate) fn oidc_credential_state() -> OidcCredentialState {
+    let state = oidc_credential_state_from(|k| std::env::var(k).ok(), now_unix());
+    if state == OidcCredentialState::StoredExpiredNoRefresh {
+        note_degraded();
+    }
+    state
+}
+
+/// Pure core of [`oidc_credential_state`]: `f` is the env lookup (so tests drive it
+/// with a map), `now` the clock. Applies exactly [`resolve_oidc_token`]'s
+/// precedence and its expiry rule ([`StoredToken::is_stale`]).
+fn oidc_credential_state_from(f: impl Fn(&str) -> Option<String>, now: u64) -> OidcCredentialState {
+    if env_token(&f).is_some() {
+        return OidcCredentialState::Env;
+    }
+    if let Ok(Some(_)) = token_from_file(&f) {
+        return OidcCredentialState::Env;
+    }
+    let Ok(path) = token_store_path(&f) else {
+        return OidcCredentialState::None;
+    };
+    let Ok(stored) = read_stored_token(&path) else {
+        return OidcCredentialState::None;
+    };
+    if !stored.is_stale(now) {
+        OidcCredentialState::StoredFresh
+    } else if stored.usable_refresh_token(now).is_some() {
+        OidcCredentialState::StoredExpiredRefreshable
+    } else {
+        OidcCredentialState::StoredExpiredNoRefresh
+    }
+}
+
+/// `CT_OIDC_TOKEN`, if set to something non-blank.
+fn env_token(f: impl Fn(&str) -> Option<String>) -> Option<String> {
+    f("CT_OIDC_TOKEN").filter(|s| !s.trim().is_empty())
+}
+
+/// The bearer in the file `CT_OIDC_TOKEN_FILE` names (ct-agent#181), read fresh on
+/// every call so a rotated file is picked up without a restart. `Ok(None)` when the
+/// variable is unset/blank OR the file is empty after trimming ("not configured" --
+/// the stored login is used instead); `Err` when the variable names a file that
+/// cannot be read, which the caller treats as transient (a rotation in progress).
+fn token_from_file(f: impl Fn(&str) -> Option<String>) -> Result<Option<String>, String> {
+    let Some(path) = f("CT_OIDC_TOKEN_FILE").map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("CT_OIDC_TOKEN_FILE={path} could not be read: {e}"))?;
+    let token = raw.trim();
+    Ok((!token.is_empty()).then(|| token.to_string()))
+}
+
+/// The tail of every DEFINITIVE resolve error: what an operator can do about it,
+/// including the unattended option (ct-agent#181).
+const UNATTENDED_HINT: &str = "or provide a long-lived credential via CT_OIDC_TOKEN_FILE";
+
+/// Printed at most once per process, the first time a resolve or a state probe
+/// finds the stored credential expired and not refreshable (ct-agent#181). One
+/// structured line an operator can alert on, rather than the same failure text
+/// once per bridge-tool call.
+static DEGRADED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn note_degraded() {
+    if !DEGRADED_LOGGED.swap(true, Ordering::SeqCst) {
+        eprintln!(
+            "ct-agent: oidc credential expired and not refreshable — bridge tools needing a plane login \
+             will fail until re-login or CT_OIDC_TOKEN_FILE is provided"
+        );
+    }
+}
+
+/// How a resolve failed, for [`resolve_oidc_token_with_retry`] (ct-agent#181).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolveError {
+    /// Retrying cannot help: nothing configured, no refresh token, the IdP
+    /// rejected the refresh (`invalid_grant`). The message names the fix.
+    Definitive(String),
+    /// Retrying may help: the IdP was unreachable or answered 5xx, or
+    /// `CT_OIDC_TOKEN_FILE` was momentarily unreadable.
+    Transient(String),
+}
+
+impl ResolveError {
+    fn into_message(self) -> String {
+        match self {
+            ResolveError::Definitive(m) | ResolveError::Transient(m) => m,
+        }
+    }
+}
+
 /// What every `CT_OIDC_TOKEN` consumer now calls. `CT_OIDC_TOKEN` explicitly set in
-/// the environment always wins (unchanged behavior for existing scripts/CI); only
-/// when it is absent does this read the token `ct-agent login` stored, silently
-/// refreshing it first if it is expired (or close to it) and a refresh token was
-/// saved. No stored login, an unrefreshable stale token, or a failed refresh is a
-/// loud error naming `ct-agent login` as the fix — never a silent fall-through to a
-/// token that is probably already being rejected server-side.
+/// the environment always wins (unchanged behavior for existing scripts/CI); then
+/// `CT_OIDC_TOKEN_FILE` (ct-agent#181, re-read on every call); only when neither is
+/// set does this read the token `ct-agent login` stored, silently refreshing it
+/// first if it is expired (or close to it) and a refresh token was saved. No stored
+/// login, an unrefreshable stale token, or a rejected refresh is a loud error
+/// naming `ct-agent login` -- and the `CT_OIDC_TOKEN_FILE` alternative -- as the
+/// fix; never a silent fall-through to a token that is probably already being
+/// rejected server-side. Callers that must not treat an unreachable IdP as
+/// "re-login required" use [`resolve_oidc_token_with_retry`].
 pub async fn resolve_oidc_token() -> Result<String, String> {
-    if let Some(t) = std::env::var("CT_OIDC_TOKEN").ok().filter(|s| !s.trim().is_empty()) {
+    resolve_oidc_token_classified().await.map_err(ResolveError::into_message)
+}
+
+/// [`resolve_oidc_token`] keeping the definitive/transient distinction.
+pub(crate) async fn resolve_oidc_token_classified() -> Result<String, ResolveError> {
+    let env = |k: &str| std::env::var(k).ok();
+    if let Some(t) = env_token(env) {
         return Ok(t);
     }
+    match token_from_file(env) {
+        Ok(Some(t)) => return Ok(t),
+        Ok(None) => {}
+        Err(e) => return Err(ResolveError::Transient(e)),
+    }
 
-    let path = token_store_path(|k| std::env::var(k).ok())?;
+    let path = token_store_path(env).map_err(ResolveError::Definitive)?;
     let stored = read_stored_token(&path).map_err(|e| {
-        format!(
-            "CT_OIDC_TOKEN is not set and no stored login was found at {} ({e}). Run `ct-agent login`.",
+        ResolveError::Definitive(format!(
+            "CT_OIDC_TOKEN is not set and no stored login was found at {} ({e}). Run `ct-agent login`, \
+             {UNATTENDED_HINT}.",
             path.display()
-        )
+        ))
     })?;
 
     let now = now_unix();
-    let is_stale = match stored.access_expires_at {
-        Some(exp) => now + ACCESS_TOKEN_EXPIRY_SKEW_SECS >= exp,
-        // Unknown expiry: never trusted indefinitely (see `StoredToken`'s doc comment).
-        None => true,
-    };
-    if !is_stale {
+    if !stored.is_stale(now) {
         return Ok(stored.access_token);
     }
 
-    let refresh_token = stored.refresh_token.clone().ok_or_else(|| {
-        "the stored login has expired and no refresh token is available. Run `ct-agent login` again.".to_string()
-    })?;
+    let Some(refresh_token) = stored.usable_refresh_token(now) else {
+        note_degraded();
+        let why = if stored.refresh_token.as_deref().is_some_and(|t| !t.is_empty()) {
+            "its refresh token has expired too"
+        } else {
+            "no refresh token is available"
+        };
+        return Err(ResolveError::Definitive(format!(
+            "the stored login has expired and {why}. Run `ct-agent login` again, {UNATTENDED_HINT}."
+        )));
+    };
     let http = build_http_client();
-    let refreshed = refresh_access_token(&http, &token_url(&stored.issuer), &stored.client_id, &refresh_token)
-        .await
-        .map_err(|e| format!("the stored login has expired and refreshing it failed ({e}). Run `ct-agent login` again."))?;
+    let token_endpoint = token_url(&stored.issuer);
+    let refreshed = match refresh_access_token(&http, &token_endpoint, &stored.client_id, refresh_token).await {
+        Ok(r) => r,
+        Err(LoginError::Http(m)) => {
+            return Err(ResolveError::Transient(format!(
+                "the stored login has expired and refreshing it failed with a transient error ({m}); the IdP \
+                 may be unreachable"
+            )))
+        }
+        Err(e) => {
+            note_degraded();
+            return Err(ResolveError::Definitive(format!(
+                "the stored login has expired and the IdP rejected the refresh ({e}). Run `ct-agent login` \
+                 again, {UNATTENDED_HINT}."
+            )));
+        }
+    };
 
     let new_stored = StoredToken::from_token_response(&refreshed, &stored.issuer, &stored.client_id, now);
-    persist_stored_token(&path, &new_stored)
-        .map_err(|e| format!("refreshed the login but failed to save it at {}: {e}", path.display()))?;
+    persist_stored_token(&path, &new_stored).map_err(|e| {
+        ResolveError::Definitive(format!("refreshed the login but failed to save it at {}: {e}", path.display()))
+    })?;
     Ok(new_stored.access_token)
+}
+
+/// Retry budget the bridge tools use with [`resolve_oidc_token_with_retry`]:
+/// three tries, 500ms then 1s between them. Bounded so a bridge-tool call that
+/// needs the plane still answers within a few seconds of a genuinely dead IdP
+/// (each try is additionally capped by [`HTTP_TIMEOUT`]).
+pub const OIDC_REFRESH_RETRY_ATTEMPTS: u32 = 3;
+pub const OIDC_REFRESH_RETRY_BASE: Duration = Duration::from_millis(500);
+/// Cap on the doubling retry delay.
+const OIDC_REFRESH_RETRY_MAX: Duration = Duration::from_secs(5);
+
+/// [`resolve_oidc_token`] for unattended callers (ct-agent#181): up to `attempts`
+/// tries, sleeping `base` (doubling, capped at [`OIDC_REFRESH_RETRY_MAX`]) between
+/// them, but ONLY over transient failures -- a definitive one (nothing configured,
+/// no refresh token, `invalid_grant`) returns its actionable message at once. If
+/// every try was transient the error says so and does NOT tell the operator to
+/// re-login: the stored login is fine, the IdP is not.
+pub async fn resolve_oidc_token_with_retry(attempts: u32, base: Duration) -> Result<String, String> {
+    let attempts = attempts.max(1);
+    let mut delay = base;
+    let mut last = String::new();
+    for attempt in 1..=attempts {
+        match resolve_oidc_token_classified().await {
+            Ok(t) => return Ok(t),
+            Err(ResolveError::Definitive(m)) => return Err(m),
+            Err(ResolveError::Transient(m)) => {
+                if attempt < attempts {
+                    eprintln!(
+                        "ct-agent: oidc refresh attempt {attempt}/{attempts} failed ({m}); retrying in {}ms (#181)",
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(OIDC_REFRESH_RETRY_MAX);
+                }
+                last = m;
+            }
+        }
+    }
+    Err(format!(
+        "{last} -- gave up after {attempts} attempt(s). The stored login itself is still refreshable; this is an \
+         IdP/network problem, not a re-login problem"
+    ))
 }
 
 #[cfg(test)]
@@ -543,6 +786,11 @@ mod tests {
         Success { access_token: &'static str, refresh_token: Option<&'static str>, expires_in: u64 },
         ExpiredToken,
         AccessDenied,
+        /// A 503 with a non-OAuth body -- what an IdP behind a restarting proxy
+        /// looks like (ct-agent#181: transient).
+        ServerError,
+        /// RFC 6749 §5.2 `invalid_grant`: the refresh token is dead (definitive).
+        InvalidGrant,
     }
 
     async fn spawn_mock_idp(script: Vec<MockTokenReply>) -> (String, Arc<MockIdp>) {
@@ -591,6 +839,14 @@ mod tests {
             MockTokenReply::AccessDenied => {
                 (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "access_denied"}))).into_response()
             }
+            MockTokenReply::ServerError => {
+                (StatusCode::SERVICE_UNAVAILABLE, "<html>upstream restarting</html>").into_response()
+            }
+            MockTokenReply::InvalidGrant => (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "invalid_grant", "error_description": "Token is not active"})),
+            )
+                .into_response(),
             MockTokenReply::Success { access_token, refresh_token, expires_in } => (
                 StatusCode::OK,
                 axum::Json(serde_json::json!({
@@ -767,9 +1023,228 @@ mod tests {
     static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn clear_env() {
-        for k in ["CT_OIDC_TOKEN", "CT_AGENT_LOGIN_TOKEN_FILE", "CT_AGENT_STATE_DIR"] {
+        for k in ["CT_OIDC_TOKEN", "CT_OIDC_TOKEN_FILE", "CT_AGENT_LOGIN_TOKEN_FILE", "CT_AGENT_STATE_DIR"] {
             std::env::remove_var(k);
         }
+    }
+
+    fn stored_at(
+        dir: &str,
+        access_expires_at: Option<u64>,
+        refresh: Option<&str>,
+        refresh_expires_at: Option<u64>,
+    ) -> PathBuf {
+        let path = scratch(dir).join("oidc-token.json");
+        let tok = StoredToken {
+            access_token: format!("at-{dir}"),
+            refresh_token: refresh.map(str::to_string),
+            access_expires_at,
+            refresh_expires_at,
+            issuer: "https://kc.example/realms/ct".into(),
+            client_id: "ct-agent-cli".into(),
+        };
+        persist_stored_token(&path, &tok).unwrap();
+        path
+    }
+
+    // ---- ct-agent#181: credential state, CT_OIDC_TOKEN_FILE, refresh retry ----
+
+    #[test]
+    fn oidc_credential_state_classifies_each_variant() {
+        // Lookup-map driven, like `token_store_path`'s test: no process env touched.
+        let now = 1_000_000u64;
+        let with_file = |path: &Path| {
+            let mut m = HashMapAlias::new();
+            m.insert("CT_AGENT_LOGIN_TOKEN_FILE".to_string(), path.to_str().unwrap().to_string());
+            m
+        };
+        let state = |m: &HashMapAlias| oidc_credential_state_from(|k| m.get(k).cloned(), now);
+
+        // env: CT_OIDC_TOKEN set, whatever is on disk.
+        let dead = stored_at("state-env", Some(now - 10), None, None);
+        let mut m = with_file(&dead);
+        m.insert("CT_OIDC_TOKEN".to_string(), "explicit".to_string());
+        assert_eq!(state(&m), OidcCredentialState::Env);
+        // A blank CT_OIDC_TOKEN does not count (same rule as resolve_oidc_token).
+        m.insert("CT_OIDC_TOKEN".to_string(), "   ".to_string());
+        assert_eq!(state(&m), OidcCredentialState::StoredExpiredNoRefresh);
+
+        // env via CT_OIDC_TOKEN_FILE holding a token; an EMPTY file is "not configured".
+        let file = scratch("state-file").join("token");
+        std::fs::write(&file, "  file-token
+").unwrap();
+        let mut m = with_file(&dead);
+        m.insert("CT_OIDC_TOKEN_FILE".to_string(), file.to_str().unwrap().to_string());
+        assert_eq!(state(&m), OidcCredentialState::Env);
+        std::fs::write(&file, "
+").unwrap();
+        assert_eq!(state(&m), OidcCredentialState::StoredExpiredNoRefresh, "empty token file falls through");
+
+        // stored (fresh): expiry well past the skew.
+        let fresh = stored_at("state-fresh", Some(now + 3600), Some("rt"), None);
+        assert_eq!(state(&with_file(&fresh)), OidcCredentialState::StoredFresh);
+        // Inside the skew window counts as expired.
+        let skewed = stored_at("state-skew", Some(now + ACCESS_TOKEN_EXPIRY_SKEW_SECS - 1), Some("rt"), None);
+        assert_eq!(state(&with_file(&skewed)), OidcCredentialState::StoredExpiredRefreshable);
+
+        // stored-expired-refreshable: refresh token present, its own expiry (if any) ahead.
+        let refreshable = stored_at("state-refreshable", Some(now - 10), Some("rt"), Some(now + 60));
+        assert_eq!(state(&with_file(&refreshable)), OidcCredentialState::StoredExpiredRefreshable);
+        let unknown_expiry = stored_at("state-unknown", None, Some("rt"), None);
+        assert_eq!(state(&with_file(&unknown_expiry)), OidcCredentialState::StoredExpiredRefreshable);
+
+        // stored-expired: no refresh token, or one whose recorded expiry has passed.
+        let no_refresh = stored_at("state-norefresh", Some(now - 10), None, None);
+        assert_eq!(state(&with_file(&no_refresh)), OidcCredentialState::StoredExpiredNoRefresh);
+        let dead_refresh = stored_at("state-deadrefresh", Some(now - 10), Some("rt"), Some(now - 1));
+        assert_eq!(state(&with_file(&dead_refresh)), OidcCredentialState::StoredExpiredNoRefresh);
+        let empty_refresh = stored_at("state-emptyrefresh", Some(now - 10), Some(""), None);
+        assert_eq!(state(&with_file(&empty_refresh)), OidcCredentialState::StoredExpiredNoRefresh);
+
+        // none: no file at the path, a corrupt file, or no path resolvable at all.
+        let missing = scratch("state-missing").join("nope.json");
+        assert_eq!(state(&with_file(&missing)), OidcCredentialState::None);
+        let corrupt = scratch("state-corrupt").join("oidc-token.json");
+        std::fs::write(&corrupt, b"{not json").unwrap();
+        assert_eq!(state(&with_file(&corrupt)), OidcCredentialState::None);
+        assert_eq!(state(&HashMapAlias::new()), OidcCredentialState::None);
+
+        // The reported spellings: the three pre-#181 ones unchanged.
+        assert_eq!(OidcCredentialState::Env.as_str(), "env");
+        assert_eq!(OidcCredentialState::StoredFresh.as_str(), "stored");
+        assert_eq!(OidcCredentialState::None.as_str(), "none");
+        assert_eq!(OidcCredentialState::StoredExpiredRefreshable.as_str(), "stored-expired-refreshable");
+        assert_eq!(OidcCredentialState::StoredExpiredNoRefresh.as_str(), "stored-expired");
+    }
+
+    #[tokio::test]
+    async fn token_file_beats_the_stored_login_and_is_reread_when_it_changes() {
+        let _g = ENV_MUTEX.lock().await;
+        clear_env();
+        let stored = stored_at("file-prec", Some(now_unix() + 3600), None, None);
+        std::env::set_var("CT_AGENT_LOGIN_TOKEN_FILE", stored.to_str().unwrap());
+        let file = scratch("file-prec-token").join("token");
+        std::fs::write(&file, " tok-1 
+").unwrap();
+        std::env::set_var("CT_OIDC_TOKEN_FILE", file.to_str().unwrap());
+
+        assert_eq!(resolve_oidc_token().await.unwrap(), "tok-1", "file wins over the stored login, trimmed");
+
+        // Rotated on disk: picked up by the very next call, no restart.
+        std::fs::write(&file, "tok-2
+").unwrap();
+        assert_eq!(resolve_oidc_token().await.unwrap(), "tok-2");
+
+        // CT_OIDC_TOKEN still wins over the file.
+        std::env::set_var("CT_OIDC_TOKEN", "explicit");
+        assert_eq!(resolve_oidc_token().await.unwrap(), "explicit");
+        std::env::remove_var("CT_OIDC_TOKEN");
+
+        // Emptied: not configured -> the stored (fresh) login is used.
+        std::fs::write(&file, "
+").unwrap();
+        assert_eq!(resolve_oidc_token().await.unwrap(), "at-file-prec");
+
+        // Unreadable: transient (a rotation in progress), never "run ct-agent login".
+        std::fs::remove_file(&file).unwrap();
+        match resolve_oidc_token_classified().await {
+            Err(ResolveError::Transient(m)) => assert!(m.contains("CT_OIDC_TOKEN_FILE"), "{m}"),
+            other => panic!("expected a transient error, got {other:?}"),
+        }
+        clear_env();
+    }
+
+    #[tokio::test]
+    async fn resolve_with_retry_recovers_from_a_transient_idp_failure() {
+        let _g = ENV_MUTEX.lock().await;
+        clear_env();
+        let (base, state) = spawn_mock_idp(vec![
+            MockTokenReply::ServerError,
+            MockTokenReply::Success {
+                access_token: "refreshed-after-503",
+                refresh_token: Some("rt-2"),
+                expires_in: 300,
+            },
+        ])
+        .await;
+        let path = scratch("retry-transient").join("oidc-token.json");
+        let stored = StoredToken {
+            access_token: "stale".into(),
+            refresh_token: Some("old-rt".into()),
+            access_expires_at: Some(now_unix().saturating_sub(10)),
+            refresh_expires_at: Some(now_unix() + 3600),
+            issuer: base.clone(),
+            client_id: "ct-agent-cli".into(),
+        };
+        persist_stored_token(&path, &stored).unwrap();
+        std::env::set_var("CT_AGENT_LOGIN_TOKEN_FILE", path.to_str().unwrap());
+
+        let tok = resolve_oidc_token_with_retry(3, Duration::from_millis(10)).await.expect("second try succeeds");
+        assert_eq!(tok, "refreshed-after-503");
+        assert_eq!(state.calls.load(Ordering::SeqCst), 2, "one failed try, one successful retry");
+        assert_eq!(read_stored_token(&path).unwrap().refresh_token.as_deref(), Some("rt-2"));
+        clear_env();
+    }
+
+    #[tokio::test]
+    async fn resolve_with_retry_gives_up_transiently_without_demanding_a_relogin() {
+        let _g = ENV_MUTEX.lock().await;
+        clear_env();
+        let (base, state) = spawn_mock_idp(vec![MockTokenReply::ServerError]).await;
+        let path = scratch("retry-exhausted").join("oidc-token.json");
+        let stored = StoredToken {
+            access_token: "stale".into(),
+            refresh_token: Some("old-rt".into()),
+            access_expires_at: Some(now_unix().saturating_sub(10)),
+            refresh_expires_at: None,
+            issuer: base.clone(),
+            client_id: "ct-agent-cli".into(),
+        };
+        persist_stored_token(&path, &stored).unwrap();
+        std::env::set_var("CT_AGENT_LOGIN_TOKEN_FILE", path.to_str().unwrap());
+
+        let err = resolve_oidc_token_with_retry(3, Duration::from_millis(10)).await.expect_err("all tries 503");
+        assert_eq!(state.calls.load(Ordering::SeqCst), 3, "every attempt was spent");
+        assert!(!err.contains("ct-agent login"), "an unreachable IdP is not a re-login problem: {err}");
+        assert!(err.contains("3 attempt"), "{err}");
+        clear_env();
+    }
+
+    #[tokio::test]
+    async fn resolve_with_retry_stops_on_invalid_grant_and_names_the_unattended_option() {
+        let _g = ENV_MUTEX.lock().await;
+        clear_env();
+        let (base, state) = spawn_mock_idp(vec![MockTokenReply::InvalidGrant]).await;
+        let path = scratch("retry-invalid-grant").join("oidc-token.json");
+        let stored = StoredToken {
+            access_token: "stale".into(),
+            refresh_token: Some("dead-rt".into()),
+            access_expires_at: Some(now_unix().saturating_sub(10)),
+            refresh_expires_at: Some(now_unix() + 3600),
+            issuer: base.clone(),
+            client_id: "ct-agent-cli".into(),
+        };
+        persist_stored_token(&path, &stored).unwrap();
+        std::env::set_var("CT_AGENT_LOGIN_TOKEN_FILE", path.to_str().unwrap());
+
+        let err = resolve_oidc_token_with_retry(5, Duration::from_millis(10))
+            .await
+            .expect_err("invalid_grant is final");
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1, "a definitive rejection is not retried");
+        assert!(err.contains("Token is not active"), "carries the IdP's reason: {err}");
+        assert!(err.contains("ct-agent login"), "names the interactive fix: {err}");
+        assert!(err.contains("CT_OIDC_TOKEN_FILE"), "names the unattended fix: {err}");
+
+        // The no-refresh-token case is definitive too, with the same two options.
+        let no_refresh = stored_at("retry-no-refresh", Some(now_unix() - 10), None, None);
+        std::env::set_var("CT_AGENT_LOGIN_TOKEN_FILE", no_refresh.to_str().unwrap());
+        match resolve_oidc_token_classified().await {
+            Err(ResolveError::Definitive(m)) => {
+                assert!(m.contains("ct-agent login") && m.contains("CT_OIDC_TOKEN_FILE"), "{m}");
+            }
+            other => panic!("expected a definitive error, got {other:?}"),
+        }
+        clear_env();
     }
 
     #[tokio::test]

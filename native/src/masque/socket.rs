@@ -23,8 +23,16 @@
 //! process-wide ([`dropped_datagrams_total`], rendered on `/metrics` as
 //! `ct_agent_masque_dropped_datagrams_total{direction}`), and every
 //! [`DROP_LOG_EVERY`]-th drop per socket and direction is logged once.
+//!
+//! ct-agent#180: both pump tasks are owned by the socket (as
+//! [`crate::task_guard::TaskGuard`]s), so dropping the socket -- which happens when
+//! quinn drops the endpoint built over it -- aborts them. Before, the inbound pump
+//! could sit in `recv_stream.data().await` for as long as the proxy kept the h2
+//! stream open after the QUIC side was long gone, and the outbound pump lived
+//! until the sender side was dropped: two tasks per dead tunnel, never counted.
 
 use super::capsule;
+use crate::task_guard::TaskGuard;
 use bytes::Bytes;
 use ct_common::sync::MutexExt;
 use quinn::udp::{RecvMeta, Transmit};
@@ -137,6 +145,10 @@ pub(super) struct MasqueUdpSocket {
     drops: Arc<DropCounters>,
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
+    /// The two h2 pump tasks (ct-agent#180): aborted when this socket is dropped.
+    /// `None` only for a socket assembled by [`MasqueUdpSocket::from_parts`] (tests
+    /// driving the pump channels directly, no tasks behind them).
+    _pumps: Option<[TaskGuard<()>; 2]>,
 }
 
 impl std::fmt::Debug for MasqueUdpSocket {
@@ -176,7 +188,7 @@ impl MasqueUdpSocket {
         let drops = Arc::new(DropCounters::default());
 
         // Outbound pump: this agent -> the proxy -> the tunneled target.
-        tokio::spawn(async move {
+        let outbound = TaskGuard::spawn(async move {
             while let Some(payload) = to_send_rx.recv().await {
                 // Both encoders fail only for a length beyond 2^62 -- impossible for a
                 // UDP payload quinn hands us -- and the alternative to skipping the one
@@ -195,7 +207,7 @@ impl MasqueUdpSocket {
 
         // Inbound pump: the tunneled target -> the proxy -> this agent.
         let inbound_drops = Arc::clone(&drops);
-        tokio::spawn(async move {
+        let inbound = TaskGuard::spawn(async move {
             let mut buf: Vec<u8> = Vec::new();
             loop {
                 let chunk = recv_stream.data().await;
@@ -225,7 +237,9 @@ impl MasqueUdpSocket {
             }
         });
 
-        (Self::from_parts(to_send_tx, recv_rx, drops, local_addr, peer_addr), peer_addr)
+        let mut socket = Self::from_parts(to_send_tx, recv_rx, drops, local_addr, peer_addr);
+        socket._pumps = Some([outbound, inbound]);
+        (socket, peer_addr)
     }
 
     /// Assemble a socket over already-created pump channels. `spawn` is the only
@@ -238,7 +252,7 @@ impl MasqueUdpSocket {
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
     ) -> Self {
-        Self { to_send, recv_rx: Mutex::new(recv_rx), drops, local_addr, peer_addr }
+        Self { to_send, recv_rx: Mutex::new(recv_rx), drops, local_addr, peer_addr, _pumps: None }
     }
 
     /// `(outbound, inbound)` datagrams this socket dropped because the respective

@@ -8,9 +8,52 @@
 //! service-handler subprocess runner with its #200 timeout.
 
 use super::*;
+use crate::task_guard::TaskGuard;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::ReadBuf;
+
+/// The session side of an in-process duplex plus, when one exists, the guard of the task pumping
+/// the OTHER side (ct-agent#180). The four `*_local` constructors below each spawn such a pump;
+/// tying its guard to the stream means the pump is aborted the moment the session drops its local
+/// -- the call's lifetime IS the pump's lifetime -- instead of running on until it happens to
+/// notice the duplex EOF (a serve-mode handler mid-`CT_AGENT_SERVICE_HANDLER_CMD` never would,
+/// for up to [`SERVICE_HANDLER_TIMEOUT`]). `From<DuplexStream>` is for a caller that drives the
+/// other half itself, inline, and has no task to own.
+pub(crate) struct LocalDuplex {
+    stream: tokio::io::DuplexStream,
+    _pump: Option<TaskGuard<()>>,
+}
+
+impl From<tokio::io::DuplexStream> for LocalDuplex {
+    fn from(stream: tokio::io::DuplexStream) -> Self {
+        Self { stream, _pump: None }
+    }
+}
+
+impl LocalDuplex {
+    fn with_pump(stream: tokio::io::DuplexStream, pump: TaskGuard<()>) -> Self {
+        Self { stream, _pump: Some(pump) }
+    }
+}
+
+impl AsyncRead for LocalDuplex {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for LocalDuplex {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+}
 
 /// The channel session's local application duplex (#135 L2.1-cli). **Pipe** mode (default) is the
 /// CLI's stdin/stdout — the historical one-shot behaviour (stdin-EOF tears the session down).
@@ -20,7 +63,7 @@ use tokio::io::ReadBuf;
 /// over one Noise tunnel. A single enum keeps the two shapes one concrete type for the generic pump.
 pub(crate) enum ChannelLocal {
     Pipe(tokio::io::Join<tokio::io::Stdin, tokio::io::Stdout>),
-    Serve(tokio::io::DuplexStream),
+    Serve(LocalDuplex),
 }
 
 impl AsyncRead for ChannelLocal {
@@ -64,13 +107,15 @@ impl AsyncWrite for ChannelLocal {
 /// Serve-mode local (#135 L2.1-cli): spawn [`serve_request_loop`](ct_common::a2a::serve_request_loop)
 /// with `handle` on one half of an in-process duplex and return the *session* half — the pump drives
 /// it, so the peer's framed requests are answered by `handle` over the one persistent Noise tunnel.
-pub(crate) fn serve_local<H, F>(handle: H) -> tokio::io::DuplexStream
+pub(crate) fn serve_local<H, F>(handle: H) -> LocalDuplex
 where
     H: FnMut(Vec<u8>) -> F + Send + 'static,
     F: std::future::Future<Output = Vec<u8>> + Send,
 {
     let (session_side, serve_side) = tokio::io::duplex(1 << 16);
-    tokio::spawn(async move {
+    // ct-agent#180: guarded -- the serve loop (and a handler it is awaiting) ends with the
+    // session that owns the returned local, not whenever its next write happens to fail.
+    let pump = TaskGuard::spawn(async move {
         let (mut recv, mut send) = tokio::io::split(serve_side);
         // ct-agent#115: `serve_request_loop`'s `Err` used to be silently discarded here (`let _ =`)
         // -- including `write_message`'s pre-wire rejection of an oversize response
@@ -81,7 +126,7 @@ where
             eprintln!("ct-agent channel: serve session ended: {e}");
         }
     });
-    session_side
+    LocalDuplex::with_pump(session_side, pump)
 }
 
 /// Call-mode local (#135 L2.3, client side): spawn a one-shot MCP client on one half of an in-process
@@ -200,9 +245,12 @@ where
     Ok(ct_common::crew::CrewBuildResponse::built(cfg, auction))
 }
 
-pub(crate) fn call_local(method: String, params: serde_json::Value) -> tokio::io::DuplexStream {
+pub(crate) fn call_local(method: String, params: serde_json::Value) -> LocalDuplex {
     let (session_side, serve_side) = tokio::io::duplex(1 << 16);
-    tokio::spawn(async move {
+    // ct-agent#180: the pump's guard rides on the returned local, so a session that drops it
+    // before the reply arrives aborts the pump. Its own `exit(1)` below still covers the case
+    // that matters for #211 -- a failure the pump itself observes while the session is up.
+    let pump = TaskGuard::spawn(async move {
         let (mut recv, mut send) = tokio::io::split(serve_side);
         match mcp_call_over(&mut send, &mut recv, &method, params).await {
             Ok(response) => println!("{}", String::from_utf8_lossy(&response)),
@@ -218,7 +266,7 @@ pub(crate) fn call_local(method: String, params: serde_json::Value) -> tokio::io
         }
         // Dropping serve_side EOFs the session side → the channel session ends → the process exits.
     });
-    session_side
+    LocalDuplex::with_pump(session_side, pump)
 }
 
 /// Invoke the peer's `service/<slug>` tool with `input` over the channel's `local` duplex and return
@@ -338,7 +386,7 @@ where
 /// clean source EOF ends the session (normal exit through the session driver), a mid-run call
 /// failure exits non-zero AFTER the structured error envelope is out (same #211 fail-closed
 /// discipline as the one-shot mode).
-pub(crate) fn call_service_persistent_local(slug: String) -> tokio::io::DuplexStream {
+pub(crate) fn call_service_persistent_local(slug: String) -> LocalDuplex {
     let (session_side, serve_side) = tokio::io::duplex(1 << 16);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
     std::thread::spawn(move || {
@@ -356,7 +404,9 @@ pub(crate) fn call_service_persistent_local(slug: String) -> tokio::io::DuplexSt
         }
         // Thread end drops `tx` -> the loop sees source EOF -> clean teardown.
     });
-    tokio::spawn(async move {
+    // ct-agent#180: guarded. Without it a session that died left this pump parked on
+    // `rx.recv()` -- the NEXT stdin line, however much later -- before it could notice.
+    let pump = TaskGuard::spawn(async move {
         let mut stdout = tokio::io::stdout();
         if let Err(e) = run_service_calls_persistent(serve_side, &slug, &mut rx, &mut stdout).await {
             eprintln!("ct-agent channel --call-service {slug} (persistent): {e}");
@@ -365,7 +415,7 @@ pub(crate) fn call_service_persistent_local(slug: String) -> tokio::io::DuplexSt
         // Ok: serve_side was moved+dropped -> session EOF -> the process exits through the
         // normal session teardown (drain + exit 0), same as the one-shot mode's happy path.
     });
-    session_side
+    LocalDuplex::with_pump(session_side, pump)
 }
 
 /// ct-agent#47: the internal-reconnect counterpart to [`call_service_persistent_local`] --
@@ -454,7 +504,8 @@ where
         let (session_side, serve_side) = tokio::io::duplex(1 << 16);
         let attempt_started = std::time::Instant::now();
 
-        let pump = admit(ChannelLocal::Serve(session_side));
+        // No task to guard here: `calls` drives the other half inline (ct-agent#180).
+        let pump = admit(ChannelLocal::Serve(session_side.into()));
         let calls = run_service_calls_persistent(serve_side, &slug, rx, &mut out);
         tokio::pin!(pump);
         tokio::pin!(calls);
@@ -507,9 +558,10 @@ where
 /// stdin→stdout contract the crew bridge's `CREW_*_CMD` expects, so `CREW_PHYSICS_CMD="ct-agent
 /// channel"` (with `CT_CHANNEL_CALL_SERVICE=text_generation` + the source-2 channel-join env) dials
 /// source-2 over the real Agent-Fabric tunnel and yields its fragment JSON — no jq/wrapper needed.
-pub(crate) fn call_service_local(slug: String, input: String) -> tokio::io::DuplexStream {
+pub(crate) fn call_service_local(slug: String, input: String) -> LocalDuplex {
     let (session_side, serve_side) = tokio::io::duplex(1 << 16);
-    tokio::spawn(async move {
+    // ct-agent#180: guarded, same reasoning as `call_local`.
+    let pump = TaskGuard::spawn(async move {
         match run_service_call(serve_side, &slug, &input).await {
             Ok(output) => println!("{output}"),
             // #211: fail closed AND exit NON-ZERO. Previously this only `eprintln!`'d and let the
@@ -525,7 +577,7 @@ pub(crate) fn call_service_local(slug: String, input: String) -> tokio::io::Dupl
         }
         // Dropping serve_side (moved into run_service_call) EOFs the session → the session ends.
     });
-    session_side
+    LocalDuplex::with_pump(session_side, pump)
 }
 
 /// Parse a `CT_AGENT_SERVICES` entry (the same slugs `ct_common::mcp`'s `service/<slug>` tool
@@ -873,8 +925,10 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
         "This agent's own non-secret configuration summary: role, broker/relay addresses, \
          whether MASQUE fallback and channel/grant issuance are configured, plus readiness flags \
          saying which bridge tools can work from here: channel-members and allowlist-* need \
-         cp_url_configured + channel_id_configured + an oidc_credential (\"env\" or \"stored\", not \
-         \"none\"); manifest-list needs manifest_registry_configured; manifest-install additionally \
+         cp_url_configured + channel_id_configured + an oidc_credential (\"env\", \"stored\" or \
+         \"stored-expired-refreshable\" -- \"stored-expired\" means the login on disk can no longer be \
+         refreshed and \"none\" that there is no credential at all); manifest-list needs \
+         manifest_registry_configured; manifest-install additionally \
          needs manifest_trust_allowlist_configured + manifest_work_dir_configured, and \
          docker_available for compose-kind manifests. Never returns actual key/token/secret VALUES, \
          only which optional features are turned on. No arguments.",
@@ -884,17 +938,21 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
             }
             Ok(bridge_config_summary(
                 |k| std::env::var(k).ok(),
-                crate::login::stored_login_present(),
+                crate::login::oidc_credential_state(),
                 docker_on_path(),
             ))
         },
     );
+    // ct-agent#181: the four CP-backed tools below resolve the bearer through
+    // `resolve_oidc_token_with_retry`, so an IdP that is briefly unreachable while the
+    // stored login is being refreshed costs a retry, not a "run ct-agent login" error
+    // surfaced to an unattended sidecar's operator.
     reg.register_ctx(
         "bridge/channel-members",
         "List this agent's own channel's members (holder + Noise pubkey per member). Needs \
          CT_AGENT_CP_URL and CT_CHANNEL_ID (or CT_GRANT_CHANNEL) configured, plus a usable OIDC \
-         credential -- either CT_OIDC_TOKEN or a prior `ct-agent login` (same resolution \
-         `channel register`/`channel allowlist` already use). The channel is always THIS agent's \
+         credential -- CT_OIDC_TOKEN, a CT_OIDC_TOKEN_FILE, or a prior `ct-agent login` (same \
+         resolution `channel register`/`channel allowlist` already use). The channel is always THIS agent's \
          own -- never caller-supplied, so a bridge peer can't use this to enumerate an unrelated \
          channel's membership. No arguments.",
         move |ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
@@ -908,7 +966,11 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
                 .to_string();
             let channel_hex = hex_encode(&req_hex32_aliased(&env, "CT_CHANNEL_ID", "CT_GRANT_CHANNEL", "64 hex channel id")?);
             let body = tokio::runtime::Handle::current().block_on(async {
-                let token = crate::login::resolve_oidc_token().await?;
+                let token = crate::login::resolve_oidc_token_with_retry(
+                    crate::login::OIDC_REFRESH_RETRY_ATTEMPTS,
+                    crate::login::OIDC_REFRESH_RETRY_BASE,
+                )
+                .await?;
                 reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(30))
                     .build()
@@ -938,7 +1000,11 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
             }
             let env = |k: &str| std::env::var(k).ok();
             let emails = tokio::runtime::Handle::current().block_on(async {
-                let token = crate::login::resolve_oidc_token().await?;
+                let token = crate::login::resolve_oidc_token_with_retry(
+                    crate::login::OIDC_REFRESH_RETRY_ATTEMPTS,
+                    crate::login::OIDC_REFRESH_RETRY_BASE,
+                )
+                .await?;
                 let req = ChannelAllowlistRequest::from_lookup_with_token(env, token)?;
                 ct_control_plane::client::ControlPlaneClient::new(req.cp_url.clone())
                     .channel_allowlist_list(&req.channel_hex, &req.token)
@@ -965,7 +1031,11 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
                 .to_string();
             let env = |k: &str| std::env::var(k).ok();
             tokio::runtime::Handle::current().block_on(async {
-                let token = crate::login::resolve_oidc_token().await?;
+                let token = crate::login::resolve_oidc_token_with_retry(
+                    crate::login::OIDC_REFRESH_RETRY_ATTEMPTS,
+                    crate::login::OIDC_REFRESH_RETRY_BASE,
+                )
+                .await?;
                 let req = ChannelAllowlistRequest::from_lookup_with_token(env, token)?;
                 ct_control_plane::client::ControlPlaneClient::new(req.cp_url.clone())
                     .channel_allowlist_add(&req.channel_hex, &email, &req.token)
@@ -993,7 +1063,11 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
                 .to_string();
             let env = |k: &str| std::env::var(k).ok();
             tokio::runtime::Handle::current().block_on(async {
-                let token = crate::login::resolve_oidc_token().await?;
+                let token = crate::login::resolve_oidc_token_with_retry(
+                    crate::login::OIDC_REFRESH_RETRY_ATTEMPTS,
+                    crate::login::OIDC_REFRESH_RETRY_BASE,
+                )
+                .await?;
                 let req = ChannelAllowlistRequest::from_lookup_with_token(env, token)?;
                 ct_control_plane::client::ControlPlaneClient::new(req.cp_url.clone())
                     .channel_allowlist_remove(&req.channel_hex, &email, &req.token)
@@ -1090,21 +1164,25 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
     );
 }
 
-/// The `bridge/config` tool's whole answer, built purely from `env` (a `CT_*` lookup), whether a
-/// stored `ct-agent login` exists, and whether `docker` is on PATH -- so the readiness logic is
-/// unit-testable without touching the process environment (CADS-Tunnel#763). Only ever reports
-/// non-secret values: addresses/role as-is, everything else as a presence boolean or, for the
-/// OIDC credential, WHICH kind (`"env"` = `CT_OIDC_TOKEN`, `"stored"` = a prior login on disk,
-/// `"none"`) -- the same precedence `crate::login::resolve_oidc_token` applies. The `*_configured`
-/// flags mirror exactly what each bridge tool checks before it can work: `bridge/channel-members`
-/// and `bridge/allowlist-*` need `cp_url_configured` + `channel_id_configured` + a credential;
-/// `bridge/manifest-list` needs `manifest_registry_configured`; `bridge/manifest-install` also
-/// needs `manifest_trust_allowlist_configured` + `manifest_work_dir_configured`, and
-/// `docker_available` for compose-kind manifests. A `bool` can't leak a secret, so the portal may
-/// render this table freely.
+/// The `bridge/config` tool's whole answer, built purely from `env` (a `CT_*` lookup), the
+/// OIDC credential's state (`crate::login::oidc_credential_state`, judged without refreshing),
+/// and whether `docker` is on PATH -- so the readiness logic is unit-testable without touching
+/// the process environment (CADS-Tunnel#763). Only ever reports non-secret values: addresses/role
+/// as-is, everything else as a presence boolean or, for the OIDC credential, WHICH kind and
+/// state (ct-agent#181): `"env"` = `CT_OIDC_TOKEN` or a `CT_OIDC_TOKEN_FILE`, `"stored"` = a usable
+/// login on disk, `"stored-expired-refreshable"` = one the next call will refresh,
+/// `"stored-expired"` = one that can no longer be refreshed (re-login or `CT_OIDC_TOKEN_FILE`
+/// needed), `"none"` -- the same precedence `crate::login::resolve_oidc_token` applies, and the
+/// three pre-#181 spellings unchanged. The `*_configured` flags mirror exactly what each bridge
+/// tool checks before it can work: `bridge/channel-members` and `bridge/allowlist-*` need
+/// `cp_url_configured` + `channel_id_configured` + a credential; `bridge/manifest-list` needs
+/// `manifest_registry_configured`; `bridge/manifest-install` also needs
+/// `manifest_trust_allowlist_configured` + `manifest_work_dir_configured`, and `docker_available`
+/// for compose-kind manifests. A `bool` can't leak a secret, so the portal may render this table
+/// freely.
 pub(crate) fn bridge_config_summary(
     env: impl Fn(&str) -> Option<String>,
-    stored_login: bool,
+    oidc: crate::login::OidcCredentialState,
     docker_on_path: bool,
 ) -> serde_json::Value {
     let set = |k: &str| env(k).is_some_and(|v| !v.trim().is_empty());
@@ -1116,13 +1194,7 @@ pub(crate) fn bridge_config_summary(
     ]
     .iter()
     .all(|&k| env(k).is_some());
-    let oidc_credential = if set("CT_OIDC_TOKEN") {
-        "env"
-    } else if stored_login {
-        "stored"
-    } else {
-        "none"
-    };
+    let oidc_credential = oidc.as_str();
     serde_json::json!({
         "role": env("CT_CHANNEL_ROLE"),
         "broker": env("CT_CHANNEL_BROKER"),

@@ -45,6 +45,7 @@ pub mod self_update;
 pub mod serve;
 pub mod signup;
 pub mod super_peer;
+pub mod task_guard;
 pub mod transport;
 pub mod well_known;
 
