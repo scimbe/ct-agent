@@ -671,7 +671,10 @@ mod tests {
         // interval=base_interval+backoff. Lower bound is exact (the loop never
         // sleeps less); upper bound leaves headroom for scheduler jitter.
         let gap = |a: usize, b: usize| times[b].duration_since(times[a]);
-        let slack = Duration::from_millis(150);
+        // Upper bounds only guard against a runaway sleep: a loaded CI runner has
+        // shown a 1 s stall on the first HTTP round-trip (PR #187), so the slack is
+        // generous; the exact lower bounds are what prove the backoff.
+        let slack = Duration::from_secs(3);
         assert!(gap(0, 1) >= base_interval && gap(0, 1) < base_interval + slack, "pre-slow_down gap ~{base_interval:?}: got {:?}", gap(0, 1));
         let backed_off = base_interval + backoff;
         assert!(gap(1, 2) >= backed_off && gap(1, 2) < backed_off + slack, "post-slow_down gap ~{backed_off:?}: got {:?}", gap(1, 2));
