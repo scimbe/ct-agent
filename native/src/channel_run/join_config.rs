@@ -83,6 +83,11 @@ pub struct ChannelJoinCliConfig {
     /// SSRF guard (`upgrade_safe_endpoint`) correctly refuses it and the session simply
     /// stays on the relay, exactly as it did before this option existed.
     pub direct_upgrade: bool,
+    /// ct-agent#22 (b), `CT_CHANNEL_ACCEPT_RACE` (opt-in, default off): an `Accept` member
+    /// with a bound listener races its accept window against the relay leg instead of
+    /// waiting the full `CHANNEL_ACCEPT_TIMEOUT` before it even dials the relay -- see
+    /// `channel_run::race_accept_against_relay`. Off ⇒ today's serial order.
+    pub accept_race: bool,
     /// #276: this member's OWN genuinely direct edge relay address (`CT_CHANNEL_RELAY_DIRECT`,
     /// host:port), tried BEFORE `relay_addr` on the relay-gate DCUtR path — "always look for
     /// direct communication; relay is only the last line of defense," specifically for a
@@ -454,6 +459,9 @@ impl ChannelJoinCliConfig {
                 t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
             })
             .unwrap_or(false);
+        // ct-agent#22 (b): opt-in accept-vs-relay race, off by default (pure helper, same
+        // truthy handling as CT_CHANNEL_DIRECT_UPGRADE above).
+        let accept_race = accept_race_enabled_from(f("CT_CHANNEL_ACCEPT_RACE").as_deref());
         // #276: optional, same treatment as CT_CHANNEL_FRONT_DOOR above (a set-but-malformed
         // value is an error, not a silently-dropped preference).
         let relay_addr_direct = match f("CT_CHANNEL_RELAY_DIRECT") {
@@ -500,6 +508,7 @@ impl ChannelJoinCliConfig {
             relay_gate_addr,
             relay_gate_cert,
             direct_upgrade,
+            accept_race,
             relay_addr_direct,
             front_door_only,
             call_reconnect,
