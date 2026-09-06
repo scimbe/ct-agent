@@ -101,6 +101,27 @@ jobs:
           echo "0118-Fix-Verfuegbarkeits-Begruendung weiterhin gedeckt: kein Fix verfuegbar."
           cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
 
+  clippy:
+    # ct-agent#176: the panic-free gate. Each crate root (native/src/lib.rs, main.rs and
+    # every src/bin/*.rs) carries `#![cfg_attr(not(test), deny(clippy::unwrap_used,
+    # clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo,
+    # clippy::unimplemented))]`; this job is what turns that attribute into a merge
+    # blocker. `--all-targets` also compiles the test targets, which are built with
+    # cfg(test) and therefore WITHOUT the deny -- intended: tests keep their unwraps.
+    # `-D warnings` on the clippy invocation promotes every ordinary clippy warning
+    # too, so this job is also where any pre-existing style warning surfaces.
+    needs: gate
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add clippy
+        run: rustup component add clippy
+      - name: Clippy (panic-free gate, -D warnings)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
   wasm:
     # ct-agent-wasm IS ct-agent for the browser (workspace restructure, see the
     # root Cargo.toml) -- the `gate` job above builds/tests it NATIVELY (which

@@ -923,7 +923,9 @@ where
 /// transport selection routes to this one unambiguously. `/memory/…` is exactly that: the
 /// same address family [`MemoryTransport`] uses elsewhere in this module, for the same reason.
 fn pre_connected_relay_addr() -> Multiaddr {
-    "/memory/1".parse().expect("a literal /memory/1 multiaddr always parses")
+    // Built structurally rather than parsed from a literal, so there is no `expect`
+    // to justify (ct-agent#176): `Protocol::Memory(1)` IS `/memory/1`.
+    Multiaddr::from(Protocol::Memory(1))
 }
 
 /// Build a **DCUtR-enabled relay client** swarm whose relay-coordination leg rides an

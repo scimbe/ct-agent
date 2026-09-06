@@ -563,7 +563,7 @@ mod tests {
         // this is the DoS the bounded scan exists to prevent (fail closed,
         // don't hang trying to find a terminator that isn't there).
         let mut req = b"GET / HTTP/1.1\r\nAuthorization: Basic YQ==\r\n".to_vec();
-        req.extend(std::iter::repeat(b'x').take(MAX_HEADER_BYTES + 100));
+        req.extend(std::iter::repeat_n(b'x', MAX_HEADER_BYTES + 100));
         assert!(parse_basic_auth(&req).is_none());
     }
 

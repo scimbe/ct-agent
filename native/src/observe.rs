@@ -26,12 +26,18 @@ pub fn metrics_router(metrics: Arc<TunnelMetrics>) -> Router {
 }
 
 /// Render the counters in the Prometheus text exposition format, with the
-/// content type Prometheus expects (`text/plain; version=0.0.4`).
+/// content type Prometheus expects (`text/plain; version=0.0.4`). The shared
+/// [`TunnelMetrics`] block is followed by this crate's own process-wide series
+/// (currently the MASQUE pump drop counter, ct-agent#177).
 async fn render(State(metrics): State<Arc<TunnelMetrics>>) -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
-        metrics.render_prometheus(),
-    )
+    ([(CONTENT_TYPE, "text/plain; version=0.0.4")], render_text(&metrics))
+}
+
+/// The full `/metrics` body: ct_common's tunnel counters plus ct-agent's own series.
+fn render_text(metrics: &TunnelMetrics) -> String {
+    let mut text = metrics.render_prometheus();
+    text.push_str(&crate::masque::render_dropped_datagrams_prometheus());
+    text
 }
 
 /// Bind `listen` and serve the metrics endpoint until the process exits.
@@ -88,6 +94,32 @@ mod tests {
         assert!(text.contains("\nct_tunnels_opened_total 1\n"), "counter value exposed");
         assert!(text.contains("\nct_bytes_to_origin_total 2048\n"));
         assert!(text.contains("\nct_handshake_millis_total 9\n"));
+        // ct-agent#177: the MASQUE drop counter rides on the same scrape. The values
+        // are process-wide statics other tests may have bumped, so only the series'
+        // presence and shape are asserted here.
+        assert!(text.contains("# TYPE ct_agent_masque_dropped_datagrams_total counter"), "masque drop counter header");
+        assert!(text.contains("\nct_agent_masque_dropped_datagrams_total{direction=\"outbound\"} "));
+        assert!(text.contains("\nct_agent_masque_dropped_datagrams_total{direction=\"inbound\"} "));
+    }
+
+    #[test]
+    fn render_text_ends_with_the_masque_drop_series() {
+        // The masque tests bump the same process-wide statics in parallel, so the
+        // rendered values are bracketed by a before/after read rather than pinned.
+        let before = crate::masque::dropped_datagrams_total();
+        let text = render_text(&TunnelMetrics::new());
+        let after = crate::masque::dropped_datagrams_total();
+        let mut tail = text.lines().rev();
+        let inbound = tail.next().unwrap();
+        let outbound = tail.next().unwrap();
+        let value = |line: &str, prefix: &str| -> u64 {
+            line.strip_prefix(prefix).unwrap_or_else(|| panic!("unexpected line {line:?}")).parse().unwrap()
+        };
+        let out = value(outbound, "ct_agent_masque_dropped_datagrams_total{direction=\"outbound\"} ");
+        let inb = value(inbound, "ct_agent_masque_dropped_datagrams_total{direction=\"inbound\"} ");
+        assert!(before.0 <= out && out <= after.0, "outbound {out} within [{}, {}]", before.0, after.0);
+        assert!(before.1 <= inb && inb <= after.1, "inbound {inb} within [{}, {}]", before.1, after.1);
+        assert!(text.ends_with('\n'));
     }
 
     #[tokio::test]

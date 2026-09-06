@@ -143,7 +143,10 @@ impl AcmeClient {
             }
             return Ok(resp);
         }
-        unreachable!("loop always returns or retries exactly once")
+        // Every iteration above returns except the one `continue` on attempt 0, so
+        // this is reached only if the loop bound itself changes -- an explicit error
+        // rather than `unreachable!` (ct-agent#176).
+        Err(format!("ACME request to {url} failed: badNonce retry budget exhausted").into())
     }
 
     /// Register (or, per RFC 8555, idempotently re-resolve) the ACME account

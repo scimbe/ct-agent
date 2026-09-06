@@ -269,17 +269,22 @@ fn parse_masque_fallback(
             if token.is_none() {
                 missing.push("CT_AGENT_MASQUE_TOKEN");
             }
-            if !missing.is_empty() {
+            // Bound once, by the type system, instead of re-checked with `unwrap`
+            // after the manual completeness check above (ct-agent#176). The `else`
+            // arm is unreachable in practice -- `missing` is non-empty whenever any
+            // of the four is `None` -- but it is an error, not a panic.
+            let (Some(proxy), Some(sni_host), Some(target), Some(token)) = (proxy, sni_host, target, token)
+            else {
                 return Err(format!(
                     "MASQUE fallback is only partially configured -- missing {}",
                     missing.join(", ")
                 ));
-            }
+            };
             Ok(Some(MasqueFallbackConfig {
-                proxy_addr: resolve_addr("CT_AGENT_MASQUE_PROXY", &proxy.unwrap())?,
-                sni_host: sni_host.unwrap().trim().to_string(),
-                target: resolve_addr("CT_AGENT_MASQUE_TARGET", &target.unwrap())?,
-                token: token.unwrap().trim().to_string(),
+                proxy_addr: resolve_addr("CT_AGENT_MASQUE_PROXY", &proxy)?,
+                sni_host: sni_host.trim().to_string(),
+                target: resolve_addr("CT_AGENT_MASQUE_TARGET", &target)?,
+                token: token.trim().to_string(),
             }))
         }
     }

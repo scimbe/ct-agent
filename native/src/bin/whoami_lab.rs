@@ -10,6 +10,22 @@
 //!   whoami_lab echo <listen-addr>     -- runs the echo server forever
 //!   whoami_lab query <target-addr>    -- one whoami query, prints the reported address (or ERR)
 
+// ct-agent#176: the data plane is panic-free by construction. Every `unwrap`/`expect`/
+// `panic!`/`unreachable!`/`todo!`/`unimplemented!` in NON-test code is a build error
+// (CI runs clippy with -D warnings); a provably-infallible site may carry a scoped
+// `#[allow(clippy::expect_used)]` with a one-line proof. Tests keep their unwraps.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 use std::net::SocketAddr;
 
 #[tokio::main]

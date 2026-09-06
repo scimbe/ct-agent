@@ -21,6 +21,10 @@ fn b64url(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// The two constant JWK members of an ES256 account key (RFC 7518 §6.2.1).
+const JWK_KTY: &str = "EC";
+const JWK_CRV: &str = "P-256";
+
 /// An ACME account's ES256 keypair — signs every protocol request. Generated
 /// once (or restored from persisted PKCS#8), then reused across an agent's
 /// lifetime so the same ACME account is reused on renewal (RFC 8555 accounts
@@ -57,13 +61,23 @@ impl AccountKey {
         &self.pkcs8
     }
 
-    /// This key's public JWK (RFC 7518 §6.2.1), for the `jwk` field of the
-    /// very first (newAccount) protected header.
-    fn jwk(&self) -> Value {
+    /// The base64url `x` and `y` coordinates of this key's public point -- the
+    /// only two members of its JWK that are not constants. Shared by [`Self::jwk`]
+    /// and [`Self::thumbprint`] so the canonical form is built from the same
+    /// strings the JWK carries, without a JSON round-trip and its `unwrap`s
+    /// (ct-agent#176).
+    fn jwk_coordinates(&self) -> (String, String) {
         // SEC1 uncompressed point: 0x04 || X (32 bytes) || Y (32 bytes) for P-256.
         let public = self.pair.public_key().as_ref();
         let (x, y) = (&public[1..33], &public[33..65]);
-        serde_json::json!({ "kty": "EC", "crv": "P-256", "x": b64url(x), "y": b64url(y) })
+        (b64url(x), b64url(y))
+    }
+
+    /// This key's public JWK (RFC 7518 §6.2.1), for the `jwk` field of the
+    /// very first (newAccount) protected header.
+    fn jwk(&self) -> Value {
+        let (x, y) = self.jwk_coordinates();
+        serde_json::json!({ "kty": JWK_KTY, "crv": JWK_CRV, "x": x, "y": y })
     }
 
     /// The JWK SHA-256 thumbprint (RFC 7638): the base64url digest of the JWK's
@@ -72,14 +86,8 @@ impl AccountKey {
     /// `keyAuthorization` (`token "." thumbprint`) for every ACME challenge type,
     /// including [`crate::acme::dns01_txt_value`]'s input for DNS-01.
     pub fn thumbprint(&self) -> String {
-        let jwk = self.jwk();
-        let canonical = format!(
-            r#"{{"crv":"{}","kty":"{}","x":"{}","y":"{}"}}"#,
-            jwk["crv"].as_str().unwrap(),
-            jwk["kty"].as_str().unwrap(),
-            jwk["x"].as_str().unwrap(),
-            jwk["y"].as_str().unwrap(),
-        );
+        let (x, y) = self.jwk_coordinates();
+        let canonical = format!(r#"{{"crv":"{JWK_CRV}","kty":"{JWK_KTY}","x":"{x}","y":"{y}"}}"#);
         b64url(ring::digest::digest(&ring::digest::SHA256, canonical.as_bytes()).as_ref())
     }
 

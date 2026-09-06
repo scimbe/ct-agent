@@ -287,11 +287,12 @@ where
     // either succeeds or simply lives long enough to not look like a flap.
     let consecutive_flaps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     loop {
-        let permit = sem
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("serve concurrency semaphore is never closed");
+        // `sem` is local and never closed, so `acquire_owned` cannot fail; if it ever
+        // did, ending the loop with an error is the right answer, not a panic
+        // (ct-agent#176).
+        let Ok(permit) = sem.clone().acquire_owned().await else {
+            return Err("serve concurrency semaphore closed".into());
+        };
         // #250: back off BEFORE the next admit if the last several sessions all died
         // near-instantly -- otherwise a flapping peer re-pairs and dies again at native RTT
         // speed forever, with no gap for the underlying interference (if transient) to clear
