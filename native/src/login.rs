@@ -317,6 +317,16 @@ fn token_store_path(f: impl Fn(&str) -> Option<String>) -> Result<PathBuf, Strin
     )
 }
 
+/// Whether a stored `ct-agent login` exists on disk -- resolved via [`token_store_path`] from the
+/// process environment -- WITHOUT reading, parsing, or returning it. A presence-only probe for the
+/// `bridge/config` readiness summary (CADS-Tunnel#763): the portal needs to know whether the
+/// CP-backed bridge tools have an OIDC credential to use at all, never what it is. Deliberately
+/// says nothing about the stored token's validity or expiry -- `resolve_oidc_token` is the only
+/// path that reads it, and it fails loudly on its own if the login is stale.
+pub(crate) fn stored_login_present() -> bool {
+    token_store_path(|k| std::env::var(k).ok()).map(|path| path.is_file()).unwrap_or(false)
+}
+
 fn persist_stored_token(path: &Path, tok: &StoredToken) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

@@ -1352,6 +1352,128 @@ fn bridge_config_tool_answers_the_configured_bridge_peer_with_only_non_secret_fi
 }
 
 #[test]
+fn bridge_config_summary_reports_readiness_flags_without_any_secret_values_763() {
+    // CADS-Tunnel#763: the pure helper behind `bridge/config`, driven by a lookup MAP -- this
+    // file never mutates the shared process environment (see the sibling tests' comments), and
+    // the helper exists precisely so the readiness logic needs no env at all.
+    let mut m = HashMap::new();
+    m.insert("CT_AGENT_CP_URL".to_string(), "https://cp.example.test".to_string());
+    m.insert("CT_CHANNEL_ID".to_string(), "ab".repeat(32));
+    m.insert("CT_OIDC_TOKEN".to_string(), "secret-x".to_string());
+    m.insert("CT_MANIFEST_TRUST_ALLOWLIST_FILE".to_string(), "/etc/ct-agent/trust.txt".to_string());
+    m.insert("CT_MANIFEST_WORK_DIR".to_string(), "/var/lib/ct-agent/work".to_string());
+
+    let configured = bridge_config_summary(|k| m.get(k).cloned(), false, true);
+    for key in [
+        "cp_url_configured",
+        "channel_id_configured",
+        "manifest_trust_allowlist_configured",
+        "manifest_work_dir_configured",
+        "docker_available",
+    ] {
+        assert_eq!(configured[key], serde_json::json!(true), "`{key}` must be true for the configured lookup");
+    }
+    assert_eq!(configured["oidc_credential"], serde_json::json!("env"), "CT_OIDC_TOKEN set -> credential kind `env`");
+    let text = serde_json::to_string(&configured).unwrap();
+    assert!(!text.contains("secret-x"), "the token VALUE must never appear in bridge/config's output: {text}");
+    // The pre-#763 keys are still all there, unchanged in name.
+    for key in [
+        "role",
+        "broker",
+        "relay",
+        "direct_upgrade",
+        "masque_fallback_configured",
+        "grant_issuance_configured",
+        "manifest_registry_configured",
+        "manifest_install_disabled",
+    ] {
+        assert!(configured.get(key).is_some(), "pre-existing field `{key}` must remain");
+    }
+
+    let empty: HashMap<String, String> = HashMap::new();
+    let stored = bridge_config_summary(|k| empty.get(k).cloned(), true, false);
+    assert_eq!(
+        stored["oidc_credential"],
+        serde_json::json!("stored"),
+        "no CT_OIDC_TOKEN but a login on disk -> `stored`"
+    );
+    for key in [
+        "cp_url_configured",
+        "channel_id_configured",
+        "manifest_trust_allowlist_configured",
+        "manifest_work_dir_configured",
+        "docker_available",
+    ] {
+        assert_eq!(stored[key], serde_json::json!(false), "`{key}` must be false for an empty lookup");
+    }
+
+    let none = bridge_config_summary(|k| empty.get(k).cloned(), false, false);
+    assert_eq!(none["oidc_credential"], serde_json::json!("none"), "neither env token nor stored login -> `none`");
+
+    // A blank CT_OIDC_TOKEN counts as unset, exactly like `resolve_oidc_token` treats it.
+    let mut blank = HashMap::new();
+    blank.insert("CT_OIDC_TOKEN".to_string(), "   ".to_string());
+    let blank_token = bridge_config_summary(|k| blank.get(k).cloned(), true, false);
+    assert_eq!(
+        blank_token["oidc_credential"],
+        serde_json::json!("stored"),
+        "a blank CT_OIDC_TOKEN must not count as `env`"
+    );
+}
+
+#[test]
+fn enrich_manifest_list_adds_manifest_url_per_entry_and_wraps_non_arrays_763() {
+    // CADS-Tunnel#763: `bridge/manifest-list` returns {registry_url, manifests}, each registry
+    // entry gaining the install-ready `manifest_url`.
+    let registry = "https://registry.example.test";
+    let body = serde_json::json!([
+        {
+            "manifest_id": "m-one",
+            "publisher_pubkey": "ab".repeat(32),
+            "name": "one",
+            "version": "1.0.0",
+            "guardrail_verdict": "pass",
+            "published_at": "2026-09-01T00:00:00Z"
+        },
+        { "manifest_id": "m-two", "name": "two", "version": "2.0.0" }
+    ]);
+    let out = enrich_manifest_list(registry, body);
+    assert_eq!(out["registry_url"], serde_json::json!(registry), "the trimmed registry base url is echoed back");
+    let manifests = out["manifests"].as_array().expect("manifests is an array");
+    assert_eq!(manifests.len(), 2, "every registry entry is kept");
+    assert_eq!(manifests[0]["manifest_url"], serde_json::json!("https://registry.example.test/manifests/m-one"));
+    assert_eq!(manifests[1]["manifest_url"], serde_json::json!("https://registry.example.test/manifests/m-two"));
+    assert_eq!(manifests[0]["name"], serde_json::json!("one"), "the registry's own fields pass through untouched");
+    assert_eq!(manifests[0]["guardrail_verdict"], serde_json::json!("pass"));
+
+    // An entry the registry already gave a manifest_url keeps it; one without a manifest_id
+    // (nothing to derive from) and a non-object element both pass through unchanged.
+    let body = serde_json::json!([
+        { "manifest_id": "m-three", "manifest_url": "https://mirror.example.test/x.json" },
+        { "name": "no-id" },
+        "not-an-object"
+    ]);
+    let out = enrich_manifest_list(registry, body);
+    let manifests = out["manifests"].as_array().expect("manifests is an array");
+    assert_eq!(
+        manifests[0]["manifest_url"],
+        serde_json::json!("https://mirror.example.test/x.json"),
+        "an existing manifest_url is left as-is"
+    );
+    assert!(manifests[1].get("manifest_url").is_none(), "no manifest_id -> no manifest_url invented");
+    assert_eq!(manifests[2], serde_json::json!("not-an-object"), "non-object elements pass through");
+
+    // A non-array body is wrapped, not dropped, so the portal always sees the same envelope.
+    let out = enrich_manifest_list(registry, serde_json::json!({ "items": [] }));
+    assert_eq!(out["registry_url"], serde_json::json!(registry));
+    assert_eq!(
+        out["manifests"],
+        serde_json::json!({ "items": [] }),
+        "a non-array body is wrapped under `manifests` unchanged"
+    );
+}
+
+#[test]
 fn bridge_manifest_install_rejects_missing_fields_without_panicking() {
     // Args are validated before touching env or network (see the handler's own ordering) -- so
     // this, too, needs no env-var setup.
