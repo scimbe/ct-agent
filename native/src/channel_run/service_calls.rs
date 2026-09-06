@@ -581,6 +581,36 @@ pub(crate) fn run_service_handler_with_timeout(
     input: &str,
     timeout: std::time::Duration,
 ) -> Result<String, String> {
+    run_service_handler_with_timeout_to(cmd, service, input, timeout, &mut std::io::stderr())
+}
+
+/// Upper bound on how much of one handler run's stderr is forwarded into this process's own
+/// stderr (ct-agent#105 diagnosability): the TAIL of the child's stderr up to this many bytes.
+/// Real handlers log heavily (an LLM CLI's whole progress chatter); the tail is what carries the
+/// verdict-adjacent lines, and a runaway handler must not be able to flood `docker logs` through
+/// this path.
+pub(crate) const HANDLER_STDERR_PASSTHROUGH_MAX: usize = 64 * 1024;
+
+/// [`run_service_handler_with_timeout`] with the diagnostic sink made explicit (ct-agent#105):
+/// everything the handler child wrote to its stderr is forwarded to `diag`, line by line,
+/// prefixed `service handler[<slug>] stderr: `, on BOTH the success and the non-zero-exit path.
+///
+/// Why: the child's stderr was only ever captured into the error string of a failed run. A
+/// handler that succeeded (exit 0) had its stderr silently discarded, so `docker logs` on a
+/// `--serve` container never showed a single handler-level log line -- which is exactly what made
+/// ct-agent#105 (a caller-side envelope mismatch that LOOKED like a serve-side corruption) so
+/// hard to localize. Production passes `std::io::stderr()` (unbuffered, so it interleaves
+/// correctly with this process's own `eprintln!` lines); tests pass a `Vec<u8>`.
+///
+/// Not forwarded: a run killed by `timeout` (the child never finished, so `wait_with_output`
+/// never returned its buffers -- the timeout error is the record of that run).
+pub(crate) fn run_service_handler_with_timeout_to(
+    cmd: &str,
+    service: ct_common::channel::ServiceType,
+    input: &str,
+    timeout: std::time::Duration,
+    diag: &mut dyn std::io::Write,
+) -> Result<String, String> {
     use std::process::{Command, Stdio};
     // Reuse ct_common's own slug derivation (now `pub`, #382 follow-up) rather than a second,
     // driftable copy of this match here -- this is the SAME name the `service/<slug>` MCP tool
@@ -660,6 +690,7 @@ pub(crate) fn run_service_handler_with_timeout(
             return Err("service handler: wait thread disconnected unexpectedly".to_string())
         }
     };
+    forward_handler_stderr(diag, slug.as_ref(), &output.stderr);
     if !output.status.success() {
         return Err(format!(
             "service handler exited {}: {}",
@@ -681,6 +712,33 @@ pub(crate) fn run_service_handler_with_timeout(
         ));
     }
     Ok(stdout)
+}
+
+/// ct-agent#105: forward a finished handler child's stderr into `diag`, one prefixed line per
+/// stderr line, keeping only the last [`HANDLER_STDERR_PASSTHROUGH_MAX`] bytes (a cut is
+/// announced so a reader never mistakes the tail for the whole). Empty stderr writes nothing --
+/// a quiet handler must not add a blank line per call. Write errors on `diag` are ignored: the
+/// diagnostic must never fail the call it describes.
+pub(crate) fn forward_handler_stderr(diag: &mut dyn std::io::Write, slug: &str, stderr: &[u8]) {
+    if stderr.is_empty() {
+        return;
+    }
+    let (tail, cut) = if stderr.len() > HANDLER_STDERR_PASSTHROUGH_MAX {
+        (&stderr[stderr.len() - HANDLER_STDERR_PASSTHROUGH_MAX..], true)
+    } else {
+        (stderr, false)
+    };
+    if cut {
+        let _ = writeln!(
+            diag,
+            "service handler[{slug}] stderr: [... {} bytes cut, last {HANDLER_STDERR_PASSTHROUGH_MAX} shown]",
+            stderr.len() - HANDLER_STDERR_PASSTHROUGH_MAX
+        );
+    }
+    for line in String::from_utf8_lossy(tail).lines() {
+        let _ = writeln!(diag, "service handler[{slug}] stderr: {line}");
+    }
+    let _ = diag.flush();
 }
 
 /// [`run_service_handler_with_timeout`] bound to the real [`SERVICE_HANDLER_TIMEOUT`] — the seam
