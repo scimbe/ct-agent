@@ -66,6 +66,10 @@ pub const CHANNEL_SESSION: &str = "channel_session";
 pub const BRIDGE_CALL: &str = "bridge_call";
 /// `{status}`: a manifest activation finished (`ok`, `rejected`, `failed`).
 pub const MANIFEST_INSTALL: &str = "manifest_install";
+/// `{would_refuse, backend}`: a dry-run plan was computed (`manifest plan`, `harness run
+/// --plan`, `bridge/manifest-plan`; scimbe/ct-agent#183) -- `backend` is the sandbox backend a
+/// Binary run would use, `null` for Compose or an unsandboxed opt-out run.
+pub const MANIFEST_PLAN: &str = "manifest_plan";
 /// `{result}`: a release check ran (`up-to-date`, `available: <v>`, `error: ..`).
 pub const UPDATE_CHECK: &str = "update_check";
 /// `{version}`: a downloaded release replaced the on-disk binary.
@@ -74,7 +78,7 @@ pub const UPDATE_APPLIED: &str = "update_applied";
 pub const CREDENTIAL_DEGRADED: &str = "credential_degraded";
 
 /// Every event kind, in the order `/metrics` renders `ct_agent_events_total{kind}`.
-pub const KINDS: [&str; 12] = [
+pub const KINDS: [&str; 13] = [
     REGISTERED,
     REGISTRATION_FAILED,
     DISCONNECTED,
@@ -84,6 +88,7 @@ pub const KINDS: [&str; 12] = [
     CHANNEL_SESSION,
     BRIDGE_CALL,
     MANIFEST_INSTALL,
+    MANIFEST_PLAN,
     UPDATE_CHECK,
     UPDATE_APPLIED,
     CREDENTIAL_DEGRADED,

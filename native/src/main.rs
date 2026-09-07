@@ -88,7 +88,9 @@ USAGE:
     ct-agent manifest sign                Sign a manifest skeleton with the holder key
     ct-agent manifest publish             PUT a signed manifest to an object-storage URL
     ct-agent manifest activate            Fetch, verify and install a signed manifest
+    ct-agent manifest plan                Dry-run: what `activate` would do on this host, and why it would refuse
     ct-agent harness run                  Run a signed task against an installed manifest's bundle
+    ct-agent harness run --plan           Dry-run: the plan for the task's bundle, no model call
 
 Every subcommand is configured entirely via CT_*/CT_AGENT_*/CT_CHANNEL_* environment
 variables, not flags -- see docs.bunsenbrenner.org for the full reference per command.
@@ -113,7 +115,8 @@ Operator forensics (ct-agent#178): the agent emits one structured event per stat
 that matters on call -- registered {edge, transport}, registration_failed {error},
 disconnected {reason}, transport_switch {from, to}, fallback_exhausted, direct_refused
 {reason}, channel_session {state, peer}, bridge_call {tool, ok}, manifest_install {status},
-update_check {result}, update_applied {version}, credential_degraded -- each stamped with
+manifest_plan {would_refuse, backend}, update_check {result}, update_applied {version},
+credential_degraded -- each stamped with
 ts, a per-process session id and a per-connection counter (conn). On stderr an event is one
 `ct-agent event: <kind> k=v ...` line next to the usual human line, or, with
 CT_AGENT_LOG_FORMAT=json, one JSON object per line (for a log shipper). Independently of the
@@ -161,8 +164,12 @@ Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
               bundle to the compose file for Compose kind, or the executable for Binary kind),
               CT_MANIFEST_VERIFY_SCRIPT, CT_MANIFEST_VERIFY_TIMEOUT_SECS; optional
               CT_MANIFEST_KIND (compose|binary|k8s, default compose), CT_MANIFEST_ENV_VARS
-              (`;`-separated NAME:required:description, NAMES only -- never a secret value) and
-              CT_MANIFEST_EXPIRES_IN_SECS (default 31536000).
+              (`;`-separated NAME:required:description, NAMES only -- never a secret value),
+              CT_MANIFEST_EXPIRES_IN_SECS (default 31536000) and CT_MANIFEST_ENVIRONMENT_JSON
+              (the manifest's environment contract as JSON, every field optional, `{}` = the
+              strictest profile: private loopback, no egress, 1 CPU / 1 GiB / 300 s; it is
+              validated here and signed by `sign` -- absent means that same strictest profile,
+              never \"unrestricted\"; #183).
               Writes the unsigned JSON to stdout; needs no key and no network.
     sign      CT_MANIFEST_HOLDER_KEY (64 hex ed25519 private key, same format as
               CT_CHANNEL_HOLDER_KEY); manifest JSON from CT_MANIFEST_IN or stdin.
@@ -186,7 +193,20 @@ Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
               ledger mode: if CT_MANIFEST_REGISTRY_URL is set, a successful activation
               additionally POSTs a ledger-only activation event (also needs
               CT_MANIFEST_REGISTRY_WRITE_TOKEN and CT_MANIFEST_ACTIVATOR_PUBKEY, this agent's
-              own 64-hex holder pubkey).
+              own 64-hex holder pubkey). Binary kind (#183, phase 1): FAIL CLOSED -- when no
+              sandbox backend (bwrap) is usable on this host the activation is refused, naming
+              the probe's own failure; CT_ALLOW_UNSANDBOXED=1 is the operator's explicit opt-out
+              (the executable then runs unconfined behind a loud warning). The old
+              CT_REQUIRE_BINARY_SANDBOX=1 is still accepted and is a no-op.
+    plan      The same variables as `activate` (nothing is installed, no directory is created,
+              the bundle is not fetched -- only the manifest), plus optional
+              CT_MANIFEST_COMPOSE_FILE: for `plan` a LOCAL path to the compose file's text, so
+              the static guardrail scan runs against it (absent: the scan is skipped and the
+              plan says so). Prints the plan JSON -- backend (the sandbox backend a Binary run
+              would use), argv_preview (secret values redacted), compose_overrides (the
+              hardening every service must carry) and refusals (EVERY reason `activate` would
+              reject it, signature/allowlist first) -- and exits 1 when refusals is non-empty,
+              so `manifest plan && manifest activate` means what it looks like it means.
 
 `harness run` (CADS-agent-marketplace Phase 2, bounded local-LLM bundle maintenance) reads:
     CT_HARNESS_TASK_URL_OR_PATH, CT_HARNESS_MANIFEST_URL_OR_PATH (the same manifest reference
@@ -199,7 +219,12 @@ Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
     CT_HARNESS_TRUST_ALLOWLIST_FILE. The harness may only read/write files inside
     CT_HARNESS_BUNDLE_DIR and rebuild that bundle's own compose file -- no shell access, no
     host-wide filesystem access. Writes the run report JSON to stdout and exits non-zero unless
-    the status is \"ok\".
+    the status is \"ok\". The run's transcript goes to <CT_AGENT_STATE_DIR>/harness/
+    <manifest_id>.transcript.jsonl ($HOME/.ct-agent with no state dir; refused with neither) --
+    outside the bundle, so the audit record is not among the files a task can edit (#183).
+    `harness run --plan` (or CT_HARNESS_PLAN=1) performs every pre-flight check, then prints the
+    plan for the bundle -- the same JSON as `manifest plan`, scanning the bundle's CURRENT
+    compose file -- and exits 1 if it lists a refusal, without calling the model.
 ";
 
 
@@ -854,6 +879,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
                 return Ok(());
             }
+            Some("plan") => {
+                // #183: the dry run. Same config as `activate`, nothing executed; the exit
+                // code carries the verdict exactly like `activate`'s does.
+                let cfg = ct_agent::manifest_run::PlanCliConfig::from_env()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                let planned = ct_agent::manifest_run::run_plan(cfg)
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                println!("{}", planned.plan.to_json());
+                let code = ct_agent::manifest_run::plan_exit_code(&planned.plan);
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                return Ok(());
+            }
             Some("activate") => {
                 let cfg = ct_agent::manifest_run::ActivateCliConfig::from_env()
                     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
@@ -882,7 +922,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 std::process::exit(1);
             }
             None => {
-                eprintln!("ct-agent: `manifest` requires a subcommand (create|sign|publish|activate)\n");
+                eprintln!("ct-agent: `manifest` requires a subcommand (create|sign|publish|activate|plan)\n");
                 eprint!("{USAGE}");
                 std::process::exit(1);
             }
@@ -896,14 +936,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if std::env::args().nth(1).as_deref() == Some("harness") {
         match std::env::args().nth(2).as_deref() {
             Some("run") => {
-                let cfg = ct_agent::harness_run::HarnessCliConfig::from_env()
+                let mut cfg = ct_agent::harness_run::HarnessCliConfig::from_env()
                     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-                let report = ct_agent::harness_run::run_harness(cfg)
+                // `--plan` is the one flag (#183); anything else after `run` is a typo and must
+                // not be ignored (#239/#14) -- a misspelt `--plna` would otherwise run the loop.
+                for arg in std::env::args().skip(3) {
+                    if arg == "--plan" {
+                        cfg.plan = true;
+                    } else {
+                        eprintln!("ct-agent: unrecognized `harness run` argument '{arg}' (only --plan is accepted)\n");
+                        eprint!("{USAGE}");
+                        std::process::exit(1);
+                    }
+                }
+                match ct_agent::harness_run::run_harness(cfg)
                     .await
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-                println!("{}", report.to_json());
-                if !matches!(report, harness_core::HarnessReport::Ok { .. }) {
-                    std::process::exit(1);
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?
+                {
+                    ct_agent::harness_run::HarnessRun::Report(report) => {
+                        println!("{}", report.to_json());
+                        if !matches!(report, harness_core::HarnessReport::Ok { .. }) {
+                            std::process::exit(1);
+                        }
+                    }
+                    ct_agent::harness_run::HarnessRun::Plan(planned) => {
+                        println!("{}", planned.plan.to_json());
+                        let code = ct_agent::manifest_run::plan_exit_code(&planned.plan);
+                        if code != 0 {
+                            std::process::exit(code);
+                        }
+                    }
                 }
                 return Ok(());
             }

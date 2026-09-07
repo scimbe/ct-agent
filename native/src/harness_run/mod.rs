@@ -10,8 +10,15 @@
 //! claims to be scoped to -- its compose file is where the manifest says, and its
 //! `.ct-agent-activation.json` marker (written by `manifest activate`, #165) names that same
 //! manifest -- before handing control to the agent loop.
+//!
+//! Sandbox phase 1 (scimbe/ct-agent#183): the run's transcript lives in ct-agent's own state
+//! directory (`CT_AGENT_STATE_DIR`, else `$HOME/.ct-agent`, the same resolution `events.rs` and
+//! `login.rs` use), never inside the bundle the task may edit -- and `--plan` (or
+//! `CT_HARNESS_PLAN=1`) stops right after the pre-flight checks, printing what a run would do
+//! for this bundle (backend, compose hardening, every refusal the bundle's CURRENT compose file
+//! would earn) without a model call.
 
-use crate::manifest_run::{read_activation_marker, ACTIVATION_MARKER_FILE};
+use crate::manifest_run::{read_activation_marker, PlanTarget, Planned, ACTIVATION_MARKER_FILE};
 use installer_engine::allowlist::TrustAllowlist;
 use manifest_core::SignedTask;
 use std::path::{Path, PathBuf};
@@ -54,6 +61,26 @@ pub struct HarnessCliConfig {
     /// stderr warning instead of refusing it. A marker that IS present must still match; this
     /// only relaxes the "must exist" half, never the "must name this manifest" half.
     pub allow_unmarked_bundle: bool,
+    /// Where the run's transcript goes: `<state_dir>/harness/<manifest_id>.transcript.jsonl`
+    /// (`harness_core::transcript_path`). `CT_AGENT_STATE_DIR`, else `$HOME/.ct-agent`; with
+    /// neither the config is refused -- the transcript is the audit record of what the harness
+    /// did, and falling back to the bundle would put it among the files a task can rewrite.
+    pub state_dir: PathBuf,
+    /// `--plan` / `CT_HARNESS_PLAN=1`: run every pre-flight check, then print the plan for this
+    /// bundle instead of calling the model (scimbe/ct-agent#183).
+    pub plan: bool,
+    /// Same derivation as `manifest activate`'s (`installer_engine::require_binary_sandbox_from_env`,
+    /// opt-out `CT_ALLOW_UNSANDBOXED=1`); only the plan reads it -- the harness's own tools run
+    /// `docker compose build`, never a Binary entrypoint.
+    pub require_binary_sandbox: bool,
+}
+
+/// What `harness run` produced: the agent loop's report, or -- under `--plan` -- the plan it
+/// stopped at instead.
+#[derive(Debug)]
+pub enum HarnessRun {
+    Report(harness_core::HarnessReport),
+    Plan(Planned),
 }
 
 impl HarnessCliConfig {
@@ -93,6 +120,11 @@ impl HarnessCliConfig {
         if allowed_models.is_empty() {
             return Err("CT_HARNESS_ALLOWED_MODELS resolved to an empty list -- name at least one model".to_string());
         }
+        let state_dir = crate::events::state_dir_from(&f).ok_or_else(|| {
+            "CT_AGENT_STATE_DIR (or HOME) required -- the harness transcript is written to \
+             <state dir>/harness/<manifest_id>.transcript.jsonl, outside the bundle a task may edit"
+                .to_string()
+        })?;
         Ok(Self {
             task_location: req(&f, "CT_HARNESS_TASK_URL_OR_PATH", "https:// URL or local path of the signed SignedTask JSON")?,
             manifest_location: req(
@@ -114,6 +146,9 @@ impl HarnessCliConfig {
             )?),
             allowed_models,
             allow_unmarked_bundle: opt(&f, "CT_HARNESS_ALLOW_UNMARKED_BUNDLE").as_deref() == Some("1"),
+            state_dir,
+            plan: opt(&f, "CT_HARNESS_PLAN").as_deref() == Some("1"),
+            require_binary_sandbox: installer_engine::require_binary_sandbox_from_env(&f),
         })
     }
 }
@@ -125,19 +160,20 @@ impl HarnessCliConfig {
 /// `manifest_id` and that `bundle_dir` really contains that manifest's `compose_file` (containment-
 /// checked against `bundle_dir` the same way the harness's own file tools are, then fail closed on
 /// any mismatch -- a task pointed at the wrong bundle must never reach the agent loop), read the
-/// LiteLLM key file, then hand off to `harness_core::run_task`.
+/// LiteLLM key file, then hand off to `harness_core::run_task_with_state_dir`. Under `--plan`
+/// the flow stops after the marker pre-flight and returns [`HarnessRun::Plan`] instead.
 ///
 /// `installer_engine`/`harness_core` are entirely synchronous (blocking HTTP, `docker`
 /// subprocesses), so the whole flow runs on the blocking pool -- same shape as
 /// `manifest_run::run_activate`'s own `tokio::task::spawn_blocking` wrapping, not stalling a
 /// runtime worker for the length of an agent-loop run that can legitimately take minutes.
-pub async fn run_harness(cfg: HarnessCliConfig) -> Result<harness_core::HarnessReport, String> {
+pub async fn run_harness(cfg: HarnessCliConfig) -> Result<HarnessRun, String> {
     tokio::task::spawn_blocking(move || run_harness_blocking(cfg))
         .await
         .map_err(|e| format!("harness task failed: {e}"))?
 }
 
-fn run_harness_blocking(cfg: HarnessCliConfig) -> Result<harness_core::HarnessReport, String> {
+fn run_harness_blocking(cfg: HarnessCliConfig) -> Result<HarnessRun, String> {
     let task_bytes = installer_engine::fetch::fetch_bytes(&cfg.task_location)
         .map_err(|e| format!("fetch task: {e}"))?;
     let task: SignedTask =
@@ -196,6 +232,14 @@ fn run_harness_blocking(cfg: HarnessCliConfig) -> Result<harness_core::HarnessRe
     // it. The activation marker `manifest activate` leaves behind is the binding instead.
     check_activation_marker(&cfg.bundle_dir, &hex32(&manifest.manifest_id), cfg.allow_unmarked_bundle)?;
 
+    // `--plan` (scimbe/ct-agent#183): every check above has passed, so this is the bundle the
+    // task is scoped to. Plan against it -- the bundle's CURRENT compose file, which an earlier
+    // task may have edited, is what the static scan reads -- and stop before the key file is
+    // even opened: no model call, no docker call.
+    if cfg.plan {
+        return Ok(HarnessRun::Plan(plan_for_bundle(&cfg, &manifest, &expected_compose, now)?));
+    }
+
     let api_key = std::fs::read_to_string(&cfg.litellm_key_file)
         .map_err(|e| format!("read CT_HARNESS_LITELLM_KEY_FILE {}: {e}", cfg.litellm_key_file.display()))?
         .trim()
@@ -212,7 +256,39 @@ fn run_harness_blocking(cfg: HarnessCliConfig) -> Result<harness_core::HarnessRe
         allowed_models: cfg.allowed_models,
         now,
     };
-    Ok(harness_core::run_task(&task, &cfg.allowlist, opts))
+    Ok(HarnessRun::Report(harness_core::run_task_with_state_dir(&task, &cfg.allowlist, opts, &cfg.state_dir)))
+}
+
+/// The `--plan` hook: `manifest_run::plan_for_manifest` for an already-activated bundle. The
+/// target is the bundle directory itself (it exists; nothing is created), the compose project
+/// name is what the activation marker recorded (else the directory's own name -- only rendered
+/// into the argv preview), and for a Compose manifest the scan reads `expected_compose`, the
+/// containment-checked path the pre-flight already verified exists.
+fn plan_for_bundle(
+    cfg: &HarnessCliConfig,
+    manifest: &manifest_core::ServiceManifest,
+    expected_compose: &Path,
+    now: u64,
+) -> Result<Planned, String> {
+    let project_name = match read_activation_marker(&cfg.bundle_dir) {
+        Ok(Some(marker)) => marker.project_name,
+        _ => cfg.bundle_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "harness".to_string()),
+    };
+    let compose_yaml = if manifest.installer_kind == manifest_core::InstallerKind::Compose {
+        Some(
+            std::fs::read_to_string(expected_compose)
+                .map_err(|e| format!("read bundle compose file {}: {e}", expected_compose.display()))?,
+        )
+    } else {
+        None
+    };
+    let target = PlanTarget {
+        allowlist: &cfg.allowlist,
+        install_dir: cfg.bundle_dir.clone(),
+        project_name,
+        require_binary_sandbox: cfg.require_binary_sandbox,
+    };
+    Ok(crate::manifest_run::plan_for_manifest(target, manifest, compose_yaml, now))
 }
 
 /// The #165 pre-flight: `bundle_dir`'s activation marker must name `expected_manifest_id_hex`.
@@ -302,6 +378,8 @@ mod tests {
             VerifySpec { script: "verify.sh".to_string(), timeout_secs: 60 },
             issued_at,
             expires_at,
+            None,
+            None,
         )
     }
 
@@ -335,6 +413,10 @@ mod tests {
             // (signature/expiry, allowlist, containment), so they never reach the marker
             // pre-flight; the #165 tests write a marker explicitly where they need one.
             allow_unmarked_bundle: false,
+            // Outside the bundle, as in production (#183) -- never `dir` itself.
+            state_dir: dir.join("state"),
+            plan: false,
+            require_binary_sandbox: true,
         }
     }
 
@@ -502,6 +584,7 @@ mod tests {
             ("CT_HARNESS_LITELLM_URL", "http://172.22.0.1:4103"),
             ("CT_HARNESS_LITELLM_KEY_FILE", "/local/key"),
             ("CT_HARNESS_ALLOWED_MODELS", "local-devstral-small2"),
+            ("CT_AGENT_STATE_DIR", "/local/state"),
         ]
     }
 
@@ -511,6 +594,65 @@ mod tests {
         assert_eq!(cfg.allowed_models, vec!["local-devstral-small2"]);
         assert!(cfg.allowlist.contains(&[0x99; 32]));
         assert!(!cfg.allow_unmarked_bundle, "unmarked bundles are refused unless explicitly allowed (#165)");
+        assert_eq!(cfg.state_dir, PathBuf::from("/local/state"));
+        assert!(!cfg.plan, "a run is a run unless --plan / CT_HARNESS_PLAN=1 says otherwise");
+        assert!(cfg.require_binary_sandbox, "fail closed by default (#183)");
+    }
+
+    #[test]
+    fn state_dir_falls_back_to_home_and_is_required_183() {
+        let mut env = full_env();
+        env.retain(|(k, _)| *k != "CT_AGENT_STATE_DIR");
+        env.push(("HOME", "/home/op"));
+        let cfg = HarnessCliConfig::from_lookup(lookup(&env)).unwrap();
+        assert_eq!(cfg.state_dir, PathBuf::from("/home/op/.ct-agent"));
+
+        env.retain(|(k, _)| *k != "HOME");
+        let err = HarnessCliConfig::from_lookup(lookup(&env)).unwrap_err();
+        assert!(err.contains("CT_AGENT_STATE_DIR"), "{err}");
+    }
+
+    #[test]
+    fn plan_flag_and_sandbox_opt_out_come_from_the_environment_183() {
+        let mut env = full_env();
+        env.push(("CT_HARNESS_PLAN", "1"));
+        env.push(("CT_ALLOW_UNSANDBOXED", "1"));
+        let cfg = HarnessCliConfig::from_lookup(lookup(&env)).unwrap();
+        assert!(cfg.plan);
+        assert!(!cfg.require_binary_sandbox);
+    }
+
+    #[test]
+    fn run_harness_blocking_with_plan_stops_after_the_pre_flight_and_scans_the_bundle_compose_183() {
+        let dir = tempfile::tempdir().unwrap();
+        // An unpinned image: the bundle's CURRENT compose file is what the plan must scan.
+        std::fs::write(dir.path().join("docker-compose.yml"), "services:\n  web:\n    image: ghcr.io/example/svc:latest\n")
+            .unwrap();
+
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let manifest_id = [7u8; 32];
+        let now = crate::manifest_run::unix_now().unwrap();
+        let manifest = signed_manifest(&key, manifest_id, now, now + 7_200);
+        let task = signed_task(&key, [9u8; 32], manifest_id, now, now + 7_200);
+        std::fs::write(dir.path().join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        std::fs::write(dir.path().join("task.json"), serde_json::to_vec(&task).unwrap()).unwrap();
+        write_marker(dir.path(), manifest_id);
+
+        // No LiteLLM key file on purpose: a plan must never get as far as opening it.
+        let allowlist = TrustAllowlist::parse(&hex32(&key.verifying_key().to_bytes())).unwrap();
+        let mut cfg = cfg_for(dir.path(), allowlist);
+        cfg.plan = true;
+        let planned = match run_harness_blocking(cfg).unwrap() {
+            HarnessRun::Plan(planned) => planned,
+            HarnessRun::Report(report) => panic!("--plan must not run the loop: {report:?}"),
+        };
+        assert_eq!(planned.install_dir, dir.path());
+        assert_eq!(planned.manifest_id, hex32(&manifest_id));
+        assert_eq!(planned.plan.argv_preview[..4], ["docker", "compose", "-p", "harness-proof"], "the marker's project name");
+        assert!(planned.plan.would_refuse(), "{:?}", planned.plan);
+        assert!(planned.plan.refusals.iter().any(|r| r.contains("F.15-image-not-digest-pinned")), "{:?}", planned.plan);
+        assert_eq!(crate::manifest_run::plan_exit_code(&planned.plan), 1);
+        assert!(!dir.path().join("state").exists(), "a plan writes no transcript");
     }
 
     #[test]
