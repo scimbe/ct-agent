@@ -342,11 +342,14 @@ pub async fn run_status_command() -> Result<(), String> {
         return Ok(());
     };
     let url = status_url(&listen);
-    let client = reqwest::Client::builder()
+    // 5 s per request, well under the shared client's default: this is a
+    // localhost metrics listener, and `ct-agent status` is interactive.
+    let resp = crate::http::shared()
+        .get(&url)
         .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let resp = client.get(&url).send().await.map_err(|e| format!("GET {url}: {e}"))?;
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
     let http_status = resp.status();
     let body = resp.text().await.map_err(|e| format!("GET {url}: reading the body: {e}"))?;
     if !http_status.is_success() {

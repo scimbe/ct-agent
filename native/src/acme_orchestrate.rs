@@ -108,6 +108,12 @@ fn note_legacy_route_in_use(what: &str) {
     });
 }
 
+/// Per-request bound on every admission-broker call below (poll and completion
+/// callback alike), applied on the request builder over the shared client's
+/// default: the broker is polled on a fixed cadence, so a slow answer is better
+/// dropped and retried next round than allowed to eat into the next one.
+const ADMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn poll_admission(http: &reqwest::Client, cp_url: &str, token: &str, hostname: &str) -> Option<Admission> {
     let base = cp_url.trim_end_matches('/');
     // ct-agent#98: the host-only route (token via header) first. ct-agent#171: the legacy
@@ -118,7 +124,13 @@ async fn poll_admission(http: &reqwest::Client, cp_url: &str, token: &str, hostn
     // (the caller retries the header route later); it must never leak the routing token
     // into a URL path as a side effect of a hiccup.
     let new_url = format!("{base}/agent/acme-admission/{hostname}");
-    let resp = match http.get(&new_url).header(AGENT_TOKEN_HEADER, token).send().await {
+    let resp = match http
+        .get(&new_url)
+        .timeout(ADMISSION_REQUEST_TIMEOUT)
+        .header(AGENT_TOKEN_HEADER, token)
+        .send()
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             eprintln!("ct-agent: admission poll failed (transport): {e}");
@@ -141,7 +153,7 @@ async fn poll_admission(http: &reqwest::Client, cp_url: &str, token: &str, hostn
     }
     note_legacy_route_in_use("acme-admission");
     let legacy_url = format!("{base}/agent/acme-admission/{token}/{hostname}");
-    let resp = http.get(&legacy_url).send().await.ok()?;
+    let resp = http.get(&legacy_url).timeout(ADMISSION_REQUEST_TIMEOUT).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -160,7 +172,7 @@ async fn notify_issuance_complete(http: &reqwest::Client, cp_url: &str, token: &
     // token-in-URL route ONLY on an explicit 404 from it. Any other failure is logged and
     // dropped (this callback is best-effort by design, see the doc comment).
     let new_url = format!("{base}/agent/acme-issuance-complete/{hostname}");
-    match http.post(&new_url).header(AGENT_TOKEN_HEADER, token).send().await {
+    match http.post(&new_url).timeout(ADMISSION_REQUEST_TIMEOUT).header(AGENT_TOKEN_HEADER, token).send().await {
         Ok(resp) if resp.status().is_success() => return,
         Ok(resp) if route_is_missing(resp.status()) => {}
         Ok(resp) => {
@@ -177,7 +189,7 @@ async fn notify_issuance_complete(http: &reqwest::Client, cp_url: &str, token: &
     }
     note_legacy_route_in_use("acme-issuance-complete");
     let legacy_url = format!("{base}/agent/acme-issuance-complete/{token}/{hostname}");
-    if let Err(e) = http.post(&legacy_url).send().await {
+    if let Err(e) = http.post(&legacy_url).timeout(ADMISSION_REQUEST_TIMEOUT).send().await {
         eprintln!("ct-agent: acme-issuance-complete callback failed (non-fatal, cert is already written): {e}");
     }
 }
@@ -363,7 +375,7 @@ pub async fn obtain_or_renew(config: &AcmeCertConfig) -> Result<bool, BoxError> 
     if !needs_renewal(&config.cert_path()) {
         return Ok(false);
     }
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let http = crate::http::shared();
     let admission = poll_admission(&http, &config.cp_url, &config.routing_token, &config.hostname)
         .await
         .ok_or("admission broker did not respond -- cannot determine whether this hostname may issue yet")?;
@@ -497,9 +509,7 @@ pub async fn run_renewal_loop(config: AcmeCertConfig) -> ! {
 /// rather than growing that into a richer type every existing test asserts
 /// against as a plain bool.
 async fn admission_poll_interval(config: &AcmeCertConfig) -> Duration {
-    let Ok(http) = reqwest::Client::builder().timeout(Duration::from_secs(10)).build() else {
-        return CHECK_INTERVAL;
-    };
+    let http = crate::http::shared();
     match poll_admission(&http, &config.cp_url, &config.routing_token, &config.hostname).await {
         Some(a) if a.status != "gruen" => ADMISSION_POLL_INTERVAL,
         _ => CHECK_INTERVAL,

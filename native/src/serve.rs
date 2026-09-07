@@ -50,13 +50,28 @@ use ct_common::RoutingToken;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Read one length-prefixed frame (2-byte big-endian length + body).
-async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Vec<u8>, BoxError> {
+/// Read one length-prefixed frame (2-byte big-endian length + body) into `buf`,
+/// returning the body length. `buf` is cleared and resized to exactly the body,
+/// so its capacity is kept across calls: the relay loops that read one frame per
+/// datagram for the lifetime of a tunnel reuse a single buffer instead of
+/// allocating (and freeing) a fresh `Vec` per frame -- a per-packet allocation
+/// churn that adds up in a process meant to run for months.
+async fn read_frame_into<R: AsyncRead + Unpin>(recv: &mut R, buf: &mut Vec<u8>) -> Result<usize, BoxError> {
     let mut len = [0u8; 2];
     recv.read_exact(&mut len).await?;
     let n = u16::from_be_bytes(len) as usize;
-    let mut body = vec![0u8; n];
-    recv.read_exact(&mut body).await?;
+    buf.clear();
+    buf.resize(n, 0);
+    recv.read_exact(&mut buf[..n]).await?;
+    Ok(n)
+}
+
+/// Read one length-prefixed frame into a fresh `Vec` -- the one-shot handshake
+/// sites, where a frame is read once per connection and owned afterwards.
+/// Built on [`read_frame_into`] so there is one framing decoder, not two.
+async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Vec<u8>, BoxError> {
+    let mut body = Vec::new();
+    read_frame_into(recv, &mut body).await?;
     Ok(body)
 }
 
@@ -1393,11 +1408,13 @@ where
     // Client -> decrypt frame -> UDP datagram to Origin.
     let to_origin = async {
         let mut tmp = vec![0u8; 65535];
+        // One frame buffer for the tunnel's lifetime (see `read_frame_into`):
+        // sized for the largest 2-byte-length frame so it never regrows.
+        let mut fr = Vec::with_capacity(65535);
         loop {
-            let fr = match read_frame(&mut recv).await {
-                Ok(f) => f,
-                Err(_) => break, // tunnel closed
-            };
+            if read_frame_into(&mut recv, &mut fr).await.is_err() {
+                break; // tunnel closed
+            }
             let len = ts.lock_safe().read_message(&fr, &mut tmp).map_err(noise_err)?;
             udp.send(&tmp[..len]).await?;
         }
@@ -2616,6 +2633,31 @@ mod tests {
     use super::*;
     use crate::transport::dial_quic;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn read_frame_into_reuses_one_buffer_across_frames() {
+        // Two frames back to back on one reader: a 3-byte body, then a 5-byte one.
+        let wire: Vec<u8> = [&[0u8, 3][..], b"abc", &[0u8, 5][..], b"hello"].concat();
+        let mut reader = wire.as_slice();
+        let mut buf = Vec::with_capacity(65535);
+        let cap_before = buf.capacity();
+
+        let n = read_frame_into(&mut reader, &mut buf).await.unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(&buf[..], b"abc");
+
+        let n = read_frame_into(&mut reader, &mut buf).await.unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..], b"hello", "the second frame replaces the first, nothing leaks over");
+        assert!(buf.capacity() >= cap_before, "the buffer is reused, never shrunk, across frames");
+
+        // Reader exhausted: the next read is an error, not a phantom empty frame.
+        assert!(read_frame_into(&mut reader, &mut buf).await.is_err());
+        // `read_frame` is the same decoder with an owned result.
+        let mut reader = wire.as_slice();
+        assert_eq!(read_frame(&mut reader).await.unwrap(), b"abc");
+        assert_eq!(read_frame(&mut reader).await.unwrap(), b"hello");
+    }
 
     #[test]
     fn parse_reconnect_max_attempts_maps_zero_to_unbounded() {

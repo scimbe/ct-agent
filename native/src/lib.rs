@@ -30,6 +30,7 @@ pub mod dns01_authoritative;
 pub mod dns01_propagation;
 pub mod events;
 pub mod harness_run;
+pub mod http;
 pub mod ladder;
 pub mod local_auth;
 pub mod login;

@@ -67,9 +67,10 @@ const DEFAULT_CLIENT_ID: &str = "ct-agent-cli";
 /// actually uses it, not merely be valid at the instant of this check.
 const ACCESS_TOKEN_EXPIRY_SKEW_SECS: u64 = 30;
 
-/// Default request timeout for every call this module makes (device-code request,
-/// token poll, refresh) — matches the timeout this codebase's other one-shot
-/// `reqwest::Client`s already use (see `dns01_propagation::build_http`).
+/// Per-request timeout for every call this module makes (device-code request,
+/// token poll, refresh), applied on each request builder over the shared
+/// client's default (`crate::http`) — matches the timeout this codebase's other
+/// one-shot calls already use (see `dns01_propagation::DEFAULT_REQUEST_TIMEOUT`).
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// RFC 8628 §3.2 device authorization response.
@@ -157,10 +158,6 @@ fn token_url(issuer: &str) -> String {
     format!("{}/protocol/openid-connect/token", issuer.trim_end_matches('/'))
 }
 
-fn build_http_client() -> reqwest::Client {
-    reqwest::Client::builder().timeout(HTTP_TIMEOUT).build().unwrap_or_else(|_| reqwest::Client::new())
-}
-
 fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -174,6 +171,7 @@ async fn request_device_code(
 ) -> Result<DeviceCodeResponse, String> {
     let resp = http
         .post(device_auth_url)
+        .timeout(HTTP_TIMEOUT)
         .form(&[("client_id", client_id), ("scope", "openid")])
         .send()
         .await
@@ -235,6 +233,7 @@ async fn poll_for_token_with_backoff(
 
         let resp = http
             .post(token_url)
+            .timeout(HTTP_TIMEOUT)
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", device_code),
@@ -272,6 +271,7 @@ async fn refresh_access_token(
 ) -> Result<TokenResponse, LoginError> {
     let resp = http
         .post(token_url)
+        .timeout(HTTP_TIMEOUT)
         .form(&[("grant_type", "refresh_token"), ("refresh_token", refresh_token), ("client_id", client_id)])
         .send()
         .await
@@ -410,7 +410,7 @@ impl LoginConfig {
 /// outcome to stdout/stderr. Returns `Err` with a message ready to print — never
 /// panics on a declined or expired login, only on a config error.
 pub async fn run_login(cfg: LoginConfig) -> Result<(), String> {
-    let http = build_http_client();
+    let http = crate::http::shared();
     let device = request_device_code(&http, &device_auth_url(&cfg.issuer), &cfg.client_id).await?;
 
     eprintln!(
@@ -625,7 +625,7 @@ pub(crate) async fn resolve_oidc_token_classified() -> Result<String, ResolveErr
             "the stored login has expired and {why}. Run `ct-agent login` again, {UNATTENDED_HINT}."
         )));
     };
-    let http = build_http_client();
+    let http = crate::http::shared();
     let token_endpoint = token_url(&stored.issuer);
     let refreshed = match refresh_access_token(&http, &token_endpoint, &stored.client_id, refresh_token).await {
         Ok(r) => r,

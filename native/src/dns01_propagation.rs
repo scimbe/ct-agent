@@ -37,11 +37,13 @@ pub const DEFAULT_RESOLVER_URLS: &[&str] = &["https://cloudflare-dns.com/dns-que
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Bound on a single DoH lookup (or Cloudflare purge) round-trip. Without it,
-/// `reqwest::Client::new()` has NO request timeout at all -- a resolver that
-/// accepts the connection and then never responds (a stall, not a refusal;
-/// `tolerates_resolver_errors_and_keeps_retrying` below already covers a
-/// refused connection) hangs `lookup().await` forever. `wait_for`'s own
+/// Bound on a single DoH lookup (or Cloudflare purge) round-trip, applied per
+/// request over the shared client's default (`crate::http`). Historically this
+/// module used a bare `reqwest::Client::new()`, which has NO request timeout
+/// at all -- a resolver that accepts the connection and then never responds
+/// (a stall, not a refusal; `tolerates_resolver_errors_and_keeps_retrying`
+/// below already covers a refused connection) hangs `lookup().await` forever.
+/// `wait_for`'s own
 /// `deadline` check (see below) only runs AFTER a full round of lookups
 /// completes, so an unbounded single request silently defeats the entire
 /// `timeout` budget this module exists to enforce. Same bug class already
@@ -89,16 +91,13 @@ const DEFAULT_INITIAL_DELAY: Duration = Duration::from_secs(5);
 const CLOUDFLARE_DOH: &str = "https://cloudflare-dns.com/dns-query";
 const CLOUDFLARE_PURGE_URL: &str = "https://cloudflare-dns.com/api/v1/purge";
 
-/// Same fallback idiom used throughout this codebase's other `reqwest::Client`
-/// construction sites (e.g. `CADS-Tunnel/crates/control-plane/src/client.rs`):
-/// a client without the intended timeout is still strictly safer than a
-/// panic on an unlikely TLS-backend build failure.
-fn build_http(request_timeout: Duration) -> reqwest::Client {
-    reqwest::Client::builder().timeout(request_timeout).build().unwrap_or_else(|_| reqwest::Client::new())
-}
-
 pub struct PropagationWaiter {
+    /// The process-wide client (`crate::http`); the per-lookup bound lives in
+    /// `request_timeout` and is applied on every request, not baked into a
+    /// client of this waiter's own.
     http: reqwest::Client,
+    /// Bound on one DoH lookup / purge round-trip (see [`DEFAULT_REQUEST_TIMEOUT`]).
+    request_timeout: Duration,
     resolver_urls: Vec<String>,
     timeout: Duration,
     interval: Duration,
@@ -125,7 +124,8 @@ impl PropagationWaiter {
 
     pub(crate) fn with_interval(resolver_urls: Vec<String>, timeout: Duration, interval: Duration) -> Self {
         Self {
-            http: build_http(DEFAULT_REQUEST_TIMEOUT),
+            http: crate::http::shared(),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             resolver_urls,
             timeout,
             interval,
@@ -147,7 +147,7 @@ impl PropagationWaiter {
     /// doesn't have to wait out the real (generous) production default.
     #[cfg(test)]
     fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
-        self.http = build_http(request_timeout);
+        self.request_timeout = request_timeout;
         self
     }
 
@@ -160,7 +160,8 @@ impl PropagationWaiter {
         cloudflare_purge_url: String,
     ) -> Self {
         Self {
-            http: build_http(DEFAULT_REQUEST_TIMEOUT),
+            http: crate::http::shared(),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             resolver_urls,
             timeout,
             interval,
@@ -247,6 +248,7 @@ impl PropagationWaiter {
         let _ = self
             .http
             .post(&self.cloudflare_purge_url)
+            .timeout(self.request_timeout)
             .query(&[("domain", record_name), ("type", "TXT")])
             .send()
             .await;
@@ -256,6 +258,7 @@ impl PropagationWaiter {
         let resp = self
             .http
             .get(resolver_url)
+            .timeout(self.request_timeout)
             .header("accept", "application/dns-json")
             .query(&[("name", name), ("type", "TXT")])
             .send()
