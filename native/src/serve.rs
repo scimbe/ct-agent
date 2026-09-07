@@ -661,13 +661,17 @@ where
 /// frames for the credential exchange, which `noise_pump` has no hook for.
 ///
 /// Returns:
-/// - `Ok(Some(bytes))`: the gate passed AND `bytes` (the Client's first real
-///   request, already decrypted by the HTTP sub-mode's credential check) must
-///   be forwarded to the Origin before starting the pump -- the request line
-///   was already consumed reading the credential, so it cannot be read twice.
-/// - `Ok(None)`: the gate passed with nothing pending to forward (mode is
-///   `Off`, or `TextChallenge` -- its prompt/reply exchange never touches the
-///   Origin at all).
+/// - `Ok(GateOutcome::Proceed(Some(bytes)))`: the gate passed AND `bytes`
+///   (the Client's first real request, already decrypted by the HTTP
+///   sub-mode's credential check) must be forwarded to the Origin before
+///   starting the pump -- the request line was already consumed reading the
+///   credential, so it cannot be read twice.
+/// - `Ok(GateOutcome::Proceed(None))`: the gate passed with nothing pending
+///   to forward (mode is `Off`, or `TextChallenge` -- its prompt/reply
+///   exchange never touches the Origin at all).
+/// - `Ok(GateOutcome::Closed)`: the gate answered the Client itself and the
+///   connection is done -- a share link's 302 (#185). Not a rejection: the
+///   caller returns `Ok(())` without dialing the Origin.
 /// - `Err(_)`: the gate rejected the connection. The caller must tear the
 ///   connection down WITHOUT ever dialing the Origin -- a rejection response
 ///   has already been written to the Client.
@@ -676,28 +680,44 @@ async fn run_local_auth_gate<S, R>(
     transport: &mut snow::TransportState,
     send: &mut S,
     recv: &mut R,
-) -> Result<Option<Vec<u8>>, BoxError>
+) -> Result<GateOutcome, BoxError>
 where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
     match gate.mode {
-        local_auth::GateMode::Off => Ok(None),
+        local_auth::GateMode::Off => Ok(GateOutcome::Proceed(None)),
         local_auth::GateMode::Http => {
             let plaintext = read_gate_message(transport, recv).await?;
-            let verdict = match local_auth::parse_basic_auth(&plaintext) {
-                Some((user, pass)) => gate.verify(&user, &pass),
-                // No Authorization header offered yet -- a browser's very first
-                // attempt, before it has ever seen the 401. Rejected the same as
-                // a wrong credential, but NOT counted against the rate limiter
-                // (gate.verify() is never called here) -- that natural first pass
+            if let Some((user, pass)) = local_auth::parse_basic_auth(&plaintext) {
+                return match gate.verify(&user, &pass) {
+                    Ok(()) => Ok(GateOutcome::Proceed(Some(plaintext))),
+                    Err(_) => {
+                        write_gate_message(transport, send, &local_auth::http_401_challenge()).await?;
+                        Err("local-auth gate: HTTP credential rejected".into())
+                    }
+                };
+            }
+            // No Authorization header. A share link (#185) may still carry the
+            // request: `?ct_link=<token>` on the target (answered with a 302
+            // that moves the token into a cookie) or the cookie itself.
+            match gate.check_share_link(&plaintext) {
+                local_auth::LinkGateVerdict::Authenticated { .. } => Ok(GateOutcome::Proceed(Some(plaintext))),
+                local_auth::LinkGateVerdict::Redirect { response, .. } => {
+                    write_gate_message(transport, send, &response).await?;
+                    Ok(GateOutcome::Closed)
+                }
+                local_auth::LinkGateVerdict::Rejected(why) => {
+                    write_gate_message(transport, send, &local_auth::http_401_challenge()).await?;
+                    Err(format!("local-auth gate: share link rejected ({why})").into())
+                }
+                // Nothing offered at all -- a browser's very first attempt,
+                // before it has ever seen the 401. Rejected the same as a wrong
+                // credential, but NOT counted against the rate limiter (neither
+                // gate.verify() nor a link check ran) -- that natural first pass
                 // must not burn part of a real attacker's failure budget away
                 // from a legitimate browser's normal flow.
-                None => Err(local_auth::GateRejection::BadCredential),
-            };
-            match verdict {
-                Ok(()) => Ok(Some(plaintext)),
-                Err(_) => {
+                local_auth::LinkGateVerdict::NotPresented => {
                     write_gate_message(transport, send, &local_auth::http_401_challenge()).await?;
                     Err("local-auth gate: HTTP credential rejected".into())
                 }
@@ -708,7 +728,7 @@ where
             let attempt = read_gate_message(transport, recv).await?;
             let attempt = trim_trailing_line_ending(&attempt);
             match gate.verify_password_only(attempt) {
-                Ok(()) => Ok(None),
+                Ok(()) => Ok(GateOutcome::Proceed(None)),
                 Err(_) => {
                     write_gate_message(transport, send, local_auth::TEXT_CHALLENGE_DENIED).await?;
                     Err("local-auth gate: text-challenge credential rejected".into())
@@ -716,6 +736,17 @@ where
             }
         }
     }
+}
+
+/// What [`run_local_auth_gate`] decided about a connection it did not reject.
+enum GateOutcome {
+    /// Dial the Origin; `Some(bytes)` is the Client's already-consumed first
+    /// request that must be written ahead of the pump.
+    Proceed(Option<Vec<u8>>),
+    /// The gate answered the Client itself (a share link's 302, #185) and the
+    /// connection is finished -- cleanly, not as a rejection. The Origin is
+    /// never dialed; the browser comes back with the cookie on a fresh one.
+    Closed,
 }
 
 /// Strip one trailing `\r\n`/`\n` from an interactive text-challenge reply --
@@ -1276,7 +1307,11 @@ where
     // frame exchange BEFORE the Origin is ever dialed, so a rejected
     // connection never reaches it at all -- see `local_auth`'s module doc for
     // the threat model this defends (and does not defend).
-    let gate_prefix = run_local_auth_gate(gate, &mut transport, &mut send, &mut recv).await?;
+    let gate_prefix = match run_local_auth_gate(gate, &mut transport, &mut send, &mut recv).await? {
+        GateOutcome::Proceed(prefix) => prefix,
+        // A share link's 302 (#185) already answered this connection.
+        GateOutcome::Closed => return Ok(()),
+    };
 
     // Bridge the Noise session <-> the Origin TCP socket, both ways, streaming.
     // Meter the Origin socket: bytes read from it flow back to the Client
@@ -3181,6 +3216,105 @@ mod tests {
             "a valid credential must let the origin be dialed"
         );
         rig.agent_task.await.unwrap().expect("gate passed, serving completed cleanly");
+    }
+
+    #[tokio::test]
+    async fn local_auth_http_gate_redeems_a_share_link_by_url_with_a_302_and_never_dials_origin() {
+        // #185: a valid `?ct_link=` answers with a 302 back to the same target
+        // minus the parameter, carrying the session cookie -- the connection
+        // ends there, cleanly, without the origin ever being dialed.
+        let gate = gate_for_test("http", "agent", "s3cret");
+        let minted = gate.links().unwrap().mint(std::time::Duration::from_secs(3600), false, "guest").unwrap();
+        let mut rig = setup_gate_test(gate).await;
+
+        let req = format!("GET /app?{}={}&x=1 HTTP/1.1\r\nHost: x\r\n\r\n", local_auth::LINK_QUERY_PARAM, minted.token);
+        let mut buf = vec![0u8; 65535];
+        let mut tmp = vec![0u8; 65535];
+        let n = rig.transport.write_message(req.as_bytes(), &mut buf).unwrap();
+        rig.c_write.write_all(&frame(&buf[..n])).await.unwrap();
+
+        let resp_ct = read_frame(&mut rig.c_read).await.unwrap();
+        let n = rig.transport.read_message(&resp_ct, &mut tmp).unwrap();
+        let resp = String::from_utf8_lossy(&tmp[..n]);
+        assert!(resp.starts_with("HTTP/1.1 302 Found\r\n"), "got: {resp}");
+        assert!(resp.contains("\r\nLocation: /app?x=1\r\n"), "got: {resp}");
+        let cookie_prefix = format!(
+            "\r\nSet-Cookie: {}={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=",
+            local_auth::LINK_COOKIE_NAME,
+            minted.token
+        );
+        assert!(resp.contains(&cookie_prefix), "got: {resp}");
+
+        let result = rig.agent_task.await.unwrap();
+        assert!(result.is_ok(), "a redeemed link ends the connection cleanly, not as a rejection: {result:?}");
+        assert!(
+            !rig.origin_dialed.load(std::sync::atomic::Ordering::SeqCst),
+            "the 302 is answered by the gate itself; the origin must not be dialed"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_auth_http_gate_accepts_a_share_link_cookie_and_forwards_the_request() {
+        let gate = gate_for_test("http", "agent", "s3cret");
+        let minted = gate.links().unwrap().mint(std::time::Duration::from_secs(3600), false, "guest").unwrap();
+        let mut rig = setup_gate_test(gate).await;
+
+        let req = format!(
+            "GET /ok HTTP/1.1\r\nHost: x\r\nCookie: theme=dark; {}={}\r\n\r\n",
+            local_auth::LINK_COOKIE_NAME,
+            minted.token
+        );
+        let mut buf = vec![0u8; 65535];
+        let n = rig.transport.write_message(req.as_bytes(), &mut buf).unwrap();
+        rig.c_write.write_all(&frame(&buf[..n])).await.unwrap();
+        rig.c_write.shutdown().await.unwrap();
+
+        let mut tmp = vec![0u8; 65535];
+        let mut echoed = Vec::new();
+        while let Ok(ct) = read_frame(&mut rig.c_read).await {
+            let n = rig.transport.read_message(&ct, &mut tmp).unwrap();
+            echoed.extend_from_slice(&tmp[..n]);
+        }
+        assert_eq!(echoed, req.as_bytes(), "the cookie-authenticated request reached the origin unmodified");
+        assert!(rig.origin_dialed.load(std::sync::atomic::Ordering::SeqCst));
+        rig.agent_task.await.unwrap().expect("gate passed, serving completed cleanly");
+    }
+
+    #[tokio::test]
+    async fn local_auth_http_gate_refuses_an_expired_share_link_with_the_401_challenge() {
+        let gate = gate_for_test("http", "agent", "s3cret");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Minted two hours ago with a one-hour TTL: expired an hour ago.
+        let stale = gate
+            .links()
+            .unwrap()
+            .mint_at(now - 7200, std::time::Duration::from_secs(3600), false, "stale")
+            .unwrap();
+        let mut rig = setup_gate_test(gate).await;
+
+        let req = format!(
+            "GET /app HTTP/1.1\r\nHost: x\r\nCookie: {}={}\r\n\r\n",
+            local_auth::LINK_COOKIE_NAME,
+            stale.token
+        );
+        let mut buf = vec![0u8; 65535];
+        let mut tmp = vec![0u8; 65535];
+        let n = rig.transport.write_message(req.as_bytes(), &mut buf).unwrap();
+        rig.c_write.write_all(&frame(&buf[..n])).await.unwrap();
+
+        let resp_ct = read_frame(&mut rig.c_read).await.unwrap();
+        let n = rig.transport.read_message(&resp_ct, &mut tmp).unwrap();
+        let resp = String::from_utf8_lossy(&tmp[..n]);
+        assert!(resp.starts_with("HTTP/1.1 401"), "got: {resp}");
+        assert!(resp.contains("WWW-Authenticate: Basic"), "got: {resp}");
+
+        let result = rig.agent_task.await.unwrap();
+        let err = result.expect_err("an expired link is a rejection").to_string();
+        assert!(err.contains("share link rejected (link expired)"), "{err}");
+        assert!(!rig.origin_dialed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

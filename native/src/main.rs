@@ -60,6 +60,12 @@ USAGE:
     ct-agent local-auth reset   Generate a fresh local-auth gate credential, printed once
     ct-agent local-auth rotate  Alias for `reset` -- same operation, the name an operator
                                  reaches for after a suspected leak
+    ct-agent local-auth link --ttl <1h|24h|7d|<n>s> [--once] [--label <text>]
+                                Mint a time-boxed share link for the gate: the token is
+                                 printed once; `?ct_link=<token>` on any URL sets a session
+                                 cookie for the link's lifetime (--once: the URL redeems once)
+    ct-agent local-auth links   List share links (ids, labels, expiry, state -- never tokens)
+    ct-agent local-auth link-revoke <id>   Revoke a share link (its cookie stops working too)
     ct-agent certificate        Run the ACME DNS-01 certificate renewal loop
     ct-agent relay-node         Run a Circuit-Relay v2 / DCUtR relay node
     ct-agent channel init                 Mint a fresh channel member identity
@@ -133,6 +139,17 @@ against the release's published <asset>.sha256 before it is written, under a 60 
 256 MiB size cap; a mismatch or a missing checksum file refuses the update. Set
 CT_AGENT_UPDATE_SKIP_VERIFY=1 to skip ONLY the checksum check for a private build that has
 none -- never on a fleet.
+
+Release provenance (#184): each release also publishes release-manifest.json (every asset's
+sha256 under one signed statement) and, once the maintainer's signing key exists, its
+ed25519 signature release-manifest.sig. This build pins the release public key(s) in
+self_update.rs's RELEASE_SIGNING_PUBKEYS; with a key pinned, `update` and auto-update
+REQUIRE a manifest that verifies and matches the asset (the per-asset .sha256 alone no
+longer suffices). While no key is pinned (the state until the maintainer creates one), a
+manifest is fetched and logged as \"unverified: no release key pinned\" and the per-asset
+check decides, exactly as before. CT_AGENT_RELEASE_PUBKEY=<64 hex> pins a private build's
+own key instead (it replaces the compiled-in list). CT_AGENT_UPDATE_SKIP_VERIFY=1 bypasses
+the manifest check as well, loudly.
 
 `manifest` (CADS-agent-marketplace: Compose services since Phase 1, Binary executables since
 Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
@@ -323,7 +340,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                      recoverable after this:\n\n{printed}\n"
                 );
             }
-            _ => return Err("usage: ct-agent local-auth set <user> <password> | reset | rotate".into()),
+            // Share links (#185): a time-boxed, revocable way in that is NOT the
+            // credential -- see ct_agent::local_auth's module doc. The serving
+            // agent re-reads the links file on every check, so these take effect
+            // without a restart.
+            Some("link") => {
+                let args: Vec<String> = std::env::args().skip(3).collect();
+                let parsed = ct_agent::local_auth::parse_link_args(&args)?;
+                let store = ct_agent::local_auth::LinkStore::new(state_dir);
+                let minted = store.mint(parsed.ttl, parsed.single_use, &parsed.label)?;
+                eprintln!("{}\n", minted.announcement(parsed.ttl));
+            }
+            Some("links") => {
+                let store = ct_agent::local_auth::LinkStore::new(state_dir);
+                let links = store.list()?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                eprintln!("ct-agent: {} share link(s) in {:?}:", links.len(), store.path());
+                for l in &links {
+                    eprintln!(
+                        "  {}  {:<26}  expires_at={}  once={}  used_at={}  label={:?}",
+                        l.id,
+                        l.status(now),
+                        l.expires_at,
+                        if l.single_use { "yes" } else { "no" },
+                        l.used_at.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()),
+                        l.label,
+                    );
+                }
+            }
+            Some("link-revoke") => {
+                let id = std::env::args().nth(3).ok_or("usage: ct-agent local-auth link-revoke <id>")?;
+                let store = ct_agent::local_auth::LinkStore::new(state_dir);
+                let revoked = store.revoke(&id)?;
+                eprintln!(
+                    "ct-agent: local-auth share link {} revoked (label {:?}) -- its URL and its cookie no longer work",
+                    revoked.id, revoked.label
+                );
+            }
+            _ => {
+                return Err("usage: ct-agent local-auth set <user> <password> | reset | rotate | \
+                            link --ttl <duration> [--once] [--label <text>] | links | link-revoke <id>"
+                    .into())
+            }
         }
         return Ok(());
     }

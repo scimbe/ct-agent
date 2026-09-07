@@ -148,3 +148,123 @@ jobs:
           cp "$sup" "$sup_asset"
           checksum "$sup_asset"
           gh release upload "$RELEASE_TAG" "$sup_asset" "$sup_asset.sha256" --clobber
+
+  manifest:
+    # #184: one signed statement of what this release IS. The per-asset .sha256 files
+    # above prove a download arrived intact; they say nothing about who published it,
+    # because whoever can write the release can write the checksum next to it. This job
+    # collects every published .sha256 into ONE release-manifest.json and -- once the
+    # operator has created the signing key -- signs it with an ed25519 key that lives
+    # only in the CT_RELEASE_SIGNING_KEY repository secret. ct-agent's self-update pins
+    # the matching PUBLIC key (native/src/self_update.rs, RELEASE_SIGNING_PUBKEYS /
+    # CT_AGENT_RELEASE_PUBKEY); with a key pinned it refuses any release whose manifest
+    # is missing, unsigned, signed by another key, or disagrees with the asset.
+    #
+    # One-time key setup (scimbe, not yet done as of 2026-09-06):
+    #   openssl genpkey -algorithm ed25519 -out ct-release-signing.pem
+    #   # public key, 64 hex chars -- paste into RELEASE_SIGNING_PUBKEYS in self_update.rs:
+    #   openssl pkey -in ct-release-signing.pem -pubout -outform DER | tail -c 32 | xxd -p -c 64
+    #   # then store the PEM (the whole file, including the BEGIN/END lines) as the
+    #   # repository secret CT_RELEASE_SIGNING_KEY (Settings -> Secrets -> Actions).
+    # Rotation: add the new public key as the second RELEASE_SIGNING_PUBKEYS slot, ship a
+    # release signed by the OLD key (so every agent learns the new key), then swap the
+    # secret and drop the old slot in the following release.
+    #
+    # Until the secret exists, the manifest is still built and uploaded UNSIGNED: agents
+    # (which pin no key yet) log it as "unverified: no release key pinned" and keep
+    # installing on the per-asset .sha256 alone, exactly as before #184. The signing step
+    # is gated on the secret being non-empty; a `secrets.*` expression is not allowed in
+    # a step-level `if`, so the secret is mapped into the job's env first.
+    #
+    # Format (schema 1, keys sorted, compact -- the signature is over these EXACT bytes):
+    #   {"assets":{"<asset-name>":"<sha256 hex>",...},"created_at":<unix>,"schema":1,"tag":"vX.Y.Z"}
+    #   release-manifest.sig = base64 of the raw 64-byte ed25519 signature.
+    # Verify by hand:
+    #   base64 -d release-manifest.sig > sig.bin
+    #   openssl pkeyutl -verify -pubin -inkey ct-release-signing.pub.pem -rawin \
+    #     -in release-manifest.json -sigfile sig.bin
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      CT_RELEASE_SIGNING_KEY: ${{ secrets.CT_RELEASE_SIGNING_KEY }}
+    steps:
+      - name: Download every published checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p sums
+          gh release download "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" -p '*.sha256' -D sums
+          ls -l sums
+          # An empty set means the build matrix uploaded nothing -- refuse to publish a
+          # manifest that vouches for no assets.
+          [ -n "$(ls -A sums)" ] || { echo "::error::no .sha256 files on release $RELEASE_TAG"; exit 1; }
+
+      - name: Build release-manifest.json
+        run: |
+          # Deterministic: sorted keys, no whitespace. The asset name is the checksum file
+          # name minus its .sha256 suffix; the digest is the first token of its one line
+          # (both `sha256sum` and macOS `shasum -a 256` write `<hex>  <name>`).
+          python3 - <<'PY'
+          import json, os, re, sys, time
+          assets = {}
+          for fn in sorted(os.listdir("sums")):
+              if not fn.endswith(".sha256"):
+                  continue
+              name = fn[: -len(".sha256")]
+              with open(os.path.join("sums", fn), encoding="utf-8") as f:
+                  digest = f.read().split()[0].lower()
+              if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                  sys.exit(f"{fn}: not a SHA-256 hex digest: {digest!r}")
+              assets[name] = digest
+          manifest = {
+              "schema": 1,
+              "tag": os.environ["RELEASE_TAG"],
+              "created_at": int(time.time()),
+              "assets": assets,
+          }
+          with open("release-manifest.json", "wb") as f:
+              f.write(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+          print(open("release-manifest.json").read())
+          PY
+
+      - name: Sign release-manifest.json (only when CT_RELEASE_SIGNING_KEY is set)
+        if: ${{ env.CT_RELEASE_SIGNING_KEY != '' }}
+        run: |
+          umask 077
+          printf '%s\n' "$CT_RELEASE_SIGNING_KEY" > key.pem
+          # Prefer python `cryptography` (preinstalled on the GitHub runner images); fall
+          # back to openssl, which produces the identical raw 64-byte signature for ed25519.
+          if python3 -c 'import cryptography.hazmat.primitives.serialization' 2>/dev/null; then
+            python3 - <<'PY'
+          from cryptography.hazmat.primitives import serialization
+          with open("key.pem", "rb") as f:
+              key = serialization.load_pem_private_key(f.read(), password=None)
+          with open("release-manifest.json", "rb") as f:
+              sig = key.sign(f.read())
+          assert len(sig) == 64
+          with open("sig.bin", "wb") as f:
+              f.write(sig)
+          PY
+          else
+            openssl pkeyutl -sign -inkey key.pem -rawin -in release-manifest.json -out sig.bin
+          fi
+          base64 -w0 sig.bin > release-manifest.sig
+          echo >> release-manifest.sig
+          # Self-check against the public half before publishing anything.
+          openssl pkey -in key.pem -pubout -out pub.pem
+          openssl pkeyutl -verify -pubin -inkey pub.pem -rawin -in release-manifest.json -sigfile sig.bin
+          echo "signed with public key $(openssl pkey -in key.pem -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+          rm -f key.pem
+
+      - name: Upload the manifest (and its signature, when signed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files="release-manifest.json"
+          if [ -f release-manifest.sig ]; then
+            files="$files release-manifest.sig"
+          else
+            echo "::warning::CT_RELEASE_SIGNING_KEY is not set -- release-manifest.json uploaded UNSIGNED (#184)"
+          fi
+          # shellcheck disable=SC2086
+          gh release upload "$RELEASE_TAG" $files --clobber
