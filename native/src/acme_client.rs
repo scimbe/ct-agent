@@ -80,12 +80,118 @@ pub struct AcmeClient {
     eab: Option<(String, String)>,
 }
 
+/// ct-agent#172: env var naming extra ACME directory hosts (comma-separated) this agent may
+/// talk to beyond the known-CA registry -- for a private CA (step-ca, Pebble, an internal
+/// Boulder). Hosts only, no scheme/port; compared case-insensitively.
+pub const ALLOW_DIRECTORY_HOST_ENV: &str = "CT_ACME_ALLOW_DIRECTORY_HOST";
+
+/// Parse a `CT_ACME_ALLOW_DIRECTORY_HOST` value into its host list (trimmed, empties dropped).
+pub fn parse_allowed_directory_hosts(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The host part of a parsed URL, lowercased, IPv6 brackets stripped -- `None` when it has
+/// no host.
+fn host_of(url: &reqwest::Url) -> Option<String> {
+    let host = url.host_str()?.trim_matches(['[', ']']).to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// [`host_of`] straight from a URL string -- `None` when it does not parse either.
+fn directory_host(url: &str) -> Option<String> {
+    host_of(&reqwest::Url::parse(url).ok()?)
+}
+
+/// Whether `host` (as produced by [`directory_host`]) names this machine.
+fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// ct-agent#172: the policy [`AcmeClient::discover`] applies to a directory URL BEFORE any
+/// byte is sent. The URL arrives from the admission broker (a control-plane decision this
+/// agent deliberately does not second-guess, see `acme_orchestrate`), but a compromised or
+/// spoofed control plane must not turn this agent into an SSRF proxy: the ACME client follows
+/// the directory's own `newNonce`/`newAccount`/`newOrder` URLs and POSTs signed bodies to them.
+///
+/// Accepted:
+/// - `https://` with a host that appears in the known-CA registry
+///   ([`crate::acme_ca::all_known`]), or
+/// - `https://` with a host the operator listed in `CT_ACME_ALLOW_DIRECTORY_HOST`
+///   (`extra_hosts`), or
+/// - `http://` ONLY for a LOOPBACK host that is ALSO listed in `extra_hosts` -- the seam a
+///   local mock/Pebble needs; loopback never crosses a network, and listing it is an explicit
+///   operator act.
+///
+/// Refused with the reason named: anything else, including `http://` to a known CA.
+pub fn directory_url_policy(directory_url: &str, extra_hosts: &[String]) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(directory_url)
+        .map_err(|e| format!("ACME directory URL '{directory_url}' is not a valid URL: {e} (ct-agent#172)"))?;
+    let host = host_of(&parsed)
+        .ok_or_else(|| format!("ACME directory URL '{directory_url}' has no host (ct-agent#172)"))?;
+    let listed = extra_hosts.iter().any(|h| h.trim().trim_matches(['[', ']']).eq_ignore_ascii_case(&host));
+    match parsed.scheme() {
+        "https" => {}
+        "http" if listed && is_loopback_host(&host) => return Ok(()),
+        "http" => {
+            return Err(format!(
+                "ACME directory URL '{directory_url}' must be https:// -- refusing to run ACME over \
+                 cleartext (http:// is accepted only for a loopback host listed in \
+                 {ALLOW_DIRECTORY_HOST_ENV}) (ct-agent#172)"
+            ))
+        }
+        other => {
+            return Err(format!(
+                "ACME directory URL '{directory_url}' must be https:// (got '{other}://') (ct-agent#172)"
+            ))
+        }
+    }
+    if listed {
+        return Ok(());
+    }
+    let known: Vec<String> =
+        crate::acme_ca::all_known().iter().filter_map(|ca| directory_host(ca.directory_url)).collect();
+    if known.iter().any(|k| k == &host) {
+        return Ok(());
+    }
+    Err(format!(
+        "ACME directory host '{host}' is not in the known-CA registry ({}) -- set \
+         {ALLOW_DIRECTORY_HOST_ENV}=<host>[,<host>] on this agent to allow a private CA \
+         (ct-agent#172)",
+        known.join(", ")
+    ))
+}
+
 impl AcmeClient {
     /// Fetch the ACME directory at `directory_url` (e.g.
     /// `https://acme-v02.api.letsencrypt.org/directory`, or the staging
     /// equivalent for testing) and prepare a client using `account` to sign
-    /// every subsequent request.
+    /// every subsequent request. ct-agent#172: the URL must pass
+    /// [`directory_url_policy`] first, with the extra hosts read from
+    /// `CT_ACME_ALLOW_DIRECTORY_HOST` in this process's environment; callers
+    /// that already hold that list use [`Self::discover_with_allowed_hosts`].
     pub async fn discover(directory_url: &str, account: AccountKey) -> Result<Self, BoxError> {
+        let extra = parse_allowed_directory_hosts(std::env::var(ALLOW_DIRECTORY_HOST_ENV).ok().as_deref());
+        Self::discover_with_allowed_hosts(directory_url, account, &extra).await
+    }
+
+    /// [`Self::discover`] with the operator's extra directory hosts made explicit
+    /// (ct-agent#172): `extra_hosts` is the parsed `CT_ACME_ALLOW_DIRECTORY_HOST` list.
+    /// Nothing is sent to a URL that fails [`directory_url_policy`].
+    pub async fn discover_with_allowed_hosts(
+        directory_url: &str,
+        account: AccountKey,
+        extra_hosts: &[String],
+    ) -> Result<Self, BoxError> {
+        directory_url_policy(directory_url, extra_hosts)?;
         let http = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
         let resp = http.get(directory_url).send().await?;
         if !resp.status().is_success() {
@@ -492,6 +598,73 @@ mod tests {
         (base, state)
     }
 
+    /// ct-agent#172: the hermetic mock listens on plain http://127.0.0.1 -- exactly the one
+    /// http:// shape the directory policy still admits, and only when the operator lists
+    /// loopback explicitly. Tests pass that list the same way a real deployment would via
+    /// CT_ACME_ALLOW_DIRECTORY_HOST, so the policy is exercised, not bypassed.
+    fn loopback_only() -> Vec<String> {
+        vec!["127.0.0.1".to_string()]
+    }
+
+    #[test]
+    fn directory_url_policy_accepts_known_ca_hosts_over_https_172() {
+        for ca in crate::acme_ca::all_known() {
+            assert!(directory_url_policy(ca.directory_url, &[]).is_ok(), "{}: {}", ca.name, ca.directory_url);
+        }
+        assert!(
+            directory_url_policy("https://ACME-V02.API.LETSENCRYPT.ORG/directory", &[]).is_ok(),
+            "host comparison is case-insensitive"
+        );
+    }
+
+    #[test]
+    fn directory_url_policy_refuses_an_unknown_host_172() {
+        let err = directory_url_policy("https://acme.evil.invalid/directory", &[]).unwrap_err();
+        assert!(err.contains("not in the known-CA registry") && err.contains("CT_ACME_ALLOW_DIRECTORY_HOST"), "{err}");
+        // A spoofed broker pointing at an internal service: refused before any byte is sent.
+        assert!(directory_url_policy("https://10.0.0.5/directory", &[]).is_err());
+        assert!(directory_url_policy("https://169.254.169.254/latest/meta-data", &[]).is_err());
+        assert!(directory_url_policy("not a url", &[]).is_err());
+    }
+
+    #[test]
+    fn directory_url_policy_refuses_http_even_for_a_known_host_172() {
+        let err = directory_url_policy("http://acme-v02.api.letsencrypt.org/directory", &[]).unwrap_err();
+        assert!(err.contains("must be https://"), "{err}");
+        // A listed NON-loopback host still needs https.
+        let err = directory_url_policy("http://ca.internal/directory", &["ca.internal".to_string()]).unwrap_err();
+        assert!(err.contains("must be https://"), "{err}");
+        // Loopback over http without listing it: refused too.
+        assert!(directory_url_policy("http://127.0.0.1:14000/dir", &[]).is_err());
+        assert!(directory_url_policy("ftp://acme-v02.api.letsencrypt.org/directory", &[]).is_err());
+    }
+
+    #[test]
+    fn directory_url_policy_honours_the_explicit_host_override_172() {
+        let extra = parse_allowed_directory_hosts(Some(" ca.internal , 127.0.0.1,, ::1 "));
+        assert_eq!(extra, vec!["ca.internal", "127.0.0.1", "::1"]);
+        assert!(directory_url_policy("https://ca.internal/acme/directory", &extra).is_ok(), "private CA over https");
+        assert!(directory_url_policy("https://CA.INTERNAL/acme/directory", &extra).is_ok());
+        assert!(directory_url_policy("http://127.0.0.1:14000/dir", &extra).is_ok(), "listed loopback may use http");
+        assert!(directory_url_policy("http://[::1]:14000/dir", &extra).is_ok(), "bracketed IPv6 loopback matches");
+        assert!(directory_url_policy("https://other.internal/dir", &extra).is_err(), "only the listed hosts");
+        assert!(parse_allowed_directory_hosts(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn discover_refuses_a_directory_outside_the_registry_before_sending_anything_172() {
+        // The mock is reachable, but not listed and not a known CA: the policy must refuse
+        // before the directory is even fetched (no nonce/account traffic ever happens).
+        let (base, mock) = spawn_mock_acme().await;
+        let account = AccountKey::generate().unwrap();
+        let err = match AcmeClient::discover_with_allowed_hosts(&format!("{base}/directory"), account, &[]).await {
+            Ok(_) => panic!("an unlisted directory host must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("ct-agent#172"), "{err}");
+        assert_eq!(*mock.nonce_uses.lock().unwrap(), 0, "nothing was sent");
+    }
+
     fn nonce_headers() -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert("replay-nonce", "test-nonce-1".parse().unwrap());
@@ -636,7 +809,7 @@ mod tests {
         let publish = Dns01Provider::SelfHosted(store.clone());
 
         let account = AccountKey::generate().unwrap();
-        let mut client = AcmeClient::discover(&format!("{base}/directory"), account).await.unwrap();
+        let mut client = AcmeClient::discover_with_allowed_hosts(&format!("{base}/directory"), account, &loopback_only()).await.unwrap();
         let issued = client.issue_certificate("shop.example.test", &publish, None, None).await.unwrap();
 
         assert!(issued.cert_chain_pem.contains("BEGIN CERTIFICATE"));
@@ -678,7 +851,7 @@ mod tests {
         // Pointing at a directory URL that does not resolve fails before any
         // order exists; that must surface at once, not after N attempts.
         let account = AccountKey::generate().unwrap();
-        let err = match AcmeClient::discover("http://127.0.0.1:1/directory", account).await {
+        let err = match AcmeClient::discover_with_allowed_hosts("http://127.0.0.1:1/directory", account, &loopback_only()).await {
             Ok(_) => panic!("discover against a dead port must not succeed"),
             Err(e) => e,
         };
@@ -691,7 +864,7 @@ mod tests {
         // at all -- some CAs reject a newAccount that carries an empty/junk one.
         let (base, mock) = spawn_mock_acme().await;
         let account = AccountKey::generate().unwrap();
-        let mut client = AcmeClient::discover(&format!("{base}/directory"), account).await.unwrap();
+        let mut client = AcmeClient::discover_with_allowed_hosts(&format!("{base}/directory"), account, &loopback_only()).await.unwrap();
         client.register_account().await.unwrap();
         assert!(mock.seen_eab.lock().unwrap().is_none(), "no EAB configured -> none sent");
     }
@@ -703,7 +876,7 @@ mod tests {
         let (base, mock) = spawn_mock_acme().await;
         let account = AccountKey::generate().unwrap();
         let hmac_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([3u8; 32]);
-        let mut client = AcmeClient::discover(&format!("{base}/directory"), account)
+        let mut client = AcmeClient::discover_with_allowed_hosts(&format!("{base}/directory"), account, &loopback_only())
             .await
             .unwrap()
             .with_eab("kid-abc", &hmac_key_b64);
@@ -732,7 +905,7 @@ mod tests {
         let store = Arc::new(AcmeDnsStore::new());
         let publish = Dns01Provider::SelfHosted(store);
 
-        let mut client = AcmeClient::discover(&format!("{base}/directory"), account).await.unwrap();
+        let mut client = AcmeClient::discover_with_allowed_hosts(&format!("{base}/directory"), account, &loopback_only()).await.unwrap();
         client.issue_certificate("renew-me.example.test", &publish, None, None).await.unwrap();
         // A second "issuance" against the same mock stands in for a later renewal run.
         client.issue_certificate("renew-me.example.test", &publish, None, None).await.unwrap();
@@ -755,7 +928,7 @@ mod tests {
         // logic works, issuance still completes -- if it looped or gave up, it wouldn't.
         let (base, _mock) = spawn_mock_acme().await;
         let account = AccountKey::generate().unwrap();
-        let mut client = AcmeClient::discover(&format!("{base}/directory"), account).await.unwrap();
+        let mut client = AcmeClient::discover_with_allowed_hosts(&format!("{base}/directory"), account, &loopback_only()).await.unwrap();
         client.register_account().await.expect("succeeds after exactly one badNonce retry");
     }
 }

@@ -851,5 +851,9 @@ pub use connectivity::*;
 mod join_config;
 pub use join_config::*;
 
+// ct-agent#169: secret-shape redaction for text that leaves this process towards a remote peer.
+mod redact;
+pub(crate) use redact::redact_secrets;
+
 #[cfg(test)]
 mod tests;

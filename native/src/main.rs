@@ -56,7 +56,10 @@ USAGE:
     ct-agent status             Show a running agent's live status (needs CT_AGENT_METRICS_LISTEN
                                  set to the same value the agent serves on), else the last 20
                                  recorded events from the state dir's events.jsonl ring (see below)
-    ct-agent local-auth set <user> <password>   Set the local-auth gate credential explicitly
+    ct-agent local-auth set <user> [-]   Set the local-auth gate credential explicitly; the
+                                password comes from stdin (prompted without echo on a
+                                terminal) or CT_LOCAL_AUTH_PASSWORD -- never from argv
+                                (an argv password still works for one release, with a warning)
     ct-agent local-auth reset   Generate a fresh local-auth gate credential, printed once
     ct-agent local-auth rotate  Alias for `reset` -- same operation, the name an operator
                                  reaches for after a suspected leak
@@ -199,6 +202,59 @@ Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
     the status is \"ok\".
 ";
 
+
+/// ct-agent#175: `local-auth set` reading its password from an interactive terminal -- echo is
+/// switched off around the read (via libc `tcgetattr`/`tcsetattr`, no new dependency) and
+/// restored afterwards, whatever the outcome. The resolution order itself is
+/// `ct_agent::local_auth::resolve_password`; this only wraps the stdin read.
+#[cfg(unix)]
+fn read_password_without_echo(
+    argv: Option<&str>,
+    env: Option<String>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    struct EchoOff(libc::termios);
+    impl Drop for EchoOff {
+        fn drop(&mut self) {
+            // SAFETY: restoring the exact termios we read from the same fd; a failure here is
+            // ignored on purpose (nothing more to do about it at exit).
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0);
+            }
+        }
+    }
+    // SAFETY: termios is a plain C struct that tcgetattr fully initialises on success; both
+    // calls only touch our own stdin fd.
+    let restore = unsafe {
+        let mut term: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut term) != 0 {
+            return Err(format!("local-auth set: cannot read terminal attributes: {}", std::io::Error::last_os_error()).into());
+        }
+        let saved = term;
+        term.c_lflag &= !libc::ECHO;
+        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term) != 0 {
+            return Err(format!("local-auth set: cannot disable terminal echo: {}", std::io::Error::last_os_error()).into());
+        }
+        EchoOff(saved)
+    };
+    eprint!("Password (input hidden): ");
+    let result = ct_agent::local_auth::resolve_password(argv, env, std::io::stdin().lock());
+    drop(restore);
+    eprintln!();
+    Ok(result?)
+}
+
+/// ct-agent#175, non-Unix: std has no portable echo control and libc's termios is Unix-only,
+/// so the prompt says the input stays visible (documented limitation, no silent claim of
+/// hiding it).
+#[cfg(not(unix))]
+fn read_password_without_echo(
+    argv: Option<&str>,
+    env: Option<String>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    eprint!("Password (WARNING: input is NOT hidden on this platform): ");
+    Ok(ct_agent::local_auth::resolve_password(argv, env, std::io::stdin().lock())?)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // #248-follow: opt-in only -- quinn and libp2p already emit their own `tracing`
@@ -326,10 +382,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Some("set") => {
                 let user = std::env::args()
                     .nth(3)
-                    .ok_or("usage: ct-agent local-auth set <user> <password>")?;
-                let password = std::env::args()
-                    .nth(4)
-                    .ok_or("usage: ct-agent local-auth set <user> <password>")?;
+                    .ok_or("usage: ct-agent local-auth set <user> [-]  (password from stdin or CT_LOCAL_AUTH_PASSWORD)")?;
+                // ct-agent#175: the password no longer belongs on the command line (visible in
+                // `ps` and shell history). Resolution order: an explicit argv password (kept for
+                // one release, with a warning), `-`/no argument -> CT_LOCAL_AUTH_PASSWORD, else
+                // one line from stdin (prompted without echo when stdin is a terminal).
+                let argv_password = std::env::args().nth(4);
+                let env_password = std::env::var(ct_agent::local_auth::PASSWORD_ENV).ok();
+                if ct_agent::local_auth::password_is_from_argv(argv_password.as_deref()) {
+                    eprintln!(
+                        "ct-agent: WARNING: passing the password as a command-line argument is deprecated \
+                         (visible in `ps` and shell history) -- pipe it on stdin (`local-auth set <user> -`) \
+                         or set {} instead; the argv form will be removed in a later release (ct-agent#175)",
+                        ct_agent::local_auth::PASSWORD_ENV
+                    );
+                }
+                let prompt = ct_agent::local_auth::password_needs_stdin(argv_password.as_deref(), env_password.is_some())
+                    && std::io::IsTerminal::is_terminal(&std::io::stdin());
+                let password = if prompt {
+                    read_password_without_echo(argv_password.as_deref(), env_password)?
+                } else {
+                    ct_agent::local_auth::resolve_password(argv_password.as_deref(), env_password, std::io::stdin().lock())?
+                };
                 ct_agent::local_auth::set_credential(state_dir, &user, &password)?;
                 eprintln!("ct-agent: local-auth credential set for user '{user}'");
             }
@@ -381,7 +455,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
             }
             _ => {
-                return Err("usage: ct-agent local-auth set <user> <password> | reset | rotate | \
+                return Err("usage: ct-agent local-auth set <user> [<password>|-] | reset | rotate | \
                             link --ttl <duration> [--once] [--label <text>] | links | link-revoke <id>"
                     .into())
             }
@@ -405,6 +479,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // expose this port.
         let listen = std::env::var("CT_RELAY_LISTEN")
             .map_err(|_| "relay-node requires CT_RELAY_LISTEN (an internal-only address, e.g. /ip4/127.0.0.1/tcp/4437 -- never a publicly reachable one)")?;
+        // ct-agent#173: the warning above is now enforced. A non-internal listen address is
+        // refused unless CT_RELAY_ALLOW_PUBLIC_BIND=1 says the operator meant it; either way
+        // the decision is logged so a public relay never appears by accident.
+        let allow_public = std::env::var(ct_agent::p2p::RELAY_ALLOW_PUBLIC_BIND_ENV)
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        match ct_agent::p2p::relay_listen_policy(&listen, allow_public) {
+            Ok(true) => eprintln!("ct-agent relay-node: binding {listen} (internal address, ct-agent#173 policy: ok)"),
+            Ok(false) => eprintln!(
+                "ct-agent relay-node: WARNING binding {listen}, which is NOT an internal address -- allowed only \
+                 because {}=1 is set; this relay is unguarded and is now reachable by anyone who can reach that \
+                 address (ct-agent#173)",
+                ct_agent::p2p::RELAY_ALLOW_PUBLIC_BIND_ENV
+            ),
+            Err(reason) => {
+                eprintln!("ct-agent relay-node: {reason}");
+                return Err(reason.into());
+            }
+        }
         ct_agent::p2p::nat_lab_relay(&listen).await?;
         return Ok(());
     }

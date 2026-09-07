@@ -550,8 +550,76 @@ pub fn credential_path(state_dir: &Path) -> PathBuf {
     state_dir.join(CREDENTIAL_FILENAME)
 }
 
-/// `ct-agent local-auth set <user> <password>`: write an operator-chosen
-/// credential to the state dir, overwriting any generated one.
+/// ct-agent#175: env var `local-auth set` reads the password from when no argv password is
+/// given and stdin was not explicitly requested with `-`.
+pub const PASSWORD_ENV: &str = "CT_LOCAL_AUTH_PASSWORD";
+
+/// ct-agent#175: whether the (deprecated) argv form is in use -- a fourth argument that is
+/// not the `-` stdin marker. The caller prints the deprecation warning for exactly this case.
+pub fn password_is_from_argv(argv: Option<&str>) -> bool {
+    matches!(argv, Some(s) if s != "-")
+}
+
+/// ct-agent#175: whether [`resolve_password`] will read stdin for these inputs -- so the
+/// caller can switch terminal echo off BEFORE handing stdin over. `-` always means stdin;
+/// no argument means stdin only when the env var is absent too.
+pub fn password_needs_stdin(argv: Option<&str>, env_is_set: bool) -> bool {
+    match argv {
+        Some("-") => true,
+        Some(_) => false,
+        None => !env_is_set,
+    }
+}
+
+/// ct-agent#175: resolve the password for `local-auth set`, in this order:
+///
+/// 1. an explicit argv password other than `-` (deprecated -- visible in `ps` and shell
+///    history; kept for one release),
+/// 2. `-` as the argument: the first line of `stdin`, even when the env var is set,
+/// 3. no argument: `CT_LOCAL_AUTH_PASSWORD` (`env`) when set, else the first line of `stdin`.
+///
+/// Whatever the source, the value is trimmed of surrounding whitespace (a trailing newline
+/// from `echo`/a prompt, stray spaces around an env value) and must be non-empty. Pure over
+/// its inputs: `stdin` is any `Read`, the env value is passed in, nothing global is touched.
+pub fn resolve_password(argv: Option<&str>, env: Option<String>, stdin: impl io::Read) -> Result<String, String> {
+    let (raw, source) = match argv {
+        Some(s) if s != "-" => (s.to_string(), "the command line"),
+        Some(_) => (read_first_line(stdin)?, "stdin"),
+        None => match env {
+            Some(v) => (v, PASSWORD_ENV),
+            None => (read_first_line(stdin)?, "stdin"),
+        },
+    };
+    let password = raw.trim().to_string();
+    if password.is_empty() {
+        return Err(format!(
+            "local-auth set: the password from {source} is empty -- pipe it on stdin \
+             (`local-auth set <user> -`) or set {PASSWORD_ENV}"
+        ));
+    }
+    Ok(password)
+}
+
+/// One line from `stdin` (without its line terminator); an immediate EOF is an error naming
+/// the two accepted sources so a script that forgot to pipe anything gets told, not a
+/// silently empty credential.
+fn read_first_line(stdin: impl io::Read) -> Result<String, String> {
+    use io::BufRead;
+    let mut line = String::new();
+    let n = io::BufReader::new(stdin)
+        .read_line(&mut line)
+        .map_err(|e| format!("local-auth set: reading the password from stdin failed: {e}"))?;
+    if n == 0 {
+        return Err(format!(
+            "local-auth set: no password on stdin (EOF) -- pipe it on stdin or set {PASSWORD_ENV}"
+        ));
+    }
+    Ok(line)
+}
+
+/// `ct-agent local-auth set <user> [-]`: write an operator-chosen credential to the state
+/// dir, overwriting any generated one. The password itself is resolved by
+/// [`resolve_password`] (ct-agent#175).
 pub fn set_credential(state_dir: &Path, username: &str, password: &str) -> io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
     #[cfg(unix)]
@@ -1135,6 +1203,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn resolve_password_prefers_argv_then_env_then_stdin_175() {
+        // ct-agent#175: the argv form still wins (deprecated, one release), then the env var,
+        // then stdin -- and stdin is only consumed when it is actually the source.
+        let stdin = || std::io::Cursor::new(b"from-stdin\n".to_vec());
+        assert_eq!(resolve_password(Some("argv-pw"), Some("env-pw".into()), stdin()).unwrap(), "argv-pw");
+        assert_eq!(resolve_password(None, Some("env-pw".into()), stdin()).unwrap(), "env-pw");
+        assert_eq!(resolve_password(None, None, stdin()).unwrap(), "from-stdin");
+        assert!(password_is_from_argv(Some("argv-pw")));
+        assert!(!password_is_from_argv(Some("-")) && !password_is_from_argv(None));
+        assert!(!password_needs_stdin(Some("argv-pw"), false));
+        assert!(!password_needs_stdin(None, true));
+        assert!(password_needs_stdin(None, false));
+    }
+
+    #[test]
+    fn resolve_password_dash_reads_stdin_even_when_the_env_var_is_set_175() {
+        let stdin = std::io::Cursor::new(b"from-stdin\nsecond line ignored\n".to_vec());
+        assert_eq!(resolve_password(Some("-"), Some("env-pw".into()), stdin).unwrap(), "from-stdin");
+        assert!(password_needs_stdin(Some("-"), true));
+    }
+
+    #[test]
+    fn resolve_password_trims_and_refuses_an_empty_value_175() {
+        assert_eq!(resolve_password(Some("-"), None, std::io::Cursor::new(b"  pw with space \r\n".to_vec())).unwrap(), "pw with space");
+        assert_eq!(resolve_password(None, Some("  env-pw\n".into()), std::io::empty()).unwrap(), "env-pw");
+        let err = resolve_password(None, None, std::io::empty()).unwrap_err();
+        assert!(err.contains("EOF") && err.contains(PASSWORD_ENV), "{err}");
+        let err = resolve_password(Some("-"), None, std::io::Cursor::new(b"\n".to_vec())).unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+        let err = resolve_password(None, Some("   ".into()), std::io::empty()).unwrap_err();
+        assert!(err.contains("empty") && err.contains(PASSWORD_ENV), "{err}");
+        let err = resolve_password(Some(""), None, std::io::empty()).unwrap_err();
+        assert!(err.contains("command line"), "{err}");
     }
 
     #[test]

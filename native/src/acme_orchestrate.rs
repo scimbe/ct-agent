@@ -84,24 +84,62 @@ struct Admission {
 /// proxy/LB/access log). Must match the control-plane's own `AGENT_TOKEN_HEADER`.
 const AGENT_TOKEN_HEADER: &str = "x-ct-agent-token";
 
+/// ct-agent#171: whether a response from the header-based route means "this control plane
+/// does not have that route" -- the ONE condition under which the legacy token-in-URL route
+/// may be tried. An unupgraded control plane answers an unknown path with a plain 404;
+/// anything else (5xx, 401/403, a 200 with an unparseable body, a transport error) is a
+/// failure OF the header route and is returned as such, never turned into a request that
+/// puts the bearer routing token into a URL path (and so into proxy/LB access logs).
+fn route_is_missing(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::NOT_FOUND
+}
+
+/// ct-agent#171: say once per process that the legacy route is in use, so an operator can
+/// see the control plane needs upgrading -- and so a silent regression back to token-in-URL
+/// can never happen unnoticed.
+fn note_legacy_route_in_use(what: &str) {
+    static LEGACY_ROUTE_LINE: std::sync::Once = std::sync::Once::new();
+    LEGACY_ROUTE_LINE.call_once(|| {
+        eprintln!(
+            "ct-agent: control plane answered 404 on the header-based {what} route -- falling back \
+             to the legacy token-in-URL route for this control plane; upgrade it to stop the \
+             routing token from appearing in URL paths (ct-agent#98/#171)"
+        );
+    });
+}
+
 async fn poll_admission(http: &reqwest::Client, cp_url: &str, token: &str, hostname: &str) -> Option<Admission> {
     let base = cp_url.trim_end_matches('/');
-    // ct-agent#98: try the new host-only route (token via header) first -- an older
-    // control-plane without this route yet 404s, which this function already treats
-    // identically to any other failure (see the doc comment above), so falling back to
-    // the legacy path-based route on ANY failure preserves this function's existing
-    // "None means unavailable" contract while adding no new failure mode. This is the
-    // "compatibility window for mixed CP/agent versions" CADS-Tunnel#666 asked for --
-    // self-adapting to whichever route the control plane actually has, no version
-    // negotiation needed.
+    // ct-agent#98: the host-only route (token via header) first. ct-agent#171: the legacy
+    // path-based route is tried ONLY when the control plane answers an explicit 404 there
+    // (an older control plane without the route yet -- the "compatibility window for mixed
+    // CP/agent versions" CADS-Tunnel#666 asked for). Every other outcome -- a transient 5xx,
+    // a malformed body, a network error -- is this route's own failure and stays `None`
+    // (the caller retries the header route later); it must never leak the routing token
+    // into a URL path as a side effect of a hiccup.
     let new_url = format!("{base}/agent/acme-admission/{hostname}");
-    if let Ok(resp) = http.get(&new_url).header(AGENT_TOKEN_HEADER, token).send().await {
-        if resp.status().is_success() {
-            if let Ok(admission) = resp.json::<Admission>().await {
-                return Some(admission);
-            }
+    let resp = match http.get(&new_url).header(AGENT_TOKEN_HEADER, token).send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            eprintln!("ct-agent: admission poll failed (transport): {e}");
+            return None;
         }
+    };
+    let status = resp.status();
+    if status.is_success() {
+        return match resp.json::<Admission>().await {
+            Ok(admission) => Some(admission),
+            Err(e) => {
+                eprintln!("ct-agent: admission poll returned an unparseable body: {e}");
+                None
+            }
+        };
     }
+    if !route_is_missing(status) {
+        eprintln!("ct-agent: admission poll returned {status}");
+        return None;
+    }
+    note_legacy_route_in_use("acme-admission");
     let legacy_url = format!("{base}/agent/acme-admission/{token}/{hostname}");
     let resp = http.get(&legacy_url).send().await.ok()?;
     if !resp.status().is_success() {
@@ -118,12 +156,26 @@ async fn poll_admission(http: &reqwest::Client, cp_url: &str, token: &str, hostn
 /// call (e.g. after a renewal) still records correctly.
 async fn notify_issuance_complete(http: &reqwest::Client, cp_url: &str, token: &str, hostname: &str) {
     let base = cp_url.trim_end_matches('/');
-    // ct-agent#98: same new-route-first, legacy-fallback shape as poll_admission above.
+    // ct-agent#98/#171: same shape as poll_admission above -- header route first, the legacy
+    // token-in-URL route ONLY on an explicit 404 from it. Any other failure is logged and
+    // dropped (this callback is best-effort by design, see the doc comment).
     let new_url = format!("{base}/agent/acme-issuance-complete/{hostname}");
     match http.post(&new_url).header(AGENT_TOKEN_HEADER, token).send().await {
         Ok(resp) if resp.status().is_success() => return,
-        _ => {}
+        Ok(resp) if route_is_missing(resp.status()) => {}
+        Ok(resp) => {
+            eprintln!(
+                "ct-agent: acme-issuance-complete callback returned {} (non-fatal, cert is already written)",
+                resp.status()
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("ct-agent: acme-issuance-complete callback failed (non-fatal, cert is already written): {e}");
+            return;
+        }
     }
+    note_legacy_route_in_use("acme-issuance-complete");
     let legacy_url = format!("{base}/agent/acme-issuance-complete/{token}/{hostname}");
     if let Err(e) = http.post(&legacy_url).send().await {
         eprintln!("ct-agent: acme-issuance-complete callback failed (non-fatal, cert is already written): {e}");
@@ -171,6 +223,10 @@ pub struct AcmeCertConfig {
     /// -- every attempt is a real order against the CA's failed-validation
     /// rate limit.
     pub dns01_attempts: Option<u32>,
+    /// ct-agent#172: extra ACME directory hosts (from `CT_ACME_ALLOW_DIRECTORY_HOST`)
+    /// this agent may talk to beyond the known-CA registry, see
+    /// [`crate::acme_client::directory_url_policy`]. Empty for every public deployment.
+    pub acme_directory_extra_hosts: Vec<String>,
 }
 
 impl AcmeCertConfig {
@@ -188,7 +244,10 @@ impl AcmeCertConfig {
     /// credentials are no longer configured here at all (#233): the
     /// admission broker at `cp_url` is the sole source of both, for every
     /// issuance and every renewal alike -- there is no locally-configured
-    /// fallback.
+    /// fallback. The broker's directory URL must still pass
+    /// [`crate::acme_client::directory_url_policy`] (ct-agent#172):
+    /// `CT_ACME_ALLOW_DIRECTORY_HOST` (comma-separated hosts) extends the
+    /// known-CA registry for a private CA.
     pub fn from_env() -> Result<Self, String> {
         Self::from_env_with(|k| std::env::var(k).ok())
     }
@@ -234,6 +293,9 @@ impl AcmeCertConfig {
             dns01_use_authoritative: get("CT_ACME_DNS01_AUTHORITATIVE")
                 .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
                 .unwrap_or(true),
+            acme_directory_extra_hosts: crate::acme_client::parse_allowed_directory_hosts(
+                get(crate::acme_client::ALLOW_DIRECTORY_HOST_ENV).as_deref(),
+            ),
         })
     }
 
@@ -321,7 +383,10 @@ pub async fn obtain_or_renew(config: &AcmeCertConfig) -> Result<bool, BoxError> 
 
     std::fs::create_dir_all(&config.cert_out_dir)?;
     let account = load_or_generate_account_key(&config.account_key_path)?;
-    let mut client = AcmeClient::discover(&directory_url, account).await?;
+    // ct-agent#172: the broker-assigned directory must pass the known-CA/override policy
+    // before a byte is sent -- a spoofed broker must not turn this agent into an SSRF proxy.
+    let mut client =
+        AcmeClient::discover_with_allowed_hosts(&directory_url, account, &config.acme_directory_extra_hosts).await?;
     if let Some((kid, hmac_key)) = eab {
         client = client.with_eab(kid, hmac_key);
     }
@@ -786,6 +851,7 @@ mod tests {
             dns01_initial_delay: Some(Duration::ZERO),
             dns01_use_authoritative: false,
             dns01_attempts: Some(1),
+            acme_directory_extra_hosts: vec!["127.0.0.1".to_string()],
         };
 
         let did_issue = obtain_or_renew(&config).await.unwrap();
@@ -841,6 +907,7 @@ mod tests {
             dns01_initial_delay: Some(Duration::ZERO),
             dns01_use_authoritative: false,
             dns01_attempts: Some(1),
+            acme_directory_extra_hosts: vec!["127.0.0.1".to_string()],
         };
 
         let cert_tmp = PathBuf::from(format!("{}.new", config.cert_path().display()));
@@ -873,6 +940,7 @@ mod tests {
             dns01_initial_delay: Some(Duration::ZERO),
             dns01_use_authoritative: false,
             dns01_attempts: Some(1),
+            acme_directory_extra_hosts: vec!["127.0.0.1".to_string()],
         };
         let err = obtain_or_renew(&config).await.unwrap_err();
         assert!(err.to_string().contains("publishing"), "{err}");
@@ -903,6 +971,7 @@ mod tests {
             dns01_initial_delay: Some(Duration::ZERO),
             dns01_use_authoritative: false,
             dns01_attempts: Some(1),
+            acme_directory_extra_hosts: vec!["127.0.0.1".to_string()],
         };
 
         let did_issue = obtain_or_renew(&config).await.unwrap();
@@ -935,6 +1004,7 @@ mod tests {
             dns01_initial_delay: Some(Duration::ZERO),
             dns01_use_authoritative: false,
             dns01_attempts: Some(1),
+            acme_directory_extra_hosts: vec!["127.0.0.1".to_string()],
         };
 
         let err = obtain_or_renew(&config).await.unwrap_err();
@@ -963,6 +1033,7 @@ mod tests {
             dns01_initial_delay: Some(Duration::ZERO),
             dns01_use_authoritative: false,
             dns01_attempts: Some(1),
+            acme_directory_extra_hosts: vec!["127.0.0.1".to_string()],
         };
 
         let did_issue = obtain_or_renew(&config).await.unwrap();
@@ -989,6 +1060,7 @@ mod tests {
             dns01_initial_delay: Some(Duration::ZERO),
             dns01_use_authoritative: false,
             dns01_attempts: Some(1),
+            acme_directory_extra_hosts: vec!["127.0.0.1".to_string()],
         };
         let err = obtain_or_renew(&config).await.unwrap_err();
         assert!(err.to_string().contains("admission broker did not respond"), "{err}");
@@ -1025,6 +1097,7 @@ mod tests {
             dns01_initial_delay: Some(Duration::ZERO),
             dns01_use_authoritative: false,
             dns01_attempts: Some(1),
+            acme_directory_extra_hosts: vec!["127.0.0.1".to_string()],
         };
 
         let did_issue = obtain_or_renew(&config).await.unwrap();
@@ -1104,5 +1177,97 @@ mod tests {
         let http = reqwest::Client::new();
         notify_issuance_complete(&http, &format!("http://{addr}"), "deadbeef-token", "app.example.com").await;
         assert_eq!(*hits.lock().unwrap(), 1, "the legacy callback must still fire once via fallback");
+    }
+
+    /// ct-agent#171 test double: a control plane whose header-based routes answer with a
+    /// configurable status/body, plus counters on the legacy token-in-URL routes -- the
+    /// assertion in every #171 test is that those counters stay at zero.
+    struct LegacyHits {
+        admission: Mutex<u32>,
+        issuance: Mutex<u32>,
+    }
+
+    async fn spawn_cp_with_counted_legacy_routes(new_status: StatusCode, new_body: &'static str) -> (String, Arc<LegacyHits>) {
+        async fn admission_new(AxState((status, body)): AxState<(StatusCode, &'static str)>) -> (StatusCode, String) {
+            (status, body.to_string())
+        }
+        async fn issuance_new(AxState((status, _)): AxState<(StatusCode, &'static str)>) -> StatusCode {
+            status
+        }
+        async fn admission_legacy(
+            AxState(hits): AxState<Arc<LegacyHits>>,
+            Path((_token, _hostname)): Path<(String, String)>,
+        ) -> AxJson<Value> {
+            *hits.admission.lock().unwrap() += 1;
+            AxJson(serde_json::json!({"status": "gruen", "may_issue_now": true, "assigned_ca": null}))
+        }
+        async fn issuance_legacy(
+            AxState(hits): AxState<Arc<LegacyHits>>,
+            Path((_token, _hostname)): Path<(String, String)>,
+        ) -> StatusCode {
+            *hits.issuance.lock().unwrap() += 1;
+            StatusCode::OK
+        }
+        let hits = Arc::new(LegacyHits { admission: Mutex::new(0), issuance: Mutex::new(0) });
+        let new_routes = Router::new()
+            .route("/agent/acme-admission/:hostname", get(admission_new))
+            .route("/agent/acme-issuance-complete/:hostname", post(issuance_new))
+            .with_state((new_status, new_body));
+        let legacy_routes = Router::new()
+            .route("/agent/acme-admission/:token/:hostname", get(admission_legacy))
+            .route("/agent/acme-issuance-complete/:token/:hostname", post(issuance_legacy))
+            .with_state(hits.clone());
+        let app = new_routes.merge(legacy_routes);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// ct-agent#171: a transient 5xx on the header route is that route's own failure --
+    /// the legacy token-in-URL route (which would put the bearer routing token into
+    /// proxy/LB access logs) must not be touched.
+    #[tokio::test]
+    async fn poll_admission_never_falls_back_to_the_legacy_url_on_a_500_171() {
+        let (base, hits) = spawn_cp_with_counted_legacy_routes(StatusCode::INTERNAL_SERVER_ERROR, "boom").await;
+        let http = reqwest::Client::new();
+        let admission = poll_admission(&http, &base, "deadbeef-token", "app.example.com").await;
+        assert!(admission.is_none(), "a 500 on the header route is a failure, not a legacy success");
+        assert_eq!(*hits.admission.lock().unwrap(), 0, "the legacy token-in-URL route must never be hit on a 500");
+    }
+
+    /// ct-agent#171: a 200 with an unparseable body is likewise NOT a route-missing signal.
+    #[tokio::test]
+    async fn poll_admission_never_falls_back_to_the_legacy_url_on_invalid_json_171() {
+        let (base, hits) = spawn_cp_with_counted_legacy_routes(StatusCode::OK, "<html>not json</html>").await;
+        let http = reqwest::Client::new();
+        let admission = poll_admission(&http, &base, "deadbeef-token", "app.example.com").await;
+        assert!(admission.is_none(), "an unparseable header-route body is a failure, not a legacy success");
+        assert_eq!(*hits.admission.lock().unwrap(), 0, "the legacy token-in-URL route must never be hit on bad JSON");
+    }
+
+    /// ct-agent#171: an EXPLICIT 404 from the header route is the one signal that still
+    /// selects the legacy route (an unupgraded control plane).
+    #[tokio::test]
+    async fn poll_admission_falls_back_to_the_legacy_url_only_on_an_explicit_404_171() {
+        let (base, hits) = spawn_cp_with_counted_legacy_routes(StatusCode::NOT_FOUND, "no such route").await;
+        let http = reqwest::Client::new();
+        let admission = poll_admission(&http, &base, "deadbeef-token", "app.example.com").await;
+        assert!(admission.is_some_and(|a| a.may_issue_now), "404 -> legacy route answers");
+        assert_eq!(*hits.admission.lock().unwrap(), 1);
+    }
+
+    /// ct-agent#171: the issuance-complete callback follows the same rule -- 5xx never
+    /// reaches the legacy URL, 404 does.
+    #[tokio::test]
+    async fn notify_issuance_complete_never_falls_back_on_a_500_but_does_on_a_404_171() {
+        let http = reqwest::Client::new();
+        let (base, hits) = spawn_cp_with_counted_legacy_routes(StatusCode::BAD_GATEWAY, "").await;
+        notify_issuance_complete(&http, &base, "deadbeef-token", "app.example.com").await;
+        assert_eq!(*hits.issuance.lock().unwrap(), 0, "a 502 must not leak the token into the legacy URL");
+
+        let (base, hits) = spawn_cp_with_counted_legacy_routes(StatusCode::NOT_FOUND, "").await;
+        notify_issuance_complete(&http, &base, "deadbeef-token", "app.example.com").await;
+        assert_eq!(*hits.issuance.lock().unwrap(), 1, "an explicit 404 still selects the legacy callback");
     }
 }
