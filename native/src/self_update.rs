@@ -112,15 +112,17 @@ const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 /// Two slots so a key rotation can ship a build that trusts BOTH the outgoing
 /// and the incoming key before the first release signed only by the new one.
 ///
-/// EMPTY until the operator generates the key (2026-09-06: not yet done --
-/// `openssl genpkey -algorithm ed25519 -out ct-release-signing.pem`, public
-/// key hex via `openssl pkey -in ct-release-signing.pem -pubout -outform DER
-/// | tail -c 32 | xxd -p -c 64`, PEM stored as the `CT_RELEASE_SIGNING_KEY`
-/// repository secret). While empty, nothing is verified against a manifest
-/// -- see the module doc's "Release provenance" paragraph for what changes
-/// the moment a key lands here.
+/// Key 1 was generated 2026-09-07 (scimbe's go on #184): `openssl genpkey
+/// -algorithm ed25519`, public key hex via `openssl pkey -pubout -outform DER
+/// | tail -c 32 | xxd -p -c 64`, the PEM stored ONLY as the
+/// `CT_RELEASE_SIGNING_KEY` repository secret (never on a developer machine).
+/// From the first release after this build, every self-update refuses a
+/// release whose manifest is missing, unsigned, signed by another key, or
+/// disagrees with the asset -- see the module doc's "Release provenance"
+/// paragraph. Rotation: add the successor as the second slot, ship one release
+/// signed by the OLD key, then drop the old slot.
 pub(crate) const RELEASE_SIGNING_PUBKEYS: &[&str] = &[
-    // "<64 hex chars: the current release key>",
+    "73706122db4e9186743ab3aabdf55d80ecf7f08ddc6c5243c9887f7d9bcc9a78",
     // "<64 hex chars: the next key, only during a rotation>",
 ];
 
@@ -1668,8 +1670,13 @@ mod tests {
 
     #[test]
     fn provenance_policy_resolves_pinned_constants_and_the_env_override() {
-        // The shipped constant is empty today: no key pinned.
-        assert!(!ProvenancePolicy::from_lookup(RELEASE_SIGNING_PUBKEYS, lookup(&[])).unwrap().has_pinned_key());
+        // The shipped constant carries the production key since 2026-09-07 (#184): it
+        // must parse as a valid ed25519 point and count as pinned, so every release
+        // from here on is verified against the manifest.
+        let shipped = ProvenancePolicy::from_lookup(RELEASE_SIGNING_PUBKEYS, lookup(&[])).unwrap();
+        assert!(shipped.has_pinned_key());
+        assert_eq!(shipped.keys.len(), 1);
+        // An empty slice plus a blank env override is the only way to get "no key".
         assert!(!ProvenancePolicy::from_lookup(&[], lookup(&[(RELEASE_PUBKEY_ENV, "  ")])).unwrap().has_pinned_key());
 
         // Two compiled-in slots.
