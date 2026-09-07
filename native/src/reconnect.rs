@@ -74,6 +74,56 @@ impl Backoff {
     }
 }
 
+/// What a reconnect loop does after one failed attempt (ct-agent#179).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retry {
+    /// Sleep this long -- the jittered exponential delay, never above the cap --
+    /// then try again.
+    After(Duration),
+    /// The configured attempt budget is spent: the loop returns its own error.
+    GiveUp,
+}
+
+/// The QUIC reconnect loop's retry policy (ct-agent#179): a [`Backoff`] plus the
+/// two events `serve::run_agent` feeds it -- an attempt failed (the dial, the
+/// registration, a dropped connection, the fallback pool giving up) or a
+/// (re)connection succeeded. Pure and clock-free like `Backoff`, so the soak
+/// harness walks simulated hours of failures through exactly the policy the
+/// serve loop runs, without a socket.
+pub struct ReconnectPolicy {
+    backoff: Backoff,
+}
+
+impl ReconnectPolicy {
+    /// `base`/`max`/`max_attempts` as for [`Backoff::new`]; `u32::MAX` attempts
+    /// (the production default) never gives up.
+    pub fn new(base: Duration, max: Duration, max_attempts: u32) -> Self {
+        Self {
+            backoff: Backoff::new(base, max, max_attempts),
+        }
+    }
+
+    /// One attempt failed. `rand01` is the jitter sample, as for
+    /// [`Backoff::next_delay_jittered`].
+    pub fn after_failure(&mut self, rand01: f64) -> Retry {
+        match self.backoff.next_delay_jittered(rand01) {
+            Some(d) => Retry::After(d),
+            None => Retry::GiveUp,
+        }
+    }
+
+    /// A (re)connection succeeded: the next failure backs off from `base` again,
+    /// with the full attempt budget.
+    pub fn after_success(&mut self) {
+        self.backoff.reset();
+    }
+
+    /// Failures since the last success.
+    pub fn failures_since_success(&self) -> u32 {
+        self.backoff.attempts_made()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +190,23 @@ mod tests {
         assert!(b.next_delay_jittered(0.5).is_some());
         assert!(b.next_delay_jittered(0.5).is_some());
         assert_eq!(b.next_delay_jittered(0.5), None, "gives up after max_attempts, jitter or not");
+    }
+
+    #[test]
+    fn reconnect_policy_maps_the_backoff_to_retry_or_give_up_and_success_rearms_it() {
+        // ct-agent#179: the policy is `Backoff` with the serve loop's two events
+        // named -- same delays, same jitter, same give-up, same reset.
+        let base = Duration::from_millis(100);
+        let max = Duration::from_secs(1);
+        let mut p = ReconnectPolicy::new(base, max, 2);
+        assert_eq!(p.after_failure(1.0), Retry::After(base));
+        assert_eq!(p.after_failure(1.0), Retry::After(base * 2));
+        assert_eq!(p.failures_since_success(), 2);
+        assert_eq!(p.after_failure(0.5), Retry::GiveUp);
+        assert_eq!(p.after_failure(0.5), Retry::GiveUp, "stays given up");
+        p.after_success();
+        assert_eq!(p.failures_since_success(), 0);
+        assert_eq!(p.after_failure(1.0), Retry::After(base), "a success re-arms the full budget");
     }
 
     #[test]

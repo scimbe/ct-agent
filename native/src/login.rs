@@ -493,7 +493,7 @@ pub(crate) fn oidc_credential_state() -> OidcCredentialState {
 /// Pure core of [`oidc_credential_state`]: `f` is the env lookup (so tests drive it
 /// with a map), `now` the clock. Applies exactly [`resolve_oidc_token`]'s
 /// precedence and its expiry rule ([`StoredToken::is_stale`]).
-fn oidc_credential_state_from(f: impl Fn(&str) -> Option<String>, now: u64) -> OidcCredentialState {
+pub(crate) fn oidc_credential_state_from(f: impl Fn(&str) -> Option<String>, now: u64) -> OidcCredentialState {
     if env_token(&f).is_some() {
         return OidcCredentialState::Env;
     }

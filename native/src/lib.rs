@@ -45,6 +45,9 @@ pub mod secret_file;
 pub mod self_update;
 pub mod serve;
 pub mod signup;
+/// ct-agent#179: the paused-time soak harness -- test-only, see `soak.rs`.
+#[cfg(test)]
+mod soak;
 pub mod status;
 pub mod super_peer;
 pub mod task_guard;

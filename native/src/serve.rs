@@ -14,14 +14,14 @@ use std::time::{Duration, Instant};
 
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 
-use crate::reconnect::Backoff;
+use crate::reconnect::{Backoff, ReconnectPolicy, Retry};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{copy_bidirectional, join, split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 use crate::config::{AgentConfig, OriginProto};
 use crate::local_auth;
-use crate::task_guard::{tracked, TaskGuard};
+use crate::task_guard::{tracked, LiveGauge, TaskGuard, TASKS_LIVE};
 use crate::transport::{
     await_ping_phase_end, bind_hostname, dial_quic, dial_quic_or_blocked_error,
     is_registration_refusal, register_tunnel, register_tunnel_stream,
@@ -1622,7 +1622,9 @@ pub async fn run_agent(
         .await;
     }
     let (reconnect_base, reconnect_max) = reconnect_backoff_bounds();
-    let mut backoff = Backoff::new(reconnect_base, reconnect_max, reconnect_max_attempts());
+    // ct-agent#179: the retry policy is a value (`reconnect::ReconnectPolicy`), so the
+    // soak harness walks the very same one through simulated hours of failures.
+    let mut policy = ReconnectPolicy::new(reconnect_base, reconnect_max, reconnect_max_attempts());
     // #45 slice 3: this loop's feed into the revocation view. Over QUIC the
     // edge's `NO` to a role-'A' registration is definitive (see
     // `RegistrationRefused`), so one refusal flips the view.
@@ -1674,7 +1676,7 @@ pub async fn run_agent(
                             FallbackExit::QuicRecovered => {
                                 // A QUIC probe answered — start over with a fresh budget and
                                 // dial it for real.
-                                backoff.reset();
+                                policy.after_success();
                                 crate::status::note_reconnect();
                                 continue;
                             }
@@ -1691,12 +1693,12 @@ pub async fn run_agent(
                                 crate::events::emit(crate::events::FALLBACK_EXHAUSTED, serde_json::json!({}));
                                 crate::status::set_registered(None);
                                 crate::status::note_reconnect();
-                                match backoff.next_delay_jittered(rand::random::<f64>()) {
-                                    Some(d) => {
+                                match policy.after_failure(rand::random::<f64>()) {
+                                    Retry::After(d) => {
                                         tokio::time::sleep(d).await;
                                         continue;
                                     }
-                                    None => {
+                                    Retry::GiveUp => {
                                         return Err("ct-agent: gave up: the TLS-TCP fallback pool and the \
                                                     reconnect loop both exhausted their budgets"
                                             .into())
@@ -1723,16 +1725,16 @@ pub async fn run_agent(
                 serde_json::json!({ "error": format!("registration failed: {e}") }),
             );
             crate::status::note_reconnect();
-            match backoff.next_delay_jittered(rand::random::<f64>()) {
-                Some(d) => {
+            match policy.after_failure(rand::random::<f64>()) {
+                Retry::After(d) => {
                     tokio::time::sleep(d).await;
                     continue;
                 }
-                None => return Err("ct-agent: gave up re-registering with the edge".into()),
+                Retry::GiveUp => return Err("ct-agent: gave up re-registering with the edge".into()),
             }
         }
         revocation_tracker.note(RegistrationOutcome::Succeeded);
-        backoff.reset();
+        policy.after_success();
         // Browser Plane (#23 BP3b): bind the public hostname to this token so an
         // SNI-routed browser reaches this tunnel. Re-bound on every reconnect.
         // Retried with backoff (#502): a fresh onboard's authorize-host call can
@@ -1784,9 +1786,9 @@ pub async fn run_agent(
         crate::status::set_last_error(reason.clone());
         crate::events::emit(crate::events::DISCONNECTED, serde_json::json!({ "reason": reason }));
         crate::status::note_reconnect();
-        match backoff.next_delay_jittered(rand::random::<f64>()) {
-            Some(d) => tokio::time::sleep(d).await,
-            None => return Err("ct-agent: gave up reconnecting after the connection dropped".into()),
+        match policy.after_failure(rand::random::<f64>()) {
+            Retry::After(d) => tokio::time::sleep(d).await,
+            Retry::GiveUp => return Err("ct-agent: gave up reconnecting after the connection dropped".into()),
         }
     }
 }
@@ -1941,7 +1943,7 @@ fn reconnect_backoff_bounds() -> (Duration, Duration) {
 /// in some third way). A base below [`RECONNECT_BASE_FLOOR`] is raised to it, and
 /// a max below the resulting base is raised to that base, so the pair can never
 /// describe an inverted backoff where the cap sits under the first delay.
-fn parse_reconnect_backoff_bounds(
+pub(crate) fn parse_reconnect_backoff_bounds(
     base_raw: Option<String>,
     max_raw: Option<String>,
 ) -> (Duration, Duration) {
@@ -1987,7 +1989,7 @@ fn reconnect_max_attempts() -> u32 {
 
 /// Pure core of [`reconnect_max_attempts`]: `Some("0")` → unbounded (`u32::MAX`),
 /// a valid count → itself, anything else (unset/garbage) → the default.
-fn parse_reconnect_max_attempts(raw: Option<String>) -> u32 {
+pub(crate) fn parse_reconnect_max_attempts(raw: Option<String>) -> u32 {
     match raw.and_then(|s| s.trim().parse::<u32>().ok()) {
         Some(0) => u32::MAX,
         Some(n) => n,
@@ -2169,7 +2171,7 @@ const QUIC_REPROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// Why a TLS-TCP fallback pool run ended (ct-agent#180). Neither is an error:
 /// the caller decides what a whole pool giving up means for ITS loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FallbackExit {
+pub(crate) enum FallbackExit {
     /// A QUIC probe dial answered -- the caller should re-dial QUIC for real.
     QuicRecovered,
     /// Every worker exhausted its reconnect budget (only possible with a finite
@@ -2181,10 +2183,10 @@ enum FallbackExit {
 /// QUIC loop reads from the environment, made a value so the pool tests can hand
 /// a worker a tiny finite budget without touching the process environment.
 #[derive(Debug, Clone, Copy)]
-struct FallbackBudget {
-    base: Duration,
-    max: Duration,
-    attempts: u32,
+pub(crate) struct FallbackBudget {
+    pub(crate) base: Duration,
+    pub(crate) max: Duration,
+    pub(crate) attempts: u32,
 }
 
 impl FallbackBudget {
@@ -2251,6 +2253,37 @@ async fn run_tcp_fallback_pool(
     budget: FallbackBudget,
     reprobe: Option<Duration>,
 ) -> FallbackExit {
+    run_tcp_fallback_pool_on(
+        &TASKS_LIVE,
+        config,
+        edge_cert,
+        token,
+        origin_keys,
+        gate,
+        revocation,
+        budget,
+        reprobe,
+    )
+    .await
+}
+
+/// [`run_tcp_fallback_pool`] with its workers counted on `gauge` instead of the
+/// process-wide [`TASKS_LIVE`] (ct-agent#179): the soak harness asserts that weeks
+/// of worker churn leak no task, on a gauge of its own so no other test's tasks
+/// can skew the sample. Production only ever calls it through the wrapper above.
+// the wrapper's signature plus the gauge; refactor tracked separately
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tcp_fallback_pool_on(
+    gauge: &'static LiveGauge,
+    config: &AgentConfig,
+    edge_cert: CertificateDer<'static>,
+    token: RoutingToken,
+    origin_keys: Arc<Vec<[u8; 32]>>,
+    gate: Arc<local_auth::LocalAuthGate>,
+    revocation: Arc<RevocationView>,
+    budget: FallbackBudget,
+    reprobe: Option<Duration>,
+) -> FallbackExit {
     let n = config.tcp_fallback_pool_size.max(1);
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..n {
@@ -2260,7 +2293,7 @@ async fn run_tcp_fallback_pool(
         let origin_keys = Arc::clone(&origin_keys);
         let gate = Arc::clone(&gate);
         let tracker = RevocationTracker::new(Arc::clone(&revocation));
-        workers.spawn(tracked(async move {
+        workers.spawn(gauge.track(async move {
             run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys, gate, tracker, budget).await
         }));
     }
