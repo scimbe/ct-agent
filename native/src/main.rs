@@ -1133,6 +1133,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         AgentConfig::from_env()?
     };
+    // CADS-Tunnel#795: a hostname that will never be bound is worth one loud line
+    // at startup, not two hours of "no tunnel registered for host".
+    if let Some(notice) = config.hostname_unbound_notice() {
+        eprintln!("{notice}");
+    }
 
     // scimbe/ct-agent#204: Agent-side TLS termination for raw-TCP Origins. Built ONCE here
     // (it owns the reloading certificate state) and threaded down to the raw-forward paths.

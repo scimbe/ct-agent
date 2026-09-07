@@ -231,6 +231,45 @@ fn resolve_addr(var: &str, s: &str) -> Result<SocketAddr, String> {
 }
 
 impl AgentConfig {
+    /// CADS-Tunnel#795: a hostname the operator set that this agent will never bind.
+    /// ct-agent binds `CT_AGENT_HOSTNAME` only in browser mode (`CT_AGENT_MODE=browser`)
+    /// -- on QUIC via the `'H'` bind, on the TLS-TCP fallback via the `'B'/'L'/'F'`
+    /// frames; the Noise-mode `'A'/'K'` registrations carry the token alone. A
+    /// Noise-mode agent with a hostname therefore registers fine at the token level,
+    /// logs "registered … serving", and the edge still answers every browser with
+    /// "no tunnel registered for host" -- a silent outage that took an operator two
+    /// hours to diagnose. This is the one-line warning that would have said so.
+    pub fn hostname_unbound_notice(&self) -> Option<String> {
+        match (&self.hostname, self.browser_forward) {
+            (Some(host), false) => Some(format!(
+                "ct-agent: WARNING: CT_AGENT_HOSTNAME='{host}' is set but CT_AGENT_MODE is not \
+                 'browser' -- the hostname will NOT be bound on the edge, so browsers reaching \
+                 https://{host} get 'no tunnel registered for host' while this agent reports \
+                 itself registered. Set CT_AGENT_MODE=browser for a public (site) hostname, or \
+                 unset CT_AGENT_HOSTNAME (CADS-Tunnel#795)."
+            )),
+            _ => None,
+        }
+    }
+
+    /// Whether a registration on this configuration binds the public hostname
+    /// (see [`Self::hostname_unbound_notice`]). Carried on the `registered` event so
+    /// the timeline shows it, and appended to the registered log lines.
+    pub fn binds_hostname(&self) -> bool {
+        self.hostname.is_some() && self.browser_forward
+    }
+
+    /// Suffix for the Noise-path "registered" log lines: names the hostname that was
+    /// NOT bound, or is empty when there is nothing to say.
+    pub fn hostname_bind_note(&self) -> String {
+        match (&self.hostname, self.browser_forward) {
+            (Some(host), false) => {
+                format!("; hostname '{host}' NOT bound -- CT_AGENT_MODE is not 'browser' (CADS-Tunnel#795)")
+            }
+            _ => String::new(),
+        }
+    }
+
     pub fn parse(edge: &str, origin: &str) -> Result<AgentConfig, String> {
         let edge = resolve_addr("CT_AGENT_EDGE", edge)?;
         let origin = resolve_addr("CT_AGENT_ORIGIN", origin)?;
@@ -605,6 +644,36 @@ mod tests {
         assert!(!AgentConfig::from_env_with(|_| None).unwrap().browser_forward);
         let c = AgentConfig::from_env_with(get_from(&[("CT_AGENT_MODE", "Browser")])).unwrap();
         assert!(c.browser_forward, "CT_AGENT_MODE=browser enables raw forward");
+    }
+
+    #[test]
+    fn hostname_without_browser_mode_is_called_out_795() {
+        // CADS-Tunnel#795: a Noise-mode agent never binds its hostname; say so.
+        let c = AgentConfig::from_env_with(get_from(&[("CT_AGENT_HOSTNAME", "site-x.example")]))
+            .unwrap();
+        assert!(!c.binds_hostname());
+        let notice = c.hostname_unbound_notice().expect("hostname set without browser mode warns");
+        assert!(notice.contains("site-x.example") && notice.contains("CT_AGENT_MODE=browser"));
+        assert!(notice.contains("no tunnel registered for host"), "names the symptom the operator sees");
+        assert!(c.hostname_bind_note().contains("NOT bound"));
+
+        // Browser mode with a hostname: bound, nothing to warn about.
+        let c = AgentConfig::from_env_with(get_from(&[
+            ("CT_AGENT_HOSTNAME", "site-x.example"),
+            ("CT_AGENT_MODE", "browser"),
+        ]))
+        .unwrap();
+        assert!(c.binds_hostname());
+        assert!(c.hostname_unbound_notice().is_none());
+        assert_eq!(c.hostname_bind_note(), "");
+
+        // No hostname at all (either mode): nothing to bind, nothing to say.
+        for env in [&[][..], &[("CT_AGENT_MODE", "browser")][..]] {
+            let c = AgentConfig::from_env_with(get_from(env)).unwrap();
+            assert!(!c.binds_hostname());
+            assert!(c.hostname_unbound_notice().is_none());
+            assert_eq!(c.hostname_bind_note(), "");
+        }
     }
 
     #[test]
