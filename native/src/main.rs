@@ -91,6 +91,7 @@ USAGE:
     ct-agent manifest plan                Dry-run: what `activate` would do on this host, and why it would refuse
     ct-agent harness run                  Run a signed task against an installed manifest's bundle
     ct-agent harness run --plan           Dry-run: the plan for the task's bundle, no model call
+    ct-agent doctor sandbox [--json]      Can THIS host run sandboxed Binary activations (bwrap)? If not, what to fix
 
 Every subcommand is configured entirely via CT_*/CT_AGENT_*/CT_CHANNEL_* environment
 variables, not flags -- see docs.bunsenbrenner.org for the full reference per command.
@@ -116,7 +117,7 @@ that matters on call -- registered {edge, transport}, registration_failed {error
 disconnected {reason}, transport_switch {from, to}, fallback_exhausted, direct_refused
 {reason}, channel_session {state, peer}, bridge_call {tool, ok}, manifest_install {status},
 manifest_plan {would_refuse, backend}, update_check {result}, update_applied {version},
-credential_degraded -- each stamped with
+credential_degraded, doctor_sandbox {available, os} -- each stamped with
 ts, a per-process session id and a per-connection counter (conn). On stderr an event is one
 `ct-agent event: <kind> k=v ...` line next to the usual human line, or, with
 CT_AGENT_LOG_FORMAT=json, one JSON object per line (for a log shipper). Independently of the
@@ -225,6 +226,17 @@ Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
     `harness run --plan` (or CT_HARNESS_PLAN=1) performs every pre-flight check, then prints the
     plan for the bundle -- the same JSON as `manifest plan`, scanning the bundle's CURRENT
     compose file -- and exits 1 if it lists a refusal, without calling the model.
+
+`doctor sandbox` (scimbe/ct-agent#183, decision C1) runs the same sandbox probe `manifest
+    activate` runs for a Binary manifest (bwrap: `--version`, then a real sandboxed exec with
+    user/pid/net namespaces) and prints `sandbox: available (bwrap)` or `sandbox: UNAVAILABLE`
+    with each candidate's failure reason. On Linux it then checks, one ok/FAIL line each with the
+    fix attached: bwrap on PATH, /proc/sys/kernel/apparmor_restrict_unprivileged_userns (Ubuntu
+    24.04+), /proc/sys/kernel/unprivileged_userns_clone (older Debian) and
+    /proc/sys/user/max_user_namespaces; a set CT_ALLOW_UNSANDBOXED=1 is shown as a WARNING. Exit
+    0 available, 1 unavailable, 2 on an OS without a Binary-manifest sandbox (compose manifests
+    and `manifest plan` only, decision B3). `--json` prints {sandbox_available, backend, tried,
+    findings, allow_unsandboxed, os} instead. No configuration; nothing is installed or changed.
 ";
 
 
@@ -385,6 +397,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // listener, or -- without one configured -- the tail of the on-disk event ring.
     if std::env::args().nth(1).as_deref() == Some("status") {
         ct_agent::status::run_status_command().await?;
+        return Ok(());
+    }
+
+    // `doctor sandbox` (scimbe/ct-agent#183, decision C1): can THIS host run a sandboxed Binary
+    // activation, and if not, what to fix. The probe spawns bwrap, so it runs on the blocking
+    // pool like `manifest plan`'s does; the exit code is the verdict (0/1/2, see USAGE) and an
+    // unknown argument prints the doctor's own usage and exits 2 (#239 discipline, in `doctor`).
+    if std::env::args().nth(1).as_deref() == Some("doctor") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let code = tokio::task::spawn_blocking(move || ct_agent::doctor::run_doctor(&args))
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("doctor task failed: {e}").into() })?;
+        if code != 0 {
+            std::process::exit(code);
+        }
         return Ok(());
     }
 

@@ -76,9 +76,13 @@ pub const UPDATE_CHECK: &str = "update_check";
 pub const UPDATE_APPLIED: &str = "update_applied";
 /// `{}`: the stored OIDC credential is expired and cannot be refreshed (#181).
 pub const CREDENTIAL_DEGRADED: &str = "credential_degraded";
+/// `{available, os}`: `ct-agent doctor sandbox` checked whether this host can run sandboxed
+/// Binary-manifest activations (scimbe/ct-agent#183, decision C1) -- recorded so a host's ring
+/// shows when its sandbox capability was last verified, and what the answer was.
+pub const DOCTOR_SANDBOX: &str = "doctor_sandbox";
 
 /// Every event kind, in the order `/metrics` renders `ct_agent_events_total{kind}`.
-pub const KINDS: [&str; 13] = [
+pub const KINDS: [&str; 14] = [
     REGISTERED,
     REGISTRATION_FAILED,
     DISCONNECTED,
@@ -92,6 +96,7 @@ pub const KINDS: [&str; 13] = [
     UPDATE_CHECK,
     UPDATE_APPLIED,
     CREDENTIAL_DEGRADED,
+    DOCTOR_SANDBOX,
 ];
 
 // ---- the event ----------------------------------------------------------------
