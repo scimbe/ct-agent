@@ -27,8 +27,11 @@ ct-dns = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.19" }
 # entirely outside the sandboxed work_dir at a pre-existing host file and have it chmod+x'd and
 # run, bypassing the bundle's sha256 verification. Same check unpack_tar_gz_safely already applied
 # to tar entry paths, now applied to this field too -- see that repo's activate.rs history.
-manifest-core = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.3-phase5" }
-installer-engine = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.3-phase5" }
+# v0.4.4-phase5 (ct-agent#183 decision B3): installer-engine refuses Binary manifests on Windows
+# fail-closed in activate() and plan() ("unsupported_platform: ..."); compose manifests and
+# `manifest plan` stay available there. Also ships the strict-scan-clean litellm-proof bundle.
+manifest-core = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.4-phase5" }
+installer-engine = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.4-phase5" }
 # CADS-agent-marketplace Phase 2: the bounded local-LLM code-maintenance agent loop behind
 # `ct-agent harness run` -- same pinned-tag style as the two deps directly above (all three come
 # from the same repo/tag together, never mixed across tags). v0.4.2-phase5 bump: harness-core's
@@ -37,7 +40,7 @@ installer-engine = { git = "https://github.com/scimbe/CADS-agent-marketplace", t
 # budget touched at all, since rebuild() never calls the LLM. v0.4.1-phase5 (this crate's tag
 # until now) predates the fix (CADS-agent-marketplace#9/#10); v0.4.2-phase5 is the first tag with
 # the MAX_TASK_TURNS=200 ceiling in place.
-harness-core = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.3-phase5" }
+harness-core = { git = "https://github.com/scimbe/CADS-agent-marketplace", tag = "v0.4.4-phase5" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 # ADR-0024 M3 (crate::masque): the RFC 9298 CONNECT-UDP client dial -- HTTP/2
 # Extended CONNECT (RFC 9220) plus RFC 9297 capsule framing, the same primitives
