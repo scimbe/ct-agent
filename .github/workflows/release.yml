@@ -267,4 +267,7 @@ jobs:
             echo "::warning::CT_RELEASE_SIGNING_KEY is not set -- release-manifest.json uploaded UNSIGNED (#184)"
           fi
           # shellcheck disable=SC2086
-          gh release upload "$RELEASE_TAG" $files --clobber
+          # The manifest job has no checkout, so gh must be told the repo explicitly
+          # (the download step above already does) -- without -R it fails with
+          # "not a git repository" (v0.7.28 release run).
+          gh release upload "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" $files --clobber
