@@ -3,8 +3,10 @@
 //! The Agent dials outbound (no inbound ports). QUIC/UDP-443 is primary; when
 //! outbound UDP is blocked it falls back to HTTP/2 over TCP/443.
 //!
-//! P1.2a implements the transport-selection decision and the QUIC dialer. The
-//! actual TCP fallback transport (P1.2c) and reconnect-on-drop (P1.2b) follow.
+//! This module holds the transport-selection decision, the QUIC dialer, the
+//! TLS-TCP fallback register primitives and the direct-TCP listener; the
+//! fallback pool that drives them lives in `serve.rs`
+//! (`run_agent_tcp_fallback_until_quic_recovers`).
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -202,9 +204,14 @@ pub async fn dial_quic(
 
 /// Dial the Edge over QUIC within `timeout`, mapping a timeout/failure to a
 /// clear, actionable error instead of quinn's bare `TimedOut` (issue #3 /
-/// P1.2c-1). Agent registration is currently QUIC/UDP-only, so a blocked UDP
-/// path is the common cause; the error names it and points at the TCP-fallback
-/// work still to come, rather than leaving the operator with an opaque timeout.
+/// P1.2c-1). A blocked outbound UDP path is the common cause, so the error
+/// names it -- and, since ct-agent#207, says what the caller does next: the
+/// registration loop in `serve.rs` falls through this error into the MASQUE
+/// relay (when configured) and then the TLS-TCP fallback pool, so the tunnel
+/// still comes up. The text must not claim that fallback is missing: two
+/// operators read the old wording as "TCP fallback is unimplemented" and
+/// reported that as their diagnosis while their agents were already serving
+/// over the fallback.
 pub async fn dial_quic_or_blocked_error(
     edge_addr: SocketAddr,
     edge_cert: CertificateDer<'static>,
@@ -213,9 +220,10 @@ pub async fn dial_quic_or_blocked_error(
     match tokio::time::timeout(timeout, dial_quic(edge_addr, edge_cert)).await {
         Ok(Ok(conn)) => Ok(conn),
         _ => Err(format!(
-            "edge UDP/QUIC unreachable at {edge_addr} — agent registration requires UDP; \
-             TCP-fallback registration is not yet implemented (issue #3 / P1.2c). \
-             Open UDP/{} between hosts, or track the fallback work.",
+            "edge UDP/QUIC unreachable at {edge_addr} (no QUIC handshake within {timeout:?}); \
+             falling back to the TLS-TCP registration path (MASQUE relay first when \
+             configured) until UDP/QUIC recovers. Open UDP/{} between hosts to restore \
+             the primary transport; only a failing TCP fallback keeps the tunnel down.",
             edge_addr.port()
         )
         .into()),
@@ -1834,8 +1842,14 @@ mod tests {
         assert!(r.is_err(), "blocked UDP must error, not hang");
         let msg = r.unwrap_err().to_string();
         assert!(
-            msg.contains("UDP") && msg.contains("issue #3"),
+            msg.contains("UDP") && msg.contains("falling back to the TLS-TCP"),
             "error must be clear + actionable, got: {msg}"
+        );
+        // ct-agent#207: the text is shown on the way INTO a working fallback, so it
+        // must never claim the fallback does not exist.
+        assert!(
+            !msg.contains("not yet implemented"),
+            "error must not deny the TCP fallback that follows it, got: {msg}"
         );
         assert!(
             start.elapsed() < Duration::from_secs(2),
