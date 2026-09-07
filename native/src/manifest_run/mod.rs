@@ -1427,6 +1427,11 @@ mod tests {
             "http://evil.invalid",
             "http://127.0.0.1.evil.invalid",
             "ftp://127.0.0.1:8787",
+            // #97: userinfo-bypass -- a "looks-loopback" authority that reqwest/the `url`
+            // crate actually parse as userinfo, connecting to the host AFTER the `@` instead.
+            "http://127.0.0.1:8787@evil.invalid",
+            "http://localhost:1@evil.invalid/",
+            "http://[::1]:8787@evil.invalid",
         ] {
             let err = require_registry_url_scheme(bad)
                 .expect_err(&format!("{bad} must be rejected -- it would leak the registry write token and manifest/bundle bytes in cleartext"));
