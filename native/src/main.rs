@@ -92,6 +92,10 @@ USAGE:
     ct-agent harness run                  Run a signed task against an installed manifest's bundle
     ct-agent harness run --plan           Dry-run: the plan for the task's bundle, no model call
     ct-agent doctor sandbox [--json]      Can THIS host run sandboxed Binary activations (bwrap)? If not, what to fix
+    ct-agent ssh <hostname> [--port <n>] [--ca <pem-file>] [--connect-timeout <secs>]
+                                OpenSSH ProxyCommand: SSH over TLS through the tunnel (see below)
+    ct-agent ssh-config <hostname> [--user <name>] [--port <n>] [--ca <pem-file>]
+                                Print the ~/.ssh/config stanza that makes `ssh <hostname>` use it
 
 Every subcommand is configured entirely via CT_*/CT_AGENT_*/CT_CHANNEL_* environment
 variables, not flags -- see docs.bunsenbrenner.org for the full reference per command.
@@ -117,7 +121,7 @@ that matters on call -- registered {edge, transport}, registration_failed {error
 disconnected {reason}, transport_switch {from, to}, fallback_exhausted, direct_refused
 {reason}, channel_session {state, peer}, bridge_call {tool, ok}, manifest_install {status},
 manifest_plan {would_refuse, backend}, update_check {result}, update_applied {version},
-credential_degraded, doctor_sandbox {available, os} -- each stamped with
+credential_degraded, doctor_sandbox {available, os}, origin_tls_terminated {sni} -- each stamped with
 ts, a per-process session id and a per-connection counter (conn). On stderr an event is one
 `ct-agent event: <kind> k=v ...` line next to the usual human line, or, with
 CT_AGENT_LOG_FORMAT=json, one JSON object per line (for a log shipper). Independently of the
@@ -238,6 +242,24 @@ Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
     0 available, 1 unavailable, 2 on an OS without a Binary-manifest sandbox (compose manifests
     and `manifest plan` only, decision B3). `--json` prints {sandbox_available, backend, tried,
     findings, allow_unsandboxed, os} instead. No configuration; nothing is installed or changed.
+
+SSH through the tunnel (scimbe/ct-agent#204), like cloudflared's `access ssh`. Two halves:
+    Origin host: run the agent with CT_AGENT_MODE=browser, CT_AGENT_HOSTNAME=<hostname>,
+        CT_AGENT_ORIGIN=127.0.0.1:22 and CT_AGENT_ORIGIN_TLS=terminate. The agent then terminates
+        the client's TLS ITSELF with the hostname's own certificate (an sshd cannot) and forwards
+        the SSH plaintext to sshd. The pair is read from CT_AGENT_TLS_CERT / CT_AGENT_TLS_KEY,
+        defaulting to <CT_ACME_CERT_OUT_DIR or /shared/acme-cert>/fullchain.pem and privkey.pem
+        -- exactly what `ct-agent certificate` renews -- and reloaded when either file changes
+        (checked at most every 30 s; a failed reload keeps the previous pair and logs once). The
+        agent fails at startup if terminate is set and the pair cannot be loaded. Only a stream
+        that starts with a TLS ClientHello is terminated; plain bytes (an Edge that already
+        stripped TLS) are forwarded raw as before, so `passthrough` (the default) and an HTTPS
+        Origin are unaffected. Any other CT_AGENT_ORIGIN_TLS value is an error.
+    Client: `ct-agent ssh-config <hostname> [--user <name>] >> ~/.ssh/config`, then plain
+        `ssh <hostname>`. ssh runs `ct-agent ssh <hostname>` as its ProxyCommand: TLS to
+        <hostname>:443 (SNI = hostname, TLS 1.3/1.2, no ALPN) trusting the public roots plus
+        every certificate in --ca, piping ssh's stdin/stdout through the session. Diagnostics go
+        to stderr prefixed `ct-agent ssh:`; stdout is the SSH byte stream and carries nothing else.
 ";
 
 
@@ -412,6 +434,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("doctor task failed: {e}").into() })?;
         if code != 0 {
             std::process::exit(code);
+        }
+        return Ok(());
+    }
+
+    // `ssh` (scimbe/ct-agent#204): the OpenSSH ProxyCommand. stdout IS the SSH byte stream, so
+    // every diagnostic goes to stderr with the `ct-agent ssh:` prefix (ssh shows it to the user)
+    // and the exit code is 1 -- never tokio-main's `Error: ..` rendering, never a usage dump on
+    // stdout. An argument error prints the subcommand's own usage (stderr) above the message.
+    if std::env::args().nth(1).as_deref() == Some("ssh") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let parsed = match ct_agent::ssh_access::parse_ssh_args(&args) {
+            Ok(p) => p,
+            Err(e) => {
+                eprint!("{}", ct_agent::ssh_access::SSH_USAGE);
+                eprintln!("{} {e}", ct_agent::ssh_access::STDERR_PREFIX);
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = ct_agent::ssh_access::run_ssh(&parsed).await {
+            eprintln!("{} {e}", ct_agent::ssh_access::STDERR_PREFIX);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // `ssh-config` (scimbe/ct-agent#204): print the stanza for ~/.ssh/config. The stanza is the
+    // whole stdout so `>> ~/.ssh/config` works; errors follow the `ssh` conventions above.
+    if std::env::args().nth(1).as_deref() == Some("ssh-config") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        match ct_agent::ssh_access::parse_ssh_config_args(&args) {
+            Ok(parsed) => print!("{}", ct_agent::ssh_access::render_ssh_config(&parsed)),
+            Err(e) => {
+                eprint!("{}", ct_agent::ssh_access::SSH_USAGE);
+                eprintln!("ct-agent ssh-config: {e}");
+                std::process::exit(1);
+            }
         }
         return Ok(());
     }
@@ -1075,6 +1133,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         AgentConfig::from_env()?
     };
+
+    // scimbe/ct-agent#204: Agent-side TLS termination for raw-TCP Origins. Built ONCE here
+    // (it owns the reloading certificate state) and threaded down to the raw-forward paths.
+    // Fails fast, naming both paths, before the edge-cert wait below can hide the problem
+    // behind a "waiting for edge cert" log line for minutes.
+    let terminator = match &config.origin_tls {
+        ct_agent::config::OriginTls::Passthrough => None,
+        ct_agent::config::OriginTls::Terminate { cert, key } => {
+            let t = ct_agent::serve::OriginTerminator::load(cert, key).map_err(|e| {
+                format!(
+                    "ct-agent: {}=terminate: {e} (certificate {}, key {}; set {} / {} or {} to point at \
+                     the pair)",
+                    ct_agent::config::ORIGIN_TLS_ENV,
+                    cert.display(),
+                    key.display(),
+                    ct_agent::config::TLS_CERT_ENV,
+                    ct_agent::config::TLS_KEY_ENV,
+                    ct_agent::config::ACME_CERT_OUT_DIR_ENV,
+                )
+            })?;
+            eprintln!(
+                "ct-agent: origin TLS termination ON -- a stream starting with a TLS ClientHello is \
+                 terminated here with {} / {} and forwarded in plaintext to {} (scimbe/ct-agent#204)",
+                t.cert_path().display(),
+                t.key_path().display(),
+                config.origin
+            );
+            if !config.browser_forward {
+                eprintln!(
+                    "ct-agent: WARNING: {}=terminate only applies to raw-forwarded streams \
+                     (CT_AGENT_MODE=browser with CT_AGENT_HOSTNAME); this agent is in Noise mode, so \
+                     the setting has no effect",
+                    ct_agent::config::ORIGIN_TLS_ENV
+                );
+            }
+            Some(std::sync::Arc::new(t))
+        }
+    };
+
     let cert_path =
         std::env::var("CT_AGENT_EDGE_CERT").unwrap_or_else(|_| "/shared/edge-cert.der".to_string());
     let cap_out = std::env::var("CT_AGENT_CAPABILITY_OUT")
@@ -1207,6 +1304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         identity.cap.token,
         std::sync::Arc::new(identity.origin_keys),
         std::sync::Arc::new(local_auth_gate),
+        terminator,
     )
     .await
 }

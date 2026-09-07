@@ -734,7 +734,7 @@ pub fn ka_negotiated(tls: &tokio_rustls::client::TlsStream<TcpStream>) -> bool {
 /// So dead-connection detection here is deliberately slow; liveness during a relay is
 /// the framed keepalive's job (`serve::serve_framed_duplex_to_origin`, ~24s verdict),
 /// not TCP's.
-fn apply_tcp_keepalive(stream: &TcpStream) {
+pub(crate) fn apply_tcp_keepalive(stream: &TcpStream) {
     let sock = socket2::SockRef::from(stream);
     // No `with_retries`: an explicit TCP_KEEPCNT bound is what made the reverted
     // tightening kill quiet in-flight connections early. The OS default (~9 on Linux)

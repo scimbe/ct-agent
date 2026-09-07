@@ -8,15 +8,18 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant, SystemTime};
 
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 
 use crate::reconnect::{Backoff, ReconnectPolicy, Retry};
 use rustls::pki_types::CertificateDer;
-use tokio::io::{copy_bidirectional, join, split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, join, split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
 
 use crate::config::{AgentConfig, OriginProto};
@@ -98,13 +101,245 @@ async fn connect_origin(origin: SocketAddr) -> Result<TcpStream, BoxError> {
 }
 
 /// Serve one relayed QUIC stream: dial the local `origin` (TCP) and relay bytes
-/// bidirectionally between the QUIC stream and the Origin connection.
+/// bidirectionally between the QUIC stream and the Origin connection. `terminator`
+/// is the Agent-side TLS termination for raw-TCP Origins (scimbe/ct-agent#204),
+/// `None` for verbatim passthrough -- see [`serve_duplex_to_origin`].
 pub async fn serve_stream_to_origin(
     quic_send: SendStream,
     quic_recv: RecvStream,
     origin: SocketAddr,
+    terminator: Option<Arc<OriginTerminator>>,
 ) -> Result<(), BoxError> {
-    serve_duplex_to_origin(join(quic_recv, quic_send), origin).await
+    serve_duplex_to_origin(join(quic_recv, quic_send), origin, terminator).await
+}
+
+/// How often [`OriginTerminator::acceptor`] is willing to stat the certificate and key
+/// files for a change. A renewal (`ct-agent certificate`, every ~60 days) is rare, so a
+/// once-per-30 s check costs nothing and picks the new pair up long before the old one
+/// expires -- while never stat'ing twice per second under a connection burst.
+const ORIGIN_TLS_RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The mutable half of [`OriginTerminator`]: the served config plus what it was built from.
+struct TerminatorState {
+    /// The rustls config every accepted connection uses; replaced wholesale on reload.
+    config: Arc<rustls::ServerConfig>,
+    /// Modification times of the cert/key files the current `config` was built from
+    /// (`None` when unreadable at build time), compared on each reload check.
+    cert_mtime: Option<SystemTime>,
+    key_mtime: Option<SystemTime>,
+    /// When the files were last stat'ed, so the check runs at most once per
+    /// [`ORIGIN_TLS_RELOAD_CHECK_INTERVAL`].
+    last_check: Instant,
+    /// Whether a failed reload has been logged already -- the failure is logged ONCE, not
+    /// once per 30 s forever, and the flag resets when a reload succeeds again.
+    reload_failure_logged: bool,
+}
+
+/// Agent-side TLS termination for raw-TCP Origins (scimbe/ct-agent#204).
+///
+/// WHY a struct with state rather than a `ServerConfig`: the certificate it serves is the
+/// hostname's ACME pair, which `ct-agent certificate` renews on disk every ~60 days without
+/// restarting this process. A config loaded once at startup would keep serving the expired
+/// certificate until someone noticed; this keeps the paths and reloads the pair when either
+/// file's modification time changes (checked at most once per 30 s). A reload that fails
+/// (a half-written renewal, a key that does not match the new chain) keeps the LAST GOOD
+/// config and logs once, so an operator's `ssh` never starts failing because of a renewal
+/// race.
+pub struct OriginTerminator {
+    cert: PathBuf,
+    key: PathBuf,
+    state: Mutex<TerminatorState>,
+}
+
+impl std::fmt::Debug for OriginTerminator {
+    /// Paths only: the loaded server config holds key material and is deliberately not printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OriginTerminator").field("cert", &self.cert).field("key", &self.key).finish_non_exhaustive()
+    }
+}
+
+impl OriginTerminator {
+    /// Load the PEM certificate chain at `cert` (leaf first, as `fullchain.pem`) and the PEM
+    /// private key at `key`. Every error names the file, because "TLS terminate failed" with
+    /// no path is exactly the startup message an operator cannot act on.
+    pub fn load(cert: &Path, key: &Path) -> Result<Self, String> {
+        let config = build_origin_server_config(cert, key)?;
+        Ok(Self {
+            cert: cert.to_path_buf(),
+            key: key.to_path_buf(),
+            state: Mutex::new(TerminatorState {
+                config,
+                cert_mtime: file_mtime(cert),
+                key_mtime: file_mtime(key),
+                last_check: Instant::now(),
+                reload_failure_logged: false,
+            }),
+        })
+    }
+
+    /// The certificate path this terminator serves (for startup logging).
+    pub fn cert_path(&self) -> &Path {
+        &self.cert
+    }
+
+    /// The private-key path this terminator serves (for startup logging).
+    pub fn key_path(&self) -> &Path {
+        &self.key
+    }
+
+    /// An acceptor for one connection, on the current config -- reloading it first when
+    /// either file changed on disk (see the struct doc for why a reload failure keeps the
+    /// old config).
+    pub fn acceptor(&self) -> tokio_rustls::TlsAcceptor {
+        let mut st = self.state.lock_safe();
+        if st.last_check.elapsed() >= ORIGIN_TLS_RELOAD_CHECK_INTERVAL {
+            st.last_check = Instant::now();
+            let (cert_mtime, key_mtime) = (file_mtime(&self.cert), file_mtime(&self.key));
+            if cert_mtime != st.cert_mtime || key_mtime != st.key_mtime {
+                match build_origin_server_config(&self.cert, &self.key) {
+                    Ok(config) => {
+                        st.config = config;
+                        st.cert_mtime = cert_mtime;
+                        st.key_mtime = key_mtime;
+                        st.reload_failure_logged = false;
+                        eprintln!(
+                            "ct-agent: origin TLS terminate: reloaded certificate {} / key {} (changed on disk)",
+                            self.cert.display(),
+                            self.key.display()
+                        );
+                    }
+                    Err(e) => {
+                        if !st.reload_failure_logged {
+                            st.reload_failure_logged = true;
+                            eprintln!(
+                                "ct-agent: origin TLS terminate: reload failed, keeping the previous certificate: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        tokio_rustls::TlsAcceptor::from(Arc::clone(&st.config))
+    }
+}
+
+/// The file's modification time, `None` when it cannot be stat'ed (missing mid-renewal, say).
+/// `None` is a value like any other for the change comparison: a file that disappears and
+/// comes back is a change, and the reload then re-reads it.
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Build the rustls server config from a PEM chain and a PEM key, each error naming its file.
+fn build_origin_server_config(cert: &Path, key: &Path) -> Result<Arc<rustls::ServerConfig>, String> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::PrivateKeyDer;
+    crate::transport::install_crypto_provider();
+    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert)
+        .map_err(|e| format!("cannot read certificate {}: {e}", cert.display()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("cannot parse certificate {}: {e}", cert.display()))?;
+    if chain.is_empty() {
+        return Err(format!("no certificate found in {}", cert.display()));
+    }
+    let key_der =
+        PrivateKeyDer::from_pem_file(key).map_err(|e| format!("cannot read private key {}: {e}", key.display()))?;
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key_der)
+        .map_err(|e| format!("certificate {} and key {} rejected: {e}", cert.display(), key.display()))?;
+    Ok(Arc::new(config))
+}
+
+/// Does `first` (the first bytes a client sent) start a TLS handshake? The sniff that lets
+/// `CT_AGENT_ORIGIN_TLS=terminate` stay correct in BOTH deployment colours (scimbe/ct-agent#204):
+/// in Grün the client's TLS reaches the Agent and this is true; in Gelb the Edge already
+/// stripped it, the bytes are plain (an SSH banner, an HTTP request) and this is false, so
+/// they are forwarded raw exactly as before. Pure: a TLS record header is `0x16` (handshake),
+/// `0x03 0x0N` (the legacy record version, SSLv3 through TLS 1.3 -- every real client sends
+/// 0x0301 or 0x0303) and a big-endian length that fits one record; when the handshake type
+/// byte is present too it must be `0x01` (ClientHello).
+pub fn looks_like_tls_client_hello(first: &[u8]) -> bool {
+    if first.len() < 5 {
+        return false;
+    }
+    let (kind, major, minor) = (first[0], first[1], first[2]);
+    let record_len = u16::from_be_bytes([first[3], first[4]]) as usize;
+    // A ClientHello is at least a 4-byte handshake header plus a 2-byte version; a record
+    // is at most 2^14 bytes of payload (RFC 8446 s5.1), with a little slack for the
+    // pre-standard oversize records some middleboxes emit.
+    let plausible_len = (6..=16 * 1024 + 2048).contains(&record_len);
+    let hello = first.get(5).map(|t| *t == 0x01).unwrap_or(true);
+    kind == 0x16 && major == 0x03 && (0x00..=0x04).contains(&minor) && plausible_len && hello
+}
+
+/// A stream that first replays `prefix` (the bytes already read off `inner` to sniff
+/// them) and then continues with `inner`; writes go straight through. This is how the
+/// sniffed ClientHello is handed back to the TLS acceptor without a second, driftable
+/// copy of tokio-rustls's handshake driver: the acceptor reads the record it expects,
+/// unaware anything looked at it first.
+struct Prefixed<T> {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: T,
+}
+
+impl<T> Prefixed<T> {
+    fn new(prefix: Vec<u8>, inner: T) -> Self {
+        Self { prefix, pos: 0, inner }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Prefixed<T> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        if this.pos < this.prefix.len() {
+            let n = buf.remaining().min(this.prefix.len() - this.pos);
+            buf.put_slice(&this.prefix[this.pos..this.pos + n]);
+            this.pos += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Prefixed<T> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Terminate the client's TLS on `client` (whose sniffed first bytes are replayed by the
+/// [`Prefixed`] wrapper), then relay the plaintext to the Origin. The handshake failure is
+/// logged here, once, with the rustls reason: it is the one failure an operator will hit
+/// while getting `ct-agent ssh --ca` and the served chain to agree, and the callers of the
+/// serve functions discard the `Err`.
+async fn terminate_tls_then_forward<T>(
+    client: Prefixed<T>,
+    origin: SocketAddr,
+    terminator: &OriginTerminator,
+) -> Result<(), BoxError>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut tls = match terminator.acceptor().accept(client).await {
+        Ok(tls) => tls,
+        Err(e) => {
+            eprintln!("ct-agent: origin TLS terminate: handshake failed: {e}");
+            return Err(format!("origin TLS terminate: handshake failed: {e}").into());
+        }
+    };
+    let sni = tls.get_ref().1.server_name().map(str::to_string);
+    crate::events::emit(crate::events::ORIGIN_TLS_TERMINATED, serde_json::json!({ "sni": sni }));
+    let mut tcp = connect_origin(origin).await?;
+    copy_bidirectional(&mut tls, &mut tcp).await?;
+    Ok(())
 }
 
 /// Raw-forward any relayed duplex byte stream to the Origin verbatim (issue #41
@@ -125,7 +360,18 @@ pub async fn serve_stream_to_origin(
 /// ever carries request/response protocols (HTTP, or the Noise handshake in
 /// [`serve_noise_bridge`]), the Client always speaks first, so waiting for
 /// its first chunk before dialing costs nothing.
-pub async fn serve_duplex_to_origin<T>(mut client: T, origin: SocketAddr) -> Result<(), BoxError>
+///
+/// scimbe/ct-agent#204: with a `terminator` (`CT_AGENT_ORIGIN_TLS=terminate`) and a
+/// first chunk that [`looks_like_tls_client_hello`], the client's TLS is terminated
+/// HERE and the plaintext relayed to the Origin -- for an sshd or any other raw-TCP
+/// Origin that cannot terminate TLS itself. A first chunk that is not a ClientHello
+/// (the Edge already stripped TLS in Gelb, or a plain client) is forwarded raw exactly
+/// as without a terminator; `None` never inspects the bytes beyond the read it always did.
+pub async fn serve_duplex_to_origin<T>(
+    mut client: T,
+    origin: SocketAddr,
+    terminator: Option<Arc<OriginTerminator>>,
+) -> Result<(), BoxError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -133,6 +379,11 @@ where
     let n = client.read(&mut first).await?;
     if n == 0 {
         return Ok(()); // Client closed before ever sending anything -- nothing to relay.
+    }
+    if let Some(terminator) = terminator {
+        if looks_like_tls_client_hello(&first[..n]) {
+            return terminate_tls_then_forward(Prefixed::new(first[..n].to_vec(), client), origin, &terminator).await;
+        }
     }
     let mut tcp = connect_origin(origin).await?;
     tcp.write_all(&first[..n]).await?;
@@ -1570,12 +1821,19 @@ impl DirectListener {
 /// relayed stream as the Origin's Noise responder, bridging plaintext to the
 /// local Origin (M8.4c-i). `origin_private` is the Agent-held Origin static key.
 /// Loops until the connection closes.
+///
+/// `terminator` (scimbe/ct-agent#204) is the Agent-side TLS termination built once
+/// at startup from `config.origin_tls` -- `None` for passthrough. It is threaded
+/// down to the two raw-forward paths (the QUIC browser path and the TLS-TCP fallback
+/// worker) rather than rebuilt per connection, because it owns the reloading
+/// certificate state.
 pub async fn run_agent(
     config: &AgentConfig,
     edge_cert: CertificateDer<'static>,
     token: RoutingToken,
     origin_keys: Arc<Vec<[u8; 32]>>,
     gate: Arc<local_auth::LocalAuthGate>,
+    terminator: Option<Arc<OriginTerminator>>,
 ) -> Result<(), BoxError> {
     // Shared tunnel metrics for this Agent (M14.1b), plus optional one-time
     // endpoints — set up once, outside the reconnect loop.
@@ -1669,7 +1927,7 @@ pub async fn run_agent(
         );
         switch_transport("tcp-fallback");
         return run_agent_tcp_fallback_with_revocation(
-            config, edge_cert, token, origin_keys, gate, revocation,
+            config, edge_cert, token, origin_keys, gate, revocation, terminator,
         )
         .await;
     }
@@ -1722,6 +1980,7 @@ pub async fn run_agent(
                             Arc::clone(&origin_keys),
                             Arc::clone(&gate),
                             Arc::clone(&revocation),
+                            terminator.clone(),
                         )
                         .await
                         {
@@ -1827,6 +2086,7 @@ pub async fn run_agent(
             &origin_keys,
             Arc::clone(&metrics),
             &gate,
+            terminator.clone(),
         )
         .await;
         eprintln!("ct-agent: edge connection dropped; reconnecting");
@@ -2056,6 +2316,8 @@ pub(crate) fn parse_reconnect_max_attempts(raw: Option<String>) -> u32 {
 /// returning (the connection dropped) aborts whatever was still being served over
 /// it -- those streams are dead with the connection anyway -- and finished tasks
 /// are reaped as they end.
+// pre-existing signature plus the #204 terminator; refactor tracked separately
+#[allow(clippy::too_many_arguments)]
 async fn serve_quic_connection(
     conn: &Connection,
     origin: SocketAddr,
@@ -2064,6 +2326,7 @@ async fn serve_quic_connection(
     origin_keys: &[[u8; 32]],
     metrics: Arc<TunnelMetrics>,
     gate: &Arc<local_auth::LocalAuthGate>,
+    terminator: Option<Arc<OriginTerminator>>,
 ) {
     let mut streams = tokio::task::JoinSet::new();
     // ct-agent#178: QUIC keepalives are quinn's business (nothing here sees a PING
@@ -2095,8 +2358,9 @@ async fn serve_quic_connection(
         // (raw TLS passthrough); the browser's TLS terminates at the Origin.
         // Out of scope for the local-auth gate -- see `local_auth`'s module doc.
         if browser_forward {
+            let terminator = terminator.clone();
             streams.spawn(tracked(async move {
-                let _ = serve_stream_to_origin(send, recv, origin).await;
+                let _ = serve_stream_to_origin(send, recv, origin, terminator).await;
             }));
             continue;
         }
@@ -2150,6 +2414,7 @@ async fn run_agent_tcp_fallback(
         origin_keys,
         gate,
         Arc::new(RevocationView::default()),
+        None,
     )
     .await
 }
@@ -2172,6 +2437,7 @@ async fn run_agent_tcp_fallback_with_revocation(
     origin_keys: Arc<Vec<[u8; 32]>>,
     gate: Arc<local_auth::LocalAuthGate>,
     revocation: Arc<RevocationView>,
+    terminator: Option<Arc<OriginTerminator>>,
 ) -> Result<(), BoxError> {
     let (reconnect_base, reconnect_max) = reconnect_backoff_bounds();
     let mut outer = Backoff::new(reconnect_base, reconnect_max, reconnect_max_attempts());
@@ -2185,6 +2451,7 @@ async fn run_agent_tcp_fallback_with_revocation(
             Arc::clone(&origin_keys),
             Arc::clone(&gate),
             Arc::clone(&revocation),
+            terminator.clone(),
             FallbackBudget::from_env(),
             None,
         )
@@ -2272,6 +2539,7 @@ async fn run_agent_tcp_fallback_until_quic_recovers(
     origin_keys: Arc<Vec<[u8; 32]>>,
     gate: Arc<local_auth::LocalAuthGate>,
     revocation: Arc<RevocationView>,
+    terminator: Option<Arc<OriginTerminator>>,
 ) -> FallbackExit {
     run_tcp_fallback_pool(
         config,
@@ -2280,6 +2548,7 @@ async fn run_agent_tcp_fallback_until_quic_recovers(
         origin_keys,
         gate,
         revocation,
+        terminator,
         FallbackBudget::from_env(),
         Some(QUIC_REPROBE_INTERVAL),
     )
@@ -2302,6 +2571,7 @@ async fn run_tcp_fallback_pool(
     origin_keys: Arc<Vec<[u8; 32]>>,
     gate: Arc<local_auth::LocalAuthGate>,
     revocation: Arc<RevocationView>,
+    terminator: Option<Arc<OriginTerminator>>,
     budget: FallbackBudget,
     reprobe: Option<Duration>,
 ) -> FallbackExit {
@@ -2313,6 +2583,7 @@ async fn run_tcp_fallback_pool(
         origin_keys,
         gate,
         revocation,
+        terminator,
         budget,
         reprobe,
     )
@@ -2333,6 +2604,7 @@ pub(crate) async fn run_tcp_fallback_pool_on(
     origin_keys: Arc<Vec<[u8; 32]>>,
     gate: Arc<local_auth::LocalAuthGate>,
     revocation: Arc<RevocationView>,
+    terminator: Option<Arc<OriginTerminator>>,
     budget: FallbackBudget,
     reprobe: Option<Duration>,
 ) -> FallbackExit {
@@ -2345,8 +2617,10 @@ pub(crate) async fn run_tcp_fallback_pool_on(
         let origin_keys = Arc::clone(&origin_keys);
         let gate = Arc::clone(&gate);
         let tracker = RevocationTracker::new(Arc::clone(&revocation));
+        let terminator = terminator.clone();
         workers.spawn(gauge.track(async move {
-            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys, gate, tracker, budget).await
+            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys, gate, tracker, terminator, budget)
+                .await
         }));
     }
     loop {
@@ -2404,6 +2678,8 @@ pub(crate) async fn run_tcp_fallback_pool_on(
 /// repeat -- the body [`run_agent_tcp_fallback`] runs N of concurrently. Each
 /// registration is still single-use/single-Client; see that function's doc
 /// for why several of these run at once. Returns only when `budget` is exhausted.
+// pre-existing signature plus the #204 terminator; refactor tracked separately
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_tcp_fallback_worker(
     config: &AgentConfig,
     edge_cert: CertificateDer<'static>,
@@ -2411,6 +2687,7 @@ async fn run_agent_tcp_fallback_worker(
     origin_keys: Arc<Vec<[u8; 32]>>,
     gate: Arc<local_auth::LocalAuthGate>,
     mut revocation: RevocationTracker,
+    terminator: Option<Arc<OriginTerminator>>,
     budget: FallbackBudget,
 ) -> Result<(), BoxError> {
     let metrics = Arc::new(TunnelMetrics::new());
@@ -2429,7 +2706,15 @@ async fn run_agent_tcp_fallback_worker(
             // ct-agent#178: every rung is one registration attempt (see the QUIC loop).
             crate::events::next_conn_id();
             match tcp_connect_register_serve(
-                config, *addr, &edge_cert, &token, &origin_keys, &metrics, &gate, &mut revocation,
+                config,
+                *addr,
+                &edge_cert,
+                &token,
+                &origin_keys,
+                &metrics,
+                &gate,
+                &mut revocation,
+                terminator.clone(),
             )
             .await
             {
@@ -2488,6 +2773,7 @@ async fn tcp_connect_register_serve(
     metrics: &Arc<TunnelMetrics>,
     gate: &local_auth::LocalAuthGate,
     revocation: &mut RevocationTracker,
+    terminator: Option<Arc<OriginTerminator>>,
 ) -> Result<(), BoxError> {
     let mut stream = tcp_tls_connect(target, edge_cert.clone()).await?;
     // Browser Plane over the TCP fallback (#41 FB3): register+bind the public
@@ -2569,10 +2855,14 @@ async fn tcp_connect_register_serve(
                 // comes AFTER the STOP byte).
                 await_ping_phase_end(&mut stream).await?;
             }
+            // scimbe/ct-agent#204: the terminator applies to the raw ('L'/'B') relay only.
+            // The framed 'F' relay carries the browser bytes inside keepalive frames on
+            // this hop, so terminating TLS there needs a frame-to-stream adapter first;
+            // until that exists an 'F' registration forwards verbatim, terminator or not.
             return if framed {
                 serve_framed_duplex_to_origin(stream, config.origin).await
             } else {
-                serve_duplex_to_origin(stream, config.origin).await
+                serve_duplex_to_origin(stream, config.origin, terminator).await
             };
         }
     }
@@ -3018,7 +3308,7 @@ mod tests {
         // Agent: dial the edge, accept the relayed stream, serve it to origin.
         let conn = dial_quic(addr, cert).await.expect("agent dial");
         let (a_send, a_recv) = conn.accept_bi().await.unwrap();
-        serve_stream_to_origin(a_send, a_recv, origin_addr)
+        serve_stream_to_origin(a_send, a_recv, origin_addr, None)
             .await
             .expect("serve to origin");
 
@@ -4330,6 +4620,7 @@ mod tests {
                 RoutingToken([1u8; 32]),
                 std::sync::Arc::new(vec![[0u8; 32]]),
                 std::sync::Arc::new(gate),
+                None,
             )
             .await;
         });
@@ -5654,6 +5945,7 @@ mod tests {
                 Arc::new(vec![[0u8; 32]]),
                 Arc::new(gate),
                 Arc::new(RevocationView::default()),
+                None,
                 budget,
                 None,
             )
@@ -5739,6 +6031,7 @@ mod tests {
                 Arc::new(vec![[0u8; 32]]),
                 Arc::new(gate),
                 Arc::new(RevocationView::default()),
+                None,
                 budget,
                 None,
             ),
@@ -5816,6 +6109,7 @@ mod tests {
             register_tcp_only: false,
             masque_fallback: None,
             direct_require_token: false,
+            origin_tls: crate::config::OriginTls::Passthrough,
         };
         let token_a = token.clone();
         let origin_priv = origin_kp.private;
@@ -5827,6 +6121,7 @@ mod tests {
                 token_a,
                 std::sync::Arc::new(vec![origin_priv]),
                 std::sync::Arc::new(gate),
+                None,
             )
             .await;
         });
@@ -5878,7 +6173,7 @@ mod tests {
         let agent = tokio::spawn(async move {
             let conn = server.accept().await.unwrap().await.unwrap();
             let (send, recv) = conn.accept_bi().await.unwrap();
-            let _ = serve_stream_to_origin(send, recv, origin_addr).await;
+            let _ = serve_stream_to_origin(send, recv, origin_addr, None).await;
             conn.closed().await;
         });
 
@@ -5939,7 +6234,7 @@ mod tests {
         });
 
         let (mut client_side, agent_side) = tokio::io::duplex(1024);
-        let relay = tokio::spawn(async move { serve_duplex_to_origin(agent_side, origin_addr).await });
+        let relay = tokio::spawn(async move { serve_duplex_to_origin(agent_side, origin_addr, None).await });
 
         // Give the relay every chance to have dialed already, if it were going
         // to dial eagerly -- it must not have.
@@ -6005,6 +6300,228 @@ mod tests {
 /// yields a usable guard instead of a second panic -- against the ct-common
 /// version this crate actually pins, so a future ct-common bump that changed the
 /// helper's semantics would fail here, not in a live tunnel.
+/// scimbe/ct-agent#204: the Agent-side TLS terminator for raw-TCP Origins.
+#[cfg(test)]
+mod origin_tls_tests {
+    use super::*;
+    use crate::ssh_access::test_pki;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn client_hello_sniff_accepts_real_record_headers_and_rejects_plain_protocols() {
+        // TLS 1.3 ClientHello as every modern client sends it: record version 0x0301, a
+        // plausible length, handshake type 1.
+        assert!(looks_like_tls_client_hello(&[0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01, 0xfc]));
+        // TLS 1.2 record version, minimal length, no handshake byte visible yet.
+        assert!(looks_like_tls_client_hello(&[0x16, 0x03, 0x03, 0x00, 0x40]));
+        // SSLv3 record version (0x0300) is still a handshake record.
+        assert!(looks_like_tls_client_hello(&[0x16, 0x03, 0x00, 0x00, 0x80, 0x01]));
+
+        assert!(!looks_like_tls_client_hello(b"SSH-2.0-OpenSSH_9.6\r\n"), "an SSH banner is plain");
+        assert!(!looks_like_tls_client_hello(b"GET / HTTP/1.1\r\n"), "an HTTP request is plain");
+        assert!(!looks_like_tls_client_hello(&[0x16, 0x03, 0x01]), "too short to be a record header");
+        assert!(!looks_like_tls_client_hello(&[]), "empty");
+        assert!(!looks_like_tls_client_hello(&[0x17, 0x03, 0x03, 0x00, 0x40, 0x01]), "application data, not handshake");
+        assert!(!looks_like_tls_client_hello(&[0x16, 0x02, 0x01, 0x00, 0x40, 0x01]), "not a 0x03 major");
+        assert!(!looks_like_tls_client_hello(&[0x16, 0x03, 0x09, 0x00, 0x40, 0x01]), "minor beyond TLS 1.3");
+        assert!(!looks_like_tls_client_hello(&[0x16, 0x03, 0x01, 0x00, 0x00, 0x01]), "zero-length record");
+        assert!(!looks_like_tls_client_hello(&[0x16, 0x03, 0x01, 0xff, 0xff, 0x01]), "record too long");
+        assert!(!looks_like_tls_client_hello(&[0x16, 0x03, 0x01, 0x00, 0x40, 0x02]), "ServerHello, not ClientHello");
+    }
+
+    #[test]
+    fn terminator_load_names_the_missing_or_mismatched_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = test_pki::issue("ssh.test.invalid");
+        let (_ca, cert, key) = test_pki::write_to(&pki, dir.path());
+        assert!(OriginTerminator::load(&cert, &key).is_ok());
+
+        let missing = dir.path().join("nope.pem");
+        let err = OriginTerminator::load(&missing, &key).unwrap_err();
+        assert!(err.contains("nope.pem"), "{err}");
+        let err = OriginTerminator::load(&cert, &missing).unwrap_err();
+        assert!(err.contains("nope.pem"), "{err}");
+
+        // A key that does not belong to the chain is refused, naming both.
+        let other = test_pki::issue("ssh.test.invalid");
+        let other_key = dir.path().join("other.key");
+        std::fs::write(&other_key, &other.key_pem).unwrap();
+        let err = OriginTerminator::load(&cert, &other_key).unwrap_err();
+        assert!(err.contains("fullchain.pem") && err.contains("other.key"), "{err}");
+    }
+
+    /// A plaintext TCP echo on loopback: the stand-in for sshd.
+    async fn spawn_plain_echo() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = s.split();
+                    let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                    let _ = wr.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn client_trusting(ca: &rustls::pki_types::CertificateDer<'static>) -> tokio_rustls::TlsConnector {
+        crate::transport::install_crypto_provider();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.clone()).unwrap();
+        let cfg = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(cfg))
+    }
+
+    #[tokio::test]
+    async fn terminator_unwraps_client_tls_and_relays_plaintext_to_the_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = test_pki::issue("ssh.test.invalid");
+        let (_ca, cert, key) = test_pki::write_to(&pki, dir.path());
+        let terminator = Arc::new(OriginTerminator::load(&cert, &key).unwrap());
+        let origin_addr = spawn_plain_echo().await;
+
+        // The relayed stream: `client_side` is what the Edge would hand us; TLS runs over it.
+        let (client_side, agent_side) = tokio::io::duplex(8192);
+        let relay =
+            tokio::spawn(async move { serve_duplex_to_origin(agent_side, origin_addr, Some(terminator)).await });
+
+        let sni = rustls::pki_types::ServerName::try_from("ssh.test.invalid").unwrap();
+        let mut tls = client_trusting(&pki.ca_der)
+            .connect(sni, client_side)
+            .await
+            .expect("the agent terminates TLS with the leaf for ssh.test.invalid");
+        tls.write_all(b"SSH-2.0-client\r\n").await.unwrap();
+        tls.flush().await.unwrap();
+        let mut echoed = [0u8; 64];
+        let n = tls.read(&mut echoed).await.unwrap();
+        assert_eq!(&echoed[..n], b"SSH-2.0-client\r\n", "the origin saw plaintext and echoed it back through TLS");
+
+        tls.shutdown().await.unwrap();
+        drop(tls);
+        let _ = tokio::time::timeout(Duration::from_secs(5), relay).await.expect("relay ends after the client closes");
+    }
+
+    #[tokio::test]
+    async fn terminator_rejects_a_client_expecting_a_different_ca_and_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let served = test_pki::issue("ssh.test.invalid");
+        let other = test_pki::issue("ssh.test.invalid");
+        let (_ca, cert, key) = test_pki::write_to(&served, dir.path());
+        let terminator = Arc::new(OriginTerminator::load(&cert, &key).unwrap());
+        let origin_addr = spawn_plain_echo().await;
+        let (client_side, agent_side) = tokio::io::duplex(8192);
+        let relay =
+            tokio::spawn(async move { serve_duplex_to_origin(agent_side, origin_addr, Some(terminator)).await });
+        let sni = rustls::pki_types::ServerName::try_from("ssh.test.invalid").unwrap();
+        let client_err = client_trusting(&other.ca_der).connect(sni, client_side).await.err();
+        assert!(client_err.is_some(), "the client must not trust the served chain");
+        let relay_err = tokio::time::timeout(Duration::from_secs(5), relay).await.unwrap().unwrap().unwrap_err();
+        assert!(relay_err.to_string().contains("handshake failed"), "{relay_err}");
+    }
+
+    #[tokio::test]
+    async fn terminator_leaves_a_plain_stream_alone() {
+        // Gelb: the Edge already stripped TLS, the first bytes are an SSH banner -- forwarded
+        // raw, terminator or not, and the origin's answer comes back raw.
+        let dir = tempfile::tempdir().unwrap();
+        let pki = test_pki::issue("ssh.test.invalid");
+        let (_ca, cert, key) = test_pki::write_to(&pki, dir.path());
+        let terminator = Arc::new(OriginTerminator::load(&cert, &key).unwrap());
+        let origin_addr = spawn_plain_echo().await;
+        let (mut client_side, agent_side) = tokio::io::duplex(8192);
+        let relay =
+            tokio::spawn(async move { serve_duplex_to_origin(agent_side, origin_addr, Some(terminator)).await });
+        client_side.write_all(b"SSH-2.0-plain\r\n").await.unwrap();
+        client_side.flush().await.unwrap();
+        let mut echoed = [0u8; 64];
+        let n = client_side.read(&mut echoed).await.unwrap();
+        assert_eq!(&echoed[..n], b"SSH-2.0-plain\r\n");
+        drop(client_side);
+        let _ = tokio::time::timeout(Duration::from_secs(5), relay).await.expect("relay ends");
+    }
+
+    #[tokio::test]
+    async fn no_terminator_forwards_a_client_hello_raw_to_the_origin() {
+        // Passthrough (the default) must not sniff-and-terminate: the ClientHello bytes reach
+        // the origin untouched, exactly as before #204.
+        let origin_addr = spawn_plain_echo().await;
+        let (mut client_side, agent_side) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move { serve_duplex_to_origin(agent_side, origin_addr, None).await });
+        let hello = [0x16, 0x03, 0x01, 0x00, 0x08, 0x01, 0x00, 0x00, 0x04, 0x03, 0x03, 0xaa, 0xbb];
+        client_side.write_all(&hello).await.unwrap();
+        client_side.flush().await.unwrap();
+        let mut echoed = [0u8; 64];
+        let n = client_side.read(&mut echoed).await.unwrap();
+        assert_eq!(&echoed[..n], &hello[..], "raw passthrough: the origin got the record verbatim");
+        drop(client_side);
+        let _ = tokio::time::timeout(Duration::from_secs(5), relay).await.expect("relay ends");
+    }
+
+    #[tokio::test]
+    async fn terminator_reloads_a_renewed_pair_after_the_check_interval() {
+        // A renewal rewrites both files; the next acceptor after the 30 s check window must
+        // serve the new leaf (proved by which CA the client has to trust), and a broken
+        // renewal must keep the old one.
+        let dir = tempfile::tempdir().unwrap();
+        let first = test_pki::issue("ssh.test.invalid");
+        let (_ca, cert, key) = test_pki::write_to(&first, dir.path());
+        let terminator = Arc::new(OriginTerminator::load(&cert, &key).unwrap());
+        let origin_addr = spawn_plain_echo().await;
+
+        let second = test_pki::issue("ssh.test.invalid");
+        std::fs::write(&cert, &second.leaf_pem).unwrap();
+        std::fs::write(&key, &second.key_pem).unwrap();
+        // Force the window to have elapsed (and a different mtime, on filesystems with coarse
+        // timestamps the rewrite alone might not change it -- the content check is by mtime).
+        {
+            let mut st = terminator.state.lock_safe();
+            st.last_check = Instant::now()
+                .checked_sub(ORIGIN_TLS_RELOAD_CHECK_INTERVAL + Duration::from_secs(1))
+                .expect("monotonic clock older than the reload window");
+            st.cert_mtime = None;
+        }
+        let (client_side, agent_side) = tokio::io::duplex(8192);
+        let t = Arc::clone(&terminator);
+        let relay = tokio::spawn(async move { serve_duplex_to_origin(agent_side, origin_addr, Some(t)).await });
+        let sni = rustls::pki_types::ServerName::try_from("ssh.test.invalid").unwrap();
+        let mut tls = client_trusting(&second.ca_der)
+            .connect(sni, client_side)
+            .await
+            .expect("after the reload the SECOND CA's leaf is served");
+        tls.shutdown().await.unwrap();
+        drop(tls);
+        let _ = tokio::time::timeout(Duration::from_secs(5), relay).await;
+
+        // A broken renewal (key does not match the chain) keeps the second pair in service.
+        std::fs::write(&key, &first.key_pem).unwrap();
+        {
+            let mut st = terminator.state.lock_safe();
+            st.last_check = Instant::now()
+                .checked_sub(ORIGIN_TLS_RELOAD_CHECK_INTERVAL + Duration::from_secs(1))
+                .expect("monotonic clock older than the reload window");
+            st.key_mtime = None;
+        }
+        let (client_side, agent_side) = tokio::io::duplex(8192);
+        let t = Arc::clone(&terminator);
+        let relay = tokio::spawn(async move { serve_duplex_to_origin(agent_side, origin_addr, Some(t)).await });
+        let sni = rustls::pki_types::ServerName::try_from("ssh.test.invalid").unwrap();
+        let mut tls = client_trusting(&second.ca_der)
+            .connect(sni, client_side)
+            .await
+            .expect("a failed reload keeps the last good pair");
+        tls.shutdown().await.unwrap();
+        drop(tls);
+        let _ = tokio::time::timeout(Duration::from_secs(5), relay).await;
+        assert!(terminator.state.lock_safe().reload_failure_logged, "the failure was logged (once)");
+    }
+}
+
 #[cfg(test)]
 mod lock_safe_tests {
     use ct_common::sync::MutexExt;

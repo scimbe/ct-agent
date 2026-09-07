@@ -180,6 +180,7 @@ async fn fallback_pool_survives_weeks_of_worker_churn_without_leaking_tasks() {
                 Arc::new(vec![[0u8; 32]]),
                 Arc::clone(&gate),
                 Arc::new(RevocationView::default()),
+                None,
                 budget,
                 None,
             )
