@@ -141,7 +141,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Soak (simulated weeks under paused time)
-        run: cargo test --locked -p ct-agent --lib -- soak:: --test-threads=1
+        run: "cargo test --locked -p ct-agent --lib -- soak:: --test-threads=1"
 
   wasm:
     # ct-agent-wasm IS ct-agent for the browser (workspace restructure, see the
