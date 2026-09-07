@@ -1407,6 +1407,10 @@ fn bridge_manifest_tools_refuse_every_caller_that_is_not_the_configured_bridge_p
             "bridge/manifest-install",
             serde_json::json!({ "manifest_location": "https://example.invalid/m.json", "project_name": "proof" }),
         ),
+        (
+            "bridge/manifest-plan",
+            serde_json::json!({ "manifest_location": "https://example.invalid/m.json", "project_name": "proof" }),
+        ),
     ] {
         let request = encode_request(1, "tools/call", serde_json::json!({ "name": name, "arguments": arguments }));
         let response = decode_response(&reg.dispatch_ctx(&other_peer, &request)).expect("valid JSON-RPC response");
@@ -1612,6 +1616,103 @@ fn bridge_manifest_install_rejects_missing_fields_without_panicking() {
     let response = decode_response(&reg.dispatch_ctx(&ctx, &request)).expect("valid JSON-RPC response");
     assert!(response.result.is_none(), "missing project_name must not return a result");
     assert!(response.error.is_some(), "missing project_name must be a JSON-RPC error");
+}
+
+#[test]
+fn bridge_manifest_plan_rejects_missing_fields_without_panicking_183() {
+    // Same ordering as manifest-install: args validated before env or the manifest fetch.
+    use ct_common::mcp::{decode_response, encode_request, CallContext, ToolRegistry};
+
+    let bridge_peer = [0x99u8; 32];
+    let mut reg = ToolRegistry::new();
+    register_bridge_tools(&mut reg, bridge_peer);
+    let ctx = CallContext::authenticated(bridge_peer);
+
+    for (id, arguments) in [
+        (1, serde_json::json!({ "project_name": "proof" })),
+        (2, serde_json::json!({ "manifest_location": "https://example.invalid/m.json" })),
+    ] {
+        let request = encode_request(id, "tools/call", serde_json::json!({ "name": "bridge/manifest-plan", "arguments": arguments }));
+        let response = decode_response(&reg.dispatch_ctx(&ctx, &request)).expect("valid JSON-RPC response");
+        assert!(response.result.is_none(), "a missing field must not return a result");
+        assert!(response.error.is_some(), "a missing field must be a JSON-RPC error");
+    }
+}
+
+#[test]
+fn bridge_manifest_plan_returns_the_plan_json_to_the_bridge_peer_183() {
+    // The injectable-env registration: a complete activate config (trust allowlist, work dir)
+    // from a lookup map, a signed compose manifest in a temp file as `manifest_location`. The
+    // plan is computed for real -- nothing fetched over the network, nothing created on disk.
+    use ct_common::mcp::{decode_response, encode_request, CallContext, ToolRegistry};
+    use ed25519_dalek::SigningKey;
+    use manifest_core::{BundleRef, InstallerKind, ServiceManifest, VerifySpec};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[3u8; 32]);
+    let now = crate::manifest_run::unix_now().unwrap();
+    let manifest = ServiceManifest::sign_new(
+        &key,
+        [7u8; 32],
+        "plan-proof".to_string(),
+        "0.1.0".to_string(),
+        InstallerKind::Compose,
+        BundleRef {
+            url: "https://example.invalid/bundle.tar.gz".to_string(),
+            sha256: [0u8; 32],
+            compose_file: "docker-compose.yml".to_string(),
+        },
+        Vec::new(),
+        VerifySpec { script: "verify.sh".to_string(), timeout_secs: 60 },
+        now,
+        now + 7_200,
+        None,
+        None,
+    );
+    let manifest_path = tmp.path().join("manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let work_dir = tmp.path().join("work");
+
+    let allowlist_hex = hex_encode(&key.verifying_key().to_bytes());
+    let env_map: HashMap<String, String> = [
+        ("CT_MANIFEST_TRUST_ALLOWLIST", allowlist_hex),
+        ("CT_MANIFEST_WORK_DIR", work_dir.to_string_lossy().into_owned()),
+        // Agent-side opt-in for a local manifest path (ct-agent#170); the caller cannot set it.
+        ("CT_MANIFEST_ALLOW_LOCAL_PATH", "1".to_string()),
+        // Would be a bundle-internal path in the agent's environment; the tool must ignore it.
+        ("CT_MANIFEST_COMPOSE_FILE", "docker-compose.yml".to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+
+    let bridge_peer = [0x99u8; 32];
+    let mut reg = ToolRegistry::new();
+    register_bridge_manifest_plan_tool(&mut reg, bridge_peer, move |k| env_map.get(k).cloned());
+
+    let arguments = serde_json::json!({ "manifest_location": manifest_path.to_string_lossy(), "project_name": "plan-proof" });
+    let request = encode_request(1, "tools/call", serde_json::json!({ "name": "bridge/manifest-plan", "arguments": arguments }));
+
+    // The gate still holds on this registration path.
+    let response = decode_response(&reg.dispatch_ctx(&CallContext::authenticated([0x11u8; 32]), &request)).expect("valid JSON-RPC response");
+    assert!(response.result.is_none() && response.error.is_some(), "a non-bridge peer must be refused");
+
+    let response = decode_response(&reg.dispatch_ctx(&CallContext::authenticated(bridge_peer), &request)).expect("valid JSON-RPC response");
+    assert!(response.error.is_none(), "the bridge peer must get a plan: {:?}", response.error);
+    let plan = response.result.expect("result present");
+    assert_eq!(plan["would_refuse"], serde_json::json!(false), "{plan}");
+    assert_eq!(plan["refusals"], serde_json::json!([]), "{plan}");
+    assert_eq!(plan["backend"], serde_json::Value::Null, "compose: no bwrap backend applies");
+    assert_eq!(plan["argv_preview"][0], serde_json::json!("docker"), "{plan}");
+    assert_eq!(plan["argv_preview"][3], serde_json::json!("plan-proof"), "{plan}");
+    assert!(plan["compose_overrides"].as_array().is_some_and(|o| !o.is_empty()), "{plan}");
+    assert!(
+        plan["compose_overrides"].as_array().unwrap().iter().any(|o| o.as_str().is_some_and(|t| t.contains("static scan skipped"))),
+        "no caller-supplied compose text is ever scanned: {plan}"
+    );
+    assert_eq!(plan["install_dir"], serde_json::json!(work_dir.join("plan-proof").to_string_lossy()), "{plan}");
+    assert_eq!(plan["manifest_id"], serde_json::json!("07".repeat(32)), "{plan}");
+    assert!(!work_dir.exists(), "a plan creates nothing on disk");
 }
 
 #[test]

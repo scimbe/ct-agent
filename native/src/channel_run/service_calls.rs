@@ -1014,6 +1014,25 @@ pub(crate) fn decode_hex_32_bridge_peer(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// ct-agent#178: every bridge tool is wrapped so ONE `bridge_call {tool, ok}` event is emitted
+/// per invocation (a refused caller is `ok=false` like any other error).
+fn bridge_traced(
+    tool: &'static str,
+    handler: impl Fn(&ct_common::mcp::CallContext, &serde_json::Value) -> Result<serde_json::Value, String>
+        + Send
+        + Sync
+        + 'static,
+) -> impl Fn(&ct_common::mcp::CallContext, &serde_json::Value) -> Result<serde_json::Value, String>
+       + Send
+       + Sync
+       + 'static {
+    move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
+        let out = handler(ctx, args);
+        crate::events::emit(crate::events::BRIDGE_CALL, serde_json::json!({ "tool": tool, "ok": out.is_ok() }));
+        out
+    }
+}
+
 /// Register the "Agent bridges" tool tranche (2026-09-01, CADS-Tunnel portal remote-control
 /// design) on `reg`, each gated to `bridge_peer` — the ONE Noise pubkey this agent trusts as
 /// its bridge (`CT_CHANNEL_BRIDGE_PEER`; today, the deployment's single shared bridge identity,
@@ -1027,7 +1046,8 @@ pub(crate) fn decode_hex_32_bridge_peer(s: &str) -> Option<[u8; 32]> {
 /// den Agent steuern" rests on at the agent's own admission point, independent of whatever the
 /// portal itself checks. `bridge/status`, `bridge/config`, `bridge/channel-members`,
 /// `bridge/allowlist-list`, `bridge/allowlist-add`, `bridge/allowlist-remove`,
-/// `bridge/manifest-list`, `bridge/manifest-install` ship in this pass. The mutating
+/// `bridge/manifest-list`, `bridge/manifest-install` ship in this pass; `bridge/manifest-plan`
+/// (scimbe/ct-agent#183, the dry run the portal shows before an install) joins them. The mutating
 /// allowlist-add/remove tools ARE gated (bridge-peer-only, same as everything else here) but
 /// the portal's own confirmation-before-calling UX is separate, not-yet-built work -- this
 /// tool existing safely does not mean the portal should call it without one yet. Only
@@ -1043,25 +1063,6 @@ pub(crate) fn decode_hex_32_bridge_peer(s: &str) -> Option<[u8; 32]> {
 /// [`enrich_manifest_list`], each registry entry carrying an added `manifest_url` the portal can
 /// hand straight back to `bridge/manifest-install` as `manifest_location`.
 pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, bridge_peer: [u8; 32]) {
-    // ct-agent#178: every bridge tool is wrapped so ONE `bridge_call {tool, ok}` event
-    // is emitted per invocation (a refused caller is `ok=false` like any other error).
-    fn bridge_traced(
-        tool: &'static str,
-        handler: impl Fn(&ct_common::mcp::CallContext, &serde_json::Value) -> Result<serde_json::Value, String>
-            + Send
-            + Sync
-            + 'static,
-    ) -> impl Fn(&ct_common::mcp::CallContext, &serde_json::Value) -> Result<serde_json::Value, String>
-           + Send
-           + Sync
-           + 'static {
-        move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
-            let out = handler(ctx, args);
-            crate::events::emit(crate::events::BRIDGE_CALL, serde_json::json!({ "tool": tool, "ok": out.is_ok() }));
-            out
-        }
-    }
-
     reg.register_ctx(
         "bridge/status",
         "Agent bridge status: this agent's version and that the bridge gate is active. Callable \
@@ -1285,7 +1286,11 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
          one. Returns the same structured InstallReport `ct-agent manifest activate` prints, plus \
          `install_dir`. Refused unconditionally, for every caller including the bridge peer, when \
          this agent's own CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL is set -- the owner's own \
-         opt-out, independent of who the bridge peer or trust allowlist otherwise trust.",
+         opt-out, independent of who the bridge peer or trust allowlist otherwise trust. A binary \
+         manifest is installed FAIL CLOSED (#183): refused when no sandbox backend is usable on \
+         this host, unless the agent's OWN process environment carries CT_ALLOW_UNSANDBOXED=1 -- \
+         that opt-out is inherited from the agent's environment and is never caller-controlled. \
+         Call bridge/manifest-plan first to see the verdict without installing.",
         bridge_traced("bridge/manifest-install", move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
             if ctx.peer != Some(bridge_peer) {
                 return Err("bridge/manifest-install: caller is not this agent's configured bridge peer".to_string());
@@ -1323,6 +1328,66 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
             Ok(crate::manifest_run::report_json_with_install_dir(&activation))
         }),
     );
+    register_bridge_manifest_plan_tool(reg, bridge_peer, |k| std::env::var(k).ok());
+}
+
+/// `bridge/manifest-plan` (scimbe/ct-agent#183): the dry run of `bridge/manifest-install`, so the
+/// portal can show what an install WOULD do -- and every reason it would be refused -- before
+/// the owner clicks install. Split out of [`register_bridge_tools`] (which registers it with
+/// the real process environment) so the env lookup is injectable: the plan's whole config
+/// (trust allowlist, work dir, sandbox opt-out) comes from `env`, and a test can supply one
+/// without touching process-global state. The handler runs the blocking plan inline: the
+/// registry's `dispatch_ctx` already executes on Tokio's blocking pool (see `channel_local`),
+/// and a plan does nothing async -- no ledger POST, no docker -- so there is nothing to await.
+/// Never accepts a compose-file path from the caller: a local path would let the bridge peer
+/// point the static scan at any file this agent can read.
+pub(crate) fn register_bridge_manifest_plan_tool(
+    reg: &mut ct_common::mcp::ToolRegistry,
+    bridge_peer: [u8; 32],
+    env: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+) {
+    reg.register_ctx(
+        "bridge/manifest-plan",
+        "Dry-run a manifest install (#183): what bridge/manifest-install WOULD do on this agent's \
+         host, computed without fetching a bundle, creating a directory, or running anything (a \
+         binary manifest probes the sandbox backend, nothing more). Arguments: {manifest_location, \
+         project_name}, exactly as bridge/manifest-install takes them. Returns the plan JSON: \
+         `backend` (the sandbox backend a binary run would use; null for compose or an unsandboxed \
+         opt-out run), `argv_preview` (secret values redacted), `compose_overrides` (the hardening \
+         every compose service must carry), `refusals` (EVERY reason the install would be rejected, \
+         in the order the checks run: signature/expiry and trust allowlist first, then the \
+         environment contract, the sandbox requirement, and the compose guardrails when the compose \
+         text is available), plus `would_refuse`, `install_dir` and `manifest_id`. The static \
+         compose scan is skipped here (the bundle is not fetched and no caller-supplied file is ever \
+         read); the real install scans the unpacked bundle. Trust allowlist, work directory and the \
+         CT_ALLOW_UNSANDBOXED opt-out come from this agent's OWN environment, never from the caller. \
+         Not gated by CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL: a plan installs nothing.",
+        bridge_traced("bridge/manifest-plan", move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
+            if ctx.peer != Some(bridge_peer) {
+                return Err("bridge/manifest-plan: caller is not this agent's configured bridge peer".to_string());
+            }
+            let manifest_location = args
+                .get("manifest_location")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "bridge/manifest-plan: missing string field `manifest_location`".to_string())?
+                .to_string();
+            let project_name = args
+                .get("project_name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "bridge/manifest-plan: missing string field `project_name`".to_string())?
+                .to_string();
+            let cfg = crate::manifest_run::PlanCliConfig::from_lookup(|k| match k {
+                "CT_MANIFEST_URL" => Some(manifest_location.clone()),
+                "CT_MANIFEST_PROJECT_NAME" => Some(project_name.clone()),
+                // Never a caller path (see the doc above); `create`'s meaning of this variable
+                // in the agent's environment is a path INSIDE a bundle and must not be scanned.
+                "CT_MANIFEST_COMPOSE_FILE" => None,
+                other => env(other),
+            })?;
+            let planned = crate::manifest_run::run_plan_blocking(cfg)?;
+            Ok(crate::manifest_run::plan_json_with_install_dir(&planned))
+        }),
+    );
 }
 
 /// The `bridge/config` tool's whole answer, built purely from `env` (a `CT_*` lookup), the
@@ -1337,7 +1402,7 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
 /// three pre-#181 spellings unchanged. The `*_configured` flags mirror exactly what each bridge
 /// tool checks before it can work: `bridge/channel-members` and `bridge/allowlist-*` need
 /// `cp_url_configured` + `channel_id_configured` + a credential; `bridge/manifest-list` needs
-/// `manifest_registry_configured`; `bridge/manifest-install` also needs
+/// `manifest_registry_configured`; `bridge/manifest-install` (and `bridge/manifest-plan`) also needs
 /// `manifest_trust_allowlist_configured` + `manifest_work_dir_configured`, and `docker_available`
 /// for compose-kind manifests. A `bool` can't leak a secret, so the portal may render this table
 /// freely.

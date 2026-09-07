@@ -1,5 +1,5 @@
-//! `ct-agent manifest {create,sign,publish,activate}`: author, sign, publish and install a
-//! CADS-agent-marketplace [`ServiceManifest`].
+//! `ct-agent manifest {create,sign,publish,activate,plan}`: author, sign, publish, install -- or
+//! dry-run -- a CADS-agent-marketplace [`ServiceManifest`].
 //!
 //! Thin CLI glue only -- the schema/crypto live in `manifest-core` and the whole
 //! fetch/verify/guardrail/compose/verify pipeline lives in `installer-engine`, exactly as the
@@ -21,11 +21,18 @@
 //! the bytes on disk came from; `harness run` refuses a bundle directory whose marker names a
 //! different manifest, so the fetch -> hash -> signature -> activate chain stays bound to the
 //! directory the harness later rebuilds from.
+//!
+//! Sandbox phase 1 (scimbe/ct-agent#183): a manifest may carry an [`EnvironmentContract`]
+//! (`CT_MANIFEST_ENVIRONMENT_JSON` at `create`, signed at `sign`); a Binary activation is refused
+//! when no sandbox backend is usable unless the operator opts out with `CT_ALLOW_UNSANDBOXED=1`
+//! (read through `installer_engine::require_binary_sandbox_from_env`, the one place that
+//! semantics lives); and `plan` computes what `activate` WOULD do on this host -- backend, argv
+//! preview, compose hardening, every refusal -- without fetching a bundle or running anything.
 
 use ed25519_dalek::SigningKey;
 use installer_engine::allowlist::TrustAllowlist;
-use installer_engine::{ActivateOptions, InstallReport};
-use manifest_core::{BundleRef, EnvVarSpec, InstallerKind, ServiceManifest, VerifySpec};
+use installer_engine::{ActivateOptions, GuardrailPolicy, InstallReport, Plan, PlanOptions};
+use manifest_core::{BundleRef, EnvVarSpec, EnvironmentContract, InstallerKind, ServiceManifest, VerifySpec};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -192,6 +199,11 @@ pub struct UnsignedManifest {
     pub verify: VerifySpec,
     pub issued_at: u64,
     pub expires_at: u64,
+    /// Optional environment contract (scimbe/ct-agent#183). Absent means the strictest profile
+    /// (`EnvironmentContract::default`), never "unrestricted" -- so a skeleton written before
+    /// this field existed still parses, signs, and means exactly what it meant then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EnvironmentContract>,
 }
 
 impl UnsignedManifest {
@@ -210,6 +222,8 @@ pub struct CreateConfig {
     pub env_template: Vec<EnvVarSpec>,
     pub verify: VerifySpec,
     pub expires_in_secs: u64,
+    /// `CT_MANIFEST_ENVIRONMENT_JSON`, parsed and validated; `None` when unset.
+    pub environment: Option<EnvironmentContract>,
 }
 
 impl CreateConfig {
@@ -238,6 +252,7 @@ impl CreateConfig {
             Some("k8s") => InstallerKind::K8s,
             Some(other) => return Err(format!("CT_MANIFEST_KIND '{other}' is not one of compose|binary|k8s")),
         };
+        let environment = opt(&f, "CT_MANIFEST_ENVIRONMENT_JSON").map(|json| parse_environment_json(&json)).transpose()?;
         Ok(Self {
             name: req(&f, "CT_MANIFEST_NAME", "the service's name")?,
             version: req(&f, "CT_MANIFEST_VERSION", "the service's version")?,
@@ -263,6 +278,7 @@ impl CreateConfig {
                 )?,
             },
             expires_in_secs,
+            environment,
         })
     }
 
@@ -278,8 +294,21 @@ impl CreateConfig {
             verify: self.verify,
             issued_at: now,
             expires_at: now.saturating_add(self.expires_in_secs),
+            environment: self.environment,
         }
     }
+}
+
+/// Parse `CT_MANIFEST_ENVIRONMENT_JSON`: an [`EnvironmentContract`] as JSON (every field optional,
+/// `{}` is the strictest default profile). Parsed AND validated here, so a contract that
+/// `installer-engine` would refuse at activation never gets as far as being signed; both error
+/// paths name the variable, and a validation error additionally names the offending field
+/// (`environment.resources.wall_secs must be > 0`, ...).
+fn parse_environment_json(json: &str) -> Result<EnvironmentContract, String> {
+    let env: EnvironmentContract =
+        serde_json::from_str(json).map_err(|e| format!("CT_MANIFEST_ENVIRONMENT_JSON invalid: {e}"))?;
+    env.validate().map_err(|e| format!("CT_MANIFEST_ENVIRONMENT_JSON invalid: {e}"))?;
+    Ok(env)
 }
 
 /// Parse `CT_MANIFEST_ENV_VARS`: `;`-separated `NAME:required:description` entries, e.g.
@@ -358,6 +387,11 @@ pub fn sign_manifest(
             unsigned.expires_at, unsigned.issued_at
         ));
     }
+    // A hand-edited skeleton can carry a contract `create` never validated; refuse to put a
+    // signature on one `installer-engine` would refuse anyway (environment_contract_invalid).
+    if let Some(env) = &unsigned.environment {
+        env.validate().map_err(|e| format!("refusing to sign: environment contract invalid: {e}"))?;
+    }
     Ok(ServiceManifest::sign_new(
         holder,
         manifest_id,
@@ -369,6 +403,8 @@ pub fn sign_manifest(
         unsigned.verify,
         unsigned.issued_at,
         unsigned.expires_at,
+        None,
+        unsigned.environment,
     ))
 }
 
@@ -540,6 +576,13 @@ pub struct ActivateCliConfig {
     /// `from_lookup`) -- a partially-configured registry mode would silently skip the ledger write
     /// instead of failing loudly.
     pub registry: Option<RegistryActivationConfig>,
+    /// Binary kind only (scimbe/ct-agent#183, phase 1): `true` -- the default -- refuses a Binary
+    /// activation when no sandbox backend is usable on this host; `false` only when the operator
+    /// set `CT_ALLOW_UNSANDBOXED=1`. Always derived through
+    /// [`installer_engine::require_binary_sandbox_from_env`] (which also honours the legacy
+    /// `CT_REQUIRE_BINARY_SANDBOX=1` as a no-op), never set by hand, so ct-agent cannot drift
+    /// from the marketplace's own semantics.
+    pub require_binary_sandbox: bool,
 }
 
 #[derive(Debug)]
@@ -637,6 +680,7 @@ impl ActivateCliConfig {
                  must be empty",
             )?),
             registry,
+            require_binary_sandbox: installer_engine::require_binary_sandbox_from_env(&f),
         })
     }
 }
@@ -821,6 +865,7 @@ pub async fn run_activate(cfg: ActivateCliConfig) -> Result<Activation, String> 
         protected_name_substrings: cfg.protected_name_substrings,
         work_dir: install_dir.clone(),
         now,
+        require_binary_sandbox: cfg.require_binary_sandbox,
     };
     let report = tokio::task::spawn_blocking(move || installer_engine::activate(opts))
         .await
@@ -898,6 +943,172 @@ pub fn report_status_str(report: &InstallReport) -> &'static str {
 /// `ct-agent manifest activate && …` means what it looks like it means.
 pub fn report_is_ok(report: &InstallReport) -> bool {
     matches!(report, InstallReport::Ok { .. })
+}
+
+/// `ct-agent manifest plan` (scimbe/ct-agent#183, phase 1): the same env as `activate` -- it IS an
+/// [`ActivateCliConfig`] -- plus an optional local compose file to scan. Nothing here is a new
+/// trust decision: a plan reads exactly the configuration the real activation would.
+#[derive(Debug)]
+pub struct PlanCliConfig {
+    pub activate: ActivateCliConfig,
+    /// `CT_MANIFEST_COMPOSE_FILE` -- for `plan` (unlike `create`, where the same variable names a
+    /// path INSIDE the bundle) a LOCAL path to the compose file's text, so the static guardrail
+    /// scan can run without fetching or unpacking the bundle. Absent: the plan says the scan was
+    /// skipped, and lists the hardening rules the file must satisfy anyway.
+    pub compose_file: Option<PathBuf>,
+}
+
+impl PlanCliConfig {
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let compose_file = opt(&f, "CT_MANIFEST_COMPOSE_FILE").map(PathBuf::from);
+        Ok(Self { activate: ActivateCliConfig::from_lookup(f)?, compose_file })
+    }
+}
+
+/// The product of [`run_plan`]: `installer-engine`'s own [`Plan`] plus the directory the real
+/// activation would unpack into (never created by a plan) and the manifest it was computed for.
+#[derive(Debug)]
+pub struct Planned {
+    pub plan: Plan,
+    pub install_dir: PathBuf,
+    /// 64-hex `manifest_id`.
+    pub manifest_id: String,
+}
+
+/// The [`Plan`] as JSON with `would_refuse`, `install_dir` and `manifest_id` added next to its
+/// own fields -- one object, so `bridge/manifest-plan`'s caller (the portal) gets the verdict
+/// without re-deriving it from `refusals`. Same shape discipline as
+/// [`report_json_with_install_dir`]; the fallback object mirrors `Plan::to_json`'s own.
+pub fn plan_json_with_install_dir(p: &Planned) -> serde_json::Value {
+    let mut value = serde_json::to_value(&p.plan).unwrap_or_else(|e| {
+        serde_json::json!({ "status": "plan_serialize_error", "detail": e.to_string() })
+    });
+    if let serde_json::Value::Object(map) = &mut value {
+        map.insert("would_refuse".to_string(), serde_json::Value::Bool(p.plan.would_refuse()));
+        map.insert(
+            "install_dir".to_string(),
+            serde_json::Value::String(p.install_dir.to_string_lossy().into_owned()),
+        );
+        map.insert("manifest_id".to_string(), serde_json::Value::String(p.manifest_id.clone()));
+    }
+    value
+}
+
+/// The exit status `ct-agent manifest plan` / `harness run --plan` end with: 1 when the real run
+/// would be refused for at least one reason, 0 otherwise -- so `manifest plan && manifest
+/// activate` means what it looks like it means. Pure; `main` performs the actual exit.
+pub fn plan_exit_code(plan: &Plan) -> i32 {
+    i32::from(plan.would_refuse())
+}
+
+/// The checks `run_activate`/`installer_engine::activate` perform on the manifest BEFORE the
+/// engine's own plan starts (its steps 2-3: signature/expiry, then the publisher trust
+/// allowlist), rendered as refusals in that order. A plan reports EVERY reason the activation
+/// would be rejected, so an untrusted publisher is a refusal in the plan, not an error that hides
+/// the rest of it. The `reason` wording matches the engine's `InstallReport::Rejected` reasons.
+pub fn pre_activation_refusals(allowlist: &TrustAllowlist, manifest: &ServiceManifest, now: u64) -> Vec<String> {
+    let mut refusals = Vec::new();
+    if !manifest.is_valid(now) {
+        refusals.push(
+            "manifest_invalid_or_expired: the signature does not verify or the manifest has expired".to_string(),
+        );
+    }
+    if !allowlist.contains(&manifest.publisher_pubkey) {
+        refusals.push(format!("publisher_not_on_trust_allowlist: {}", hex_encode(&manifest.publisher_pubkey)));
+    }
+    refusals
+}
+
+/// What a plan is computed FOR, independent of where the manifest came from: the trust
+/// allowlist the activation would check, the directory it would unpack into (or, for `harness
+/// run --plan`, the already-activated bundle directory), the compose project name, and the
+/// sandbox requirement. [`plan_target_for`] derives one from an [`ActivateCliConfig`].
+#[derive(Debug)]
+pub struct PlanTarget<'a> {
+    pub allowlist: &'a TrustAllowlist,
+    pub install_dir: PathBuf,
+    pub project_name: String,
+    pub require_binary_sandbox: bool,
+}
+
+/// The [`PlanTarget`] of a `manifest activate` under `cfg`: `install_dir` is
+/// `<CT_MANIFEST_WORK_DIR>/<CT_MANIFEST_PROJECT_NAME>` exactly as `prepare_activation_dir` would
+/// claim it (the same name rules, #165), but only RENDERED -- a plan never creates it.
+pub fn plan_target_for(cfg: &ActivateCliConfig) -> Result<PlanTarget<'_>, String> {
+    Ok(PlanTarget {
+        allowlist: &cfg.allowlist,
+        install_dir: cfg.work_dir.join(activation_dir_name(&cfg.project_name)?),
+        project_name: cfg.project_name.clone(),
+        require_binary_sandbox: cfg.require_binary_sandbox,
+    })
+}
+
+/// Pure builder: the [`PlanOptions`] the real activation of `manifest` at `target` corresponds
+/// to. `compose_yaml` is the compose file's text when the caller has it locally (Compose kind
+/// only; ignored by the engine otherwise). The guardrail policy is the strict default
+/// `installer_engine::activate` itself scans with. Env-var NAMES only reach the plan; values are
+/// previewed as `<redacted>` by the engine.
+pub fn build_plan_options(target: &PlanTarget<'_>, manifest: &ServiceManifest, compose_yaml: Option<String>) -> PlanOptions {
+    PlanOptions {
+        installer_kind: manifest.installer_kind,
+        environment: manifest.environment.clone(),
+        entrypoint: manifest.bundle.compose_file.clone(),
+        work_dir: target.install_dir.clone(),
+        env_names: manifest.env_template.iter().map(|e| e.name.clone()).collect(),
+        require_binary_sandbox: target.require_binary_sandbox,
+        project_name: target.project_name.clone(),
+        compose_yaml,
+        guardrail_policy: GuardrailPolicy::default(),
+    }
+}
+
+/// Blocking core of [`run_plan`]: fetch the manifest (https:// or a local path, the engine's own
+/// size-capped/timeout-bounded fetch), compute the plan, prepend the pre-activation refusals,
+/// emit one `manifest_plan` event. No bundle fetch, no unpack, no docker, no model call -- the
+/// only thing that runs is the sandbox backend probe for a Binary manifest.
+pub fn run_plan_blocking(cfg: PlanCliConfig) -> Result<Planned, String> {
+    let now = unix_now()?;
+    let manifest = installer_engine::fetch::fetch_manifest(&cfg.activate.manifest_location)
+        .map_err(|e| format!("fetch manifest: {e}"))?;
+    let compose_yaml = cfg
+        .compose_file
+        .as_ref()
+        .map(|path| {
+            std::fs::read_to_string(path).map_err(|e| format!("read CT_MANIFEST_COMPOSE_FILE {}: {e}", path.display()))
+        })
+        .transpose()?;
+    let target = plan_target_for(&cfg.activate)?;
+    Ok(plan_for_manifest(target, &manifest, compose_yaml, now))
+}
+
+/// [`run_plan_blocking`] minus the fetch: the plan for an already-held manifest at `target`, the
+/// pre-activation refusals first, one `manifest_plan` event emitted. Shared with
+/// `harness run --plan`, which holds the manifest it verified for its bundle.
+pub fn plan_for_manifest(target: PlanTarget<'_>, manifest: &ServiceManifest, compose_yaml: Option<String>, now: u64) -> Planned {
+    let opts = build_plan_options(&target, manifest, compose_yaml);
+    let mut plan = installer_engine::plan(opts);
+    let pre = pre_activation_refusals(target.allowlist, manifest, now);
+    if !pre.is_empty() {
+        plan.refusals.splice(0..0, pre);
+    }
+    // ct-agent#183: one structured line per plan, like `manifest_install` per activation.
+    crate::events::emit(
+        crate::events::MANIFEST_PLAN,
+        serde_json::json!({ "would_refuse": plan.would_refuse(), "backend": plan.backend }),
+    );
+    Planned { plan, install_dir: target.install_dir, manifest_id: hex_encode(&manifest.manifest_id) }
+}
+
+/// `ct-agent manifest plan`. Blocking HTTP and the backend probe go on the blocking pool, same as
+/// [`run_activate`].
+pub async fn run_plan(cfg: PlanCliConfig) -> Result<Planned, String> {
+    tokio::task::spawn_blocking(move || run_plan_blocking(cfg))
+        .await
+        .map_err(|e| format!("plan task failed: {e}"))?
 }
 
 #[cfg(test)]
@@ -1361,5 +1572,260 @@ mod tests {
         assert_eq!(json["status"], serde_json::json!("rejected"));
         assert_eq!(json["reason"], serde_json::json!("fetch_manifest: nope"));
         assert_eq!(json["install_dir"], serde_json::json!("/var/lib/ct-agent/work/proj"));
+    }
+
+    // --- sandbox phase 1 (scimbe/ct-agent#183) -----------------------------------------------
+
+    fn sample_environment_json() -> &'static str {
+        r#"{"network":{"mode":"none"},"resources":{"memory_mb":256,"wall_secs":120},"hooks":{"rollback":"rollback.sh"}}"#
+    }
+
+    #[test]
+    fn unsigned_manifest_round_trips_with_and_without_environment_183() {
+        let cfg = CreateConfig::from_lookup(lookup(&with_sha(create_env(), SHA))).unwrap();
+        let without = cfg.unsigned(1_000);
+        assert_eq!(without.environment, None);
+        let json = without.to_json().unwrap();
+        assert!(!json.contains("\"environment\""), "None must be omitted, not written as null: {json}");
+        assert_eq!(serde_json::from_str::<UnsignedManifest>(&json).unwrap(), without);
+
+        let mut env = with_sha(create_env(), SHA);
+        env.push(("CT_MANIFEST_ENVIRONMENT_JSON", sample_environment_json()));
+        let with = CreateConfig::from_lookup(lookup(&env)).unwrap().unsigned(1_000);
+        let contract = with.environment.clone().expect("environment parsed");
+        assert_eq!(contract.network.mode, manifest_core::NetworkMode::None);
+        assert_eq!(contract.resources.memory_mb, 256);
+        assert_eq!(contract.hooks.rollback.as_deref(), Some("rollback.sh"));
+        let json = with.to_json().unwrap();
+        assert!(json.contains("\"environment\""), "{json}");
+        assert_eq!(serde_json::from_str::<UnsignedManifest>(&json).unwrap(), with);
+    }
+
+    #[test]
+    fn unsigned_manifest_still_denies_unknown_fields_183() {
+        let cfg = CreateConfig::from_lookup(lookup(&with_sha(create_env(), SHA))).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&cfg.unsigned(1_000).to_json().unwrap()).unwrap();
+        // A typo'd contract key must fail loudly, not be dropped and signed as "no contract".
+        value["enviroment"] = serde_json::json!({ "network": { "mode": "none" } });
+        let err = serde_json::from_value::<UnsignedManifest>(value).unwrap_err().to_string();
+        assert!(err.contains("enviroment"), "{err}");
+    }
+
+    #[test]
+    fn create_rejects_invalid_environment_json_naming_the_variable_183() {
+        let mut env = with_sha(create_env(), SHA);
+        env.push(("CT_MANIFEST_ENVIRONMENT_JSON", "{ not json"));
+        let err = CreateConfig::from_lookup(lookup(&env)).unwrap_err();
+        assert!(err.contains("CT_MANIFEST_ENVIRONMENT_JSON"), "{err}");
+
+        // Parses, but fails the contract's own validation: the offending field is named too.
+        let mut env = with_sha(create_env(), SHA);
+        env.push(("CT_MANIFEST_ENVIRONMENT_JSON", r#"{"resources":{"wall_secs":0}}"#));
+        let err = CreateConfig::from_lookup(lookup(&env)).unwrap_err();
+        assert!(err.contains("CT_MANIFEST_ENVIRONMENT_JSON"), "{err}");
+        assert!(err.contains("environment.resources.wall_secs"), "{err}");
+
+        // `{}` is the strictest default profile and is valid.
+        let mut env = with_sha(create_env(), SHA);
+        env.push(("CT_MANIFEST_ENVIRONMENT_JSON", "{}"));
+        let cfg = CreateConfig::from_lookup(lookup(&env)).unwrap();
+        assert_eq!(cfg.environment, Some(EnvironmentContract::default()));
+    }
+
+    #[test]
+    fn sign_carries_the_environment_contract_into_the_signature_183() {
+        let mut env = with_sha(create_env(), SHA);
+        env.push(("CT_MANIFEST_ENVIRONMENT_JSON", sample_environment_json()));
+        let json = CreateConfig::from_lookup(lookup(&env)).unwrap().unsigned(1_000).to_json().unwrap();
+        let holder = SigningKey::from_bytes(&[3u8; 32]);
+        let signed = sign_manifest(&json, &holder, [7u8; 32]).unwrap();
+        assert!(signed.is_valid(1_500));
+        let contract = signed.environment.clone().expect("contract signed in");
+        assert_eq!(contract.network.mode, manifest_core::NetworkMode::None);
+
+        // Grafting the contract off after signing invalidates the signature: it IS signed.
+        let mut stripped = signed.clone();
+        stripped.environment = None;
+        assert!(!stripped.is_valid(1_500));
+
+        // A hand-edited skeleton with an invalid contract is refused before any signing.
+        let mut unsigned: UnsignedManifest = serde_json::from_str(&json).unwrap();
+        unsigned.environment.as_mut().unwrap().resources.memory_mb = 0;
+        let err = sign_manifest(&unsigned.to_json().unwrap(), &holder, [7u8; 32]).unwrap_err();
+        assert!(err.contains("environment.resources.memory_mb"), "{err}");
+    }
+
+    #[test]
+    fn activate_requires_the_binary_sandbox_unless_the_opt_out_is_set_183() {
+        let cfg = ActivateCliConfig::from_lookup(lookup(&activate_base_env())).unwrap();
+        assert!(cfg.require_binary_sandbox, "nothing set: fail closed");
+
+        let mut env = activate_base_env();
+        env.push(("CT_ALLOW_UNSANDBOXED", "1"));
+        let cfg = ActivateCliConfig::from_lookup(lookup(&env)).unwrap();
+        assert!(!cfg.require_binary_sandbox, "CT_ALLOW_UNSANDBOXED=1 is the opt-out");
+
+        // Anything but exactly `1` is not an opt-out, and the legacy flag is a no-op.
+        for (k, v) in [("CT_ALLOW_UNSANDBOXED", "true"), ("CT_ALLOW_UNSANDBOXED", "0"), ("CT_REQUIRE_BINARY_SANDBOX", "1")] {
+            let mut env = activate_base_env();
+            env.push((k, v));
+            let cfg = ActivateCliConfig::from_lookup(lookup(&env)).unwrap();
+            assert!(cfg.require_binary_sandbox, "{k}={v} must keep the default");
+        }
+    }
+
+    /// A signed Compose manifest whose publisher is `key`, for the plan tests (Compose: the
+    /// engine's plan never probes a sandbox backend, so these tests need no bwrap).
+    fn compose_manifest(key: &SigningKey, environment: Option<EnvironmentContract>) -> ServiceManifest {
+        ServiceManifest::sign_new(
+            key,
+            [7u8; 32],
+            "plan-proof".to_string(),
+            "0.1.0".to_string(),
+            InstallerKind::Compose,
+            BundleRef {
+                url: "https://example.invalid/bundle.tar.gz".to_string(),
+                sha256: [0u8; 32],
+                compose_file: "docker-compose.yml".to_string(),
+            },
+            vec![EnvVarSpec { name: "API_KEY".to_string(), required: true, description: "key".to_string() }],
+            VerifySpec { script: "verify.sh".to_string(), timeout_secs: 60 },
+            1_000,
+            u64::MAX / 2,
+            None,
+            environment,
+        )
+    }
+
+    fn plan_env_for(key: &SigningKey) -> Vec<(&'static str, String)> {
+        vec![
+            ("CT_MANIFEST_URL", "/local/path/manifest.json".to_string()),
+            ("CT_MANIFEST_PROJECT_NAME", "plan-proof".to_string()),
+            ("CT_MANIFEST_WORK_DIR", "/tmp/work".to_string()),
+            ("CT_MANIFEST_TRUST_ALLOWLIST", hex_encode(&key.verifying_key().to_bytes())),
+            // The plan tests read the manifest from a local file; that is an agent-side opt-in
+            // since ct-agent#170, exactly as it is for activation.
+            ("CT_MANIFEST_ALLOW_LOCAL_PATH", "1".to_string()),
+        ]
+    }
+
+    fn lookup_owned(pairs: &[(&str, String)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        move |k: &str| map.get(k).cloned()
+    }
+
+    #[test]
+    fn build_plan_options_mirrors_the_activation_config_183() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let mut contract = EnvironmentContract::default();
+        contract.processes.max_pids = 8;
+        let manifest = compose_manifest(&key, Some(contract.clone()));
+        let mut env = plan_env_for(&key);
+        env.push(("CT_ALLOW_UNSANDBOXED", "1".to_string()));
+        let cfg = ActivateCliConfig::from_lookup(lookup_owned(&env)).unwrap();
+
+        let target = plan_target_for(&cfg).unwrap();
+        assert_eq!(target.install_dir, PathBuf::from("/tmp/work/plan-proof"), "rendered, never created");
+        assert!(!target.install_dir.exists());
+        let opts = build_plan_options(&target, &manifest, Some("services: {}".to_string()));
+        assert_eq!(opts.installer_kind, InstallerKind::Compose);
+        assert_eq!(opts.environment, Some(contract));
+        assert_eq!(opts.entrypoint, "docker-compose.yml");
+        assert_eq!(opts.work_dir, target.install_dir);
+        assert_eq!(opts.env_names, vec!["API_KEY"], "names only -- never a value");
+        assert!(!opts.require_binary_sandbox, "the opt-out flows through to the plan");
+        assert_eq!(opts.project_name, "plan-proof");
+        assert_eq!(opts.compose_yaml.as_deref(), Some("services: {}"));
+        assert!(opts.guardrail_policy.require_image_digest, "the strict default activate scans with");
+
+        // The #165 directory-name rules apply to a plan exactly as to an activation.
+        let mut bad = plan_env_for(&key);
+        bad[1].1 = "../escape".to_string();
+        let cfg = ActivateCliConfig::from_lookup(lookup_owned(&bad)).unwrap();
+        let err = plan_target_for(&cfg).unwrap_err();
+        assert!(err.contains("CT_MANIFEST_PROJECT_NAME"), "{err}");
+    }
+
+    #[test]
+    fn plan_exit_code_maps_would_refuse_to_1_183() {
+        let clean = Plan { backend: None, argv_preview: Vec::new(), compose_overrides: Vec::new(), refusals: Vec::new() };
+        assert_eq!(plan_exit_code(&clean), 0);
+        let refused = Plan { refusals: vec!["guardrail_violations: web[F.16-missing-read-only]: x".to_string()], ..clean };
+        assert!(refused.would_refuse());
+        assert_eq!(plan_exit_code(&refused), 1);
+    }
+
+    #[test]
+    fn plan_for_manifest_lists_pre_activation_refusals_first_183() {
+        let publisher = SigningKey::from_bytes(&[3u8; 32]);
+        let other = SigningKey::from_bytes(&[4u8; 32]);
+        let manifest = compose_manifest(&publisher, None);
+
+        // Trusted publisher, no compose text: no refusal at all -- exit 0.
+        let cfg = ActivateCliConfig::from_lookup(lookup_owned(&plan_env_for(&publisher))).unwrap();
+        let planned = plan_for_manifest(plan_target_for(&cfg).unwrap(), &manifest, None, 2_000);
+        assert!(!planned.plan.would_refuse(), "{:?}", planned.plan);
+        assert_eq!(plan_exit_code(&planned.plan), 0);
+        assert_eq!(planned.plan.argv_preview[..4], ["docker", "compose", "-p", "plan-proof"]);
+        assert!(planned.plan.compose_overrides.iter().any(|o| o == "pids_limit: 64"), "{:?}", planned.plan);
+        assert_eq!(planned.manifest_id, "07".repeat(32));
+        assert_eq!(planned.install_dir, PathBuf::from("/tmp/work/plan-proof"));
+
+        // Publisher not on the allowlist: the very first refusal, before anything the engine finds.
+        let cfg = ActivateCliConfig::from_lookup(lookup_owned(&plan_env_for(&other))).unwrap();
+        let yaml = "services:\n  web:\n    image: ghcr.io/example/svc:latest\n";
+        let planned = plan_for_manifest(plan_target_for(&cfg).unwrap(), &manifest, Some(yaml.to_string()), 2_000);
+        assert!(planned.plan.would_refuse());
+        assert_eq!(plan_exit_code(&planned.plan), 1);
+        assert!(planned.plan.refusals[0].starts_with("publisher_not_on_trust_allowlist:"), "{:?}", planned.plan.refusals);
+        assert!(planned.plan.refusals[0].contains(&hex_encode(&publisher.verifying_key().to_bytes())));
+        assert!(
+            planned.plan.refusals.iter().any(|r| r.starts_with("guardrail_violations:")),
+            "the engine's own scan findings still follow: {:?}",
+            planned.plan.refusals
+        );
+
+        // Expired: signature/expiry refusal, named as such.
+        let cfg = ActivateCliConfig::from_lookup(lookup_owned(&plan_env_for(&publisher))).unwrap();
+        let planned = plan_for_manifest(plan_target_for(&cfg).unwrap(), &manifest, None, u64::MAX);
+        assert!(planned.plan.refusals[0].starts_with("manifest_invalid_or_expired"), "{:?}", planned.plan.refusals);
+
+        let json = plan_json_with_install_dir(&planned);
+        assert_eq!(json["would_refuse"], serde_json::json!(true));
+        assert_eq!(json["install_dir"], serde_json::json!("/tmp/work/plan-proof"));
+        assert_eq!(json["manifest_id"], serde_json::json!("07".repeat(32)));
+        assert_eq!(json["refusals"].as_array().unwrap().len(), 1, "{json}");
+    }
+
+    #[test]
+    fn run_plan_blocking_plans_a_local_manifest_without_creating_the_install_dir_183() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let manifest = compose_manifest(&key, None);
+        let manifest_path = tmp.path().join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let compose_path = tmp.path().join("docker-compose.yml");
+        std::fs::write(&compose_path, "services:\n  web:\n    image: ghcr.io/example/svc:latest\n").unwrap();
+        let work_dir = tmp.path().join("work");
+
+        let mut env = plan_env_for(&key);
+        env[0].1 = manifest_path.to_string_lossy().into_owned();
+        env[2].1 = work_dir.to_string_lossy().into_owned();
+        env.push(("CT_MANIFEST_COMPOSE_FILE", compose_path.to_string_lossy().into_owned()));
+        let cfg = PlanCliConfig::from_lookup(lookup_owned(&env)).unwrap();
+        assert_eq!(cfg.compose_file.as_deref(), Some(compose_path.as_path()));
+
+        let planned = run_plan_blocking(cfg).unwrap();
+        assert!(planned.plan.would_refuse(), "the unpinned image must be a refusal: {:?}", planned.plan);
+        assert!(planned.plan.refusals.iter().any(|r| r.contains("F.15-image-not-digest-pinned")), "{:?}", planned.plan);
+        assert_eq!(planned.install_dir, work_dir.join("plan-proof"));
+        assert!(!work_dir.exists(), "a plan creates nothing on disk");
+
+        // A compose path that does not exist is an error naming the variable, not a silent skip.
+        let mut missing = plan_env_for(&key);
+        missing[0].1 = manifest_path.to_string_lossy().into_owned();
+        missing.push(("CT_MANIFEST_COMPOSE_FILE", tmp.path().join("nope.yml").to_string_lossy().into_owned()));
+        let err = run_plan_blocking(PlanCliConfig::from_lookup(lookup_owned(&missing)).unwrap()).unwrap_err();
+        assert!(err.contains("CT_MANIFEST_COMPOSE_FILE"), "{err}");
     }
 }
