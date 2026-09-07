@@ -744,10 +744,14 @@ pub(crate) fn run_service_handler_with_timeout_to(
     };
     forward_handler_stderr(diag, slug.as_ref(), &output.stderr);
     if !output.status.success() {
+        // ct-agent#169: this error string is what the REMOTE peer receives as the JSON-RPC
+        // error. The full stderr already went to the local diagnostic sink above (the
+        // operator's own log); the peer gets the exit status plus a bounded, secret-redacted
+        // tail -- never an unbounded crash trace that may quote the handler's API keys.
         return Err(format!(
             "service handler exited {}: {}",
             output.status,
-            String::from_utf8_lossy(&output.stderr)
+            peer_facing_stderr_tail(&output.stderr)
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -793,6 +797,35 @@ pub(crate) fn forward_handler_stderr(diag: &mut dyn std::io::Write, slug: &str, 
     let _ = diag.flush();
 }
 
+/// ct-agent#169: how much of a FAILED handler's stderr may travel to the remote peer inside the
+/// tool error -- the tail, at most this many bytes, after [`redact_secrets`]. Deliberately far
+/// below [`HANDLER_STDERR_PASSTHROUGH_MAX`] (the local sink's cap): the peer needs a hint of
+/// what went wrong, the operator's own log keeps the record.
+pub(crate) const HANDLER_STDERR_PEER_TAIL_MAX: usize = 2 * 1024;
+
+/// ct-agent#169: the peer-facing rendering of a failed handler's stderr -- the last
+/// [`HANDLER_STDERR_PEER_TAIL_MAX`] bytes (a cut is announced), trailing whitespace trimmed,
+/// every secret-shaped span masked by [`redact_secrets`]. Empty stderr renders empty.
+pub(crate) fn peer_facing_stderr_tail(stderr: &[u8]) -> String {
+    if stderr.is_empty() {
+        return String::new();
+    }
+    let (tail, cut) = if stderr.len() > HANDLER_STDERR_PEER_TAIL_MAX {
+        (&stderr[stderr.len() - HANDLER_STDERR_PEER_TAIL_MAX..], true)
+    } else {
+        (stderr, false)
+    };
+    let text = redact_secrets(String::from_utf8_lossy(tail).trim_end());
+    if cut {
+        format!(
+            "[... {} bytes cut, last {HANDLER_STDERR_PEER_TAIL_MAX} shown] {text}",
+            stderr.len() - HANDLER_STDERR_PEER_TAIL_MAX
+        )
+    } else {
+        text
+    }
+}
+
 /// [`run_service_handler_with_timeout`] bound to the real [`SERVICE_HANDLER_TIMEOUT`] — the seam
 /// every non-test call site uses.
 pub(crate) fn run_service_handler(
@@ -835,22 +868,42 @@ pub(crate) fn call_service_params_ignored_warning(params_env_is_set: bool) -> Op
 /// needed to prove the JSON-RPC wiring (argument parsing, error propagation, response shape)
 /// is correct. See [`channel_local`]'s own comment at the call site for the design rationale
 /// (replaces the removed local REST-server listener; no new network listener anywhere).
-pub(crate) fn register_grant_tool(reg: &mut ct_common::mcp::ToolRegistry, operator: SigningKey) {
+pub(crate) fn register_grant_tool(reg: &mut ct_common::mcp::ToolRegistry, operator: SigningKey, scope: GrantScope) {
+    if scope.any {
+        // ct-agent#174: the pre-#174 cross-channel behaviour, kept for one release behind an
+        // explicit flag. Said once per process, at registration.
+        static GRANT_ANY_LINE: std::sync::Once = std::sync::Once::new();
+        GRANT_ANY_LINE.call_once(|| {
+            eprintln!(
+                "ct-agent channel: DEPRECATED: {GRANT_ANY_ENV}=1 lets channel/grant mint grants for ANY \
+                 channel under this operator key -- any admitted member of this channel can then obtain \
+                 a grant for every other channel this operator signs for; this override will be removed \
+                 in a later release (ct-agent#174)"
+            );
+        });
+    }
     reg.register(
         "channel/grant",
-        "Issue a channel grant. Arguments: {channel, holder, direction, expires_in} \
-         (64-hex channel id, 64-hex member holder pubkey, \"initiate\"|\"accept\", a \
-         relative duration like \"30d\" -- the same fields `channel grant --interactive` \
-         prompts for). Returns {grant: <hex>}.",
+        "Issue a channel grant FOR THIS AGENT'S OWN CHANNEL. Arguments: {channel, holder, \
+         direction, expires_in} (64-hex channel id, 64-hex member holder pubkey, \
+         \"initiate\"|\"accept\", a relative duration like \"30d\" -- the same fields `channel \
+         grant --interactive` prompts for). Returns {grant: <hex>}. One channel per serving \
+         process (ct-agent#174): `channel` must equal the channel this process serves \
+         (CT_CHANNEL_ID, CT_GRANT_CHANNEL, or the channel inside its own CT_CHANNEL_GRANT); any \
+         other channel id is refused, so an admitted \
+         member of this channel can never mint grants for another channel the same operator key \
+         signs for.",
         move |args: &serde_json::Value| {
             let field = |name: &str| -> Result<&str, String> {
                 args.get(name)
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| format!("missing string field `{name}`"))
             };
+            let channel = field("channel")?;
+            scope.check(channel)?;
             let grant = issue_grant_from_fields(
                 operator.clone(),
-                field("channel")?,
+                channel,
                 field("holder")?,
                 field("direction")?,
                 field("expires_in")?,
@@ -858,6 +911,91 @@ pub(crate) fn register_grant_tool(reg: &mut ct_common::mcp::ToolRegistry, operat
             Ok(serde_json::json!({ "grant": grant }))
         },
     );
+}
+
+/// ct-agent#174: env var restoring `channel/grant`'s pre-#174 cross-channel issuance for one
+/// release (`1`/`true`/`yes`). Logged as deprecated once per process when in effect.
+pub(crate) const GRANT_ANY_ENV: &str = "CT_CHANNEL_GRANT_ANY";
+
+/// ct-agent#174: which channel(s) this process's `channel/grant` tool may issue grants for.
+/// The audit finding: `CallContext` carries no channel id and the tool had no scoping check,
+/// so any admitted member of ANY channel served under one operator key could mint
+/// operator-signed grants for a DIFFERENT channel. The model is one channel per serving
+/// process, so the fix is the simplest possible: the caller's `channel` must equal this
+/// process's own configured channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrantScope {
+    /// This process's own channel -- `CT_CHANNEL_ID`, else `CT_GRANT_CHANNEL` (the same alias
+    /// order every other channel-scoped request in this crate uses), else the channel named
+    /// inside this member's own `CT_CHANNEL_GRANT` (what a `--serve` session is admitted with,
+    /// so it is exactly "the channel this process serves" -- and the only one of the three a
+    /// typical serve deployment has set at all). `None` when none of them yields a channel: the
+    /// tool then refuses every call, naming what is missing.
+    pub(crate) own_channel: Option<[u8; 32]>,
+    /// `CT_CHANNEL_GRANT_ANY=1`: skip the check (deprecated, one release).
+    pub(crate) any: bool,
+}
+
+impl GrantScope {
+    pub(crate) fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// Read from a variable lookup (the testable seam). A malformed channel id is treated as
+    /// unset rather than silently accepted: the tool will refuse and say what it needs.
+    pub(crate) fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Self {
+        let own_channel = ["CT_CHANNEL_ID", "CT_GRANT_CHANNEL"]
+            .into_iter()
+            .find_map(&f)
+            .and_then(|v| decode_hex_32_bridge_peer(v.trim()))
+            .or_else(|| {
+                let bytes = hex_bytes(&f("CT_CHANNEL_GRANT")?)?;
+                let grant = ct_common::channel::SignedChannelGrant::decode(&bytes).ok()?;
+                Some(grant.grant.channel.0)
+            });
+        let any = matches!(
+            f(GRANT_ANY_ENV).as_deref().map(str::trim),
+            Some(s) if s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+        );
+        Self { own_channel, any }
+    }
+
+    /// Only this channel, no override -- what a test or an explicit caller constructs.
+    #[cfg(test)]
+    pub(crate) fn own(channel: [u8; 32]) -> Self {
+        Self { own_channel: Some(channel), any: false }
+    }
+
+    /// Refuse unless `requested_channel_hex` is this process's own channel (or the deprecated
+    /// override is on). Both refusals name what the caller can do about it.
+    pub(crate) fn check(&self, requested_channel_hex: &str) -> Result<(), String> {
+        if self.any {
+            return Ok(());
+        }
+        let own = self.own_channel.ok_or_else(|| {
+            "channel/grant: grant issuance needs CT_CHANNEL_ID (or CT_GRANT_CHANNEL, or this member's \
+             own CT_CHANNEL_GRANT) set on this agent -- it only issues grants for its own channel \
+             (ct-agent#174)"
+                .to_string()
+        })?;
+        let requested = decode_hex_32_bridge_peer(requested_channel_hex.trim())
+            .ok_or_else(|| "channel/grant: `channel` must be exactly 64 hex characters".to_string())?;
+        if requested != own {
+            return Err(format!(
+                "channel/grant: this agent only issues grants for its own channel {}... (requested {}...) \
+                 (ct-agent#174)",
+                hex_prefix(&own),
+                hex_prefix(&requested)
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The first four bytes of an id as 8 lowercase hex chars -- enough to tell channels apart in
+/// an error line without echoing a whole id back.
+fn hex_prefix(id: &[u8; 32]) -> String {
+    id[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Decode `CT_CHANNEL_BRIDGE_PEER`'s 64 lowercase-hex chars into the raw pubkey, or `None`.
@@ -1171,7 +1309,11 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
                 .to_string();
             // Every OTHER field (trust allowlist, work dir, registry ledger config) still comes
             // from this agent's own process environment, exactly like `ct-agent manifest activate`
-            // -- only which manifest and what to isolate it as are caller-supplied.
+            // -- only which manifest and what to isolate it as are caller-supplied. That includes
+            // `CT_MANIFEST_ALLOW_LOCAL_PATH` (ct-agent#170): the `other` arm below is what makes
+            // the https://-only policy in `ActivateCliConfig::from_lookup` read the local-path
+            // opt-in from THIS process, so a caller-supplied `manifest_location` can never be a
+            // filesystem probe unless the agent's owner allowed local paths.
             let cfg = crate::manifest_run::ActivateCliConfig::from_lookup(move |k| match k {
                 "CT_MANIFEST_URL" => Some(manifest_location.clone()),
                 "CT_MANIFEST_PROJECT_NAME" => Some(project_name.clone()),
@@ -1470,13 +1612,24 @@ pub(crate) fn channel_local(peer: Option<[u8; 32]>) -> ChannelLocal {
         // Silently absent (not registered) when CT_CHANNEL_OPERATOR_KEY isn't set, same
         // "only exists if configured" posture as agent/card and the auction tools above.
         if let Ok(operator) = operator_key_from_env() {
-            register_grant_tool(&mut reg, operator);
+            // ct-agent#174: scoped to this process's own channel (CT_CHANNEL_ID, else
+            // CT_GRANT_CHANNEL, else the channel inside this member's own CT_CHANNEL_GRANT);
+            // with none of them the tool is still registered but refuses every call naming
+            // what it needs, so the misconfiguration is visible to the caller rather than
+            // silently widening to every channel.
+            let scope = GrantScope::from_env();
+            let scope_line = match (&scope.own_channel, scope.any) {
+                (_, true) => "for ANY channel (CT_CHANNEL_GRANT_ANY=1, deprecated)".to_string(),
+                (Some(own), false) => format!("for its own channel {}... only", hex_prefix(own)),
+                (None, false) => "-- but none of CT_CHANNEL_ID/CT_GRANT_CHANNEL/CT_CHANNEL_GRANT names a channel, so every call will be refused (ct-agent#174)".to_string(),
+            };
+            register_grant_tool(&mut reg, operator, scope);
             static GRANT_TOOL_LINE: std::sync::Once = std::sync::Once::new();
             GRANT_TOOL_LINE.call_once(|| {
                 eprintln!(
                     "ct-agent channel: --serve configured to expose channel/grant \
-                     (CT_CHANNEL_OPERATOR_KEY set) -- served to admitted peers only, no new \
-                     network listener"
+                     (CT_CHANNEL_OPERATOR_KEY set) {scope_line} -- served to admitted peers only, \
+                     no new network listener"
                 );
             });
         }

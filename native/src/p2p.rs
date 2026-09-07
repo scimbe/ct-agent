@@ -335,6 +335,82 @@ fn relay_node_key_seed(hex: &str) -> Option<[u8; 32]> {
     Some(seed)
 }
 
+/// ct-agent#173: env var that lets an operator deliberately bind `ct-agent relay-node` to a
+/// public address (`1`/`true`/`yes`), overriding [`relay_bind_policy`]'s refusal.
+pub const RELAY_ALLOW_PUBLIC_BIND_ENV: &str = "CT_RELAY_ALLOW_PUBLIC_BIND";
+
+/// ct-agent#173: whether `ip` is one this unguarded relay may listen on without an explicit
+/// override -- loopback, RFC 1918 private (10/8, 172.16/12, 192.168/16), IPv4 link-local
+/// (169.254/16), IPv6 unique-local (fc00::/7) or link-local (fe80::/10), and the IPv4-mapped
+/// IPv6 forms of the IPv4 ranges. The unspecified addresses (`0.0.0.0`, `::`) bind EVERY
+/// interface, public ones included, and are therefore never internal.
+fn is_internal_bind_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_internal_bind_ip(IpAddr::V4(v4));
+            }
+            let s0 = v6.segments()[0];
+            v6.is_loopback() || (s0 & 0xfe00) == 0xfc00 || (s0 & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// ct-agent#173: the bind policy for `ct-agent relay-node`. This relay accepts a reservation
+/// or circuit from ANY peer ([`build_relay_swarm`] is deliberately unguarded); its only gate
+/// is network isolation behind the edge's `:443` relay-gate. So a listen address that is not
+/// loopback/private (see [`is_internal_bind_ip`]) is refused with the reason named, unless
+/// `allow_public` (`CT_RELAY_ALLOW_PUBLIC_BIND=1`) says the operator meant it. Pure: the
+/// caller logs the decision.
+pub fn relay_bind_policy(addr: &std::net::SocketAddr, allow_public: bool) -> Result<(), String> {
+    if is_internal_bind_ip(addr.ip()) || allow_public {
+        return Ok(());
+    }
+    Err(format!(
+        "relay-node: refusing to bind {addr}: not a loopback/private address (RFC 1918, unique-local \
+         fc00::/7, link-local) -- this relay is unguarded and must only be reachable through the \
+         edge's :443 relay-gate; set {RELAY_ALLOW_PUBLIC_BIND_ENV}=1 to bind a public address \
+         deliberately (ct-agent#173)"
+    ))
+}
+
+/// ct-agent#173: the first `/ip4/..` or `/ip6/..` component of a listen multiaddr as a
+/// `SocketAddr` (the port, if any `/tcp/`/`/udp/` component follows, else 0) -- `None` when the
+/// string is not a multiaddr or names no IP at all (`/dns4/..`, `/memory/..`).
+pub fn relay_listen_socket_addr(listen: &str) -> Option<std::net::SocketAddr> {
+    let ma: Multiaddr = listen.parse().ok()?;
+    let ip = ma.iter().find_map(|p| match p {
+        Protocol::Ip4(ip) => Some(std::net::IpAddr::V4(ip)),
+        Protocol::Ip6(ip) => Some(std::net::IpAddr::V6(ip)),
+        _ => None,
+    })?;
+    let port = ma
+        .iter()
+        .find_map(|p| match p {
+            Protocol::Tcp(port) | Protocol::Udp(port) => Some(port),
+            _ => None,
+        })
+        .unwrap_or(0);
+    Some(std::net::SocketAddr::new(ip, port))
+}
+
+/// ct-agent#173: [`relay_bind_policy`] applied to the raw `CT_RELAY_LISTEN` multiaddr. A listen
+/// address without an IP component cannot be classified and is refused unless `allow_public`.
+/// `Ok(true)` means the address is internal, `Ok(false)` that only the override admitted it.
+pub fn relay_listen_policy(listen: &str, allow_public: bool) -> Result<bool, String> {
+    match relay_listen_socket_addr(listen) {
+        Some(addr) => relay_bind_policy(&addr, allow_public).map(|()| is_internal_bind_ip(addr.ip())),
+        None if allow_public => Ok(false),
+        None => Err(format!(
+            "relay-node: refusing to bind {listen}: CT_RELAY_LISTEN must name an /ip4/ or /ip6/ \
+             address so its reachability can be classified (set {RELAY_ALLOW_PUBLIC_BIND_ENV}=1 to \
+             skip the check deliberately) (ct-agent#173)"
+        )),
+    }
+}
+
 /// Build the **relay node**'s swarm: a Tokio TCP transport upgraded with libp2p-noise +
 /// yamux, driving the Circuit-Relay v2 **server** [`relay::Behaviour`]. This node forwards
 /// circuits between clients; it terminates none of our channel traffic and never sees
@@ -2059,6 +2135,48 @@ mod tests {
         assert_eq!(relay_node_key_seed(&"aa".repeat(31)), None, "too short");
         assert_eq!(relay_node_key_seed(&"aa".repeat(33)), None, "too long");
         assert_eq!(relay_node_key_seed(&"zz".repeat(32)), None, "not hex");
+    }
+
+    #[test]
+    fn relay_bind_policy_refuses_public_and_unspecified_binds_unless_overridden_173() {
+        // ct-agent#173: the relay is unguarded, so only an internal bind is acceptable by
+        // default -- 0.0.0.0/[::] bind every interface and are refused like a public address.
+        let sa = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        for refused in ["0.0.0.0:4437", "[::]:4437", "203.0.113.9:4437", "[2001:db8::1]:4437", "[::ffff:203.0.113.9]:4437"] {
+            let err = relay_bind_policy(&sa(refused), false).unwrap_err();
+            assert!(err.contains("refusing to bind") && err.contains("CT_RELAY_ALLOW_PUBLIC_BIND"), "{refused}: {err}");
+            assert!(relay_bind_policy(&sa(refused), true).is_ok(), "{refused}: the override admits it");
+        }
+        for accepted in [
+            "127.0.0.1:4437",
+            "[::1]:4437",
+            "10.1.2.3:4437",
+            "172.16.0.9:4437",
+            "192.168.1.1:4437",
+            "169.254.10.10:4437",
+            "[fd00::1]:4437",
+            "[fe80::1]:4437",
+            "[::ffff:10.1.2.3]:4437",
+        ] {
+            assert!(relay_bind_policy(&sa(accepted), false).is_ok(), "{accepted} is internal");
+        }
+    }
+
+    #[test]
+    fn relay_listen_policy_classifies_the_multiaddrs_ip_component_173() {
+        assert_eq!(relay_listen_policy("/ip4/127.0.0.1/tcp/4437", false), Ok(true));
+        assert_eq!(relay_listen_policy("/ip4/10.0.0.5/udp/4437/quic-v1", false), Ok(true));
+        assert!(relay_listen_policy("/ip4/0.0.0.0/tcp/4437", false).is_err(), "bind-all is refused");
+        assert!(relay_listen_policy("/ip6/::/udp/4437/quic-v1", false).is_err(), "IPv6 bind-all is refused");
+        assert!(relay_listen_policy("/ip4/203.0.113.9/tcp/4437", false).is_err());
+        assert_eq!(relay_listen_policy("/ip4/0.0.0.0/tcp/4437", true), Ok(false), "override: allowed, flagged public");
+        assert!(relay_listen_policy("/dns4/relay.internal/tcp/4437", false).is_err(), "unclassifiable without an IP");
+        assert_eq!(relay_listen_policy("/dns4/relay.internal/tcp/4437", true), Ok(false));
+        assert!(relay_listen_policy("not a multiaddr", false).is_err());
+        assert_eq!(
+            relay_listen_socket_addr("/ip4/10.0.0.5/tcp/4437"),
+            Some("10.0.0.5:4437".parse().unwrap())
+        );
     }
 
     #[test]

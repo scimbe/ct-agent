@@ -83,6 +83,56 @@ fn require_registry_url_scheme(url: &str) -> Result<(), String> {
     ))
 }
 
+/// ct-agent#170: the one place `CT_MANIFEST_URL` (and, through `bridge/manifest-install`, a
+/// caller-supplied `manifest_location`) is checked before `installer-engine` fetches it.
+/// `https://` is the only location accepted by default. A local path is accepted only when the
+/// AGENT sets `CT_MANIFEST_ALLOW_LOCAL_PATH=1` (`allow_local_path`) -- never the caller: the
+/// bridge peer chooses WHICH manifest, and without this gate it could probe this host's
+/// filesystem (an existence oracle) or reach internal `http://` services from the agent's own
+/// network position. `http://`, `file://` and every other scheme are refused with the reason
+/// named, whatever the flag says.
+fn require_manifest_location(location: &str, allow_local_path: bool) -> Result<(), String> {
+    if location.starts_with("https://") {
+        return Ok(());
+    }
+    if location.starts_with("http://") {
+        return Err(format!(
+            "CT_MANIFEST_URL must be https:// (got '{location}') -- a manifest fetched over \
+             cleartext http:// could be swapped on path, and via bridge/manifest-install a \
+             caller could aim this agent at internal HTTP services (ct-agent#170)"
+        ));
+    }
+    if location.starts_with("file://") {
+        return Err(format!(
+            "CT_MANIFEST_URL does not accept file:// (got '{location}') -- to activate a manifest \
+             from a local file, pass its bare path and set CT_MANIFEST_ALLOW_LOCAL_PATH=1 on this \
+             agent (ct-agent#170)"
+        ));
+    }
+    if let Some(scheme) = location.split_once("://").map(|(scheme, _)| scheme) {
+        return Err(format!(
+            "CT_MANIFEST_URL must be https:// (got unsupported scheme '{scheme}://') (ct-agent#170)"
+        ));
+    }
+    if allow_local_path {
+        return Ok(());
+    }
+    Err(format!(
+        "CT_MANIFEST_URL must be an https:// URL (got a local path '{location}') -- set \
+         CT_MANIFEST_ALLOW_LOCAL_PATH=1 on this agent to activate manifests from local files; \
+         the flag is read from the agent's own environment only, never from a caller \
+         (ct-agent#170)"
+    ))
+}
+
+/// `1`/`true`/`yes` (case-insensitive, trimmed) is set; anything else -- including unset -- is not.
+fn flag_set(v: Option<String>) -> bool {
+    matches!(
+        v.as_deref().map(str::trim),
+        Some(s) if s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+    )
+}
+
 /// Decode exactly 64 ASCII hex characters into 32 bytes.
 ///
 /// The ASCII-hex check comes BEFORE any indexed slicing. `&s[i..i + 2]` on unchecked input can
@@ -476,7 +526,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// `ct-agent manifest activate`: env config for [`installer_engine::activate`].
 #[derive(Debug)]
 pub struct ActivateCliConfig {
-    /// `CT_MANIFEST_URL` -- an https:// URL or a local file path (installer-engine handles both).
+    /// `CT_MANIFEST_URL` -- an https:// URL, or (only with `CT_MANIFEST_ALLOW_LOCAL_PATH=1` set on
+    /// this agent, ct-agent#170) a local file path; installer-engine handles both shapes.
     pub manifest_location: String,
     pub allowlist: TrustAllowlist,
     pub env_file: Option<PathBuf>,
@@ -553,12 +604,19 @@ impl ActivateCliConfig {
                 })
             }
         };
+        // ct-agent#170: https:// only, unless THIS agent opted into local paths. When the lookup
+        // is `bridge/manifest-install`'s, `CT_MANIFEST_URL` is the caller's `manifest_location`
+        // but the flag still comes from the process environment (that closure falls through to
+        // `std::env::var` for every other key) -- the caller can never grant itself local paths.
+        let manifest_location = req(
+            &f,
+            "CT_MANIFEST_URL",
+            "https:// URL of the signed manifest JSON (a local path only with \
+             CT_MANIFEST_ALLOW_LOCAL_PATH=1 set on this agent)",
+        )?;
+        require_manifest_location(&manifest_location, flag_set(opt(&f, "CT_MANIFEST_ALLOW_LOCAL_PATH")))?;
         Ok(Self {
-            manifest_location: req(
-                &f,
-                "CT_MANIFEST_URL",
-                "https:// URL or local path of the signed manifest JSON",
-            )?,
+            manifest_location,
             allowlist,
             env_file: opt(&f, "CT_MANIFEST_ENV_FILE").map(PathBuf::from),
             // No default, ever: the compose project name is what keeps this install from
@@ -1032,6 +1090,8 @@ mod tests {
     fn activate_parses_a_full_config() {
         let env = [
             ("CT_MANIFEST_URL", "/local/path/manifest.json"),
+            // ct-agent#170: a local path needs the agent-side opt-in.
+            ("CT_MANIFEST_ALLOW_LOCAL_PATH", "1"),
             ("CT_MANIFEST_PROJECT_NAME", "proof-run"),
             ("CT_MANIFEST_WORK_DIR", "/tmp/work"),
             ("CT_MANIFEST_TRUST_ALLOWLIST", SHA),
@@ -1039,6 +1099,7 @@ mod tests {
             ("CT_MANIFEST_PROTECTED_NAMES", "litellm-proxy, cads-tunnel"),
         ];
         let cfg = ActivateCliConfig::from_lookup(lookup(&env)).unwrap();
+        assert_eq!(cfg.manifest_location, "/local/path/manifest.json");
         assert!(cfg.allowlist.contains(&[0x99; 32]));
         assert_eq!(cfg.env_file, Some(PathBuf::from("/local/secrets.env")));
         assert_eq!(cfg.protected_name_substrings, vec!["litellm-proxy", "cads-tunnel"]);
@@ -1047,11 +1108,70 @@ mod tests {
 
     fn activate_base_env() -> Vec<(&'static str, &'static str)> {
         vec![
-            ("CT_MANIFEST_URL", "/local/path/manifest.json"),
+            ("CT_MANIFEST_URL", "https://example.invalid/m.json"),
             ("CT_MANIFEST_PROJECT_NAME", "proof-run"),
             ("CT_MANIFEST_WORK_DIR", "/tmp/work"),
             ("CT_MANIFEST_TRUST_ALLOWLIST", SHA),
         ]
+    }
+
+    #[test]
+    fn activate_refuses_a_local_manifest_path_unless_the_agent_allows_it_170() {
+        // ct-agent#170: via bridge/manifest-install the bridge peer supplies CT_MANIFEST_URL, so
+        // a bare path used to be a filesystem existence oracle. Refused by default, with the
+        // opt-in named; accepted once THIS agent sets the flag.
+        let mut env = activate_base_env();
+        env[0] = ("CT_MANIFEST_URL", "/etc/passwd");
+        let err = ActivateCliConfig::from_lookup(lookup(&env)).unwrap_err();
+        assert!(err.contains("local path") && err.contains("CT_MANIFEST_ALLOW_LOCAL_PATH"), "{err}");
+
+        env.push(("CT_MANIFEST_ALLOW_LOCAL_PATH", "1"));
+        let cfg = ActivateCliConfig::from_lookup(lookup(&env)).unwrap();
+        assert_eq!(cfg.manifest_location, "/etc/passwd");
+
+        // Only an explicit affirmative value opts in.
+        let mut off = activate_base_env();
+        off[0] = ("CT_MANIFEST_URL", "relative/manifest.json");
+        off.push(("CT_MANIFEST_ALLOW_LOCAL_PATH", "0"));
+        assert!(ActivateCliConfig::from_lookup(lookup(&off)).is_err(), "'0' must not opt in");
+    }
+
+    #[test]
+    fn activate_refuses_http_and_file_manifest_locations_even_with_local_paths_allowed_170() {
+        for (bad, reason) in [
+            ("http://registry.internal:8787/manifests/x", "https://"),
+            ("http://127.0.0.1:8787/manifests/x", "https://"),
+            ("file:///etc/passwd", "file://"),
+            ("ftp://example.invalid/m.json", "ftp://"),
+        ] {
+            for flag in [None, Some(("CT_MANIFEST_ALLOW_LOCAL_PATH", "1"))] {
+                let mut env = activate_base_env();
+                env[0] = ("CT_MANIFEST_URL", bad);
+                env.extend(flag);
+                let err = ActivateCliConfig::from_lookup(lookup(&env))
+                    .expect_err(&format!("{bad} must be refused (flag: {flag:?})"));
+                assert!(err.contains(reason) && err.contains("170"), "{bad}: {err}");
+            }
+        }
+        // And https:// stays accepted, flag or not.
+        let cfg = ActivateCliConfig::from_lookup(lookup(&activate_base_env())).unwrap();
+        assert_eq!(cfg.manifest_location, "https://example.invalid/m.json");
+    }
+
+    #[test]
+    fn manifest_location_policy_names_each_refusal_reason_170() {
+        assert!(require_manifest_location("https://example.invalid/m.json", false).is_ok());
+        assert!(require_manifest_location("/srv/m.json", true).is_ok());
+        let path_err = require_manifest_location("/srv/m.json", false).unwrap_err();
+        assert!(path_err.contains("local path"), "{path_err}");
+        let http_err = require_manifest_location("http://example.invalid/m.json", true).unwrap_err();
+        assert!(http_err.contains("must be https://"), "{http_err}");
+        let file_err = require_manifest_location("file:///srv/m.json", true).unwrap_err();
+        assert!(file_err.contains("file://"), "{file_err}");
+        let scheme_err = require_manifest_location("gopher://x/m.json", true).unwrap_err();
+        assert!(scheme_err.contains("gopher://"), "{scheme_err}");
+        assert!(flag_set(Some("1".into())) && flag_set(Some(" true ".into())) && flag_set(Some("YES".into())));
+        assert!(!flag_set(None) && !flag_set(Some("0".into())) && !flag_set(Some("".into())));
     }
 
     #[test]

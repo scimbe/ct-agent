@@ -1163,7 +1163,8 @@ fn channel_grant_tool_issues_a_verifiable_grant_over_json_rpc() {
     let channel_hex = hex_encode(&[0x66u8; 32]);
 
     let mut reg = ToolRegistry::new();
-    register_grant_tool(&mut reg, op.key.clone());
+    // ct-agent#174: the tool is scoped to the serving process's own channel.
+    register_grant_tool(&mut reg, op.key.clone(), GrantScope::own([0x66u8; 32]));
 
     let request = encode_request(
         1,
@@ -1196,7 +1197,7 @@ fn channel_grant_tool_rejects_missing_or_invalid_fields_without_panicking() {
 
     let op = OperatorIdentity::generate();
     let mut reg = ToolRegistry::new();
-    register_grant_tool(&mut reg, op.key.clone());
+    register_grant_tool(&mut reg, op.key.clone(), GrantScope::own([0x11u8; 32]));
 
     // Missing a required field entirely.
     let request = encode_request(
@@ -1225,6 +1226,111 @@ fn channel_grant_tool_rejects_missing_or_invalid_fields_without_panicking() {
     let response = decode_response(&reg.dispatch(&request)).expect("valid JSON-RPC response");
     assert!(response.result.is_none());
     assert!(response.error.is_some(), "garbled channel hex must be a JSON-RPC error");
+}
+
+/// ct-agent#174 helper: one `tools/call` of channel/grant for `channel_hex`, returning the
+/// JSON-RPC error message (`None` on success).
+fn grant_call_error(reg: &ct_common::mcp::ToolRegistry, channel_hex: &str, holder_hex: &str) -> Option<String> {
+    use ct_common::mcp::{decode_response, encode_request};
+    let request = encode_request(
+        1,
+        "tools/call",
+        serde_json::json!({
+            "name": "channel/grant",
+            "arguments": { "channel": channel_hex, "holder": holder_hex, "direction": "accept", "expires_in": "30d" }
+        }),
+    );
+    let response = decode_response(&reg.dispatch(&request)).expect("valid JSON-RPC response");
+    response.error.map(|e| format!("{e:?}"))
+}
+
+#[test]
+fn channel_grant_tool_refuses_a_grant_for_another_channel_174() {
+    // ct-agent#174 (critical): any admitted member could mint operator-signed grants for a
+    // DIFFERENT channel under the same operator key. Now: own channel ok, any other refused
+    // with the own channel's prefix named.
+    use ct_common::mcp::ToolRegistry;
+    let op = OperatorIdentity::generate();
+    let holder_hex = hex_encode(&ChannelIdentity::generate().holder.verifying_key().to_bytes());
+    let own = [0x66u8; 32];
+    let mut reg = ToolRegistry::new();
+    register_grant_tool(&mut reg, op.key.clone(), GrantScope::own(own));
+
+    assert_eq!(grant_call_error(&reg, &hex_encode(&own), &holder_hex), None, "own channel is served");
+    assert_eq!(
+        grant_call_error(&reg, &hex_encode(&own).to_uppercase(), &holder_hex),
+        None,
+        "hex case does not matter for the comparison"
+    );
+    let err = grant_call_error(&reg, &hex_encode(&[0x77u8; 32]), &holder_hex).expect("other channel must be refused");
+    assert!(err.contains("only issues grants for its own channel 66666666"), "{err}");
+    assert!(!err.contains(&hex_encode(&own)), "the error names a prefix, never the whole id: {err}");
+}
+
+#[test]
+fn channel_grant_tool_refuses_every_call_when_no_channel_is_configured_174() {
+    use ct_common::mcp::ToolRegistry;
+    let op = OperatorIdentity::generate();
+    let holder_hex = hex_encode(&ChannelIdentity::generate().holder.verifying_key().to_bytes());
+    let mut reg = ToolRegistry::new();
+    register_grant_tool(&mut reg, op.key.clone(), GrantScope { own_channel: None, any: false });
+    let err = grant_call_error(&reg, &hex_encode(&[0x66u8; 32]), &holder_hex).expect("must be refused");
+    assert!(err.contains("needs CT_CHANNEL_ID") && err.contains("CT_CHANNEL_GRANT"), "{err}");
+}
+
+#[test]
+fn channel_grant_tool_env_override_restores_cross_channel_issuance_174() {
+    use ct_common::mcp::ToolRegistry;
+    let op = OperatorIdentity::generate();
+    let holder_hex = hex_encode(&ChannelIdentity::generate().holder.verifying_key().to_bytes());
+    let mut reg = ToolRegistry::new();
+    register_grant_tool(&mut reg, op.key.clone(), GrantScope { own_channel: Some([0x66u8; 32]), any: true });
+    assert_eq!(grant_call_error(&reg, &hex_encode(&[0x77u8; 32]), &holder_hex), None, "CT_CHANNEL_GRANT_ANY=1: old behaviour");
+    // The override alone is enough -- even with no own channel configured.
+    let mut reg = ToolRegistry::new();
+    register_grant_tool(&mut reg, op.key.clone(), GrantScope { own_channel: None, any: true });
+    assert_eq!(grant_call_error(&reg, &hex_encode(&[0x77u8; 32]), &holder_hex), None);
+}
+
+#[test]
+fn grant_scope_from_lookup_prefers_ct_channel_id_then_ct_grant_channel_174() {
+    let lookup = |pairs: &[(&str, &str)]| {
+        let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        GrantScope::from_lookup(move |k| m.get(k).cloned())
+    };
+    let id = hex_encode(&[0x66u8; 32]);
+    let grant_channel = hex_encode(&[0x77u8; 32]);
+    assert_eq!(lookup(&[]), GrantScope { own_channel: None, any: false });
+    assert_eq!(lookup(&[("CT_CHANNEL_ID", &id)]).own_channel, Some([0x66u8; 32]));
+    assert_eq!(lookup(&[("CT_GRANT_CHANNEL", &grant_channel)]).own_channel, Some([0x77u8; 32]));
+    assert_eq!(
+        lookup(&[("CT_CHANNEL_ID", &id), ("CT_GRANT_CHANNEL", &grant_channel)]).own_channel,
+        Some([0x66u8; 32]),
+        "CT_CHANNEL_ID wins, same alias order as every other channel-scoped request"
+    );
+    assert_eq!(lookup(&[("CT_CHANNEL_ID", "not-hex")]).own_channel, None, "malformed -> unset -> refuses, never widens");
+    // A --serve session usually has neither var, only its own CT_CHANNEL_GRANT: the channel
+    // inside that grant is the channel this process serves.
+    let op = OperatorIdentity::generate();
+    let holder_hex = hex_encode(&ChannelIdentity::generate().holder.verifying_key().to_bytes());
+    let own_grant = issue_grant_from_fields(op.key.clone(), &hex_encode(&[0x55u8; 32]), &holder_hex, "accept", "30d")
+        .expect("valid grant");
+    assert_eq!(lookup(&[("CT_CHANNEL_GRANT", &own_grant)]).own_channel, Some([0x55u8; 32]));
+    assert_eq!(
+        lookup(&[("CT_GRANT_CHANNEL", &grant_channel), ("CT_CHANNEL_GRANT", &own_grant)]).own_channel,
+        Some([0x77u8; 32]),
+        "an explicit channel var still wins over the grant"
+    );
+    assert_eq!(lookup(&[("CT_CHANNEL_GRANT", "not-a-grant")]).own_channel, None);
+    assert!(lookup(&[("CT_CHANNEL_GRANT_ANY", "1")]).any);
+    assert!(lookup(&[("CT_CHANNEL_GRANT_ANY", " true ")]).any);
+    assert!(!lookup(&[("CT_CHANNEL_GRANT_ANY", "0")]).any);
+
+    // The check itself, on the pure type.
+    let scope = GrantScope::own([0x66u8; 32]);
+    assert!(scope.check(&id).is_ok());
+    assert!(scope.check(&grant_channel).unwrap_err().contains("66666666"));
+    assert!(scope.check("zz").unwrap_err().contains("64 hex"));
 }
 
 #[test]
@@ -3573,6 +3679,55 @@ fn service_handler_stderr_is_forwarded_to_the_diagnostic_sink_on_success_and_fai
     assert!(diag.ends_with("service handler[text_generation] stderr: LAST\n"), "the tail (last line) survives");
     assert!(diag.len() < HANDLER_STDERR_PASSTHROUGH_MAX + 512, "forwarded volume is bounded: {}", diag.len());
 }
+
+#[test]
+fn service_handler_failure_error_carries_only_a_bounded_redacted_stderr_tail_169() {
+    // ct-agent#169: the error a FAILED handler produces is sent to the remote peer as the
+    // JSON-RPC error. It used to carry the whole stderr verbatim -- an LLM CLI's crash trace,
+    // API keys from its environment included. Now: exit status + last 2 KiB + secret redaction,
+    // while the local diagnostic sink still receives the full (64 KiB-capped) text.
+    use ct_common::channel::ServiceType::SafetyCheck;
+    let t = std::time::Duration::from_secs(10);
+
+    let filler = HANDLER_STDERR_FILLER_LINES;
+    let hex64 = "ab".repeat(32);
+    let cmd = format!(
+        "echo HEAD-MARKER >&2; \
+         for i in $(seq 1 {filler}); do echo 'progress line that is long enough to add up quickly' >&2; done; \
+         echo 'OPENAI_API_KEY=sk-live-abc123' >&2; \
+         echo 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig' >&2; \
+         echo 'channel {hex64}' >&2; \
+         echo 'TAIL-MARKER' >&2; \
+         exit 7"
+    );
+    let mut sink = Vec::new();
+    let err = run_service_handler_with_timeout_to(&cmd, SafetyCheck, "x", t, &mut sink).unwrap_err();
+
+    assert!(err.starts_with("service handler exited exit status: 7:"), "exit status is preserved: {err}");
+    assert!(err.len() <= HANDLER_STDERR_PEER_TAIL_MAX + 256, "peer-facing error is bounded: {} bytes", err.len());
+    assert!(err.contains("TAIL-MARKER"), "the tail survives: {err}");
+    assert!(!err.contains("HEAD-MARKER"), "the head does not: {err}");
+    assert!(err.contains("bytes cut"), "the cut is announced: {err}");
+    assert!(!err.contains("sk-live-abc123"), "the API key is masked: {err}");
+    assert!(!err.contains("eyJhbGciOiJIUzI1NiJ9"), "the JWT is masked: {err}");
+    assert!(!err.contains(&hex64), "the 64-hex value is masked: {err}");
+    assert!(err.contains("[REDACTED]"), "masks are visible as such: {err}");
+
+    // The local sink is unchanged (ct-agent#105): full text, secrets included -- this is the
+    // operator's own log, not the peer's.
+    let diag = String::from_utf8(sink).unwrap();
+    assert!(diag.contains("HEAD-MARKER") && diag.contains("sk-live-abc123"), "local sink keeps the full text");
+
+    // Short stderr: no cut marker, the redacted text is passed through whole.
+    let mut sink = Vec::new();
+    let err = run_service_handler_with_timeout_to("echo 'token=abc' >&2; exit 2", SafetyCheck, "x", t, &mut sink)
+        .unwrap_err();
+    assert_eq!(err, "service handler exited exit status: 2: token=[REDACTED]");
+}
+
+/// Enough ~50-byte lines to push the handler's stderr well past
+/// [`HANDLER_STDERR_PEER_TAIL_MAX`] (and still under the local sink's 64 KiB cap).
+const HANDLER_STDERR_FILLER_LINES: usize = 200;
 
 #[test]
 fn timeout_kills_the_whole_process_group_not_just_the_immediate_child() {
