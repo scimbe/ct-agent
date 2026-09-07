@@ -192,7 +192,9 @@ impl AcmeClient {
         extra_hosts: &[String],
     ) -> Result<Self, BoxError> {
         directory_url_policy(directory_url, extra_hosts)?;
-        let http = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+        // The shared client's 30 s whole-request bound is the one this site
+        // always used; every ACME call below goes through the same handle.
+        let http = crate::http::shared();
         let resp = http.get(directory_url).send().await?;
         if !resp.status().is_success() {
             return Err(format!("ACME directory fetch failed: {}", resp.status()).into());

@@ -483,13 +483,10 @@ async fn run_publish_dumb_put(url: String) -> Result<(), String> {
     }
     let (body, manifest) = load_and_verify_manifest_to_publish()?;
 
-    // A bare `reqwest::Client::new()` has no request timeout -- a stalled
-    // publish endpoint would hang `ct-agent manifest publish` indefinitely
-    // rather than surfacing a clear error. Same bug class as #54.
-    let resp = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+    // The shared client's 30 s whole-request timeout applies: a stalled publish
+    // endpoint must not hang `ct-agent manifest publish` indefinitely rather
+    // than surfacing a clear error. Same bug class as #54.
+    let resp = crate::http::shared()
         .put(&url)
         .header("content-type", "application/json")
         .body(body)
@@ -531,11 +528,11 @@ async fn run_publish_to_registry<F: Fn(&str) -> Option<String>>(f: &F, registry_
         .map_err(|e| e.to_string())?;
     let form = reqwest::multipart::Form::new().part("manifest", manifest_part).part("bundle", bundle_part);
 
-    let resp = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+    // 60 s rather than the shared client's 30 s: this request carries the
+    // multi-megabyte bundle tarball.
+    let resp = crate::http::shared()
         .post(format!("{registry_url}/manifests"))
+        .timeout(std::time::Duration::from_secs(60))
         .header("authorization", format!("Bearer {token}"))
         .multipart(form)
         .send()
@@ -912,10 +909,7 @@ pub async fn run_activate(cfg: ActivateCliConfig) -> Result<Activation, String> 
 }
 
 async fn post_activation_ledger_event(registry: &RegistryActivationConfig, manifest_id: &str) -> Result<(), String> {
-    let resp = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+    let resp = crate::http::shared()
         .post(format!("{}/manifests/{manifest_id}/activations", registry.registry_url))
         .header("authorization", format!("Bearer {}", registry.registry_write_token))
         .json(&serde_json::json!({ "activator_pubkey": registry.activator_pubkey, "status": "ok" }))

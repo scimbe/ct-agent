@@ -1129,10 +1129,7 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
                     crate::login::OIDC_REFRESH_RETRY_BASE,
                 )
                 .await?;
-                reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(30))
-                    .build()
-                    .map_err(|e| format!("building HTTP client: {e}"))?
+                crate::http::shared()
                     .get(format!("{cp_url}/me/channels/{channel_hex}/members"))
                     .header("authorization", format!("Bearer {token}"))
                     .send()
@@ -1254,10 +1251,7 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
                 .to_string();
             let body = tokio::runtime::Handle::current()
                 .block_on(async {
-                    reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(30))
-                        .build()
-                        .map_err(|e| format!("building HTTP client: {e}"))?
+                    crate::http::shared()
                         .get(format!("{registry_url}/manifests"))
                         .send()
                         .await
