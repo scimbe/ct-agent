@@ -4,6 +4,7 @@
 //! container node in the Docker testbed.
 
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 
 /// Transport protocol of the local Origin the Agent bridges to (M10.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -21,6 +22,83 @@ impl OriginProto {
             "tcp" => Ok(OriginProto::Tcp),
             "udp" => Ok(OriginProto::Udp),
             other => Err(format!("invalid CT_AGENT_ORIGIN_PROTO '{other}' (expected tcp|udp)")),
+        }
+    }
+}
+
+/// `CT_AGENT_ORIGIN_TLS`: whether the Agent terminates TLS for a raw-forwarded (Browser-Plane)
+/// stream itself, or passes the bytes through to the Origin untouched.
+pub const ORIGIN_TLS_ENV: &str = "CT_AGENT_ORIGIN_TLS";
+/// `CT_AGENT_TLS_CERT`: the PEM certificate chain [`OriginTls::Terminate`] serves.
+pub const TLS_CERT_ENV: &str = "CT_AGENT_TLS_CERT";
+/// `CT_AGENT_TLS_KEY`: the PEM private key matching [`TLS_CERT_ENV`].
+pub const TLS_KEY_ENV: &str = "CT_AGENT_TLS_KEY";
+/// `CT_ACME_CERT_OUT_DIR`: where `ct-agent certificate` writes `fullchain.pem`/`privkey.pem` --
+/// the default location [`OriginTls::Terminate`] reads them back from, so a host that already
+/// renews its own Let's Encrypt certificate needs no second copy of the paths.
+pub const ACME_CERT_OUT_DIR_ENV: &str = "CT_ACME_CERT_OUT_DIR";
+/// The `CT_ACME_CERT_OUT_DIR` default, shared with `acme_orchestrate` (kept in sync by the test
+/// there that pins it): one place the two commands agree on.
+pub const DEFAULT_ACME_CERT_OUT_DIR: &str = "/shared/acme-cert";
+
+/// What the Agent does with the TLS layer of a raw-forwarded stream (scimbe/ct-agent#204).
+///
+/// WHY: the Browser Plane forwards a relayed stream to the Origin verbatim, because an HTTPS
+/// Origin terminates the browser's TLS itself. An SSH or other raw-TCP Origin (sshd, a
+/// database) cannot -- it speaks its own protocol and has never heard of TLS. In Grün the
+/// client's TLS session reaches this Agent byte-for-byte (the Edge only routes on SNI), so
+/// the only place left to terminate it is HERE, with the hostname's own ACME certificate
+/// (`ct-agent certificate` already renews exactly that pair): the Agent unwraps the TLS
+/// and forwards plaintext to `CT_AGENT_ORIGIN`. That is what `ct-agent ssh` (an OpenSSH
+/// ProxyCommand speaking SSH-over-TLS, like cloudflared's) connects to. In Gelb the Edge has
+/// already stripped TLS and the relayed bytes arrive plain -- the serve path sniffs the first
+/// bytes for a TLS ClientHello before terminating, so a Gelb deployment with this set on keeps
+/// working unchanged, and an HTTPS Origin behind a `passthrough` Agent is untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum OriginTls {
+    /// Forward the stream verbatim; TLS (if any) terminates at the Origin. The default.
+    #[default]
+    Passthrough,
+    /// Terminate TLS at the Agent with this PEM certificate chain and private key, then forward
+    /// the plaintext to the Origin. Only streams that begin with a TLS ClientHello are
+    /// terminated; anything else is still forwarded raw.
+    Terminate {
+        /// PEM certificate chain (`fullchain.pem`), leaf first.
+        cert: PathBuf,
+        /// PEM private key (`privkey.pem`) for the leaf.
+        key: PathBuf,
+    },
+}
+
+impl OriginTls {
+    /// Parse `CT_AGENT_ORIGIN_TLS` and, for `terminate`, the two path variables (falling back to
+    /// the ACME output directory). Unset or blank means [`OriginTls::Passthrough`]; any value
+    /// other than `passthrough`/`terminate` is an error naming the variable -- a typo must not
+    /// silently leave an sshd exposed to raw TLS bytes it cannot read.
+    pub fn from_env_with(get: &impl Fn(&str) -> Option<String>) -> Result<OriginTls, String> {
+        let mode = get(ORIGIN_TLS_ENV).map(|v| v.trim().to_ascii_lowercase()).unwrap_or_default();
+        match mode.as_str() {
+            "" | "passthrough" => Ok(OriginTls::Passthrough),
+            "terminate" => {
+                let cert_dir = PathBuf::from(
+                    get(ACME_CERT_OUT_DIR_ENV)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| DEFAULT_ACME_CERT_OUT_DIR.to_string()),
+                );
+                let path_or = |var: &str, default: PathBuf| -> PathBuf {
+                    get(var)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                        .unwrap_or(default)
+                };
+                Ok(OriginTls::Terminate {
+                    cert: path_or(TLS_CERT_ENV, cert_dir.join("fullchain.pem")),
+                    key: path_or(TLS_KEY_ENV, cert_dir.join("privkey.pem")),
+                })
+            }
+            other => Err(format!("invalid {ORIGIN_TLS_ENV} '{other}' (expected passthrough|terminate)")),
         }
     }
 }
@@ -103,6 +181,12 @@ pub struct AgentConfig {
     /// sends the token, see `serve::DirectTokenPolicy`). Only consulted when
     /// `direct_advertise_ip` is set -- the relayed path never reads it.
     pub direct_require_token: bool,
+    /// scimbe/ct-agent#204: whether a raw-forwarded stream's TLS is terminated here (with the
+    /// hostname's own certificate, for SSH/raw-TCP Origins that cannot) or passed through to
+    /// the Origin. `CT_AGENT_ORIGIN_TLS`; default [`OriginTls::Passthrough`]. Only consulted on
+    /// the Browser-Plane raw-forward paths (`CT_AGENT_MODE=browser`); the Noise path never
+    /// carries client TLS. See [`OriginTls`] for the Grün/Gelb reasoning.
+    pub origin_tls: OriginTls,
 }
 
 /// The four values `dial_quic_via_masque` needs, read together (ADR-0024 M3-followup).
@@ -164,6 +248,7 @@ impl AgentConfig {
             register_tcp_only: false,
             masque_fallback: None,
             direct_require_token: false,
+            origin_tls: OriginTls::Passthrough,
         })
     }
 
@@ -236,6 +321,8 @@ impl AgentConfig {
             _ => DEFAULT_TCP_FALLBACK_POOL_SIZE,
         };
         cfg.masque_fallback = parse_masque_fallback(&get)?;
+        // scimbe/ct-agent#204: terminate TLS here for an sshd-style Origin, or pass it through.
+        cfg.origin_tls = OriginTls::from_env_with(&get)?;
         Ok(cfg)
     }
 }
@@ -562,5 +649,86 @@ mod tests {
         assert!(err.contains("CT_AGENT_MASQUE_SNI_HOST"), "names the missing var: {err}");
         assert!(err.contains("CT_AGENT_MASQUE_TARGET"), "names the missing var: {err}");
         assert!(err.contains("CT_AGENT_MASQUE_TOKEN"), "names the missing var: {err}");
+    }
+
+    #[test]
+    fn origin_tls_defaults_to_passthrough_when_unset_or_named() {
+        // scimbe/ct-agent#204: the default must stay the pre-#204 behaviour (TLS terminates at
+        // the Origin) -- an HTTPS Origin behind an upgraded agent is untouched.
+        assert_eq!(AgentConfig::from_env_with(|_| None).unwrap().origin_tls, OriginTls::Passthrough);
+        let c = AgentConfig::from_env_with(get_from(&[("CT_AGENT_ORIGIN_TLS", "passthrough")])).unwrap();
+        assert_eq!(c.origin_tls, OriginTls::Passthrough);
+        let c = AgentConfig::from_env_with(get_from(&[("CT_AGENT_ORIGIN_TLS", " PassThrough ")])).unwrap();
+        assert_eq!(c.origin_tls, OriginTls::Passthrough, "case-insensitive, trimmed");
+        let c = AgentConfig::from_env_with(get_from(&[("CT_AGENT_ORIGIN_TLS", "")])).unwrap();
+        assert_eq!(c.origin_tls, OriginTls::Passthrough, "blank counts as unset");
+    }
+
+    #[test]
+    fn origin_tls_terminate_defaults_to_the_acme_output_pair() {
+        // With no explicit paths the pair `ct-agent certificate` writes is used -- the host
+        // already renews exactly that certificate, so no second configuration of the paths.
+        let c = AgentConfig::from_env_with(get_from(&[("CT_AGENT_ORIGIN_TLS", "terminate")])).unwrap();
+        assert_eq!(
+            c.origin_tls,
+            OriginTls::Terminate {
+                cert: PathBuf::from("/shared/acme-cert/fullchain.pem"),
+                key: PathBuf::from("/shared/acme-cert/privkey.pem"),
+            }
+        );
+        // A relocated ACME output dir moves both defaults with it.
+        let c = AgentConfig::from_env_with(get_from(&[
+            ("CT_AGENT_ORIGIN_TLS", "terminate"),
+            ("CT_ACME_CERT_OUT_DIR", "/var/lib/ct/certs"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            c.origin_tls,
+            OriginTls::Terminate {
+                cert: PathBuf::from("/var/lib/ct/certs/fullchain.pem"),
+                key: PathBuf::from("/var/lib/ct/certs/privkey.pem"),
+            }
+        );
+    }
+
+    #[test]
+    fn origin_tls_terminate_takes_explicit_paths() {
+        let c = AgentConfig::from_env_with(get_from(&[
+            ("CT_AGENT_ORIGIN_TLS", "terminate"),
+            ("CT_AGENT_TLS_CERT", "/etc/ssl/site/chain.pem"),
+            ("CT_AGENT_TLS_KEY", "/etc/ssl/site/key.pem"),
+            ("CT_ACME_CERT_OUT_DIR", "/ignored"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            c.origin_tls,
+            OriginTls::Terminate {
+                cert: PathBuf::from("/etc/ssl/site/chain.pem"),
+                key: PathBuf::from("/etc/ssl/site/key.pem"),
+            }
+        );
+        // One explicit path still leaves the other on its default.
+        let c = AgentConfig::from_env_with(get_from(&[
+            ("CT_AGENT_ORIGIN_TLS", "terminate"),
+            ("CT_AGENT_TLS_KEY", "/etc/ssl/site/key.pem"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            c.origin_tls,
+            OriginTls::Terminate {
+                cert: PathBuf::from("/shared/acme-cert/fullchain.pem"),
+                key: PathBuf::from("/etc/ssl/site/key.pem"),
+            }
+        );
+    }
+
+    #[test]
+    fn origin_tls_rejects_unknown_values_naming_the_variable() {
+        // A typo ("terminat") must fail loudly: silently passing raw TLS through to an sshd
+        // would just look like a broken tunnel.
+        let err = AgentConfig::from_env_with(get_from(&[("CT_AGENT_ORIGIN_TLS", "terminat")])).unwrap_err();
+        assert!(err.contains("CT_AGENT_ORIGIN_TLS"), "names the variable: {err}");
+        assert!(err.contains("terminat"), "echoes the bad value: {err}");
+        assert!(err.contains("passthrough|terminate"), "lists the accepted values: {err}");
     }
 }

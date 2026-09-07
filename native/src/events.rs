@@ -80,9 +80,15 @@ pub const CREDENTIAL_DEGRADED: &str = "credential_degraded";
 /// Binary-manifest activations (scimbe/ct-agent#183, decision C1) -- recorded so a host's ring
 /// shows when its sandbox capability was last verified, and what the answer was.
 pub const DOCTOR_SANDBOX: &str = "doctor_sandbox";
+/// `{sni}`: a raw-forwarded stream's TLS was terminated at this Agent with the configured
+/// certificate (`CT_AGENT_ORIGIN_TLS=terminate`, scimbe/ct-agent#204) and its plaintext handed
+/// to the Origin -- once per connection, so an operator can see that `ct-agent ssh` sessions
+/// really are being unwrapped here (Grün) rather than arriving already plain (Gelb). `sni` is
+/// the name the client asked for, `null` when it sent none.
+pub const ORIGIN_TLS_TERMINATED: &str = "origin_tls_terminated";
 
 /// Every event kind, in the order `/metrics` renders `ct_agent_events_total{kind}`.
-pub const KINDS: [&str; 14] = [
+pub const KINDS: [&str; 15] = [
     REGISTERED,
     REGISTRATION_FAILED,
     DISCONNECTED,
@@ -97,6 +103,7 @@ pub const KINDS: [&str; 14] = [
     UPDATE_APPLIED,
     CREDENTIAL_DEGRADED,
     DOCTOR_SANDBOX,
+    ORIGIN_TLS_TERMINATED,
 ];
 
 // ---- the event ----------------------------------------------------------------
