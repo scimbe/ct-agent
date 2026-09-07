@@ -2069,13 +2069,19 @@ pub async fn run_agent(
             }
             _ => None,
         };
-        eprintln!("ct-agent: registered with edge {} (serving)", config.edge);
+        eprintln!(
+            "ct-agent: registered with edge {} (serving){}",
+            config.edge,
+            config.hostname_bind_note()
+        );
         crate::status::set_registered_now();
         crate::events::emit(
             crate::events::REGISTERED,
             serde_json::json!({
                 "edge": config.edge.to_string(),
                 "transport": crate::status::STATUS.transport(),
+                // CADS-Tunnel#795: whether this registration also bound the public hostname.
+                "hostname_bound": config.binds_hostname(),
             }),
         );
         serve_quic_connection(
@@ -2845,7 +2851,7 @@ async fn tcp_connect_register_serve(
             crate::status::set_registered_now();
             crate::events::emit(
                 crate::events::REGISTERED,
-                serde_json::json!({ "edge": target.to_string(), "transport": "tcp-fallback" }),
+                serde_json::json!({ "edge": target.to_string(), "transport": "tcp-fallback", "hostname_bound": true }),
             );
             if framed || ping_capable {
                 // Answer the Edge's PINGs until it writes STOP; the stream is then
@@ -2899,14 +2905,16 @@ async fn tcp_connect_register_serve(
     }
     revocation.note(RegistrationOutcome::Succeeded);
     eprintln!(
-        "ct-agent: registered over the TLS-TCP fallback (UDP blocked){}, serving one tunnel to {}",
+        "ct-agent: registered over the TLS-TCP fallback (UDP blocked){}, serving one tunnel to {}{}",
         if ping_capable { ", ping-capable" } else { "" },
-        config.origin
+        config.origin,
+        config.hostname_bind_note()
     );
     crate::status::set_registered_now();
     crate::events::emit(
         crate::events::REGISTERED,
-        serde_json::json!({ "edge": target.to_string(), "transport": "tcp-fallback" }),
+        // CADS-Tunnel#795: the Noise 'K'/'A' frames carry the token only -- never a hostname.
+        serde_json::json!({ "edge": target.to_string(), "transport": "tcp-fallback", "hostname_bound": false }),
     );
     // Answer the Edge's parked-connection PINGs until it signals STOP. Returns
     // with the stream byte-exactly at the first relayed byte, so the Noise
