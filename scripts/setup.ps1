@@ -59,6 +59,13 @@ function Test-Environment {
 
 # --- 2. mode select + sandbox warning -------------------------------------------
 function Confirm-Mode {
+  # Printed on every run, whichever mode (scimbe/ct-agent#183, decision B3): there is no
+  # Binary-manifest sandbox on Windows and no supported unsandboxed mode, so the agent
+  # refuses binary manifests here fail-closed. Single quotes on purpose: no backtick
+  # escapes, no interpolation.
+  Warn 'Windows: binary manifests are NOT supported -- ct-agent manifest activate refuses them'
+  Warn '(fail-closed, decision B3, scimbe/ct-agent#183). Compose manifests (Docker Desktop) and'
+  Warn 'ct-agent manifest plan work as usual; ct-agent doctor sandbox explains this host''s state.'
   if ($Mode -eq 'docker') { Log "mode: Docker container (recommended isolation)"; return }
   Log "mode: direct install on this host"
   Warn "ct-agent is a network-facing process that will run directly on this machine."
