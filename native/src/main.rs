@@ -198,7 +198,8 @@ Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
               sandbox backend (bwrap) is usable on this host the activation is refused, naming
               the probe's own failure; CT_ALLOW_UNSANDBOXED=1 is the operator's explicit opt-out
               (the executable then runs unconfined behind a loud warning). The old
-              CT_REQUIRE_BINARY_SANDBOX=1 is still accepted and is a no-op.
+              CT_REQUIRE_BINARY_SANDBOX=1 is still accepted and is a no-op. On Windows, binary
+              manifests are refused (decision B3); use compose manifests or `manifest plan`.
     plan      The same variables as `activate` (nothing is installed, no directory is created,
               the bundle is not fetched -- only the manifest), plus optional
               CT_MANIFEST_COMPOSE_FILE: for `plan` a LOCAL path to the compose file's text, so
