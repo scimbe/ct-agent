@@ -6684,6 +6684,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_fallback_pool_serves_a_burst_of_browsers_far_beyond_its_size_799() {
+        // CADS-Tunnel#799 / "stable under load": a REAL pinned edge, a Browser-Plane
+        // agent ('L' registrations, raw relay -- the production shape of the lab
+        // hosts and rn-praktikum) with a pool of 6, and 30 browsers arriving at
+        // once, each holding its connection open for 2 s (an origin that answers
+        // slowly). The front door does what production does on a miss: wait the
+        // bounded deliver wait for a parked slot, then deliver. Every parked slot
+        // is a single-use delivery ticket, so before #799 the 7th..30th browser
+        // waited for a relay to finish (2 s a round, 5 rounds) and the 3 s wait ran
+        // out for most of them: "no agent tunnel for token" on a healthy agent.
+        // With the spare-slot pool every consumed slot is re-parked at once, so all
+        // 30 are delivered inside the wait and every one gets its echo, and the
+        // whole burst takes about one hold, not five.
+        use ct_common::pow::Challenge;
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use ct_edge::serve::serve_tcp_connection;
+        use ct_edge::state::EdgeState;
+        use quinn::Connection;
+        use std::net::Ipv4Addr;
+
+        const POOL: usize = 6;
+        const BROWSERS: usize = 30;
+        const HOLD: Duration = Duration::from_secs(2);
+        const DELIVER_WAIT: Duration = Duration::from_secs(3);
+        const HOST: &str = "burst.example.test";
+
+        let ca = Ca::new("burst-799-ca").unwrap();
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let token = RoutingToken([0x99; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        // The production edge: 'L' parks (queued per token) and binds the host.
+        let state_e = state.clone();
+        let edge = tokio::spawn(async move {
+            loop {
+                let (tcp, peer) = tcp_listener.accept().await.unwrap();
+                let (acc, st, ch) = (acceptor.clone(), state_e.clone(), challenge.clone());
+                tokio::spawn(async move {
+                    if let Ok(tls) = acc.accept(tcp).await {
+                        if let Err(e) = serve_tcp_connection(tls, &st, &ch, None, peer.ip()).await {
+                            eprintln!("edge: {e}");
+                        }
+                    }
+                });
+            }
+        });
+
+        // Origin: a slow echo -- every relay stays open for HOLD, so the pool's
+        // slots are genuinely tied up, not recycled within milliseconds.
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            loop {
+                let (mut s, _) = origin_listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    tokio::time::sleep(HOLD).await;
+                    let _ = s.write_all(&buf[..n]).await;
+                    let _ = s.shutdown().await;
+                });
+            }
+        });
+
+        let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), &origin_addr.to_string()).unwrap();
+        cfg.browser_forward = true;
+        cfg.hostname = Some(HOST.to_string());
+        cfg.tcp_fallback_pool_size = POOL;
+        let a_token = token.clone();
+        let agent = tokio::spawn(async move {
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ = run_agent_tcp_fallback(&cfg, ca_root, a_token, Arc::new(vec![[0u8; 32]]), Arc::new(gate))
+                .await;
+        });
+
+        // The full pool is parked and the host bound before the burst.
+        for _ in 0..300 {
+            if state.tcp_parked_for(&token) >= POOL && state.route_host(HOST).as_ref() == Some(&token) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.tcp_parked_for(&token), POOL, "the whole pool is parked");
+        assert_eq!(state.route_host(HOST).as_ref(), Some(&token), "hostname bound");
+
+        // The burst: BROWSERS connections at once through the front door's
+        // wait-then-deliver, each expecting its own echo.
+        let started = Instant::now();
+        let mut browsers = tokio::task::JoinSet::new();
+        for i in 0..BROWSERS {
+            let (state, token) = (Arc::clone(&state), token.clone());
+            browsers.spawn(async move {
+                let t0 = Instant::now();
+                let (mut browser, edge_side) = tokio::io::duplex(1 << 16);
+                let mut stream: ct_edge::state::BoxedStream = Box::new(edge_side);
+                // Exactly the front door's miss handling: deliver, else wait and retry.
+                loop {
+                    match state.deliver_to_tcp_agent_draining(&token, stream) {
+                        Ok(()) => break,
+                        Err(back) => {
+                            stream = back;
+                            if t0.elapsed() >= DELIVER_WAIT {
+                                return Err::<usize, BoxError>(
+                                    format!("browser {i}: no agent tunnel after {:?}", t0.elapsed()).into(),
+                                );
+                            }
+                            let _ = state.wait_for_tcp_agent(&token, DELIVER_WAIT - t0.elapsed()).await;
+                        }
+                    }
+                }
+                let payload = format!("burst-{i}");
+                browser.write_all(payload.as_bytes()).await?;
+                browser.flush().await?;
+                let mut answer = Vec::new();
+                tokio::time::timeout(Duration::from_secs(20), browser.read_to_end(&mut answer))
+                    .await
+                    .map_err(|_| format!("browser {i}: no answer within 20 s"))??;
+                if answer == payload.as_bytes() {
+                    Ok(i)
+                } else {
+                    Err(format!("browser {i}: wrong echo {:?}", String::from_utf8_lossy(&answer)).into())
+                }
+            });
+        }
+        let mut ok = 0usize;
+        let mut failures = Vec::new();
+        while let Some(r) = browsers.join_next().await {
+            match r.unwrap() {
+                Ok(_) => ok += 1,
+                Err(e) => failures.push(e.to_string()),
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            failures.is_empty(),
+            "{} of {BROWSERS} browsers failed through a pool of {POOL}: {failures:?}",
+            failures.len()
+        );
+        assert_eq!(ok, BROWSERS);
+        // All relays overlapped: the whole burst took about one HOLD, not
+        // BROWSERS / POOL rounds of it.
+        assert!(
+            elapsed < HOLD * 3,
+            "the burst was served in rounds ({elapsed:?}); the pool did not re-park on consumption"
+        );
+
+        agent.abort();
+        edge.abort();
+        origin.abort();
+    }
+
+    #[tokio::test]
     async fn run_agent_registers_and_serves_relayed_streams() {
         use ct_common::noise::{client_handshake_for, frame, generate_static_keypair};
         use ct_common::{Capability, OriginIdentity};
