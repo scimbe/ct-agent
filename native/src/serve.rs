@@ -1939,16 +1939,26 @@ pub async fn run_agent(
     // edge's `NO` to a role-'A' registration is definitive (see
     // `RegistrationRefused`), so one refusal flips the view.
     let mut revocation_tracker = RevocationTracker::new(Arc::clone(&revocation));
+    // CADS-Tunnel#799: consecutive short-lived QUIC sessions, feeding the fallback
+    // pool's reprobe hysteresis (see `reprobe_policy_after`).
+    let mut quic_flaps: u32 = 0;
     loop {
         if let Some((listener, task)) = direct.as_mut() {
             listener.ensure_running(task);
         }
-        let conn = match dial_quic_or_blocked_error(config.edge, edge_cert.clone(), Duration::from_secs(5))
-            .await
+        // `pre_registered`: the TLS-TCP fallback pool already registered this
+        // connection before handing it over (make-before-break, CADS-Tunnel#799),
+        // so the registration below is skipped for it.
+        let (conn, pre_registered) = match dial_quic_or_blocked_error(
+            config.edge,
+            edge_cert.clone(),
+            Duration::from_secs(5),
+        )
+        .await
         {
             Ok(conn) => {
                 switch_transport("quic");
-                conn
+                (conn, false)
             }
             Err(e) => {
                 // ct-agent#178: the dial is the first step of a registration attempt;
@@ -1966,7 +1976,7 @@ pub async fn run_agent(
                              RFC 9298 CONNECT-UDP (MASQUE) tunnel"
                         );
                         switch_transport("masque");
-                        conn
+                        (conn, false)
                     }
                     None => {
                         eprintln!(
@@ -1981,15 +1991,18 @@ pub async fn run_agent(
                             Arc::clone(&gate),
                             Arc::clone(&revocation),
                             terminator.clone(),
+                            reprobe_policy_after(quic_flaps),
                         )
                         .await
                         {
-                            FallbackExit::QuicRecovered => {
-                                // A QUIC probe answered — start over with a fresh budget and
-                                // dial it for real.
+                            FallbackExit::QuicRecovered(conn) => {
+                                // The pool's probe answered and the pool already
+                                // registered over it: serve on that connection with a
+                                // fresh budget, no second registration.
                                 policy.after_success();
                                 crate::status::note_reconnect();
-                                continue;
+                                switch_transport("quic");
+                                (conn, true)
                             }
                             FallbackExit::AllWorkersGaveUp => {
                                 // ct-agent#180: every pool worker burned its (finite,
@@ -2021,27 +2034,29 @@ pub async fn run_agent(
                 }
             }
         };
-        // ct-agent#178: one connection id per registration attempt; every event
-        // until the next attempt carries it.
-        crate::events::next_conn_id();
-        if let Err(e) = register_tunnel(&conn, &token).await {
-            // #45 slice 3: a wire `NO` here means the token is revoked at the
-            // plane; a dial/stream error means nothing about the token.
-            revocation_tracker.note(RevocationTracker::classify_failure(&e, true));
-            eprintln!("ct-agent: registration failed ({e}); will reconnect");
-            crate::status::set_registered(None);
-            crate::status::set_last_error(format!("registration failed: {e}"));
-            crate::events::emit(
-                crate::events::REGISTRATION_FAILED,
-                serde_json::json!({ "error": format!("registration failed: {e}") }),
-            );
-            crate::status::note_reconnect();
-            match policy.after_failure(rand::random::<f64>()) {
-                Retry::After(d) => {
-                    tokio::time::sleep(d).await;
-                    continue;
+        if !pre_registered {
+            // ct-agent#178: one connection id per registration attempt; every event
+            // until the next attempt carries it.
+            crate::events::next_conn_id();
+            if let Err(e) = register_tunnel(&conn, &token).await {
+                // #45 slice 3: a wire `NO` here means the token is revoked at the
+                // plane; a dial/stream error means nothing about the token.
+                revocation_tracker.note(RevocationTracker::classify_failure(&e, true));
+                eprintln!("ct-agent: registration failed ({e}); will reconnect");
+                crate::status::set_registered(None);
+                crate::status::set_last_error(format!("registration failed: {e}"));
+                crate::events::emit(
+                    crate::events::REGISTRATION_FAILED,
+                    serde_json::json!({ "error": format!("registration failed: {e}") }),
+                );
+                crate::status::note_reconnect();
+                match policy.after_failure(rand::random::<f64>()) {
+                    Retry::After(d) => {
+                        tokio::time::sleep(d).await;
+                        continue;
+                    }
+                    Retry::GiveUp => return Err("ct-agent: gave up re-registering with the edge".into()),
                 }
-                Retry::GiveUp => return Err("ct-agent: gave up re-registering with the edge".into()),
             }
         }
         revocation_tracker.note(RegistrationOutcome::Succeeded);
@@ -2084,6 +2099,7 @@ pub async fn run_agent(
                 "hostname_bound": config.binds_hostname(),
             }),
         );
+        let session_started = Instant::now();
         serve_quic_connection(
             &conn,
             config.origin,
@@ -2095,6 +2111,9 @@ pub async fn run_agent(
             terminator.clone(),
         )
         .await;
+        // CADS-Tunnel#799: a session this short after a dial that worked is a flap;
+        // the next fallback stint probes less eagerly and wants two answers.
+        quic_flaps = next_quic_flaps(quic_flaps, session_started.elapsed());
         eprintln!("ct-agent: edge connection dropped; reconnecting");
         let reason = conn
             .close_reason()
@@ -2491,14 +2510,68 @@ const QUIC_LIVENESS_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 /// recovered (#16). One cheap dial per interval: rare enough to cost nothing,
 /// frequent enough that a healed network upgrades the agent back to QUIC (and
 /// its multiplexed, pooled-connection-free serving) within a minute.
+///
+/// CADS-Tunnel#799: this is the interval with NO recent flap; see
+/// [`reprobe_policy_after`] for how it stretches once QUIC has proven flaky.
 const QUIC_REPROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// CADS-Tunnel#799: a QUIC session that lasted shorter than this counts as a
+/// flap. On a path where UDP works for a few seconds and then blackholes again
+/// (a NAT that drops the mapping, a middlebox that rate-limits new flows) the
+/// old 30 s probe found QUIC "recovered" every time, tore the whole TCP pool
+/// down, registered over QUIC, lost the connection, fell back, and did it all
+/// again -- with every Client of the switch-over window getting "no agent
+/// tunnel for token". Two minutes is comfortably longer than any of those
+/// failure cycles observed and still short enough that a genuinely healed path
+/// is trusted again within minutes.
+const QUIC_STABLE_AFTER: Duration = Duration::from_secs(120);
+
+/// CADS-Tunnel#799: how many times the reprobe interval doubles at most --
+/// `30 s * 2^4 = 8 min` between probes on a path that keeps flapping.
+const QUIC_REPROBE_MAX_DOUBLINGS: u32 = 4;
+
+/// CADS-Tunnel#799: how the TLS-TCP fallback pool decides that UDP/QUIC is back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReprobePolicy {
+    /// Time between probe dials.
+    pub(crate) interval: Duration,
+    /// How many CONSECUTIVE probe dials must answer before the pool registers
+    /// over QUIC. 1 = the first answer is trusted (no recent flap).
+    pub(crate) confirmations: u32,
+}
+
+/// The reprobe policy after `flaps` consecutive short-lived QUIC sessions
+/// (CADS-Tunnel#799 hysteresis): the interval doubles per flap (capped by
+/// [`QUIC_REPROBE_MAX_DOUBLINGS`]) and, once QUIC has flapped at all, two
+/// consecutive answered probes are required instead of one. Pure, so it is
+/// unit-tested on its own.
+fn reprobe_policy_after(flaps: u32) -> ReprobePolicy {
+    ReprobePolicy {
+        interval: QUIC_REPROBE_INTERVAL * (1u32 << flaps.min(QUIC_REPROBE_MAX_DOUBLINGS)),
+        confirmations: if flaps == 0 { 1 } else { 2 },
+    }
+}
+
+/// The flap counter after a QUIC session of length `session` ended
+/// (CADS-Tunnel#799): a session shorter than [`QUIC_STABLE_AFTER`] is one more
+/// flap; a longer one proves the path and clears the counter.
+fn next_quic_flaps(flaps: u32, session: Duration) -> u32 {
+    if session < QUIC_STABLE_AFTER {
+        flaps.saturating_add(1)
+    } else {
+        0
+    }
+}
 
 /// Why a TLS-TCP fallback pool run ended (ct-agent#180). Neither is an error:
 /// the caller decides what a whole pool giving up means for ITS loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum FallbackExit {
-    /// A QUIC probe dial answered -- the caller should re-dial QUIC for real.
-    QuicRecovered,
+    /// UDP/QUIC recovered AND the pool already registered this connection with
+    /// the edge (make-before-break, CADS-Tunnel#799): the caller serves on it
+    /// directly, without a registration gap in which the parked TCP slots are
+    /// gone and the QUIC one is not there yet.
+    QuicRecovered(Connection),
     /// Every worker exhausted its reconnect budget (only possible with a finite
     /// `CT_AGENT_RECONNECT_MAX_ATTEMPTS`); the pool is empty.
     AllWorkersGaveUp,
@@ -2527,17 +2600,20 @@ impl FallbackBudget {
 }
 
 /// [`run_agent_tcp_fallback`], but temporary (#16): serve over the TLS-TCP
-/// fallback pool while probing UDP/QUIC every [`QUIC_REPROBE_INTERVAL`], and
-/// return [`FallbackExit::QuicRecovered`] as soon as a probe dial succeeds — the
-/// caller ([`run_agent`]'s reconnect loop) then re-dials QUIC for real. The pool
-/// workers are spawned on a [`tokio::task::JoinSet`], whose drop ABORTS them —
-/// so returning here (probe success) tears the whole pool down rather than
-/// leaking N workers that would keep re-registering over TCP alongside the
-/// revived QUIC registration.
+/// fallback pool while probing UDP/QUIC per `reprobe`, and return
+/// [`FallbackExit::QuicRecovered`] as soon as the probe policy is satisfied AND
+/// the pool has registered over the probe connection (CADS-Tunnel#799) — the
+/// caller ([`run_agent`]'s reconnect loop) then serves on that connection. The
+/// pool workers are spawned on a [`tokio::task::JoinSet`]; on the way out the
+/// parked (idle) workers are aborted and the workers mid-tunnel are detached to
+/// finish their relayed Client, so no live tunnel is cut and no worker keeps
+/// re-registering over TCP alongside the revived QUIC registration.
 ///
 /// ct-agent#180: a worker that gives up ends that worker only; the pool returns
 /// [`FallbackExit::AllWorkersGaveUp`] once none is left, and `run_agent` treats
 /// that as one step of ITS reconnect budget rather than a process exit.
+// the pool's signature plus the #799 reprobe policy; refactor tracked separately
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_tcp_fallback_until_quic_recovers(
     config: &AgentConfig,
     edge_cert: CertificateDer<'static>,
@@ -2546,6 +2622,7 @@ async fn run_agent_tcp_fallback_until_quic_recovers(
     gate: Arc<local_auth::LocalAuthGate>,
     revocation: Arc<RevocationView>,
     terminator: Option<Arc<OriginTerminator>>,
+    reprobe: ReprobePolicy,
 ) -> FallbackExit {
     run_tcp_fallback_pool(
         config,
@@ -2556,18 +2633,27 @@ async fn run_agent_tcp_fallback_until_quic_recovers(
         revocation,
         terminator,
         FallbackBudget::from_env(),
-        Some(QUIC_REPROBE_INTERVAL),
+        Some(reprobe),
     )
     .await
 }
 
-/// The TLS-TCP fallback pool itself (#229, ct-agent#180): `config.tcp_fallback_pool_size`
-/// workers on a `JoinSet` (dropped -- and so aborted -- with this future), each on
-/// `budget`. Ends with [`FallbackExit::AllWorkersGaveUp`] once every worker has
-/// returned, or -- when `reprobe` is set -- with [`FallbackExit::QuicRecovered`]
-/// as soon as a probe dial every `reprobe` succeeds. A single worker giving up is
-/// logged once, with how many are left, and is otherwise NOT an event: the mode
-/// stays up on the remaining workers (before #180 it was fatal to the whole mode).
+/// The TLS-TCP fallback pool itself (#229, ct-agent#180, CADS-Tunnel#799):
+/// `config.tcp_fallback_pool_size` registrations kept PARKED at the edge at all
+/// times, each worker on `budget`. When the edge consumes a parked registration
+/// (a Client arrived; the worker now relays that one tunnel) the pool spawns a
+/// replacement at once, so a burst of Clients never drains the pool -- before
+/// #799 the pool held N registrations total, and the (N+1)th Client of a burst
+/// got "no agent tunnel for token" until some tunnel finished. The total is
+/// capped at `pool_size + config.tcp_fallback_max_serving`.
+///
+/// Ends with [`FallbackExit::AllWorkersGaveUp`] once every worker has returned,
+/// or -- when `reprobe` is set -- with [`FallbackExit::QuicRecovered`] once the
+/// probe policy is satisfied and a registration over the probe connection
+/// succeeded. A single worker giving up is logged once, with how many are left,
+/// and is otherwise NOT an event: the mode stays up on the remaining workers
+/// (before #180 it was fatal to the whole mode). A given-up worker is not
+/// replaced, so a finite budget still ends the pool.
 // pre-existing pool signature plus the two #180 parameters; refactor tracked separately
 #[allow(clippy::too_many_arguments)]
 async fn run_tcp_fallback_pool(
@@ -2579,7 +2665,7 @@ async fn run_tcp_fallback_pool(
     revocation: Arc<RevocationView>,
     terminator: Option<Arc<OriginTerminator>>,
     budget: FallbackBudget,
-    reprobe: Option<Duration>,
+    reprobe: Option<ReprobePolicy>,
 ) -> FallbackExit {
     run_tcp_fallback_pool_on(
         &TASKS_LIVE,
@@ -2594,6 +2680,25 @@ async fn run_tcp_fallback_pool(
         reprobe,
     )
     .await
+}
+
+/// CADS-Tunnel#799: a worker's way of telling its pool "the edge consumed my
+/// parked registration -- a Client is being relayed on it now". Fired exactly
+/// once per consumed registration, right after the STOP byte; the pool then
+/// tops the parked count back up. `None` (a worker outside a pool) is a no-op.
+pub(crate) struct ConsumedSignal {
+    id: usize,
+    tx: Option<tokio::sync::mpsc::UnboundedSender<usize>>,
+}
+
+impl ConsumedSignal {
+    fn fire(&self) {
+        if let Some(tx) = &self.tx {
+            // The pool dropping its receiver means it is already gone (its
+            // JoinSet aborts us next); nothing to report to then.
+            let _ = tx.send(self.id);
+        }
+    }
 }
 
 /// [`run_tcp_fallback_pool`] with its workers counted on `gauge` instead of the
@@ -2612,11 +2717,23 @@ pub(crate) async fn run_tcp_fallback_pool_on(
     revocation: Arc<RevocationView>,
     terminator: Option<Arc<OriginTerminator>>,
     budget: FallbackBudget,
-    reprobe: Option<Duration>,
+    reprobe: Option<ReprobePolicy>,
 ) -> FallbackExit {
+    use std::collections::{HashMap, HashSet};
+
     let n = config.tcp_fallback_pool_size.max(1);
-    let mut workers = tokio::task::JoinSet::new();
-    for _ in 0..n {
+    let max_serving = config.tcp_fallback_max_serving.max(1);
+    let (consumed_tx, mut consumed_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    let mut workers: tokio::task::JoinSet<(usize, Result<(), BoxError>)> = tokio::task::JoinSet::new();
+    // Every worker not yet joined, by id -- the abort handles are what lets the
+    // QUIC hand-over close the parked ones and leave the serving ones alone.
+    let mut handles: HashMap<usize, tokio::task::AbortHandle> = HashMap::new();
+    // The workers whose registration the edge consumed (relaying one Client).
+    let mut serving: HashSet<usize> = HashSet::new();
+    let mut next_id = 0usize;
+    // ct-agent#180: a worker that burned its budget is not replaced.
+    let mut given_up = 0usize;
+    let spawn_one = |workers: &mut tokio::task::JoinSet<(usize, Result<(), BoxError>)>, id: usize| {
         let config = config.clone();
         let edge_cert = edge_cert.clone();
         let token = token.clone();
@@ -2624,67 +2741,237 @@ pub(crate) async fn run_tcp_fallback_pool_on(
         let gate = Arc::clone(&gate);
         let tracker = RevocationTracker::new(Arc::clone(&revocation));
         let terminator = terminator.clone();
+        let consumed = ConsumedSignal { id, tx: Some(consumed_tx.clone()) };
         workers.spawn(gauge.track(async move {
-            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys, gate, tracker, terminator, budget)
-                .await
-        }));
+            let r = run_agent_tcp_fallback_worker(
+                &config,
+                edge_cert,
+                token,
+                origin_keys,
+                gate,
+                tracker,
+                terminator,
+                budget,
+                consumed,
+            )
+            .await;
+            (id, r)
+        }))
+    };
+    // Keep `n - given_up` registrations parked, within the total cap.
+    macro_rules! top_up {
+        () => {{
+            let target = n.saturating_sub(given_up);
+            while handles.len() - serving.len() < target && handles.len() < target + max_serving {
+                let id = next_id;
+                next_id += 1;
+                let h = spawn_one(&mut workers, id);
+                handles.insert(id, h);
+            }
+        }};
     }
+    top_up!();
+    // CADS-Tunnel#799: consecutive probe dials that answered.
+    let mut probe_ok_streak: u32 = 0;
     loop {
-        // With no reprobe interval this arm never fires; the pool then only ends
+        if handles.is_empty() {
+            return FallbackExit::AllWorkersGaveUp;
+        }
+        // With no reprobe policy this arm never fires; the pool then only ends
         // once every worker has.
         let reprobe_due = async {
             match reprobe {
-                Some(d) => tokio::time::sleep(d).await,
+                Some(p) => tokio::time::sleep(p.interval).await,
                 None => std::future::pending::<()>().await,
             }
         };
         tokio::select! {
             ended = workers.join_next() => {
                 match ended {
-                    Some(Ok(Err(e))) => eprintln!(
-                        "ct-agent: a TLS-TCP fallback worker gave up ({e}); {} of {n} still serving (#180)",
-                        workers.len()
-                    ),
-                    Some(Ok(Ok(()))) => eprintln!(
-                        "ct-agent: a TLS-TCP fallback worker ended; {} of {n} still serving (#180)",
-                        workers.len()
-                    ),
-                    Some(Err(join)) => eprintln!(
-                        "ct-agent: a TLS-TCP fallback worker ended abnormally ({join}); {} of {n} still serving (#180)",
-                        workers.len()
-                    ),
+                    Some(Ok((id, result))) => {
+                        let was_serving = serving.remove(&id);
+                        handles.remove(&id);
+                        match result {
+                            // The normal end of a consumed registration: its Client
+                            // was relayed, its replacement is long parked. Not news.
+                            Ok(()) if was_serving => {}
+                            Ok(()) => eprintln!(
+                                "ct-agent: a TLS-TCP fallback worker ended; {} of {n} parked (#180)",
+                                handles.len() - serving.len()
+                            ),
+                            Err(e) => {
+                                given_up += 1;
+                                eprintln!(
+                                    "ct-agent: a TLS-TCP fallback worker gave up ({e}); {} of {n} parked, \
+                                     {} relaying (#180)",
+                                    handles.len() - serving.len(),
+                                    serving.len()
+                                );
+                            }
+                        }
+                    }
+                    Some(Err(join)) => {
+                        // A panicked worker carries no id: drop every finished handle.
+                        given_up += 1;
+                        handles.retain(|_, h| !h.is_finished());
+                        serving.retain(|id| handles.contains_key(id));
+                        eprintln!(
+                            "ct-agent: a TLS-TCP fallback worker ended abnormally ({join}); {} of {n} parked (#180)",
+                            handles.len() - serving.len()
+                        );
+                    }
                     None => {}
                 }
-                if workers.is_empty() {
-                    return FallbackExit::AllWorkersGaveUp;
+                top_up!();
+            }
+            consumed = consumed_rx.recv() => {
+                // The sender lives in `spawn_one` for this whole function, so
+                // `None` cannot happen; a stale id (worker already joined) is
+                // simply not marked.
+                if let Some(id) = consumed {
+                    if handles.contains_key(&id) {
+                        serving.insert(id);
+                    }
                 }
+                top_up!();
             }
             _ = reprobe_due => {
-                if let Ok(Ok(conn)) = tokio::time::timeout(
+                let Some(policy) = reprobe else { continue };
+                let conn = match tokio::time::timeout(
                     Duration::from_secs(5),
                     dial_quic(config.edge, edge_cert.clone()),
                 )
                 .await
                 {
-                    conn.close(0u32.into(), b"udp recovered - upgrading back to QUIC (#16)");
+                    Ok(Ok(conn)) => conn,
+                    _ => {
+                        probe_ok_streak = 0;
+                        continue;
+                    }
+                };
+                // ct-agent#178: a probe the edge answered is a liveness observation.
+                crate::status::note_keepalive();
+                probe_ok_streak += 1;
+                if probe_ok_streak < policy.confirmations {
+                    conn.close(0u32.into(), b"quic probe answered - confirming before leaving the tcp fallback");
                     eprintln!(
-                        "ct-agent: UDP/QUIC to {} recovered — leaving the TLS-TCP fallback (#16)",
-                        config.edge
+                        "ct-agent: UDP/QUIC to {} answered a probe ({probe_ok_streak}/{}); staying on the \
+                         TLS-TCP fallback until it holds (CADS-Tunnel#799)",
+                        config.edge, policy.confirmations
                     );
-                    // ct-agent#178: a probe the edge answered is a liveness observation.
-                    crate::status::note_keepalive();
-                    return FallbackExit::QuicRecovered;
+                    continue;
+                }
+                // Make-before-break (CADS-Tunnel#799): register over the probe
+                // connection while every TCP slot is still parked. Only once the
+                // edge has accepted that registration do the parked slots go.
+                crate::events::next_conn_id();
+                match register_tunnel(&conn, &token).await {
+                    Ok(()) => {
+                        let parked = handles.len() - serving.len();
+                        eprintln!(
+                            "ct-agent: UDP/QUIC to {} recovered and the QUIC registration is up — leaving \
+                             the TLS-TCP fallback: {parked} parked registration(s) closed, {} relayed \
+                             tunnel(s) left to finish (#16, CADS-Tunnel#799)",
+                            config.edge,
+                            serving.len()
+                        );
+                        for (id, h) in &handles {
+                            if !serving.contains(id) {
+                                h.abort();
+                            }
+                        }
+                        // The relaying workers end on their own (a consumed worker
+                        // never re-registers); dropping the set must not abort them.
+                        workers.detach_all();
+                        return FallbackExit::QuicRecovered(conn);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "ct-agent: UDP/QUIC to {} answered a probe but registering over it failed ({e}); \
+                             staying on the TLS-TCP fallback (CADS-Tunnel#799)",
+                            config.edge
+                        );
+                        conn.close(0u32.into(), b"quic registration failed - staying on the tcp fallback");
+                        probe_ok_streak = 0;
+                    }
                 }
             }
         }
     }
 }
 
-/// One TCP-fallback pool worker (#229): connect, register, serve one Client,
-/// repeat -- the body [`run_agent_tcp_fallback`] runs N of concurrently. Each
+/// CADS-Tunnel#799: a parked registration that the edge ends within this long
+/// of accepting it is "short-lived". One is normal (the edge reaps a stale
+/// park slot, a NAT rebinds); several in a row mean the registration itself
+/// is not sticking, and the worker paces itself like a failing one.
+const SHORT_REGISTRATION: Duration = Duration::from_secs(2);
+/// How many consecutive short-lived registrations before the worker backs off.
+const SHORT_REGISTRATION_STRIKES: u32 = 3;
+/// The pause between re-registrations while short-lived ones are still below
+/// the strike count: long enough not to hammer the edge, short enough that a
+/// single reaped slot is back within a Client's connect timeout.
+const SHORT_REGISTRATION_PAUSE: Duration = Duration::from_millis(500);
+
+/// How one TLS-TCP attempt ended after the edge accepted the registration
+/// (CADS-Tunnel#799).
+#[derive(Debug)]
+pub(crate) enum TcpServed {
+    /// The edge relayed a Client on this registration (STOP received, the
+    /// pool told) and the tunnel ran to its end.
+    Consumed,
+    /// A plain ('A'/'B', no ping phase) registration served one tunnel. There is
+    /// no STOP on that path, so the pool was not told; the worker re-registers.
+    Plain,
+}
+
+/// How one TLS-TCP attempt failed (CADS-Tunnel#799). The split is what the
+/// worker's pacing turns on: before the edge accepted the registration the
+/// failure is a dial/handshake/refusal and spends reconnect budget; after it,
+/// the registration WORKED and what ended was a parked or relaying connection
+/// -- the worker re-registers at once, with no "registration failed" on the
+/// event log and no backoff step. Before #799 every post-registration end (the
+/// edge reaping a stale slot, a Client aborting its tunnel) was logged as
+/// "all TLS-TCP rungs failed", emitted `registration_failed`, and cost one
+/// backoff step -- so a pool under real traffic backed off exactly when it
+/// should have re-parked.
+#[derive(Debug)]
+pub(crate) enum TcpAttemptEnd {
+    /// Dial, TLS, or registration failed: no slot was ever parked.
+    NotRegistered(BoxError),
+    /// The edge accepted the registration and the connection ended `parked_for`
+    /// later; `consumed` says whether the STOP had arrived (a Client was being
+    /// relayed) or not (the parked slot itself went away).
+    Registered {
+        parked_for: Duration,
+        consumed: bool,
+        err: BoxError,
+    },
+}
+
+impl From<BoxError> for TcpAttemptEnd {
+    fn from(err: BoxError) -> Self {
+        TcpAttemptEnd::NotRegistered(err)
+    }
+}
+
+impl TcpAttemptEnd {
+    fn registered(since: Instant, consumed: bool, err: BoxError) -> Self {
+        TcpAttemptEnd::Registered { parked_for: since.elapsed(), consumed, err }
+    }
+}
+
+/// One TCP-fallback pool worker (#229): connect, register, park, relay one
+/// Client -- the body [`run_agent_tcp_fallback`] runs N of concurrently. Each
 /// registration is still single-use/single-Client; see that function's doc
-/// for why several of these run at once. Returns only when `budget` is exhausted.
-// pre-existing signature plus the #204 terminator; refactor tracked separately
+/// for why several of these run at once.
+///
+/// CADS-Tunnel#799: returns `Ok(())` once its registration was consumed and the
+/// relayed tunnel is over (the pool spawned the replacement at consumption, see
+/// [`ConsumedSignal`]); returns `Err` only when `budget` is exhausted. A parked
+/// registration the edge ends without a Client is re-registered immediately
+/// (see [`TcpAttemptEnd`]); a plain ('A'/'B') registration re-registers after
+/// its tunnel as before.
+// pre-existing signature plus the #204 terminator and the #799 signal; refactor tracked separately
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_tcp_fallback_worker(
     config: &AgentConfig,
@@ -2695,6 +2982,7 @@ async fn run_agent_tcp_fallback_worker(
     mut revocation: RevocationTracker,
     terminator: Option<Arc<OriginTerminator>>,
     budget: FallbackBudget,
+    consumed: ConsumedSignal,
 ) -> Result<(), BoxError> {
     let metrics = Arc::new(TunnelMetrics::new());
     // Reconnect loop (issue #5 / P1.2b): re-register and serve again after each
@@ -2705,7 +2993,13 @@ async fn run_agent_tcp_fallback_worker(
     // then the unified :443 front door when CT_AGENT_FALLBACK_443 is set. The first
     // rung that connects+registers serves the client; if all fail, back off.
     let rungs = crate::ladder::tcp_rungs(config.edge, config.fallback_443);
+    // CADS-Tunnel#799: consecutive parked registrations the edge ended within
+    // `SHORT_REGISTRATION`.
+    let mut short_lived: u32 = 0;
     loop {
+        // `Some(d)`: a rung got registered and its parked slot ended without a
+        // Client after `d`. `None` with `served`: a plain tunnel completed.
+        let mut parked_ended: Option<Duration> = None;
         let mut served = false;
         let mut last_err: Option<BoxError> = None;
         for addr in &rungs {
@@ -2721,41 +3015,94 @@ async fn run_agent_tcp_fallback_worker(
                 &gate,
                 &mut revocation,
                 terminator.clone(),
+                &consumed,
             )
             .await
             {
-                // A tunnel completed cleanly — re-register (re-walk from the primary).
-                Ok(()) => {
+                // The relayed Client is done; the pool parked a replacement the
+                // moment this registration was consumed. This worker is finished.
+                Ok(TcpServed::Consumed) => return Ok(()),
+                // A plain tunnel completed cleanly — re-register (re-walk from the primary).
+                Ok(TcpServed::Plain) => {
                     backoff.reset();
+                    short_lived = 0;
                     served = true;
                     break;
                 }
-                Err(e) => {
+                Err(TcpAttemptEnd::Registered { parked_for, consumed: true, err }) => {
+                    // The Client's tunnel ended with an error (an aborted handshake,
+                    // a dropped browser): that tunnel's business, not a registration
+                    // failure. The replacement is parked already.
+                    eprintln!(
+                        "ct-agent: relayed TLS-TCP tunnel at {addr} ended after {:.1}s ({err}) (CADS-Tunnel#799)",
+                        parked_for.as_secs_f64()
+                    );
+                    return Ok(());
+                }
+                Err(TcpAttemptEnd::Registered { parked_for, consumed: false, err }) => {
+                    eprintln!(
+                        "ct-agent: parked TLS-TCP registration at {addr} ended after {:.1}s without a \
+                         Client ({err}); re-registering (CADS-Tunnel#799)",
+                        parked_for.as_secs_f64()
+                    );
+                    crate::status::note_reconnect();
+                    parked_ended = Some(parked_for);
+                    break;
+                }
+                Err(TcpAttemptEnd::NotRegistered(e)) => {
                     eprintln!("ct-agent: TLS-TCP rung {addr} failed: {e}; trying next rung");
                     last_err = Some(e);
                 }
             }
         }
-        if !served {
-            let e = last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "no TCP rung configured".to_string());
-            eprintln!("ct-agent: all TLS-TCP rungs failed ({e}); will reconnect");
-            // ct-agent#178: with a pool larger than one, another worker may still be
-            // parked and registered, so `registered` is left alone here -- the pool's
-            // end (`fallback_exhausted`) is what clears it.
-            crate::status::set_last_error(format!("all TLS-TCP rungs failed: {e}"));
-            crate::events::emit(
-                crate::events::REGISTRATION_FAILED,
-                serde_json::json!({ "error": format!("all TLS-TCP rungs failed: {e}") }),
+        if served {
+            continue;
+        }
+        if let Some(parked_for) = parked_ended {
+            if parked_for >= SHORT_REGISTRATION {
+                // A registration that held: the edge reaping it (or the path
+                // dropping it) after that long is routine, not a fault.
+                backoff.reset();
+                short_lived = 0;
+                continue;
+            }
+            short_lived += 1;
+            if short_lived < SHORT_REGISTRATION_STRIKES {
+                tokio::time::sleep(SHORT_REGISTRATION_PAUSE).await;
+                continue;
+            }
+            // Registrations keep dying within seconds of being accepted: the
+            // edge is accepting and then dropping us. Pace like a failure (the
+            // backoff keeps growing until one registration holds), but say what
+            // is actually happening rather than "registration failed".
+            let msg = format!(
+                "TLS-TCP registrations keep ending within {}s of being accepted ({short_lived} in a row)",
+                SHORT_REGISTRATION.as_secs()
             );
-            crate::status::note_reconnect();
+            eprintln!("ct-agent: {msg}; backing off (CADS-Tunnel#799)");
+            crate::status::set_last_error(msg);
             match backoff.next_delay_jittered(rand::random::<f64>()) {
                 Some(d) => tokio::time::sleep(d).await,
-                None => {
-                    return Err("ct-agent: gave up reconnecting over the TLS-TCP fallback".into())
-                }
+                None => return Err("ct-agent: gave up reconnecting over the TLS-TCP fallback".into()),
             }
+            continue;
+        }
+        let e = last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "no TCP rung configured".to_string());
+        eprintln!("ct-agent: all TLS-TCP rungs failed ({e}); will reconnect");
+        // ct-agent#178: with a pool larger than one, another worker may still be
+        // parked and registered, so `registered` is left alone here -- the pool's
+        // end (`fallback_exhausted`) is what clears it.
+        crate::status::set_last_error(format!("all TLS-TCP rungs failed: {e}"));
+        crate::events::emit(
+            crate::events::REGISTRATION_FAILED,
+            serde_json::json!({ "error": format!("all TLS-TCP rungs failed: {e}") }),
+        );
+        crate::status::note_reconnect();
+        match backoff.next_delay_jittered(rand::random::<f64>()) {
+            Some(d) => tokio::time::sleep(d).await,
+            None => return Err("ct-agent: gave up reconnecting over the TLS-TCP fallback".into()),
         }
     }
 }
@@ -2768,6 +3115,10 @@ async fn run_agent_tcp_fallback_worker(
 /// an accepted registration (any role) clears it, the Edge's typed `NO` to the
 /// final `'A'` counts as an AMBIGUOUS refusal (on this path the same bytes also
 /// mean "#410 sub-cap full"), and every other failure is transient.
+///
+/// CADS-Tunnel#799: failures before and after the edge accepted the
+/// registration are told apart in the error (see [`TcpAttemptEnd`]), and the
+/// STOP byte that ends the ping phase fires `consumed` so the pool re-parks.
 // pre-existing signature; refactor tracked separately
 #[allow(clippy::too_many_arguments)]
 async fn tcp_connect_register_serve(
@@ -2780,7 +3131,8 @@ async fn tcp_connect_register_serve(
     gate: &local_auth::LocalAuthGate,
     revocation: &mut RevocationTracker,
     terminator: Option<Arc<OriginTerminator>>,
-) -> Result<(), BoxError> {
+    consumed: &ConsumedSignal,
+) -> Result<TcpServed, TcpAttemptEnd> {
     let mut stream = tcp_tls_connect(target, edge_cert.clone()).await?;
     // Browser Plane over the TCP fallback (#41 FB3): register+bind the public
     // hostname in one 'B' frame, then raw-forward the relayed browser stream to
@@ -2837,6 +3189,7 @@ async fn tcp_connect_register_serve(
             // The edge admits 'B'/'L'/'F' only for a live token (#665), so an
             // accepted browser registration clears the revocation view too.
             revocation.note(RegistrationOutcome::Succeeded);
+            let registered_at = Instant::now();
             eprintln!(
                 "ct-agent: browser-registered '{host}' over the TLS-TCP fallback (UDP blocked){}, \
                  {}-forwarding to {}",
@@ -2853,22 +3206,32 @@ async fn tcp_connect_register_serve(
                 crate::events::REGISTERED,
                 serde_json::json!({ "edge": target.to_string(), "transport": "tcp-fallback", "hostname_bound": true }),
             );
+            let mut was_consumed = false;
             if framed || ping_capable {
                 // Answer the Edge's PINGs until it writes STOP; the stream is then
                 // positioned exactly at the first relayed browser byte. Identical
                 // contract to the 'K' path -- `await_ping_phase_end` is shared, and
                 // 'F' keeps the park phase byte-for-byte ('F' only changes what
                 // comes AFTER the STOP byte).
-                await_ping_phase_end(&mut stream).await?;
+                if let Err(e) = await_ping_phase_end(&mut stream).await {
+                    return Err(TcpAttemptEnd::registered(registered_at, false, e));
+                }
+                consumed.fire();
+                was_consumed = true;
             }
             // scimbe/ct-agent#204: the terminator applies to the raw ('L'/'B') relay only.
             // The framed 'F' relay carries the browser bytes inside keepalive frames on
             // this hop, so terminating TLS there needs a frame-to-stream adapter first;
             // until that exists an 'F' registration forwards verbatim, terminator or not.
-            return if framed {
+            let relayed = if framed {
                 serve_framed_duplex_to_origin(stream, config.origin).await
             } else {
                 serve_duplex_to_origin(stream, config.origin, terminator).await
+            };
+            return match relayed {
+                Ok(()) if was_consumed => Ok(TcpServed::Consumed),
+                Ok(()) => Ok(TcpServed::Plain),
+                Err(e) => Err(TcpAttemptEnd::registered(registered_at, was_consumed, e)),
             };
         }
     }
@@ -2899,11 +3262,12 @@ async fn tcp_connect_register_serve(
         // ambiguous kind -- see `tcp_connect_register_serve`'s doc.
         if let Err(e) = register_tunnel_stream(&mut stream, token).await {
             revocation.note(RevocationTracker::classify_failure(&e, false));
-            return Err(e);
+            return Err(TcpAttemptEnd::NotRegistered(e));
         }
         ping_capable = false;
     }
     revocation.note(RegistrationOutcome::Succeeded);
+    let registered_at = Instant::now();
     eprintln!(
         "ct-agent: registered over the TLS-TCP fallback (UDP blocked){}, serving one tunnel to {}{}",
         if ping_capable { ", ping-capable" } else { "" },
@@ -2919,11 +3283,20 @@ async fn tcp_connect_register_serve(
     // Answer the Edge's parked-connection PINGs until it signals STOP. Returns
     // with the stream byte-exactly at the first relayed byte, so the Noise
     // handshake below sees an untouched stream.
+    let mut was_consumed = false;
     if ping_capable {
-        await_ping_phase_end(&mut stream).await?;
+        if let Err(e) = await_ping_phase_end(&mut stream).await {
+            return Err(TcpAttemptEnd::registered(registered_at, false, e));
+        }
+        consumed.fire();
+        was_consumed = true;
     }
     let (recv, send) = split(stream);
-    serve_noise_stream(send, recv, config.origin, origin_keys, Arc::clone(metrics), gate).await
+    match serve_noise_stream(send, recv, config.origin, origin_keys, Arc::clone(metrics), gate).await {
+        Ok(()) if was_consumed => Ok(TcpServed::Consumed),
+        Ok(()) => Ok(TcpServed::Plain),
+        Err(e) => Err(TcpAttemptEnd::registered(registered_at, was_consumed, e)),
+    }
 }
 
 #[cfg(test)]
@@ -2965,6 +3338,29 @@ mod tests {
         assert_eq!(parse_reconnect_max_attempts(Some("not-a-number".into())), RECONNECT_MAX_ATTEMPTS);
         assert_eq!(parse_reconnect_max_attempts(Some("0".into())), u32::MAX, "0 -> retry forever");
         assert_eq!(parse_reconnect_max_attempts(Some(" 7 ".into())), 7);
+    }
+
+    #[test]
+    fn reprobe_policy_stretches_and_demands_confirmation_after_quic_flaps_799() {
+        // CADS-Tunnel#799: with no flap the pool probes every 30 s and trusts the
+        // first answer (today's behavior). Each short-lived QUIC session doubles
+        // the interval (capped at 8 min) and, once QUIC has flapped at all, two
+        // consecutive answers are needed before the parked TCP slots are given up.
+        let p0 = reprobe_policy_after(0);
+        assert_eq!(p0, ReprobePolicy { interval: QUIC_REPROBE_INTERVAL, confirmations: 1 });
+        assert_eq!(reprobe_policy_after(1).interval, QUIC_REPROBE_INTERVAL * 2);
+        assert_eq!(reprobe_policy_after(1).confirmations, 2);
+        assert_eq!(reprobe_policy_after(3).interval, QUIC_REPROBE_INTERVAL * 8);
+        assert_eq!(reprobe_policy_after(4).interval, Duration::from_secs(480), "8 min cap");
+        assert_eq!(reprobe_policy_after(40).interval, Duration::from_secs(480), "stays capped");
+        assert_eq!(reprobe_policy_after(u32::MAX).confirmations, 2);
+
+        // The counter: a session under the stability bar is one more flap; one
+        // over it proves the path and clears everything.
+        assert_eq!(next_quic_flaps(0, Duration::from_secs(5)), 1);
+        assert_eq!(next_quic_flaps(1, Duration::from_secs(119)), 2);
+        assert_eq!(next_quic_flaps(2, QUIC_STABLE_AFTER), 0, "a stable session resets");
+        assert_eq!(next_quic_flaps(u32::MAX, Duration::ZERO), u32::MAX, "saturates");
     }
 
     #[test]
@@ -6046,9 +6442,244 @@ mod tests {
         )
         .await
         .expect("the pool ends once every worker has given up");
-        assert_eq!(exit, FallbackExit::AllWorkersGaveUp);
+        assert!(matches!(exit, FallbackExit::AllWorkersGaveUp), "{exit:?}");
         // Each of the two workers: one initial failure + one retry.
         assert!(refused.load(SeqCst) >= 4, "both workers walked their budgets: {}", refused.load(SeqCst));
+        edge.abort();
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_reaped_registration_re_registers_without_backoff_799() {
+        // CADS-Tunnel#799 (a): the edge ACCEPTS the registration and then ends the
+        // parked connection (reaps a stale slot, drops the mapping). Before, the
+        // worker booked that as "all TLS-TCP rungs failed", emitted
+        // `registration_failed`, and slept one backoff step -- with a 10 s base
+        // that is one registration per ~5-10 s while the edge would have taken a
+        // fresh one at once. Now a post-registration end re-registers immediately
+        // (a short pause between short-lived ones), so three registrations land
+        // well inside 2 s where the old code managed one.
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use std::net::Ipv4Addr;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        let ca = Ca::new("reap-799-ca").unwrap();
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_e = Arc::clone(&accepted);
+        // Edge: admit every registration ('K' or 'A'), ack it, then close the
+        // parked connection right away -- the reaping edge.
+        let edge = tokio::spawn(async move {
+            loop {
+                let (tcp, _) = tcp_listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(tcp).await.unwrap();
+                let mut hdr = [0u8; 33];
+                tls.read_exact(&mut hdr).await.unwrap();
+                tls.write_all(b"OK").await.unwrap();
+                tls.flush().await.unwrap();
+                accepted_e.fetch_add(1, SeqCst);
+                drop(tls);
+            }
+        });
+
+        let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), "127.0.0.1:9").unwrap();
+        cfg.tcp_fallback_pool_size = 1;
+        // A budget whose FIRST step alone is longer than the whole assertion window:
+        // if a post-registration end still cost a backoff step, the count stays at 1.
+        let budget = FallbackBudget {
+            base: Duration::from_secs(10),
+            max: Duration::from_secs(20),
+            attempts: 5,
+        };
+        let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+        let agent = tokio::spawn(async move {
+            let _ = run_tcp_fallback_pool(
+                &cfg,
+                ca_root,
+                RoutingToken([0x79u8; 32]),
+                Arc::new(vec![[0u8; 32]]),
+                Arc::new(gate),
+                Arc::new(RevocationView::default()),
+                None,
+                budget,
+                None,
+            )
+            .await;
+        });
+
+        let started = Instant::now();
+        let mut reached = 0;
+        while started.elapsed() < Duration::from_secs(2) {
+            reached = accepted.load(SeqCst);
+            if reached >= SHORT_REGISTRATION_STRIKES as usize {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            reached >= SHORT_REGISTRATION_STRIKES as usize,
+            "a reaped registration is re-registered without a backoff step: {reached} in 2 s"
+        );
+        agent.abort();
+        edge.abort();
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_pool_re_parks_a_consumed_registration_799() {
+        // CADS-Tunnel#799 (b): the pool keeps N registrations PARKED, not N in
+        // total. The edge consumes one (STOP: a Client is being relayed on it) and
+        // the pool must open a replacement while that tunnel is still running --
+        // before, the next Client of a burst found no parked slot until some
+        // tunnel finished ("no agent tunnel for token" on a healthy agent).
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use std::net::Ipv4Addr;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        const POOL: usize = 2;
+
+        let ca = Ca::new("repark-799-ca").unwrap();
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let registered = Arc::new(AtomicUsize::new(0));
+        let registered_e = Arc::clone(&registered);
+        // Edge: park POOL registrations, then consume the first (STOP) and hold
+        // everything open: the consumed one sits in its tunnel waiting for the
+        // Client's first Noise frame, the other stays parked. A (POOL+1)th
+        // registration can only come from the pool re-parking.
+        let edge = tokio::spawn(async move {
+            let mut held = Vec::new();
+            for i in 0..POOL + 1 {
+                let (tcp, _) = tcp_listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(tcp).await.unwrap();
+                let mut hdr = [0u8; 33];
+                tls.read_exact(&mut hdr).await.unwrap();
+                assert_eq!(hdr[0], b'K', "agent prefers the ping-capable role");
+                tls.write_all(b"OK").await.unwrap();
+                tls.flush().await.unwrap();
+                registered_e.fetch_add(1, SeqCst);
+                if i == 0 {
+                    // A Client arrived on this one: STOP ends the ping phase.
+                    tls.write_all(&[0xFB]).await.unwrap();
+                    tls.flush().await.unwrap();
+                }
+                held.push(tls);
+            }
+            // Keep every connection open until the test has seen the third.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), "127.0.0.1:9").unwrap();
+        cfg.tcp_fallback_pool_size = POOL;
+        let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+        let agent = tokio::spawn(async move {
+            let _ = run_tcp_fallback_pool(
+                &cfg,
+                ca_root,
+                RoutingToken([0x7au8; 32]),
+                Arc::new(vec![[0u8; 32]]),
+                Arc::new(gate),
+                Arc::new(RevocationView::default()),
+                None,
+                FallbackBudget { base: Duration::from_secs(10), max: Duration::from_secs(20), attempts: 5 },
+                None,
+            )
+            .await;
+        });
+
+        let mut reached = 0;
+        for _ in 0..300 {
+            reached = registered.load(SeqCst);
+            if reached > POOL {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            reached,
+            POOL + 1,
+            "the consumed registration was replaced while its tunnel is still open"
+        );
+        agent.abort();
+        edge.abort();
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_pool_caps_serving_registrations_799() {
+        // CADS-Tunnel#799 (b): the re-parking is bounded. With `max_serving = 1`
+        // and a pool of 1, the edge consuming the first registration gets one
+        // replacement (1 parked + 1 relaying); consuming THAT one gets none until a
+        // tunnel finishes -- the total never exceeds pool + max_serving.
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use std::net::Ipv4Addr;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        let ca = Ca::new("cap-799-ca").unwrap();
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let registered = Arc::new(AtomicUsize::new(0));
+        let registered_e = Arc::clone(&registered);
+        // Edge: consume EVERY registration the moment it is parked, hold all open.
+        let edge = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (tcp, _) = tcp_listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(tcp).await.unwrap();
+                let mut hdr = [0u8; 33];
+                tls.read_exact(&mut hdr).await.unwrap();
+                tls.write_all(b"OK").await.unwrap();
+                tls.flush().await.unwrap();
+                registered_e.fetch_add(1, SeqCst);
+                tls.write_all(&[0xFB]).await.unwrap();
+                tls.flush().await.unwrap();
+                held.push(tls);
+            }
+        });
+
+        let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), "127.0.0.1:9").unwrap();
+        cfg.tcp_fallback_pool_size = 1;
+        cfg.tcp_fallback_max_serving = 1;
+        let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+        let agent = tokio::spawn(async move {
+            let _ = run_tcp_fallback_pool(
+                &cfg,
+                ca_root,
+                RoutingToken([0x7bu8; 32]),
+                Arc::new(vec![[0u8; 32]]),
+                Arc::new(gate),
+                Arc::new(RevocationView::default()),
+                None,
+                FallbackBudget { base: Duration::from_secs(10), max: Duration::from_secs(20), attempts: 5 },
+                None,
+            )
+            .await;
+        });
+
+        // Two registrations (the original and its one allowed replacement), then
+        // the cap holds: no third even though the edge would consume it at once.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(registered.load(SeqCst), 2, "pool 1 + max_serving 1 = at most 2 registrations");
+        agent.abort();
         edge.abort();
     }
 
@@ -6113,6 +6744,7 @@ mod tests {
             hostname: None,
             fallback_443: false,
             tcp_fallback_pool_size: 4,
+            tcp_fallback_max_serving: 32,
             framed_fallback: false,
             register_tcp_only: false,
             masque_fallback: None,

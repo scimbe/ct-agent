@@ -232,8 +232,18 @@ Since v0.4.7 ([#16]) a **mid-life** UDP failure falls back to TLS-TCP (pool, [#2
 QUIC every 30 s to upgrade back — previously only the *first* dial ever fell back, so a UDP flap
 took the tunnel down for its whole duration. `CT_AGENT_REGISTER_TCP_ONLY=1` pins registration to
 TLS-TCP outright (combine with `CT_AGENT_FALLBACK_443=1` for the `:443` front door). The TCP
-fallback pool holds `CT_AGENT_TCP_FALLBACK_POOL_SIZE` parallel registrations (default **6**,
+fallback pool keeps `CT_AGENT_TCP_FALLBACK_POOL_SIZE` registrations *parked* (default **6**,
 must be ≥1) — raise it on a deployment juggling many concurrent tunnels per agent process.
+Since [CADS-Tunnel#799] a registration the edge consumes (a Client is relayed on it) is replaced
+at once, so a burst of Clients no longer drains the pool; the replacements are capped at
+`CT_AGENT_TCP_FALLBACK_MAX_SERVING` (default **32**) tunnels in flight on top of the parked ones.
+The same change stops booking a parked registration the edge ends (a reaped slot, a dropped
+mapping) as a *registration failure*: the worker re-registers immediately instead of spending a
+backoff step, and only three such ends within 2 s in a row make it back off. The upgrade back to
+QUIC is make-before-break — the pool registers over the answering probe connection *before*
+closing its parked TCP slots — and the probe backs off after a short-lived QUIC session (interval
+doubles per flap up to 8 min, two consecutive answers required), so a UDP path that works for
+seconds at a time no longer flaps the tunnel between transports.
 
 A *parked* TLS-TCP registration is kept alive across middleboxes that ignore ACK-only keepalives
 by real-payload PING/PONG (roles `'K'` mesh / `'L'` browser). That framing stops the moment a
@@ -347,6 +357,7 @@ needed exactly once, at `sign`, so an operator can review the unsigned skeleton 
 [#140]: https://github.com/scimbe/ct-agent/issues/15
 [#200]: https://github.com/scimbe/ct-agent/issues/15
 [#229]: https://github.com/scimbe/ct-agent/issues/16
+[CADS-Tunnel#799]: https://github.com/scimbe/CADS-Tunnel/issues/799
 [#231]: https://github.com/scimbe/ct-agent/issues/15
 [#250]: https://github.com/scimbe/ct-agent/issues/15
 [#330]: https://github.com/scimbe/ct-agent/issues/16

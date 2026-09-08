@@ -144,6 +144,16 @@ pub struct AgentConfig {
     /// (`wait_for_tcp_agent`) rather than failing outright. Only used in
     /// TLS-TCP fallback mode; QUIC already multiplexes and needs no pool.
     pub tcp_fallback_pool_size: usize,
+    /// CADS-Tunnel#799: how many CONSUMED TLS-TCP fallback registrations (a
+    /// Client relayed, the tunnel running) may be in flight on top of the
+    /// `tcp_fallback_pool_size` parked ones. The pool keeps `tcp_fallback_pool_size`
+    /// registrations parked at all times by spawning a replacement the moment the
+    /// Edge consumes one (spare slot), so a burst of Clients no longer eats the
+    /// whole pool and leaves the next Client with "no agent tunnel for token"
+    /// until a tunnel finishes. This cap bounds the total to
+    /// `pool_size + max_serving` connections. `CT_AGENT_TCP_FALLBACK_MAX_SERVING`;
+    /// default 32, minimum 1.
+    pub tcp_fallback_max_serving: usize,
     /// CADS-Tunnel#528: when true, the Browser-Plane TLS-TCP fallback prefers the
     /// **framed** `'F'` registration, whose relay phase is length-prefix framed on
     /// the edge↔agent hop so a keepalive can be interleaved *during* an in-flight
@@ -283,6 +293,7 @@ impl AgentConfig {
             hostname: None,
             fallback_443: false,
             tcp_fallback_pool_size: DEFAULT_TCP_FALLBACK_POOL_SIZE,
+            tcp_fallback_max_serving: DEFAULT_TCP_FALLBACK_MAX_SERVING,
             framed_fallback: false,
             register_tcp_only: false,
             masque_fallback: None,
@@ -359,6 +370,21 @@ impl AgentConfig {
                 })?,
             _ => DEFAULT_TCP_FALLBACK_POOL_SIZE,
         };
+        // CADS-Tunnel#799: the spare-slot cap, same shape as the pool size.
+        cfg.tcp_fallback_max_serving = match get("CT_AGENT_TCP_FALLBACK_MAX_SERVING") {
+            Some(s) if !s.trim().is_empty() => s
+                .trim()
+                .parse::<usize>()
+                .map_err(|e| format!("invalid CT_AGENT_TCP_FALLBACK_MAX_SERVING '{s}': {e}"))
+                .and_then(|n| {
+                    if n == 0 {
+                        Err("CT_AGENT_TCP_FALLBACK_MAX_SERVING must be at least 1".to_string())
+                    } else {
+                        Ok(n)
+                    }
+                })?,
+            _ => DEFAULT_TCP_FALLBACK_MAX_SERVING,
+        };
         cfg.masque_fallback = parse_masque_fallback(&get)?;
         // scimbe/ct-agent#204: terminate TLS here for an sshd-style Origin, or pass it through.
         cfg.origin_tls = OriginTls::from_env_with(&get)?;
@@ -430,6 +456,9 @@ fn truthy(get: &impl Fn(&str) -> Option<String>, key: &str) -> bool {
 
 /// See [`AgentConfig::tcp_fallback_pool_size`].
 const DEFAULT_TCP_FALLBACK_POOL_SIZE: usize = 6;
+
+/// See [`AgentConfig::tcp_fallback_max_serving`].
+const DEFAULT_TCP_FALLBACK_MAX_SERVING: usize = 32;
 
 #[cfg(test)]
 mod tests {
