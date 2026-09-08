@@ -185,7 +185,7 @@ async fn fallback_pool_survives_weeks_of_worker_churn_without_leaking_tasks() {
                 None,
             )
             .await;
-            if exit != FallbackExit::AllWorkersGaveUp {
+            if !matches!(exit, FallbackExit::AllWorkersGaveUp) {
                 unexpected_l.fetch_add(1, Ordering::SeqCst);
             }
             pools_l.fetch_add(1, Ordering::SeqCst);
