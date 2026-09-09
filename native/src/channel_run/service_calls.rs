@@ -131,8 +131,18 @@ pub(crate) fn spawn_stream_handler(cmd: &str, service: &str) -> io::Result<Strea
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .spawn()?;
-    let stdout = child.stdout.take().expect("stdout piped above");
-    let stdin = child.stdin.take().expect("stdin piped above");
+    // `.take()` on a freshly spawned `Child` whose stdin/stdout were both just requested as
+    // `Stdio::piped()` above cannot actually be `None` -- but this crate's panic-free gate
+    // (clippy::expect_used, native/src/lib.rs) forbids asserting that with `.expect()`, so a
+    // genuinely-impossible `None` here surfaces as an honest `io::Error` instead of a panic.
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("spawned child has no piped stdout (requested Stdio::piped())"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("spawned child has no piped stdin (requested Stdio::piped())"))?;
     Ok(StreamHandlerProcess { child, io: tokio::io::join(stdout, stdin) })
 }
 
