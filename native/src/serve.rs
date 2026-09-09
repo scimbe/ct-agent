@@ -2787,6 +2787,15 @@ pub(crate) async fn run_tcp_fallback_pool_on(
         };
         tokio::select! {
             ended = workers.join_next() => {
+                // A worker whose relay was over within milliseconds of the STOP (a health check,
+                // a registry ping) sends its consumed signal and finishes back to back; `select!`
+                // may then hand us the join first. Drain the signals that are already queued so
+                // that worker is booked as consumed, not logged as an unexplained end.
+                while let Ok(id) = consumed_rx.try_recv() {
+                    if handles.contains_key(&id) {
+                        serving.insert(id);
+                    }
+                }
                 match ended {
                     Some(Ok((id, result))) => {
                         let was_serving = serving.remove(&id);
