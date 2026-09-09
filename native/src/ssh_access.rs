@@ -30,13 +30,18 @@ use tokio::net::TcpStream;
 /// Usage of the two subcommands, printed on stderr above any argument error (#239 discipline:
 /// a typo fails loudly, and the message says what would have been accepted).
 pub const SSH_USAGE: &str = "\
-usage: ct-agent ssh <hostname> [--port <n>] [--ca <pem-file>] [--connect-timeout <secs>]
-       ct-agent ssh-config <hostname> [--user <name>] [--port <n>] [--ca <pem-file>]
+usage: ct-agent ssh <hostname> [--port <n>] [--ca <pem-file>] [--connect-timeout <secs>] [--owner-key-file <file>]
+       ct-agent ssh-config <hostname> [--user <name>] [--port <n>] [--ca <pem-file>] [--owner-key-file <file> | --owner-key <hex>]
+       ct-agent ssh-owner show|init            (on the agent host: print / create the owner key)
 
-  ssh          OpenSSH ProxyCommand: open TLS to <hostname>:<port> (default 443, SNI = hostname)
-               and pipe ssh's stdin/stdout through it. Trusts the system's public roots plus every
-               certificate in --ca (PEM). Never run by hand -- ssh runs it via ProxyCommand.
-  ssh-config   Print the ~/.ssh/config stanza that makes `ssh <hostname>` use it.
+  ssh          OpenSSH ProxyCommand: open TLS to <hostname>:<port> (default 443, SNI = hostname),
+               answer the agent's owner-auth challenge with the key from --owner-key-file (or
+               CT_AGENT_SSH_OWNER_KEY), then pipe ssh's stdin/stdout through it. Trusts the system's
+               public roots plus every certificate in --ca (PEM). Never run by hand -- ssh runs it.
+  ssh-config   Print the ~/.ssh/config stanza that makes `ssh <hostname>` use it. --owner-key <hex>
+               stores the key in ~/.ssh/ct-agent-<hostname>.owner (0600) and references it.
+  ssh-owner    Owner authentication is ON by default for every SSH tunnel (scimbe/ct-agent#214):
+               `show` prints this agent's key (from CT_AGENT_STATE_DIR), `init` creates it if absent.
 ";
 
 /// The default TLS port: the tunnel's SNI-routed front door.
@@ -64,6 +69,9 @@ pub struct SshArgs {
     /// match the leaf's SAN while the TCP target is a loopback listener; an operator can use it
     /// to bypass a stale DNS entry. Deliberately not in [`SSH_USAGE`].
     pub connect: Option<SocketAddr>,
+    /// The owner key that answers the agent's preamble (scimbe/ct-agent#214): `--owner-key-file`,
+    /// else `CT_AGENT_SSH_OWNER_KEY`. `None` still works against a pre-#214 agent.
+    pub owner_key: Option<crate::ssh_owner::OwnerKey>,
 }
 
 /// Parsed `ct-agent ssh-config` arguments.
@@ -77,6 +85,11 @@ pub struct SshConfigArgs {
     pub port: Option<u16>,
     /// `--ca` on the ProxyCommand line, when given.
     pub ca: Option<PathBuf>,
+    /// `--owner-key-file` on the ProxyCommand line, when given (scimbe/ct-agent#214).
+    pub owner_key_file: Option<PathBuf>,
+    /// `--owner-key <hex>`: the caller (`main`) stores it as a 0600 file and fills
+    /// `owner_key_file` before rendering; the renderer itself never sees the key.
+    pub owner_key: Option<String>,
 }
 
 /// Reject a hostname that cannot be an SNI. rustls accepts IP literals as a `ServerName` too,
@@ -105,16 +118,23 @@ fn parse_port(raw: &str) -> Result<u16, String> {
 /// after the hostname (ssh's `%h` substitution puts it wherever the stanza does); exactly one
 /// positional argument is the hostname; an unknown flag or a second positional is an error.
 pub fn parse_ssh_args(args: &[String]) -> Result<SshArgs, String> {
+    parse_ssh_args_with(args, |k| std::env::var(k).ok())
+}
+
+/// [`parse_ssh_args`] with the env lookup injected (`CT_AGENT_SSH_OWNER_KEY`).
+pub fn parse_ssh_args_with(args: &[String], env: impl Fn(&str) -> Option<String>) -> Result<SshArgs, String> {
     let mut hostname: Option<String> = None;
     let mut port = DEFAULT_PORT;
     let mut ca = None;
     let mut connect_timeout = DEFAULT_CONNECT_TIMEOUT;
     let mut connect = None;
+    let mut owner_key_file: Option<PathBuf> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--port" => port = parse_port(take_value("--port", &mut it)?)?,
             "--ca" => ca = Some(PathBuf::from(take_value("--ca", &mut it)?)),
+            "--owner-key-file" => owner_key_file = Some(PathBuf::from(take_value("--owner-key-file", &mut it)?)),
             "--connect-timeout" => {
                 let raw = take_value("--connect-timeout", &mut it)?;
                 connect_timeout = match raw.trim().parse::<u64>() {
@@ -141,7 +161,14 @@ pub fn parse_ssh_args(args: &[String]) -> Result<SshArgs, String> {
     }
     let hostname = hostname.ok_or_else(|| "missing <hostname>".to_string())?;
     validate_sni_hostname(&hostname)?;
-    Ok(SshArgs { hostname, port, ca, connect_timeout, connect })
+    let owner_key = match (owner_key_file, env(crate::ssh_owner::OWNER_KEY_ENV)) {
+        (Some(path), _) => Some(crate::ssh_owner::read_key_file(&path)?),
+        (None, Some(hex)) if !hex.trim().is_empty() => {
+            Some(crate::ssh_owner::OwnerKey::from_hex(&hex).map_err(|e| format!("{}: {e}", crate::ssh_owner::OWNER_KEY_ENV))?)
+        }
+        _ => None,
+    };
+    Ok(SshArgs { hostname, port, ca, connect_timeout, connect, owner_key })
 }
 
 /// Parse `ct-agent ssh-config`'s arguments (everything after `ssh-config`). Pure; same
@@ -151,9 +178,17 @@ pub fn parse_ssh_config_args(args: &[String]) -> Result<SshConfigArgs, String> {
     let mut user = None;
     let mut port = None;
     let mut ca = None;
+    let mut owner_key_file = None;
+    let mut owner_key = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--owner-key-file" => owner_key_file = Some(PathBuf::from(take_value("--owner-key-file", &mut it)?)),
+            "--owner-key" => {
+                let raw = take_value("--owner-key", &mut it)?;
+                crate::ssh_owner::OwnerKey::from_hex(raw).map_err(|e| format!("invalid --owner-key: {e}"))?;
+                owner_key = Some(raw.trim().to_string());
+            }
             "--user" => {
                 let raw = take_value("--user", &mut it)?;
                 if raw.trim().is_empty() || raw.chars().any(char::is_whitespace) {
@@ -174,7 +209,15 @@ pub fn parse_ssh_config_args(args: &[String]) -> Result<SshConfigArgs, String> {
     }
     let hostname = hostname.ok_or_else(|| "missing <hostname>".to_string())?;
     validate_sni_hostname(&hostname)?;
-    Ok(SshConfigArgs { hostname, user, port, ca })
+    if owner_key.is_some() && owner_key_file.is_some() {
+        return Err("--owner-key and --owner-key-file are alternatives; give one".to_string());
+    }
+    Ok(SshConfigArgs { hostname, user, port, ca, owner_key_file, owner_key })
+}
+
+/// Where `ssh-config --owner-key` stores the key: `~/.ssh/ct-agent-<hostname>.owner`.
+pub fn default_owner_key_file(home: &Path, hostname: &str) -> PathBuf {
+    home.join(".ssh").join(format!("ct-agent-{hostname}.owner"))
 }
 
 /// A path as it goes on the ProxyCommand line: double-quoted when it contains whitespace
@@ -208,6 +251,9 @@ pub fn render_ssh_config(args: &SshConfigArgs) -> String {
     }
     if let Some(ca) = &args.ca {
         proxy.push_str(&format!(" --ca {}", shell_word(ca)));
+    }
+    if let Some(f) = &args.owner_key_file {
+        proxy.push_str(&format!(" --owner-key-file {}", shell_word(f)));
     }
     let mut out = String::new();
     out.push_str("# ct-agent ssh: SSH over TLS through the CADS tunnel (scimbe/ct-agent#204)\n");
@@ -268,6 +314,7 @@ pub async fn pipe_over_tls<R, W, S>(
     transport: S,
     hostname: &str,
     tls: Arc<rustls::ClientConfig>,
+    owner_key: Option<&crate::ssh_owner::OwnerKey>,
 ) -> Result<(), String>
 where
     R: AsyncRead + Unpin,
@@ -278,10 +325,20 @@ where
         .map_err(|e| format!("'{hostname}' is not a valid TLS server name: {e}"))?
         .to_owned();
     let connector = tokio_rustls::TlsConnector::from(tls);
-    let stream = connector
+    let mut stream = connector
         .connect(server_name, transport)
         .await
         .map_err(|e| format!("TLS handshake with {hostname} failed: {e}"))?;
+    // scimbe/ct-agent#214: the agent speaks first. Either its owner-auth challenge (answered with
+    // the key, refused with a clear message) or, from a pre-#214 agent, sshd's own banner, which
+    // must reach ssh before the pump starts.
+    match crate::ssh_owner::client_handshake(&mut stream, owner_key).await? {
+        crate::ssh_owner::ClientPreamble::Authenticated => {}
+        crate::ssh_owner::ClientPreamble::Passthrough(head) => {
+            client_out.write_all(&head).await.map_err(|e| format!("{hostname} -> stdout: {e}"))?;
+            client_out.flush().await.map_err(|e| format!("{hostname} -> stdout: {e}"))?;
+        }
+    }
     let (mut tls_rd, mut tls_wr) = tokio::io::split(stream);
 
     let upstream = async {
@@ -343,7 +400,7 @@ pub async fn dial(args: &SshArgs) -> Result<TcpStream, String> {
 pub async fn run_ssh(args: &SshArgs) -> Result<(), String> {
     let tls = build_client_config(args.ca.as_deref())?;
     let tcp = dial(args).await?;
-    pipe_over_tls(tokio::io::stdin(), tokio::io::stdout(), tcp, &args.hostname, tls).await
+    pipe_over_tls(tokio::io::stdin(), tokio::io::stdout(), tcp, &args.hostname, tls, args.owner_key.as_ref()).await
 }
 
 /// Test-only PKI: a fresh rcgen CA plus a leaf for one hostname, as the PEM/DER pieces the
@@ -423,6 +480,7 @@ mod tests {
                 ca: None,
                 connect_timeout: Duration::from_secs(10),
                 connect: None,
+                owner_key: None,
             }
         );
     }
@@ -533,6 +591,8 @@ mod tests {
             user: None,
             port: None,
             ca: Some(PathBuf::from("/my certs/ca.pem")),
+            owner_key_file: None,
+            owner_key: None,
         };
         assert!(render_ssh_config(&a).contains("--ca \"/my certs/ca.pem\"\n"));
     }
@@ -600,7 +660,9 @@ mod tests {
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
                     // A refused handshake (unknown CA test) just ends this connection.
-                    if let Ok(tls) = acceptor.accept(s).await {
+                    if let Ok(mut tls) = acceptor.accept(s).await {
+                        // A pre-#214 agent: sshd speaks first with its banner, then the echo.
+                        let _ = tls.write_all(b"SSH-2.0-echo\r\n").await;
                         let (mut rd, mut wr) = tokio::io::split(tls);
                         let _ = tokio::io::copy(&mut rd, &mut wr).await;
                         let _ = wr.shutdown().await;
@@ -628,9 +690,13 @@ mod tests {
         let (mut to_pump, pump_in) = tokio::io::duplex(4096);
         let (pump_out, mut from_pump) = tokio::io::duplex(4096);
         let pump = tokio::spawn(async move {
-            pipe_over_tls(pump_in, pump_out, tcp, "ssh.test.invalid", trust_only(&pki.ca_der)).await
+            pipe_over_tls(pump_in, pump_out, tcp, "ssh.test.invalid", trust_only(&pki.ca_der), None).await
         });
 
+        // The server's banner (a pre-#214 agent's sshd) reaches stdout first, untouched.
+        let mut banner = [0u8; 14];
+        from_pump.read_exact(&mut banner).await.unwrap();
+        assert_eq!(&banner, b"SSH-2.0-echo\r\n", "the sshd banner passes straight through");
         to_pump.write_all(b"SSH-2.0-test\r\n").await.unwrap();
         let mut echoed = [0u8; 64];
         let n = from_pump.read(&mut echoed).await.unwrap();
@@ -654,7 +720,7 @@ mod tests {
         let tcp = TcpStream::connect(addr).await.unwrap();
         let (_to_pump, pump_in) = tokio::io::duplex(64);
         let (pump_out, _from_pump) = tokio::io::duplex(64);
-        let err = pipe_over_tls(pump_in, pump_out, tcp, "ssh.test.invalid", trust_only(&other.ca_der))
+        let err = pipe_over_tls(pump_in, pump_out, tcp, "ssh.test.invalid", trust_only(&other.ca_der), None)
             .await
             .unwrap_err();
         assert!(err.contains("TLS handshake with ssh.test.invalid failed"), "{err}");
@@ -691,7 +757,7 @@ mod tests {
         let (to_pump, pump_in) = tokio::io::duplex(64);
         let (pump_out, mut from_pump) = tokio::io::duplex(64);
         let pump = tokio::spawn(async move {
-            pipe_over_tls(pump_in, pump_out, tcp, "ssh.test.invalid", trust_only(&pki.ca_der)).await
+            pipe_over_tls(pump_in, pump_out, tcp, "ssh.test.invalid", trust_only(&pki.ca_der), None).await
         });
         let mut banner = Vec::new();
         from_pump.read_to_end(&mut banner).await.unwrap();
@@ -699,6 +765,125 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(5), pump).await.expect("pump ends").unwrap();
         assert_eq!(result, Ok(()));
         drop(to_pump);
+    }
+
+    /// scimbe/ct-agent#214: a TLS server that runs the agent's owner-auth preamble with `key` and
+    /// then echoes -- the shape of a #214 agent in front of sshd.
+    async fn spawn_tls_owner_auth_echo(pki: &test_pki::TestPki, key: Arc<crate::ssh_owner::OwnerKey>) -> SocketAddr {
+        use rustls::pki_types::pem::PemObject;
+        let chain: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_slice_iter(pki.leaf_pem.as_bytes()).map(|c| c.unwrap()).collect();
+        let pkey = PrivateKeyDer::from_pem_slice(pki.key_pem.as_bytes()).unwrap();
+        let scfg = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(chain, pkey).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                let acceptor = acceptor.clone();
+                let key = Arc::clone(&key);
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = acceptor.accept(s).await {
+                        if crate::ssh_owner::server_handshake(&mut tls, &key).await.is_err() {
+                            return; // refused: dropped before "sshd" says a word
+                        }
+                        let _ = tls.write_all(b"SSH-2.0-echo\r\n").await;
+                        let (mut rd, mut wr) = tokio::io::split(tls);
+                        let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                        let _ = wr.shutdown().await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn owner_auth_right_key_reaches_sshd_wrong_or_missing_key_is_refused_214() {
+        let pki = test_pki::issue("ssh.test.invalid");
+        let key = Arc::new(crate::ssh_owner::OwnerKey::generate());
+        let addr = spawn_tls_owner_auth_echo(&pki, Arc::clone(&key)).await;
+        let trust = trust_only(&pki.ca_der);
+
+        // right key: the preamble passes, sshd's banner and the echo flow as before
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (mut to_pump, pump_in) = tokio::io::duplex(4096);
+        let (pump_out, mut from_pump) = tokio::io::duplex(4096);
+        let k = Arc::clone(&key);
+        let t = Arc::clone(&trust);
+        let pump = tokio::spawn(async move {
+            pipe_over_tls(pump_in, pump_out, tcp, "ssh.test.invalid", t, Some(&k)).await
+        });
+        let mut banner = [0u8; 14];
+        from_pump.read_exact(&mut banner).await.unwrap();
+        assert_eq!(&banner, b"SSH-2.0-echo\r\n");
+        to_pump.write_all(b"SSH-2.0-test\r\n").await.unwrap();
+        let mut echoed = [0u8; 64];
+        let n = from_pump.read(&mut echoed).await.unwrap();
+        assert_eq!(&echoed[..n], b"SSH-2.0-test\r\n");
+        drop(to_pump);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5), pump).await.expect("pump ends").unwrap(), Ok(()));
+
+        // wrong key: refused, and the pump reports it instead of hanging
+        let wrong = crate::ssh_owner::OwnerKey::generate();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (_to_pump, pump_in) = tokio::io::duplex(64);
+        let (pump_out, _from_pump) = tokio::io::duplex(64);
+        let err = pipe_over_tls(pump_in, pump_out, tcp, "ssh.test.invalid", Arc::clone(&trust), Some(&wrong))
+            .await
+            .unwrap_err();
+        assert!(err.contains("refused"), "{err}");
+
+        // no key: a clear instruction naming the way to get one
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (_to_pump, pump_in) = tokio::io::duplex(64);
+        let (pump_out, _from_pump) = tokio::io::duplex(64);
+        let err = pipe_over_tls(pump_in, pump_out, tcp, "ssh.test.invalid", trust, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("ssh-owner show") && err.contains("--owner-key-file"), "{err}");
+    }
+
+    #[test]
+    fn ssh_args_take_the_owner_key_from_a_file_or_the_env_214() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = crate::ssh_owner::OwnerKey::generate();
+        let file = dir.path().join("k.owner");
+        key.save(&file).unwrap();
+        let none = |_: &str| None::<String>;
+        let a = parse_ssh_args_with(&["h.test.invalid".into(), "--owner-key-file".into(), file.display().to_string()], none).unwrap();
+        assert_eq!(a.owner_key.as_ref(), Some(&key));
+        let hex = key.to_hex();
+        let env = |k: &str| (k == crate::ssh_owner::OWNER_KEY_ENV).then(|| hex.clone());
+        let a = parse_ssh_args_with(&["h.test.invalid".into()], env).unwrap();
+        assert_eq!(a.owner_key.as_ref(), Some(&key), "env fallback");
+        let a = parse_ssh_args_with(&["h.test.invalid".into()], none).unwrap();
+        assert_eq!(a.owner_key, None, "no key given: still usable against a pre-#214 agent");
+        let e = parse_ssh_args_with(&["h.test.invalid".into(), "--owner-key-file".into(), "/nonexistent/x".into()], none).unwrap_err();
+        assert!(e.contains("--owner-key-file") && e.contains("/nonexistent/x"), "{e}");
+        let bad = |k: &str| (k == crate::ssh_owner::OWNER_KEY_ENV).then(|| "nothex".to_string());
+        assert!(parse_ssh_args_with(&["h.test.invalid".into()], bad).unwrap_err().contains(crate::ssh_owner::OWNER_KEY_ENV));
+    }
+
+    #[test]
+    fn ssh_config_renders_the_owner_key_file_and_never_the_key_214() {
+        let hex = crate::ssh_owner::OwnerKey::generate().to_hex();
+        let a = parse_ssh_config_args(&["h.test.invalid".into(), "--owner-key".into(), hex.clone()]).unwrap();
+        assert_eq!(a.owner_key.as_deref(), Some(hex.as_str()));
+        assert_eq!(a.owner_key_file, None, "main stores the key and fills the file path");
+        let mut a = a;
+        a.owner_key = None;
+        a.owner_key_file = Some(default_owner_key_file(Path::new("/home/u"), "h.test.invalid"));
+        let out = render_ssh_config(&a);
+        assert!(out.contains("ProxyCommand ct-agent ssh h.test.invalid --owner-key-file /home/u/.ssh/ct-agent-h.test.invalid.owner\n"), "{out}");
+        assert!(!out.contains(&hex), "the stanza never carries the key");
+        assert!(parse_ssh_config_args(&["h.test.invalid".into(), "--owner-key".into(), "nothex".into()]).unwrap_err().contains("--owner-key"));
+        let e = parse_ssh_config_args(&["h.test.invalid".into(), "--owner-key".into(), hex, "--owner-key-file".into(), "/x".into()]).unwrap_err();
+        assert!(e.contains("alternatives"), "{e}");
     }
 
     #[test]

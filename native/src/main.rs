@@ -464,10 +464,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if std::env::args().nth(1).as_deref() == Some("ssh-config") {
         let args: Vec<String> = std::env::args().skip(2).collect();
         match ct_agent::ssh_access::parse_ssh_config_args(&args) {
-            Ok(parsed) => print!("{}", ct_agent::ssh_access::render_ssh_config(&parsed)),
+            Ok(mut parsed) => {
+                // scimbe/ct-agent#214: `--owner-key <hex>` is stored as a 0600 file next to the
+                // user's ssh config and referenced from the stanza; the stanza never carries the key.
+                if let Some(hex) = parsed.owner_key.take() {
+                    let home = std::env::var("HOME").map_err(|_| "ct-agent ssh-config --owner-key: HOME is not set")?;
+                    let path = ct_agent::ssh_access::default_owner_key_file(std::path::Path::new(&home), &parsed.hostname);
+                    let key = ct_agent::ssh_owner::OwnerKey::from_hex(&hex).map_err(|e| format!("ct-agent ssh-config: {e}"))?;
+                    key.save(&path).map_err(|e| format!("ct-agent ssh-config: {e}"))?;
+                    eprintln!("ct-agent ssh-config: owner key stored in {} (0600)", path.display());
+                    parsed.owner_key_file = Some(path);
+                }
+                print!("{}", ct_agent::ssh_access::render_ssh_config(&parsed));
+            }
             Err(e) => {
                 eprint!("{}", ct_agent::ssh_access::SSH_USAGE);
                 eprintln!("ct-agent ssh-config: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    // `ssh-owner show|init` (scimbe/ct-agent#214): the agent host's owner key. `show` prints the
+    // key the serve loop uses (hex, one line, stdout); `init` creates it if there is none yet, so
+    // the key can be handed to the client before the agent's first start in terminate mode.
+    if std::env::args().nth(1).as_deref() == Some("ssh-owner") {
+        let sub = std::env::args().nth(2).unwrap_or_default();
+        let dir = ct_agent::events::state_dir().ok_or("ct-agent ssh-owner: set CT_AGENT_STATE_DIR (or HOME)")?;
+        let path = ct_agent::ssh_owner::OwnerKey::path_in(&dir);
+        match sub.as_str() {
+            "show" => match ct_agent::ssh_owner::OwnerKey::load(&path).map_err(|e| format!("ct-agent ssh-owner: {e}"))? {
+                Some(k) => println!("{}", k.to_hex()),
+                None => {
+                    eprintln!(
+                        "ct-agent ssh-owner: no owner key at {} yet (the agent generates one at its first start in \
+                         terminate mode; `ct-agent ssh-owner init` creates it now)",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+            },
+            "init" => {
+                let (k, generated) = ct_agent::ssh_owner::OwnerKey::load_or_generate(&dir).map_err(|e| format!("ct-agent ssh-owner: {e}"))?;
+                eprintln!("ct-agent ssh-owner: {} {}", if generated { "generated" } else { "already present at" }, path.display());
+                println!("{}", k.to_hex());
+            }
+            other => {
+                eprint!("{}", ct_agent::ssh_access::SSH_USAGE);
+                eprintln!("ct-agent ssh-owner: unknown subcommand '{other}' (expected show|init)");
                 std::process::exit(1);
             }
         }
@@ -1165,6 +1210,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 t.key_path().display(),
                 config.origin
             );
+            // scimbe/ct-agent#214: SSH owner authentication, ON by default. Resolved here so a
+            // missing state dir fails the start (fail closed) with the way out in the message.
+            let state_dir = ct_agent::events::state_dir();
+            let (policy, generated) = ct_agent::ssh_owner::owner_auth_from_env(&|k| std::env::var(k).ok(), state_dir.as_deref())
+                .map_err(|e| format!("ct-agent: {e}"))?;
+            let t = match &policy {
+                ct_agent::ssh_owner::OwnerAuth::Required(key) => {
+                    let path = state_dir.as_deref().map(ct_agent::ssh_owner::OwnerKey::path_in);
+                    eprintln!(
+                        "ct-agent: SSH owner authentication ON (scimbe/ct-agent#214): every terminated stream must \
+                         answer the owner-key challenge before sshd sees a byte; key at {}",
+                        path.as_deref().map(|p| p.display().to_string()).unwrap_or_default()
+                    );
+                    if generated {
+                        eprintln!(
+                            "ct-agent: SSH owner key GENERATED (shown once; `ct-agent ssh-owner show` prints it again):\n\
+                             ct-agent: {}\n\
+                             ct-agent: on the client: ct-agent ssh-config <hostname> --owner-key {}",
+                            key.to_hex(),
+                            key.to_hex()
+                        );
+                    }
+                    t.with_owner_auth(policy.clone())
+                }
+                ct_agent::ssh_owner::OwnerAuth::Off => {
+                    eprintln!(
+                        "ct-agent: WARNING: SSH owner authentication is OFF ({}=off): anyone reaching this hostname \
+                         talks to sshd directly; only sshd's own authentication protects it (scimbe/ct-agent#214)",
+                        ct_agent::ssh_owner::OWNER_AUTH_ENV
+                    );
+                    t
+                }
+            };
             if !config.browser_forward {
                 eprintln!(
                     "ct-agent: WARNING: {}=terminate only applies to raw-forwarded streams \
