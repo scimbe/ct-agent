@@ -87,8 +87,12 @@ pub const DOCTOR_SANDBOX: &str = "doctor_sandbox";
 /// the name the client asked for, `null` when it sent none.
 pub const ORIGIN_TLS_TERMINATED: &str = "origin_tls_terminated";
 
+/// scimbe/ct-agent#214: a terminated (SSH) stream failed the owner-auth preamble and was dropped
+/// before any byte reached sshd. `sni` as above, `error` the reason (wrong/missing key, timeout).
+pub const SSH_OWNER_AUTH_REFUSED: &str = "ssh_owner_auth_refused";
+
 /// Every event kind, in the order `/metrics` renders `ct_agent_events_total{kind}`.
-pub const KINDS: [&str; 15] = [
+pub const KINDS: [&str; 16] = [
     REGISTERED,
     REGISTRATION_FAILED,
     DISCONNECTED,
@@ -104,6 +108,7 @@ pub const KINDS: [&str; 15] = [
     CREDENTIAL_DEGRADED,
     DOCTOR_SANDBOX,
     ORIGIN_TLS_TERMINATED,
+    SSH_OWNER_AUTH_REFUSED,
 ];
 
 // ---- the event ----------------------------------------------------------------

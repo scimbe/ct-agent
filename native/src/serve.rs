@@ -149,6 +149,9 @@ pub struct OriginTerminator {
     cert: PathBuf,
     key: PathBuf,
     state: Mutex<TerminatorState>,
+    /// scimbe/ct-agent#214: the SSH owner-auth preamble every terminated stream must pass.
+    /// `Off` only on the explicit opt-out; `load` starts with `Off` and `main` sets the policy.
+    owner_auth: crate::ssh_owner::OwnerAuth,
 }
 
 impl std::fmt::Debug for OriginTerminator {
@@ -167,6 +170,7 @@ impl OriginTerminator {
         Ok(Self {
             cert: cert.to_path_buf(),
             key: key.to_path_buf(),
+            owner_auth: crate::ssh_owner::OwnerAuth::Off,
             state: Mutex::new(TerminatorState {
                 config,
                 cert_mtime: file_mtime(cert),
@@ -178,6 +182,18 @@ impl OriginTerminator {
     }
 
     /// The certificate path this terminator serves (for startup logging).
+    /// scimbe/ct-agent#214: set the owner-auth policy (the default is `Required` with the agent's
+    /// owner key; `main` resolves it from the environment and the state dir).
+    pub fn with_owner_auth(mut self, policy: crate::ssh_owner::OwnerAuth) -> Self {
+        self.owner_auth = policy;
+        self
+    }
+
+    /// The owner-auth policy in force.
+    pub fn owner_auth(&self) -> &crate::ssh_owner::OwnerAuth {
+        &self.owner_auth
+    }
+
     pub fn cert_path(&self) -> &Path {
         &self.cert
     }
@@ -337,6 +353,15 @@ where
     };
     let sni = tls.get_ref().1.server_name().map(str::to_string);
     crate::events::emit(crate::events::ORIGIN_TLS_TERMINATED, serde_json::json!({ "sni": sni }));
+    // scimbe/ct-agent#214: the owner-auth preamble, before a single byte reaches sshd. A refusal
+    // is logged once and the stream dropped; the Origin is never dialed for it.
+    if let crate::ssh_owner::OwnerAuth::Required(key) = terminator.owner_auth() {
+        if let Err(e) = crate::ssh_owner::server_handshake(&mut tls, key).await {
+            eprintln!("ct-agent: origin TLS terminate: {e}; stream refused (#214)");
+            crate::events::emit(crate::events::SSH_OWNER_AUTH_REFUSED, serde_json::json!({ "sni": sni, "error": e }));
+            return Err(format!("origin TLS terminate: {e}").into());
+        }
+    }
     let mut tcp = connect_origin(origin).await?;
     copy_bidirectional(&mut tls, &mut tcp).await?;
     Ok(())

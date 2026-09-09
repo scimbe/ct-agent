@@ -49,6 +49,7 @@ pub mod serve;
 pub mod signup;
 /// scimbe/ct-agent#204: `ct-agent ssh` (OpenSSH ProxyCommand over TLS) and `ssh-config`.
 pub mod ssh_access;
+pub mod ssh_owner;
 /// ct-agent#179: the paused-time soak harness -- test-only, see `soak.rs`.
 #[cfg(test)]
 mod soak;
