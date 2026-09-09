@@ -6591,3 +6591,79 @@ async fn accept_race_off_does_not_dial_the_relay_before_the_accept_window_expire
 
     b.abort();
 }
+
+// ct-agent#220: streaming (unframed) handler mode -- `spawn_stream_handler`/`ChannelLocal::Stream`.
+// These are new: before this feature, `ChannelLocal` had no `Stream` variant at all, so none of
+// the assertions below could even compile against the pre-#220 code (the whole point being
+// proven here is the persistent-process, multi-round-trip behavior that the existing
+// request/response handler -- fresh subprocess per call -- structurally cannot provide).
+
+#[tokio::test]
+async fn stream_handler_pumps_multiple_round_trips_over_one_persistent_process() {
+    // The defining difference from CT_AGENT_SERVICE_HANDLER_CMD (fresh `cat`-like subprocess
+    // per call): here ONE `cat` process serves several separate writes/reads in a row over the
+    // same pipe, proving this is a continuous duplex, not a one-shot spawn-write-read-exit cycle.
+    let mut proc = spawn_stream_handler("cat", "speech_to_text").expect("cat spawns");
+    for chunk in ["chunk-one", "chunk-two", "chunk-three"] {
+        proc.write_all(chunk.as_bytes()).await.expect("write chunk");
+        proc.flush().await.expect("flush chunk");
+        let mut buf = vec![0u8; chunk.len()];
+        proc.read_exact(&mut buf).await.expect("read the same chunk back");
+        assert_eq!(&buf, chunk.as_bytes(), "cat echoes each chunk over the SAME still-open process");
+    }
+}
+
+#[tokio::test]
+async fn stream_handler_sets_ct_service_type_in_the_childs_environment() {
+    // Parity with the request/response handler's CT_SERVICE_TYPE (`run_service_handler_with_timeout_to`)
+    // -- a script backing both modes can branch on the same variable either way.
+    let mut proc =
+        spawn_stream_handler("printf '%s' \"$CT_SERVICE_TYPE\"", "speech_to_text").expect("spawns");
+    let mut out = Vec::new();
+    proc.read_to_end(&mut out).await.expect("read the printed env var to EOF");
+    assert_eq!(out, b"speech_to_text");
+}
+
+#[tokio::test]
+async fn stream_handler_kills_the_child_on_drop_instead_of_leaking_it() {
+    // ct-agent#220: a `tokio::process::Child`, like `std::process::Child`, is NOT killed by a
+    // plain drop -- only owning it (not just its piped stdio) and calling `start_kill()`
+    // explicitly (done in `StreamHandlerProcess::drop`) tears the OS process down. Without that,
+    // a long-running `--serve` process handling many streaming sessions over time would leak one
+    // orphaned handler subprocess per session.
+    let proc = spawn_stream_handler("sleep 30", "speech_to_text").expect("sleep spawns");
+    let pid = proc.child.id().expect("a freshly spawned child has a pid");
+    assert!(
+        std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "sanity: the child is actually running before we drop it"
+    );
+    drop(proc);
+    // start_kill() only sends the signal; give the kernel a moment to actually reap it.
+    for _ in 0..50 {
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("child pid {pid} (`sleep 30`) is still alive 1s after StreamHandlerProcess was dropped");
+}
+
+#[tokio::test]
+async fn channel_local_stream_variant_surfaces_a_spawn_failure_on_every_poll_not_a_panic() {
+    // Constructed directly (not through a real failed `spawn_stream_handler` call, which would
+    // need a genuinely broken `sh` to fail deterministically in CI) -- this exercises exactly the
+    // `ChannelLocal::Stream(Err(..))` match arms added for #220, proving a session configured with
+    // a stream handler that failed to start fails loud and cleanly instead of panicking or, worse,
+    // silently falling back to a different (unconfigured) local mode.
+    let mut local = ChannelLocal::Stream(Err(std::sync::Arc::new(io::Error::new(
+        io::ErrorKind::NotFound,
+        "injected: handler binary not found",
+    ))));
+    let err = local.write_all(b"anything").await.unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    assert!(err.to_string().contains("injected"), "the real spawn error message is preserved: {err}");
+
+    let mut buf = [0u8; 4];
+    let err2 = local.read(&mut buf).await.unwrap_err();
+    assert_eq!(err2.kind(), io::ErrorKind::NotFound, "the failure surfaces on read too, not just write");
+}
