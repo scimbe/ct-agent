@@ -64,6 +64,76 @@ impl AsyncWrite for LocalDuplex {
 pub(crate) enum ChannelLocal {
     Pipe(tokio::io::Join<tokio::io::Stdin, tokio::io::Stdout>),
     Serve(LocalDuplex),
+    /// ct-agent#220: a persistent, UNFRAMED duplex to a spawned handler subprocess's own
+    /// stdio -- the streaming counterpart to `Serve`'s framed MCP request/response dispatch.
+    /// `Err` when the handler failed to spawn, captured at construction (not lost) so every
+    /// poll on this session surfaces that same failure instead of silently falling back to a
+    /// different mode -- a stream handler the operator explicitly configured either runs, or
+    /// the session fails loud, never a quiet downgrade to an unconfigured default.
+    Stream(Result<StreamHandlerProcess, std::sync::Arc<io::Error>>),
+}
+
+/// ct-agent#220: the spawned `CT_AGENT_STREAM_HANDLER_CMD` child, kept alive alongside its
+/// piped stdio for as long as the channel session pumping bytes through it is alive. Unlike
+/// the request/response handler (`run_service_handler_with_timeout`, spawned fresh per call
+/// and always reaped by the time it returns), a streaming handler's lifetime IS the session's
+/// lifetime -- so this owns the `Child` itself and kills it on drop, rather than letting
+/// `ChildStdin`/`ChildStdout` alone go out of scope, which would leave the OS process running
+/// detached (`tokio::process::Child`, like `std::process::Child`, is not killed by a plain
+/// drop) -- a real resource leak for a long-running `--serve` process handling many streaming
+/// sessions over time.
+pub(crate) struct StreamHandlerProcess {
+    pub(crate) child: tokio::process::Child,
+    io: tokio::io::Join<tokio::process::ChildStdout, tokio::process::ChildStdin>,
+}
+
+impl Drop for StreamHandlerProcess {
+    fn drop(&mut self) {
+        // Best-effort: `start_kill` is sync (just sends the signal, doesn't wait for reaping)
+        // so this can't block a drop. A handler that already exited on its own (e.g. on stdin
+        // EOF, once the session tears down its send side) simply errors here, which is fine --
+        // nothing left to kill.
+        let _ = self.child.start_kill();
+    }
+}
+
+impl AsyncRead for StreamHandlerProcess {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for StreamHandlerProcess {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+
+/// ct-agent#220: spawn `CT_AGENT_STREAM_HANDLER_CMD` (via `sh -c`, same convention as
+/// [`run_service_handler_with_timeout_to`]) with its stdin/stdout piped for the raw duplex
+/// pump, `CT_SERVICE_TYPE` set in its env for parity with the request/response handler
+/// (useful if one script backs both modes and branches on it), and stderr inherited (flows
+/// straight to this process's own stderr, unprefixed -- simpler than the request/response
+/// handler's bounded/prefixed forwarding; tightening this to match #105 is a reasonable
+/// follow-up, not required for a correct first cut).
+pub(crate) fn spawn_stream_handler(cmd: &str, service: &str) -> io::Result<StreamHandlerProcess> {
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .env("CT_SERVICE_TYPE", service)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("stdout piped above");
+    let stdin = child.stdin.take().expect("stdin piped above");
+    Ok(StreamHandlerProcess { child, io: tokio::io::join(stdout, stdin) })
 }
 
 impl AsyncRead for ChannelLocal {
@@ -75,6 +145,8 @@ impl AsyncRead for ChannelLocal {
         match self.get_mut() {
             ChannelLocal::Pipe(p) => Pin::new(p).poll_read(cx, buf),
             ChannelLocal::Serve(d) => Pin::new(d).poll_read(cx, buf),
+            ChannelLocal::Stream(Ok(s)) => Pin::new(s).poll_read(cx, buf),
+            ChannelLocal::Stream(Err(e)) => Poll::Ready(Err(io::Error::new(e.kind(), e.to_string()))),
         }
     }
 }
@@ -88,18 +160,24 @@ impl AsyncWrite for ChannelLocal {
         match self.get_mut() {
             ChannelLocal::Pipe(p) => Pin::new(p).poll_write(cx, buf),
             ChannelLocal::Serve(d) => Pin::new(d).poll_write(cx, buf),
+            ChannelLocal::Stream(Ok(s)) => Pin::new(s).poll_write(cx, buf),
+            ChannelLocal::Stream(Err(e)) => Poll::Ready(Err(io::Error::new(e.kind(), e.to_string()))),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             ChannelLocal::Pipe(p) => Pin::new(p).poll_flush(cx),
             ChannelLocal::Serve(d) => Pin::new(d).poll_flush(cx),
+            ChannelLocal::Stream(Ok(s)) => Pin::new(s).poll_flush(cx),
+            ChannelLocal::Stream(Err(e)) => Poll::Ready(Err(io::Error::new(e.kind(), e.to_string()))),
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             ChannelLocal::Pipe(p) => Pin::new(p).poll_shutdown(cx),
             ChannelLocal::Serve(d) => Pin::new(d).poll_shutdown(cx),
+            ChannelLocal::Stream(Ok(s)) => Pin::new(s).poll_shutdown(cx),
+            ChannelLocal::Stream(Err(e)) => Poll::Ready(Err(io::Error::new(e.kind(), e.to_string()))),
         }
     }
 }
@@ -1562,6 +1640,21 @@ pub(crate) fn channel_local(peer: Option<[u8; 32]>) -> ChannelLocal {
         })
         .unwrap_or(false);
     if serve {
+        // ct-agent#220: a streaming handler is an EXCLUSIVE mode for this session -- a raw,
+        // unframed duplex can't be multiplexed with the MCP/JSON-RPC tool dispatch below on
+        // the same wire, so when configured it short-circuits the rest of this branch entirely
+        // (no ping/agent-card/service/<slug> tools on a session running this). An operator
+        // wanting both request/response services AND a streaming one runs two separate
+        // `--serve` channels (two `CT_CHANNEL_ID`s), same as any two differently-shaped
+        // services already would.
+        if let Ok(cmd) = std::env::var("CT_AGENT_STREAM_HANDLER_CMD") {
+            let service = std::env::var("CT_AGENT_STREAM_SERVICE").unwrap_or_default();
+            eprintln!(
+                "ct-agent channel: --serve mode (streaming; unframed duplex piped to a '{service}' \
+                 handler subprocess via CT_AGENT_STREAM_HANDLER_CMD, one handler per session)"
+            );
+            return ChannelLocal::Stream(spawn_stream_handler(&cmd, &service).map_err(std::sync::Arc::new));
+        }
         // #135 L2.3: each framed request body is a JSON-RPC 2.0 message dispatched against the agent's
         // MCP tool registry; the response body is the JSON-RPC reply. Arc so the registry is shared
         // across the persistent session's calls. #144×#135: if the agent has AgentCard config
