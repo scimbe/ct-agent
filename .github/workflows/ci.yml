@@ -179,3 +179,5 @@ jobs:
         run: bash scripts/tests/test-setup-sh-ensure-env.sh
       - name: setup.ps1 Import-DotEnv regression test
         run: pwsh -File scripts/tests/test-setup-ps1-import-dotenv.ps1
+      - name: setup.ps1 Install-Docker regression test
+        run: pwsh -File scripts/tests/test-setup-ps1-docker.ps1
