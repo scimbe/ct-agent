@@ -201,8 +201,10 @@ ensure_env() {
     log "redeeming CT_BOOTSTRAP server-side"
     : "${CT_AGENT_CP_URL:?set CT_AGENT_CP_URL in .env}"
     local resp bundle
-    resp=$(curl -fsSL -X POST -H 'content-type: application/json' \
-      --data "{\"token\":\"$CT_BOOTSTRAP\"}" "${CT_AGENT_CP_URL%/}/bootstrap/redeem") \
+    # Body on stdin (printf is a builtin): as a --data argument the token would be
+    # readable by any local user via ps / /proc/<pid>/cmdline while curl runs.
+    resp=$(printf '{"token":"%s"}' "$CT_BOOTSTRAP" | curl -fsSL -X POST -H 'content-type: application/json' \
+      --data-binary @- "${CT_AGENT_CP_URL%/}/bootstrap/redeem") \
       || die "bootstrap redeem failed — the token may be expired/already used"
     bundle=$(printf '%s' "$resp" | sed -n 's/.*"secret":"\([^"]*\)".*/\1/p')
     CT_AGENT_JOIN_TOKEN=$(printf '%s' "$bundle" | sed -n 's/.*CT_JOIN_TOKEN=\([^;"]*\).*/\1/p')
@@ -356,8 +358,26 @@ install_docker() {
     || die "docker build failed"
   log "starting the container"
   docker rm -f ct-agent >/dev/null 2>&1 || true
-  docker run -d --name ct-agent --env-file .env -v "$(pwd)/$STATE_DIR:/state" \
-    -e CT_AGENT_STATE_DIR=/state ct-agent:local || die "docker run failed"
+  mkdir -p "$STATE_DIR"
+  local abs_state
+  abs_state="$(cd "$STATE_DIR" && pwd)"
+  # ensure_env resolved the redeemed tokens, CT_AGENT_ID, CT_AGENT_EDGE and the
+  # other defaults into THIS process's environment; a bare --env-file .env drops
+  # all of them (and fails outright when there is no .env). `-e NAME` without a
+  # value makes docker copy it from our environment, keeping secrets out of argv.
+  local env_file=()
+  [ -f .env ] && env_file=(--env-file .env)
+  CT_AGENT_STATE_DIR=/state CT_AGENT_CAPABILITY_OUT=/state/capability.bin \
+    docker run -d --name ct-agent ${env_file[@]+"${env_file[@]}"} -v "$abs_state:/state" \
+    -e CT_AGENT_CP_URL -e CT_AGENT_HOSTNAME -e CT_AGENT_ORIGIN -e CT_AGENT_ORIGIN_PROTO \
+    -e CT_AGENT_JOIN_TOKEN -e CT_AGENT_TOKEN -e CT_AGENT_MODE -e CT_AGENT_EDGE_CERT_URL \
+    -e CT_AGENT_ID -e CT_AGENT_EDGE -e CT_AGENT_STATE_DIR -e CT_AGENT_CAPABILITY_OUT \
+    ct-agent:local || die "docker run failed"
+  case "$CT_AGENT_ORIGIN" in
+    127.*|localhost*|\[::1\]*)
+      warn "CT_AGENT_ORIGIN=${CT_AGENT_ORIGIN} is loopback: inside the container that is the"
+      warn "container itself, not this host. Point it at an address the container can reach." ;;
+  esac
   ok "container 'ct-agent' running (logs: docker logs -f ct-agent)"
 }
 

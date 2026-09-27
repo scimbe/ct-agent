@@ -177,6 +177,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: setup.sh ensure_env() regression test
         run: bash scripts/tests/test-setup-sh-ensure-env.sh
+      - name: setup.sh secret-argv + --docker env passthrough regression test
+        run: bash scripts/tests/test-setup-sh-secrets-docker.sh
       - name: setup.sh piped-install (curl | bash) regression test
         run: bash scripts/tests/test-setup-sh-piped.sh
       - name: setup.sh --client-only regression test
