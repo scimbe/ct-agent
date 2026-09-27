@@ -267,19 +267,52 @@ function Install-Direct {
 }
 
 function Install-Docker {
-  Log "building the Docker image"
+  # Pinned to the latest RELEASE tag, not the moving `#main` branch tip -- parity
+  # with setup.sh: two installs a day apart must not build different, unaudited
+  # commits.
+  Log "resolving the latest ct-agent release tag"
+  $latestTag = $null
+  try { $latestTag = (Invoke-RestMethod -Uri 'https://api.github.com/repos/scimbe/ct-agent/releases/latest').tag_name } catch { }
+  if (-not $latestTag) { Die "could not resolve the latest ct-agent release tag from GitHub" }
+  Log "building the Docker image (pinned to release $latestTag)"
   # Build straight from this repo's git history (docker supports git-URL build
   # contexts natively) -- this script is commonly run with no local checkout.
   # buildx (not the classic builder) is required here: the Dockerfile's
   # TARGETOS/TARGETARCH build args are only auto-populated by buildx, and a
   # plain `docker build` leaves them empty, failing with "unsupported
   # TARGETARCH: " on every platform (#3).
-  docker buildx build --load -t ct-agent:local "https://github.com/scimbe/ct-agent.git#main:docker"
+  docker buildx build --load -t ct-agent:local "https://github.com/scimbe/ct-agent.git#${latestTag}:docker"
   if ($LASTEXITCODE -ne 0) { Die "docker build failed" }
   Log "starting the container"
   docker rm -f ct-agent 2>$null | Out-Null
-  docker run -d --name ct-agent --env-file .env -v "${StateDir}:/state" -e CT_AGENT_STATE_DIR=/state ct-agent:local
-  if ($LASTEXITCODE -ne 0) { Die "docker run failed" }
+  New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+  $absState = (Resolve-Path $StateDir).Path
+  # Import-DotEnv resolved the redeemed tokens, CT_AGENT_ID, CT_AGENT_EDGE and the
+  # other defaults into THIS process's environment; a bare --env-file .env drops
+  # all of them (and fails outright when there is no .env). `-e NAME` without a
+  # value makes docker copy it from our environment, keeping secrets out of argv.
+  $envFile = @()
+  if (Test-Path .env) { $envFile = @('--env-file', '.env') }
+  $hostStateDir = $env:CT_AGENT_STATE_DIR
+  $hostCapOut = $env:CT_AGENT_CAPABILITY_OUT
+  $env:CT_AGENT_STATE_DIR = '/state'
+  $env:CT_AGENT_CAPABILITY_OUT = '/state/capability.bin'
+  try {
+    docker run -d --name ct-agent @envFile -v "${absState}:/state" `
+      -e CT_AGENT_CP_URL -e CT_AGENT_HOSTNAME -e CT_AGENT_ORIGIN -e CT_AGENT_ORIGIN_PROTO `
+      -e CT_AGENT_JOIN_TOKEN -e CT_AGENT_TOKEN -e CT_AGENT_MODE -e CT_AGENT_EDGE_CERT_URL `
+      -e CT_AGENT_ID -e CT_AGENT_EDGE -e CT_AGENT_STATE_DIR -e CT_AGENT_CAPABILITY_OUT `
+      ct-agent:local
+    $runExit = $LASTEXITCODE
+  } finally {
+    $env:CT_AGENT_STATE_DIR = $hostStateDir
+    $env:CT_AGENT_CAPABILITY_OUT = $hostCapOut
+  }
+  if ($runExit -ne 0) { Die "docker run failed" }
+  if ($env:CT_AGENT_ORIGIN -match '^(127\.|localhost|\[::1\])') {
+    Warn "CT_AGENT_ORIGIN=$($env:CT_AGENT_ORIGIN) is loopback: inside the container that is the"
+    Warn "container itself, not this host. Point it at an address the container can reach."
+  }
   Ok "container 'ct-agent' running (logs: docker logs -f ct-agent)"
 }
 

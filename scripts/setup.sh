@@ -448,6 +448,8 @@ main() {
 # Guarded so scripts/tests/*.sh can `source` this file to unit-test individual
 # functions (e.g. ensure_env) without it immediately downloading/running a
 # real agent -- `main` only fires on a direct invocation, matching `${0}`.
-if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+# Under `curl ... | bash` there is no backing file, BASH_SOURCE is empty, and
+# `set -u` turns the bare expansion into a hard error before main (#218).
+if [ "${BASH_SOURCE[0]:-$0}" = "${0}" ]; then
   main
 fi

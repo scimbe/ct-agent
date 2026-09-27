@@ -131,9 +131,18 @@ impl OwnerKey {
             let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
         }
         let tmp = path.with_extension("key.tmp");
+        // create_new (O_CREAT|O_EXCL) never follows a pre-planted symlink and never
+        // inherits a stale temp file's mode; removing a leftover first unlinks the
+        // link itself, not its target. A re-plant in between fails closed.
+        match std::fs::remove_file(&tmp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("{}: {e}", tmp.display()));
+            }
+            _ => {}
+        }
         {
             let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
+            opts.write(true).create_new(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -370,6 +379,31 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         assert_eq!(read_key_file(&OwnerKey::path_in(dir.path())).unwrap(), k1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_never_writes_through_a_pre_planted_temp_file_or_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = OwnerKey::path_in(dir.path());
+        let tmp = path.with_extension("key.tmp");
+        let decoy = dir.path().join("decoy");
+        std::fs::write(&decoy, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&decoy, &tmp).unwrap();
+        let k = OwnerKey::generate();
+        k.save(&path).unwrap();
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"untouched", "the key leaked into the symlink target");
+        assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink(), "key file is a symlink");
+        assert_eq!(OwnerKey::load(&path).unwrap(), Some(k));
+
+        // A stale world-readable temp file must not lend its mode to the new key.
+        std::fs::write(&tmp, b"stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let k2 = OwnerKey::generate();
+        k2.save(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(OwnerKey::load(&path).unwrap(), Some(k2));
     }
 
     #[test]
