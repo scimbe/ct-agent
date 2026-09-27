@@ -11,6 +11,7 @@
 #   ./scripts/setup.sh --yes            # skip the sandbox-warning confirmation
 #   ./scripts/setup.sh --template       # also fetch the starter site template
 #   ./scripts/setup.sh --green          # push straight through to Grün (own cert)
+#   ./scripts/setup.sh --client-only    # just install the binary (ssh/ssh-config/login/channel)
 #   ./scripts/setup.sh --help
 #
 # Env overrides: CT_RELEASE_BASE (default: this repo's GitHub releases), NO_COLOR.
@@ -41,7 +42,10 @@ Grün) and the commands you need to stop/reset it or go from Gelb to Grün.
   ./scripts/setup.sh --yes            # skip the sandbox-warning confirmation
   ./scripts/setup.sh --template       # also fetch the starter site template
   ./scripts/setup.sh --green          # push straight through to Grün (own cert)
+  ./scripts/setup.sh --client-only    # just install the binary (ssh/ssh-config/login/channel)
   ./scripts/setup.sh --help
+
+Piped: curl -fsSL .../setup.sh | bash -s -- --client-only
 
 Env overrides: CT_RELEASE_BASE (default: this repo's GitHub releases), NO_COLOR.
 USAGE
@@ -53,6 +57,7 @@ MODE="direct"
 ASSUME_YES=0
 WANT_TEMPLATE=0
 WANT_GREEN=0
+CLIENT_ONLY=0
 STATE_DIR="${CT_AGENT_STATE_DIR:-./.ct-agent-state}"
 PID_FILE="./ct-agent.pid"
 
@@ -62,11 +67,16 @@ while [ $# -gt 0 ]; do
     --yes)      ASSUME_YES=1 ;;
     --template) WANT_TEMPLATE=1 ;;
     --green)    WANT_GREEN=1 ;;
+    --client-only) CLIENT_ONLY=1 ;;
     -h|--help)  usage 0 ;;
     *)          die "unknown argument: $1 (try --help)" ;;
   esac
   shift
 done
+
+if [ "$CLIENT_ONLY" -eq 1 ] && { [ "$MODE" = "docker" ] || [ "$WANT_TEMPLATE" -eq 1 ] || [ "$WANT_GREEN" -eq 1 ]; }; then
+  die "--client-only installs just the CLI binary; it can't be combined with --docker/--template/--green"
+fi
 
 # --- 1. environment check ------------------------------------------------------
 os=""
@@ -272,13 +282,17 @@ maybe_install_template() {
 }
 
 # --- 5. install + onboard -------------------------------------------------------
-install_direct() {
+download_binary() {
   local asset="ct-agent-${os}-${arch}"
   local url="${RELEASE_BASE%/}/${asset}"
   log "downloading $asset"
   curl -fsSL "$url" -o ./ct-agent -w '' || die "download failed: $url"
   chmod +x ./ct-agent
   ok "ct-agent binary ready"
+}
+
+install_direct() {
+  download_binary
 
   local fresh=1
   if [ -d "$STATE_DIR" ] && [ -n "$(ls -A "$STATE_DIR" 2>/dev/null || true)" ]; then
@@ -416,7 +430,19 @@ final_report() {
   fi
 }
 
+# The CLI subcommands (ssh, ssh-config, login, channel ...) take everything via
+# flags/args and need no .env, tunnel config or running agent (#219).
+client_only() {
+  detect_env
+  download_binary
+  echo
+  log "done — ct-agent CLI installed at $(pwd)/ct-agent (no serving agent was started)"
+  echo "  move it onto your PATH, e.g.:  sudo install -m 0755 ./ct-agent /usr/local/bin/ct-agent"
+  echo "  then see:  ct-agent --help"
+}
+
 main() {
+  if [ "$CLIENT_ONLY" -eq 1 ]; then client_only; return; fi
   detect_env
   confirm_mode
   ensure_env
