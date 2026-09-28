@@ -37,13 +37,15 @@
 //! for everyone. `ct-agent local-auth link --ttl 24h [--once]` mints a
 //! time-boxed token instead. Presented as `?ct_link=<token>` on any request
 //! target, a valid token answers with a 302 to the same path WITHOUT the
-//! parameter plus a `ct_link_session` cookie carrying the token (so it does
-//! not stay in the address bar / history / referers); the cookie is then
-//! accepted until the link expires. Only SHA-256 hashes of tokens are stored
-//! (`local-auth-links.json`, `0600`); the token itself is printed once at
-//! mint time. `--once` links redeem a single time via the URL (the first
-//! redemption stamps `used_at`), but the cookie that redemption set keeps
-//! working until expiry. The store is re-read on every check, so a link
+//! parameter plus a `ct_link_session` cookie carrying a fresh **session
+//! secret** minted for that redemption (so the token does not stay in the
+//! address bar / history / referers, and knowing the URL is not knowing the
+//! cookie); the cookie is then accepted until the link expires. Only SHA-256
+//! hashes of tokens and session secrets are stored (`local-auth-links.json`,
+//! `0600`); the token itself is printed once at mint time. `--once` links
+//! redeem a single time via the URL (the first redemption stamps `used_at`);
+//! the session that redemption opened keeps working until expiry, and a
+//! replayed URL -- in the URL or as a cookie -- opens nothing. The store is re-read on every check, so a link
 //! minted or revoked by the CLI while the agent serves takes effect
 //! immediately. This is Mesh-Plane HTTP-mode only, like the rest of the gate.
 
@@ -71,6 +73,22 @@ pub enum GateMode {
     Http,
     /// A plain `Password: ` prompt for interactive/text-oriented Origins.
     TextChallenge,
+}
+
+/// The startup warning for a gate that is configured but cannot run on this
+/// agent: it only inspects Mesh-Plane (Noise) streams to a TCP Origin, so a
+/// UDP Origin or browser mode (`CT_AGENT_MODE=browser`) serves every client
+/// unchecked. Loud, not fatal: refusing to start would take an auto-updated
+/// agent offline over a setting that never protected it. Pure.
+pub fn unenforced_gate_warning(mode: GateMode, udp_origin: bool, browser_forward: bool) -> Option<String> {
+    if mode == GateMode::Off || !(udp_origin || browser_forward) {
+        return None;
+    }
+    let what = if browser_forward { "browser mode (CT_AGENT_MODE=browser)" } else { "a UDP Origin" };
+    Some(format!(
+        "ct-agent: WARNING: CT_AGENT_LOCAL_AUTH is set but is NOT enforced for {what} -- every client that \
+         reaches this agent reaches the Origin unchecked. Unset it, or protect the Origin itself."
+    ))
 }
 
 impl GateMode {
@@ -266,7 +284,12 @@ impl Default for RateLimiter {
 pub struct LocalAuthGate {
     pub mode: GateMode,
     credential: Option<StoredCredential>,
+    /// Failed password checks. Only a correct password resets it.
     pub limiter: RateLimiter,
+    /// Failed `?ct_link=` redemptions -- a separate budget, so a share-link
+    /// holder cannot reset the password lockout (and link probing cannot lock
+    /// the owner out of the password path).
+    pub link_limiter: RateLimiter,
     /// Share links (#185) -- present whenever the gate is on and a state dir
     /// is known (the links file lives beside the credential hash). `None`
     /// means no link can ever be accepted: mode `Off`, or a
@@ -297,7 +320,7 @@ impl LocalAuthGate {
         };
         if mode == GateMode::Off {
             return Ok((
-                LocalAuthGate { mode, credential: None, limiter: RateLimiter::new(), links: None },
+                LocalAuthGate { mode, credential: None, limiter: RateLimiter::new(), link_limiter: RateLimiter::new(), links: None },
                 None,
             ));
         }
@@ -311,7 +334,7 @@ impl LocalAuthGate {
             let credential = StoredCredential::parse(contents.trim())
                 .map_err(|e| format!("CT_AGENT_LOCAL_AUTH_FILE '{file}': {e}"))?;
             return Ok((
-                LocalAuthGate { mode, credential: Some(credential), limiter: RateLimiter::new(), links },
+                LocalAuthGate { mode, credential: Some(credential), limiter: RateLimiter::new(), link_limiter: RateLimiter::new(), links },
                 None,
             ));
         }
@@ -325,7 +348,7 @@ impl LocalAuthGate {
             let contents = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
             let credential = StoredCredential::parse(contents.trim())?;
             return Ok((
-                LocalAuthGate { mode, credential: Some(credential), limiter: RateLimiter::new(), links },
+                LocalAuthGate { mode, credential: Some(credential), limiter: RateLimiter::new(), link_limiter: RateLimiter::new(), links },
                 None,
             ));
         }
@@ -345,7 +368,7 @@ impl LocalAuthGate {
             credential.username,
         );
         Ok((
-            LocalAuthGate { mode, credential: Some(credential), limiter: RateLimiter::new(), links },
+            LocalAuthGate { mode, credential: Some(credential), limiter: RateLimiter::new(), link_limiter: RateLimiter::new(), links },
             Some(notice),
         ))
     }
@@ -358,9 +381,11 @@ impl LocalAuthGate {
     /// Look for a share link (#185) on an HTTP request head -- `?ct_link=`
     /// on the request target, else a `ct_link_session` cookie -- and judge
     /// it. Only called by the HTTP sub-mode when no `Authorization` header
-    /// was offered; the rate limiter covers a presented-but-wrong token the
-    /// same way it covers a wrong password, and a request that presents no
-    /// token at all costs nothing (a browser's natural first request).
+    /// was offered. A presented-but-wrong URL token counts against
+    /// [`link_limiter`](Self::link_limiter); a session cookie is a 256-bit
+    /// secret and is judged without it, so link probing can never lock out a
+    /// guest who already holds a session. A request that presents no token at
+    /// all costs nothing (a browser's natural first request).
     pub fn check_share_link(&self, request: &[u8]) -> LinkGateVerdict {
         self.check_share_link_at(unix_now(), request)
     }
@@ -380,23 +405,26 @@ impl LocalAuthGate {
                 None => return LinkGateVerdict::NotPresented,
             },
         };
-        if let RateLimitVerdict::Locked { retry_after_secs } = self.limiter.check() {
-            return LinkGateVerdict::Rejected(LinkRejection::RateLimited { retry_after_secs });
+        if via == LinkPresentation::Query {
+            if let RateLimitVerdict::Locked { retry_after_secs } = self.link_limiter.check() {
+                return LinkGateVerdict::Rejected(LinkRejection::RateLimited { retry_after_secs });
+            }
         }
         let redeemed = match store.redeem_at(now, &token, via) {
             Ok(r) => r,
             Err(e) => {
-                self.limiter.record(false);
+                if via == LinkPresentation::Query {
+                    self.link_limiter.record(false);
+                }
                 return LinkGateVerdict::Rejected(e);
             }
         };
-        self.limiter.record(true);
-        match stripped_target {
-            Some(location) => LinkGateVerdict::Redirect {
-                response: http_302_link_redirect(&location, &token, redeemed.remaining_secs),
+        match (stripped_target, redeemed.session) {
+            (Some(location), Some(session)) => LinkGateVerdict::Redirect {
+                response: http_302_link_redirect(&location, &session, redeemed.remaining_secs),
                 id: redeemed.id,
             },
-            None => LinkGateVerdict::Authenticated { id: redeemed.id },
+            _ => LinkGateVerdict::Authenticated { id: redeemed.id },
         }
     }
 
@@ -656,6 +684,10 @@ pub const LINK_QUERY_PARAM: &str = "ct_link";
 /// Cookie the 302 sets and later requests are recognised by.
 pub const LINK_COOKIE_NAME: &str = "ct_link_session";
 
+/// Sessions kept per link. A multi-use link opens one per URL redemption; the
+/// oldest is dropped past this (its browser redeems the URL again).
+pub const MAX_SESSIONS_PER_LINK: usize = 16;
+
 /// Labels are printed in log lines and listings: one line, bounded.
 const MAX_LABEL_CHARS: usize = 64;
 
@@ -672,9 +704,13 @@ pub struct ShareLink {
     pub label: String,
     pub expires_at: u64,
     pub single_use: bool,
-    /// First successful redemption (URL or cookie) -- stamped once.
+    /// First successful URL redemption -- stamped once.
     #[serde(default)]
     pub used_at: Option<u64>,
+    /// Hex SHA-256 of each session secret a URL redemption issued as the
+    /// cookie, newest last, at most [`MAX_SESSIONS_PER_LINK`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_hashes: Vec<String>,
     /// Set by `link-revoke`; the record stays for the listing until pruned.
     #[serde(default)]
     pub revoked_at: Option<u64>,
@@ -900,6 +936,9 @@ pub struct RedeemedLink {
     pub remaining_secs: u64,
     /// This redemption stamped `used_at`.
     pub first_use: bool,
+    /// The session secret a URL redemption issued (the cookie value);
+    /// `None` for a cookie presentation.
+    pub session: Option<String>,
 }
 
 /// The share-link store: `<state_dir>/local-auth-links.json`, re-read on
@@ -983,6 +1022,7 @@ impl LinkStore {
             expires_at: now.saturating_add(ttl.as_secs()),
             single_use,
             used_at: None,
+            session_hashes: Vec::new(),
             revoked_at: None,
         };
         links.push(link.clone());
@@ -1018,11 +1058,13 @@ impl LinkStore {
         Ok(revoked)
     }
 
-    /// Judge a presented token. The hash comparison is constant-time per
-    /// record; the walk over records is not (their count is not secret).
-    /// A `--once` link accepts the URL form exactly once; the cookie form is
-    /// accepted for as long as the link is unexpired and unrevoked, since
-    /// the cookie IS the session that one redemption opened.
+    /// Judge a presented token (URL) or session secret (cookie). The hash
+    /// comparison is constant-time per value; the walk over records is not
+    /// (their count is not secret). A URL redemption mints a new session
+    /// secret, returned in [`RedeemedLink::session`]; a `--once` link accepts
+    /// the URL form exactly once. A cookie is accepted only if it is one of the
+    /// link's session secrets, for as long as the link is unexpired and
+    /// unrevoked -- the link token itself is never a valid cookie.
     pub fn redeem(&self, token: &str, via: LinkPresentation) -> Result<RedeemedLink, LinkRejection> {
         self.redeem_at(unix_now(), token, via)
     }
@@ -1033,11 +1075,15 @@ impl LinkStore {
             return Err(LinkRejection::Unknown);
         }
         let presented = hash_link_token(token);
+        let matches = |hex: &String| hex_decode_fixed::<32>(hex).map(|h| constant_time_eq(&h, &presented)).unwrap_or(false);
         let _guard = self.lock.lock_safe();
         let mut links = self.load().map_err(LinkRejection::Store)?;
         let link = links
             .iter_mut()
-            .find(|l| hex_decode_fixed::<32>(&l.token_hash).map(|h| constant_time_eq(&h, &presented)).unwrap_or(false))
+            .find(|l| match via {
+                LinkPresentation::Query => matches(&l.token_hash),
+                LinkPresentation::Cookie => l.session_hashes.iter().any(matches),
+            })
             .ok_or(LinkRejection::Unknown)?;
         if link.revoked_at.is_some() {
             return Err(LinkRejection::Revoked);
@@ -1048,19 +1094,29 @@ impl LinkStore {
         if link.single_use && link.used_at.is_some() && via == LinkPresentation::Query {
             return Err(LinkRejection::AlreadyUsed);
         }
-        let first_use = link.used_at.is_none();
+        let first_use = via == LinkPresentation::Query && link.used_at.is_none();
         if first_use {
             link.used_at = Some(now);
         }
+        let session = (via == LinkPresentation::Query).then(|| {
+            let mut secret = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut secret);
+            let session = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
+            link.session_hashes.push(hex_encode(&hash_link_token(&session)));
+            let excess = link.session_hashes.len().saturating_sub(MAX_SESSIONS_PER_LINK);
+            link.session_hashes.drain(..excess);
+            session
+        });
         let redeemed = RedeemedLink {
             id: link.id.clone(),
             label: link.label.clone(),
             single_use: link.single_use,
             remaining_secs: link.expires_at - now,
             first_use,
+            session,
         };
         let snapshot = link.clone();
-        if first_use {
+        if via == LinkPresentation::Query {
             self.save(&mut links, now).map_err(LinkRejection::Store)?;
         }
         let via_name = match via {
@@ -1143,23 +1199,27 @@ pub fn link_token_in_cookies(head: &RequestHead<'_>) -> Option<String> {
 }
 
 /// The 302 that answers a valid `?ct_link=` redemption: back to `location`
-/// (the same target minus the parameter) with the session cookie set for
-/// exactly the link's remaining lifetime. `HttpOnly` keeps page scripts away
+/// (the same target minus the parameter) with the session cookie (the
+/// redemption's session secret) set for exactly the link's remaining lifetime. `HttpOnly` keeps page scripts away
 /// from it, `Secure` keeps it off plain-HTTP hops, `SameSite=Lax` keeps a
 /// cross-site POST from riding on it. `location` comes from a request line
 /// (no whitespace by construction); anything with a control character in it
-/// falls back to `/` so no header can be injected through it.
-pub fn http_302_link_redirect(location: &str, token: &str, max_age_secs: u64) -> Vec<u8> {
-    let safe_location = if location.is_empty() || location.bytes().any(|b| b.is_ascii_control() || b == b' ') {
+/// falls back to `/` so no header can be injected through it, and so does
+/// anything that is not a same-origin path (`//host`, `/\host`, `http://host`)
+/// so the redirect can never leave the tunnel's own origin.
+pub fn http_302_link_redirect(location: &str, session: &str, max_age_secs: u64) -> Vec<u8> {
+    let same_origin_path =
+        location.starts_with('/') && !location.starts_with("//") && !location.starts_with("/\\");
+    let safe_location = if !same_origin_path || location.bytes().any(|b| b.is_ascii_control() || b == b' ') {
         "/"
     } else {
         location
     };
-    let token = if looks_like_link_token(token) { token } else { "" };
+    let session = if looks_like_link_token(session) { session } else { "" };
     format!(
         "HTTP/1.1 302 Found\r\n\
          Location: {safe_location}\r\n\
-         Set-Cookie: {LINK_COOKIE_NAME}={token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={max_age_secs}\r\n\
+         Set-Cookie: {LINK_COOKIE_NAME}={session}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={max_age_secs}\r\n\
          Cache-Control: no-store\r\n\
          Content-Length: 0\r\n\
          Connection: close\r\n\r\n"
@@ -1428,6 +1488,17 @@ mod tests {
         format!("GET /app/page?x=1&{LINK_QUERY_PARAM}={token}&y=2 HTTP/1.1\r\nHost: x\r\n\r\n").into_bytes()
     }
 
+    /// Redeem `token` via the URL at `now` and return the session cookie value the 302 set.
+    fn session_from_redirect(gate: &LocalAuthGate, now: u64, token: &str) -> String {
+        let LinkGateVerdict::Redirect { response, .. } = gate.check_share_link_at(now, &get_with_query(token)) else {
+            panic!("expected a redirect for {token}");
+        };
+        let resp = String::from_utf8(response).unwrap();
+        let start = resp.find(&format!("{LINK_COOKIE_NAME}=")).unwrap() + LINK_COOKIE_NAME.len() + 1;
+        let end = start + resp[start..].find(';').unwrap();
+        resp[start..end].to_string()
+    }
+
     fn get_with_cookie(token: &str) -> Vec<u8> {
         format!("GET /app/page HTTP/1.1\r\nHost: x\r\nCookie: a=b; {LINK_COOKIE_NAME}={token}; c=d\r\n\r\n")
             .into_bytes()
@@ -1592,9 +1663,14 @@ mod tests {
         let resp = String::from_utf8(response).unwrap();
         assert!(resp.starts_with("HTTP/1.1 302 Found\r\n"), "{resp}");
         assert!(resp.contains("\r\nLocation: /app/page?x=1&y=2\r\n"), "parameter stripped, others kept: {resp}");
+        let session = {
+            let start = resp.find(&format!("{LINK_COOKIE_NAME}=")).unwrap() + LINK_COOKIE_NAME.len() + 1;
+            resp[start..start + resp[start..].find(';').unwrap()].to_string()
+        };
+        assert!(looks_like_link_token(&session), "a fresh session secret: {resp}");
+        assert_ne!(session, minted.token, "the cookie is never the URL token");
         let cookie = format!(
-            "\r\nSet-Cookie: {LINK_COOKIE_NAME}={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=3540\r\n",
-            minted.token
+            "\r\nSet-Cookie: {LINK_COOKIE_NAME}={session}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=3540\r\n"
         );
         assert!(resp.contains(&cookie), "{resp}");
         assert!(resp.contains("\r\nConnection: close\r\n"), "{resp}");
@@ -1608,8 +1684,9 @@ mod tests {
         let dir = scratch("link-cookie");
         let gate = http_gate(&dir);
         let minted = gate.links().unwrap().mint_at(NOW, HOUR, false, "guest").unwrap();
+        let session = session_from_redirect(&gate, NOW, &minted.token);
 
-        let req = get_with_cookie(&minted.token);
+        let req = get_with_cookie(&session);
         assert_eq!(
             gate.check_share_link_at(NOW + 1, &req),
             LinkGateVerdict::Authenticated { id: minted.id.clone() },
@@ -1641,13 +1718,14 @@ mod tests {
         );
         // Revoked.
         let revoked = store.mint_at(NOW, HOUR, false, "revoked").unwrap();
+        let revoked_session = session_from_redirect(&gate, NOW, &revoked.token);
         store.revoke_at(NOW, &revoked.id).unwrap();
         assert_eq!(
             gate.check_share_link_at(NOW + 1, &get_with_query(&revoked.token)),
             LinkGateVerdict::Rejected(LinkRejection::Revoked)
         );
         assert_eq!(
-            gate.check_share_link_at(NOW + 1, &get_with_cookie(&revoked.token)),
+            gate.check_share_link_at(NOW + 1, &get_with_cookie(&revoked_session)),
             LinkGateVerdict::Rejected(LinkRejection::Revoked),
             "revocation kills the cookie session too"
         );
@@ -1664,8 +1742,14 @@ mod tests {
         // No link at all: nothing to judge, and it never touched the limiter.
         assert_eq!(gate.check_share_link_at(NOW, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"), LinkGateVerdict::NotPresented);
         assert_eq!(gate.check_share_link_at(NOW, b"not http at all"), LinkGateVerdict::NotPresented);
-        // Every rejection above counted as a failure; the lockout must engage.
-        assert!(matches!(gate.limiter.check(), RateLimitVerdict::Locked { .. }));
+        // One more refused URL makes five; the link lockout must engage (the
+        // cookie refusal above never counted).
+        assert_eq!(
+            gate.check_share_link_at(NOW, &get_with_query(&stranger)),
+            LinkGateVerdict::Rejected(LinkRejection::Unknown)
+        );
+        assert!(matches!(gate.link_limiter.check(), RateLimitVerdict::Locked { .. }));
+        assert_eq!(gate.limiter.check(), RateLimitVerdict::Allowed, "the password lockout is a separate budget");
         let good = store.mint_at(NOW, HOUR, false, "good").unwrap();
         assert!(matches!(
             gate.check_share_link_at(NOW, &get_with_query(&good.token)),
@@ -1680,10 +1764,7 @@ mod tests {
         let minted = gate.links().unwrap().mint_at(NOW, HOUR, true, "once").unwrap();
 
         // First visit: redirect + cookie, used_at stamped.
-        assert!(matches!(
-            gate.check_share_link_at(NOW + 1, &get_with_query(&minted.token)),
-            LinkGateVerdict::Redirect { .. }
-        ));
+        let session = session_from_redirect(&gate, NOW + 1, &minted.token);
         let rec = &gate.links().unwrap().list().unwrap()[0];
         assert_eq!(rec.used_at, Some(NOW + 1));
         assert_eq!(rec.status(NOW + 1), "used (cookie still valid)");
@@ -1694,11 +1775,17 @@ mod tests {
         );
         // The cookie the first visit set: still the session it opened.
         assert_eq!(
-            gate.check_share_link_at(NOW + 3, &get_with_cookie(&minted.token)),
+            gate.check_share_link_at(NOW + 3, &get_with_cookie(&session)),
             LinkGateVerdict::Authenticated { id: minted.id.clone() }
         );
+        // The URL token replayed as the cookie opens nothing (it used to: the
+        // cookie WAS the token, so a leaked `--once` URL worked until expiry).
         assert_eq!(
-            gate.check_share_link_at(NOW + 3_600, &get_with_cookie(&minted.token)),
+            gate.check_share_link_at(NOW + 3, &get_with_cookie(&minted.token)),
+            LinkGateVerdict::Rejected(LinkRejection::Unknown)
+        );
+        assert_eq!(
+            gate.check_share_link_at(NOW + 3_600, &get_with_cookie(&session)),
             LinkGateVerdict::Rejected(LinkRejection::Expired)
         );
     }
@@ -1720,6 +1807,74 @@ mod tests {
         // Off mode has none either.
         let (off, _) = LocalAuthGate::from_env(Some(&dir), |_| None).unwrap();
         assert!(off.links().is_none());
+    }
+
+    #[test]
+    fn an_unenforceable_gate_is_warned_about() {
+        assert_eq!(unenforced_gate_warning(GateMode::Off, true, true), None);
+        assert_eq!(unenforced_gate_warning(GateMode::Http, false, false), None);
+        assert!(unenforced_gate_warning(GateMode::Http, true, false).unwrap().contains("UDP Origin"));
+        assert!(unenforced_gate_warning(GateMode::TextChallenge, false, true).unwrap().contains("browser mode"));
+    }
+
+    #[test]
+    fn a_share_link_success_never_resets_the_password_lockout() {
+        // A guest alternating wrong passwords with a valid session must still hit the lockout.
+        let dir = scratch("link-limiter");
+        let gate = http_gate(&dir);
+        let minted = gate.links().unwrap().mint_at(NOW, HOUR, false, "guest").unwrap();
+        let session = session_from_redirect(&gate, NOW, &minted.token);
+        for _ in 0..MAX_FAILURES {
+            assert_eq!(gate.verify("agent", b"wrong"), Err(GateRejection::BadCredential));
+            assert!(matches!(gate.check_share_link_at(NOW + 1, &get_with_cookie(&session)), LinkGateVerdict::Authenticated { .. }));
+        }
+        assert!(matches!(gate.verify("agent", b"wrong"), Err(GateRejection::RateLimited { .. })));
+    }
+
+    #[test]
+    fn link_probing_never_locks_out_a_guest_session() {
+        let dir = scratch("link-probe");
+        let gate = http_gate(&dir);
+        let minted = gate.links().unwrap().mint_at(NOW, HOUR, false, "guest").unwrap();
+        let session = session_from_redirect(&gate, NOW, &minted.token);
+        for _ in 0..(MAX_FAILURES * 2) {
+            let _ = gate.check_share_link_at(NOW + 1, &get_with_query("x"));
+        }
+        assert!(matches!(
+            gate.check_share_link_at(NOW + 1, &get_with_query(&minted.token)),
+            LinkGateVerdict::Rejected(LinkRejection::RateLimited { .. })
+        ));
+        assert!(matches!(gate.check_share_link_at(NOW + 2, &get_with_cookie(&session)), LinkGateVerdict::Authenticated { .. }));
+        assert_eq!(gate.limiter.check(), RateLimitVerdict::Allowed, "nor the owner's password path");
+    }
+
+    #[test]
+    fn a_multi_use_link_keeps_a_bounded_number_of_sessions() {
+        let dir = scratch("link-sessions");
+        let gate = http_gate(&dir);
+        let minted = gate.links().unwrap().mint_at(NOW, HOUR, false, "shared").unwrap();
+        let first = session_from_redirect(&gate, NOW, &minted.token);
+        let mut last = String::new();
+        for i in 0..MAX_SESSIONS_PER_LINK as u64 {
+            last = session_from_redirect(&gate, NOW + 1 + i, &minted.token);
+        }
+        assert_eq!(gate.links().unwrap().list().unwrap()[0].session_hashes.len(), MAX_SESSIONS_PER_LINK);
+        assert_eq!(
+            gate.check_share_link_at(NOW + 100, &get_with_cookie(&first)),
+            LinkGateVerdict::Rejected(LinkRejection::Unknown),
+            "the oldest session was dropped"
+        );
+        assert!(matches!(gate.check_share_link_at(NOW + 100, &get_with_cookie(&last)), LinkGateVerdict::Authenticated { .. }));
+    }
+
+    #[test]
+    fn the_link_redirect_never_leaves_the_origin() {
+        for evil in ["//evil.example/x", "/\\evil.example/x", "http://evil.example/", "evil"] {
+            let resp = String::from_utf8(http_302_link_redirect(evil, "tok_-1", 5)).unwrap();
+            assert!(resp.contains("\r\nLocation: /\r\n"), "{evil}: {resp}");
+        }
+        let resp = String::from_utf8(http_302_link_redirect("/a//b?c=//d", "tok_-1", 5)).unwrap();
+        assert!(resp.contains("\r\nLocation: /a//b?c=//d\r\n"), "{resp}");
     }
 
     #[test]

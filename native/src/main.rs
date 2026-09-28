@@ -1364,6 +1364,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(notice) = &local_auth_notice {
         eprintln!("{notice}");
     }
+    if let Some(warning) = ct_agent::local_auth::unenforced_gate_warning(
+        local_auth_gate.mode,
+        config.origin_proto == ct_agent::config::OriginProto::Udp,
+        config.browser_forward,
+    ) {
+        eprintln!("{warning}");
+    }
 
     // Auto-update (2026-09-01 operator ask): opt-in only -- see
     // ct_agent::self_update's module doc for why the exit it performs on a

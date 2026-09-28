@@ -4139,12 +4139,10 @@ mod tests {
         let resp = String::from_utf8_lossy(&tmp[..n]);
         assert!(resp.starts_with("HTTP/1.1 302 Found\r\n"), "got: {resp}");
         assert!(resp.contains("\r\nLocation: /app?x=1\r\n"), "got: {resp}");
-        let cookie_prefix = format!(
-            "\r\nSet-Cookie: {}={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=",
-            local_auth::LINK_COOKIE_NAME,
-            minted.token
-        );
+        let cookie_prefix = format!("\r\nSet-Cookie: {}=", local_auth::LINK_COOKIE_NAME);
         assert!(resp.contains(&cookie_prefix), "got: {resp}");
+        assert!(resp.contains("; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age="), "got: {resp}");
+        assert!(!resp.contains(&minted.token), "the cookie is a session secret, never the URL token: {resp}");
 
         let result = rig.agent_task.await.unwrap();
         assert!(result.is_ok(), "a redeemed link ends the connection cleanly, not as a rejection: {result:?}");
@@ -4158,12 +4156,14 @@ mod tests {
     async fn local_auth_http_gate_accepts_a_share_link_cookie_and_forwards_the_request() {
         let gate = gate_for_test("http", "agent", "s3cret");
         let minted = gate.links().unwrap().mint(std::time::Duration::from_secs(3600), false, "guest").unwrap();
+        let session =
+            gate.links().unwrap().redeem(&minted.token, local_auth::LinkPresentation::Query).unwrap().session.unwrap();
         let mut rig = setup_gate_test(gate).await;
 
         let req = format!(
             "GET /ok HTTP/1.1\r\nHost: x\r\nCookie: theme=dark; {}={}\r\n\r\n",
             local_auth::LINK_COOKIE_NAME,
-            minted.token
+            session
         );
         let mut buf = vec![0u8; 65535];
         let n = rig.transport.write_message(req.as_bytes(), &mut buf).unwrap();
@@ -4194,12 +4194,20 @@ mod tests {
             .unwrap()
             .mint_at(now - 7200, std::time::Duration::from_secs(3600), false, "stale")
             .unwrap();
+        // Its session was opened while the link was still valid.
+        let session = gate
+            .links()
+            .unwrap()
+            .redeem_at(now - 7000, &stale.token, local_auth::LinkPresentation::Query)
+            .unwrap()
+            .session
+            .unwrap();
         let mut rig = setup_gate_test(gate).await;
 
         let req = format!(
             "GET /app HTTP/1.1\r\nHost: x\r\nCookie: {}={}\r\n\r\n",
             local_auth::LINK_COOKIE_NAME,
-            stale.token
+            session
         );
         let mut buf = vec![0u8; 65535];
         let mut tmp = vec![0u8; 65535];
