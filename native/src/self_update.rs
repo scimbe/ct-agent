@@ -65,10 +65,20 @@ use sha2::{Digest, Sha256};
 /// -- no token needed, same rate limits any anonymous release-checker has.
 const RELEASES_API: &str = "https://api.github.com/repos/scimbe/ct-agent/releases/latest";
 
-/// Where released assets are downloaded from once their exact name is known
-/// (same convention `docker/Dockerfile` already uses for its own download).
-/// `<base>/<asset>` is the binary, `<base>/<asset>.sha256` its checksum.
-const RELEASE_DOWNLOAD_BASE: &str = "https://github.com/scimbe/ct-agent/releases/latest/download";
+/// Where a release's assets are downloaded from: `<base>/<tag>/<asset>` is the binary,
+/// `<asset>.sha256` its checksum. Always the tag the check decided on, never `latest/download`:
+/// "latest" can move between the check and the download, and the files fetched must be the
+/// ones of the release that was compared against the running version.
+const RELEASE_DOWNLOAD_ROOT: &str = "https://github.com/scimbe/ct-agent/releases/download";
+
+/// The download base for release `tag`. The tag comes from an unauthenticated API response and
+/// becomes a URL path segment, so only a plain version tag (`v` + digits and dots) is accepted.
+fn release_download_base(tag: &str) -> Result<String, String> {
+    if parse_version(tag).is_none() || !tag.starts_with('v') {
+        return Err(format!("refusing to download release {tag:?}: not a plain vMAJOR.MINOR.PATCH tag"));
+    }
+    Ok(format!("{RELEASE_DOWNLOAD_ROOT}/{tag}"))
+}
 
 /// Hard ceiling on a downloaded release asset (256 MiB). A real `ct-agent`
 /// binary is a few tens of MiB; anything past this is not a release we
@@ -219,14 +229,25 @@ fn asset_name_for_platform(os: &str, arch: &str) -> Result<String, String> {
     Ok(format!("ct-agent-{os_name}-{arch_name}{ext}"))
 }
 
+/// `v0.7.12` / `0.7.12` as numeric components; `None` for anything else (a pre-release suffix,
+/// an empty or non-numeric component, a stray character).
+fn parse_version(v: &str) -> Option<Vec<u64>> {
+    let v = v.strip_prefix('v').unwrap_or(v);
+    v.split('.')
+        .map(|p| if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) { p.parse().ok() } else { None })
+        .collect()
+}
+
 /// Strip a `v` prefix (release tags are `v0.7.12`; `CARGO_PKG_VERSION` is
 /// `0.7.12`) and compare as dotted numeric components -- not a string
 /// compare, which would sort "0.7.9" ahead of "0.7.12" lexicographically.
+/// A candidate that is not a plain numeric version is never newer: `v1.0.0-rc1` used to read as
+/// `1.0.0` and `vX.9` as `0.9`, so an odd tag could be installed over a real release.
 fn version_is_newer(current: &str, candidate: &str) -> bool {
-    fn parts(v: &str) -> Vec<u64> {
-        v.trim_start_matches('v').split('.').map(|p| p.parse().unwrap_or(0)).collect()
+    match (parse_version(current), parse_version(candidate)) {
+        (Some(current), Some(candidate)) => candidate > current,
+        _ => false,
     }
-    parts(candidate) > parts(current)
 }
 
 /// Check the releases API and decide whether an update is available. Pure
@@ -754,10 +775,11 @@ pub(crate) async fn download_verified(
 pub async fn perform_update(check: &UpdateCheck) -> Result<(PathBuf, ProvenanceOutcome), String> {
     let current_exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let provenance = ProvenancePolicy::from_env()?;
+    let base = release_download_base(&check.latest_version)?;
     perform_update_into(
         check,
         &current_exe,
-        RELEASE_DOWNLOAD_BASE,
+        &base,
         ChecksumPolicy::from_env(),
         &provenance,
         MAX_UPDATE_BYTES,
@@ -1004,6 +1026,22 @@ mod tests {
         assert!(!version_is_newer("0.7.12", "v0.7.9"));
         assert!(!version_is_newer("0.7.12", "v0.7.12"), "equal versions are not \"newer\"");
         assert!(version_is_newer("0.6.9", "v0.7.0"));
+        // Not a plain version: never newer, whatever its numbers say.
+        assert!(!version_is_newer("0.7.12", "v9.0.0-rc1"));
+        assert!(!version_is_newer("0.7.12", "v9..0"));
+        assert!(!version_is_newer("0.7.12", "v9.0.x"));
+        assert!(!version_is_newer("0.7.12", ""));
+    }
+
+    #[test]
+    fn downloads_are_pinned_to_the_checked_tag() {
+        assert_eq!(
+            release_download_base("v0.7.35").unwrap(),
+            "https://github.com/scimbe/ct-agent/releases/download/v0.7.35"
+        );
+        for bad in ["0.7.35", "v0.7.35/../../x", "v0.7.35?x", "latest", "v1.0.0-rc1", ""] {
+            assert!(release_download_base(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -1193,7 +1231,7 @@ mod tests {
 
     // ---- end-to-end against a local release server ---------------------------------
 
-    /// A stand-in for `https://github.com/.../releases/latest/download/`: serves the
+    /// A stand-in for `https://github.com/.../releases/download/<tag>/`: serves the
     /// files it was given by exact path, 404 for anything else. `chunked` streams the
     /// body without a Content-Length so the streaming half of the size cap is hit.
     struct MockRelease {
