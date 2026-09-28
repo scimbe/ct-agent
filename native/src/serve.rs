@@ -2798,6 +2798,10 @@ pub(crate) async fn run_tcp_fallback_pool_on(
     top_up!();
     // CADS-Tunnel#799: consecutive probe dials that answered.
     let mut probe_ok_streak: u32 = 0;
+    // An absolute deadline, re-armed only when a probe fires: a sleep built fresh
+    // on every loop pass would restart on each worker join or consumed signal, so
+    // a pool serving traffic more often than `interval` would never probe.
+    let mut next_probe = reprobe.map(|p| tokio::time::Instant::now() + p.interval);
     loop {
         if handles.is_empty() {
             return FallbackExit::AllWorkersGaveUp;
@@ -2805,8 +2809,8 @@ pub(crate) async fn run_tcp_fallback_pool_on(
         // With no reprobe policy this arm never fires; the pool then only ends
         // once every worker has.
         let reprobe_due = async {
-            match reprobe {
-                Some(p) => tokio::time::sleep(p.interval).await,
+            match next_probe {
+                Some(at) => tokio::time::sleep_until(at).await,
                 None => std::future::pending::<()>().await,
             }
         };
@@ -2871,6 +2875,7 @@ pub(crate) async fn run_tcp_fallback_pool_on(
             }
             _ = reprobe_due => {
                 let Some(policy) = reprobe else { continue };
+                next_probe = Some(tokio::time::Instant::now() + policy.interval);
                 let conn = match tokio::time::timeout(
                     Duration::from_secs(5),
                     dial_quic(config.edge, edge_cert.clone()),
@@ -2909,6 +2914,13 @@ pub(crate) async fn run_tcp_fallback_pool_on(
                             config.edge,
                             serving.len()
                         );
+                        // A worker whose STOP arrived while we were probing is relaying a
+                        // Client now: book it before deciding which slots are parked.
+                        while let Ok(id) = consumed_rx.try_recv() {
+                            if handles.contains_key(&id) {
+                                serving.insert(id);
+                            }
+                        }
                         for (id, h) in &handles {
                             if !serving.contains(id) {
                                 h.abort();
@@ -3216,7 +3228,11 @@ async fn tcp_connect_register_serve(
                          falling back to a plain 'B' registration on a fresh connection"
                     );
                     stream = tcp_tls_connect(target, edge_cert.clone()).await?;
-                    register_tunnel_stream_browser(&mut stream, token, host).await?;
+                    // #45 slice 3: the final verdict counts, as on the Noise path below.
+                    if let Err(e) = register_tunnel_stream_browser(&mut stream, token, host).await {
+                        revocation.note(RevocationTracker::classify_failure(&e, false));
+                        return Err(TcpAttemptEnd::NotRegistered(e));
+                    }
                     ping_capable = false;
                 }
             }
@@ -3326,7 +3342,11 @@ async fn tcp_connect_register_serve(
         was_consumed = true;
     }
     let (recv, send) = split(stream);
-    match serve_noise_stream(send, recv, config.origin, origin_keys, Arc::clone(metrics), gate).await {
+    let served = match config.origin_proto {
+        OriginProto::Tcp => serve_noise_stream(send, recv, config.origin, origin_keys, Arc::clone(metrics), gate).await,
+        OriginProto::Udp => serve_noise_udp(send, recv, config.origin, origin_keys).await,
+    };
+    match served {
         Ok(()) if was_consumed => Ok(TcpServed::Consumed),
         Ok(()) => Ok(TcpServed::Plain),
         Err(e) => Err(TcpAttemptEnd::registered(registered_at, was_consumed, e)),
@@ -3698,6 +3718,133 @@ mod tests {
         assert_eq!(
             resp, b"hello-tcp-fallback",
             "cross-host TCP-fallback Noise round-trip succeeds"
+        );
+
+        agent.abort();
+        edge.abort();
+    }
+
+    /// A `CT_AGENT_ORIGIN_PROTO=udp` agent on the TLS-TCP fallback must bridge
+    /// datagrams to its UDP origin, as the QUIC path does.
+    #[tokio::test]
+    async fn tcp_fallback_agent_serves_a_udp_origin_end_to_end() {
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::pow::Challenge;
+        use ct_common::{Capability, OriginIdentity};
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use ct_edge::serve::serve_tcp_connection;
+        use ct_edge::state::EdgeState;
+        use quinn::Connection;
+        use std::net::Ipv4Addr;
+
+        // Real dual edge (TCP + QUIC); we exercise only the TCP fallback side.
+        let ca = Ca::new("e2e-ca").unwrap();
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let token = RoutingToken([0x33; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        // Edge: accept each TCP connection and serve it ('A' parks, 'C' delivers).
+        //
+        // ct-agent#15: this is the REAL pinned ct-edge, which predates role 'K'
+        // and rejects an unknown role byte by erroring out and dropping the
+        // connection with no ack. That makes this test a genuine end-to-end proof
+        // of the legacy-Edge fallback: the Agent's 'K' attempt gets dropped
+        // ack-less, it redials and registers with plain 'A', and the tunnel works
+        // exactly as before. Accept in an unbounded loop rather than a fixed count
+        // so the extra probe dial isn't a brittle magic number.
+        let state_e = state.clone();
+        let edge = tokio::spawn(async move {
+            loop {
+                let (tcp, peer) = tcp_listener.accept().await.unwrap();
+                let (acc, st, ch) = (acceptor.clone(), state_e.clone(), challenge.clone());
+                tokio::spawn(async move {
+                    if let Ok(tls) = acc.accept(tcp).await {
+                        // The trailing None is ct-edge's per-connection cap (no cap in this
+                        // test); peer.ip() (#603) is the real accept()-time address.
+                        let _ = serve_tcp_connection(tls, &st, &ch, None, peer.ip()).await;
+                    }
+                });
+            }
+        });
+
+        // Origin: a UDP echo. Before the fix the fallback dialed it over TCP.
+        let origin_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 2048];
+            while let Ok((n, peer)) = origin_sock.recv_from(&mut b).await {
+                let _ = origin_sock.send_to(&b[..n], peer).await;
+            }
+        });
+
+        // The agent holds the origin private key; the Capability pins its public.
+        let origin_kp = generate_static_keypair();
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: tcp_addr.to_string(),
+        };
+
+        // Agent: run the TCP fallback (connect + register + serve one tunnel).
+        // Pool size 1: the real edge parks one registration per token, and a
+        // larger pool would just have the Agent's own workers supersede each
+        // other's park slot before the Client arrives.
+        let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), &origin_addr.to_string()).unwrap();
+        cfg.tcp_fallback_pool_size = 1;
+        cfg.origin_proto = OriginProto::Udp;
+        let ca_root_a = ca_root.clone();
+        let a_token = token.clone();
+        let agent = tokio::spawn(async move {
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ = run_agent_tcp_fallback(
+                &cfg,
+                ca_root_a,
+                a_token,
+                std::sync::Arc::new(vec![origin_kp.private]),
+                std::sync::Arc::new(gate),
+            )
+            .await;
+        });
+
+        // Wait until the agent has registered (parked) at the edge.
+        for _ in 0..200 {
+            if state.has_tcp_agent(&token) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(state.has_tcp_agent(&token), "agent parked over TLS-TCP");
+
+        // Client: tunnel over TLS-TCP through the edge to the origin, expect echo.
+        let client_kp = generate_static_keypair();
+        let client_stream = ct_client::transport::tcp_tls_connect(tcp_addr, ca_root)
+            .await
+            .unwrap();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(15),
+            ct_client::transport::client_tunnel_noise_tcp(
+                client_stream,
+                &token,
+                &cap,
+                &client_kp.private,
+                b"hello-udp-origin",
+            ),
+        )
+        .await
+        .expect("round-trip timed out (relay/serve deadlock)")
+        .unwrap();
+        assert_eq!(
+            resp, b"hello-udp-origin",
+            "a UDP origin is served over the TLS-TCP fallback"
         );
 
         agent.abort();
