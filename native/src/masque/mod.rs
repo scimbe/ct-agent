@@ -136,6 +136,42 @@ async fn dial_quic_via_masque_with_proxy_roots(
     token: &str,
     proxy_roots: rustls::RootCertStore,
 ) -> Result<quinn::Connection, BoxError> {
+    dial_quic_via_masque_within(MASQUE_DIAL_TIMEOUT, proxy_tcp_addr, sni_host, target, edge_cert, token, proxy_roots)
+        .await
+}
+
+/// Upper bound on one whole MASQUE dial (TCP connect, TLS, h2, extended CONNECT,
+/// inner QUIC handshake). Without it a proxy that accepts TCP and then stays silent
+/// stalls the reconnect loop before it ever reaches the TLS-TCP fallback.
+const MASQUE_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Dropping the inner future on timeout is safe: the h2 driver is a `TaskGuard`
+/// and aborts with it.
+async fn dial_quic_via_masque_within(
+    bound: std::time::Duration,
+    proxy_tcp_addr: SocketAddr,
+    sni_host: &str,
+    target: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    token: &str,
+    proxy_roots: rustls::RootCertStore,
+) -> Result<quinn::Connection, BoxError> {
+    tokio::time::timeout(
+        bound,
+        dial_quic_via_masque_unbounded(proxy_tcp_addr, sni_host, target, edge_cert, token, proxy_roots),
+    )
+    .await
+    .map_err(|_| -> BoxError { format!("MASQUE dial via {proxy_tcp_addr} timed out after {bound:?}").into() })?
+}
+
+async fn dial_quic_via_masque_unbounded(
+    proxy_tcp_addr: SocketAddr,
+    sni_host: &str,
+    target: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    token: &str,
+    proxy_roots: rustls::RootCertStore,
+) -> Result<quinn::Connection, BoxError> {
     let tcp = TcpStream::connect(proxy_tcp_addr).await?;
 
     let mut tls_config = rustls::ClientConfig::builder()
