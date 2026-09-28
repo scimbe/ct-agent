@@ -133,8 +133,18 @@ pub(crate) fn install_crypto_provider() {
 const AGENT_KEEPALIVE: Duration = Duration::from_secs(5);
 const AGENT_MAX_IDLE: Duration = Duration::from_secs(30);
 
-fn client_endpoint(edge_cert: CertificateDer<'static>) -> Result<Endpoint, BoxError> {
-    client_endpoint_with(edge_cert, Some(AGENT_KEEPALIVE), AGENT_MAX_IDLE)
+fn client_endpoint(edge_cert: CertificateDer<'static>, edge_addr: SocketAddr) -> Result<Endpoint, BoxError> {
+    client_endpoint_with(edge_cert, Some(AGENT_KEEPALIVE), AGENT_MAX_IDLE, edge_addr)
+}
+
+/// The wildcard address of `peer`'s own family, port 0: a socket bound to
+/// `0.0.0.0` cannot reach an IPv6 peer (and `resolve_addr` may well return one
+/// for a hostname), so every socket that talks to a configured peer binds this.
+pub(crate) fn unspecified_for(peer: SocketAddr) -> SocketAddr {
+    match peer {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
+    }
 }
 
 /// Build the `quinn::ClientConfig` trusting `edge_cert`, applying a
@@ -176,10 +186,11 @@ fn client_endpoint_with(
     edge_cert: CertificateDer<'static>,
     keep_alive: Option<Duration>,
     max_idle: Duration,
+    edge_addr: SocketAddr,
 ) -> Result<Endpoint, BoxError> {
     let cfg = quic_client_config(edge_cert, keep_alive, max_idle)?;
     // Bind all interfaces (not loopback) so the Agent can reach a non-local Edge.
-    let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
+    let mut endpoint = Endpoint::client(unspecified_for(edge_addr))?;
     endpoint.set_default_client_config(cfg);
     Ok(endpoint)
 }
@@ -197,7 +208,7 @@ pub async fn dial_quic(
     edge_addr: SocketAddr,
     edge_cert: CertificateDer<'static>,
 ) -> Result<Connection, BoxError> {
-    let endpoint = client_endpoint(edge_cert)?;
+    let endpoint = client_endpoint(edge_cert, edge_addr)?;
     let conn = endpoint.connect(edge_addr, "localhost")?.await?;
     Ok(conn)
 }
@@ -1804,7 +1815,7 @@ mod tests {
 
         // Client with a keepalive shorter than the server's idle timeout.
         let ep =
-            client_endpoint_with(cert, Some(Duration::from_millis(300)), Duration::from_secs(30))
+            client_endpoint_with(cert, Some(Duration::from_millis(300)), Duration::from_secs(30), addr)
                 .unwrap();
         let conn = ep.connect(addr, "localhost").unwrap().await.unwrap();
 

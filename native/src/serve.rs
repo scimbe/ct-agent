@@ -1670,7 +1670,7 @@ where
     send.flush().await?;
     let transport = hs.into_transport_mode()?;
 
-    let udp = UdpSocket::bind("0.0.0.0:0").await?;
+    let udp = UdpSocket::bind(crate::transport::unspecified_for(origin)).await?;
     udp.connect(origin).await?;
 
     // Locked with ct_common's poison-tolerant `lock_safe` (ct-agent#176): a panic

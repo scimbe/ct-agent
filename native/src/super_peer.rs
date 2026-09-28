@@ -113,7 +113,17 @@ async fn run_with_cap(listen: SocketAddr, upstream: SocketAddr, max_clients: usi
 
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
-        let (n, from) = front.recv_from(&mut buf).await?;
+        let (n, from) = match front.recv_from(&mut buf).await {
+            Ok(r) => r,
+            // Windows reports an earlier send's ICMP port-unreachable as a
+            // ConnectionReset on the NEXT recv of an unconnected UDP socket: one
+            // LAN client going away must not end the relay for every other one.
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused) => {
+                eprintln!("ct-agent super-peer: ignoring a per-peer receive error on {listen}: {e}");
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         let upstream_sock = {
             let mut locked = clients.lock().await;
             if let Some(entry) = locked.get(&from) {
@@ -132,7 +142,7 @@ async fn run_with_cap(listen: SocketAddr, upstream: SocketAddr, max_clients: usi
             } else {
                 // First datagram from this local client: open its dedicated upstream socket
                 // and spawn the upstream->local return-path forwarder for it.
-                let sock = match UdpSocket::bind(("0.0.0.0", 0)).await {
+                let sock = match UdpSocket::bind(crate::transport::unspecified_for(upstream)).await {
                     Ok(s) => Arc::new(s),
                     Err(e) => {
                         eprintln!("ct-agent super-peer: failed to open an upstream socket for {from}: {e}");
@@ -227,6 +237,35 @@ mod tests {
             .expect("reply within timeout")
             .unwrap();
         assert_eq!(&buf[..n], b"hello from the LAN", "the edge's echo round-trips through the relay unmodified");
+    }
+
+    #[tokio::test]
+    async fn relays_to_an_ipv6_upstream() {
+        // The per-client upstream socket must match the upstream's family: a 0.0.0.0
+        // socket cannot send to [::1].
+        let Ok(edge) = TokioUdp::bind("[::1]:0").await else { return }; // host without IPv6
+        let edge_addr = edge.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            loop {
+                let Ok((n, from)) = edge.recv_from(&mut buf).await else { return };
+                let _ = edge.send_to(&buf[..n], from).await;
+            }
+        });
+        let relay_bind = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_bind.local_addr().unwrap();
+        drop(relay_bind);
+        tokio::spawn(run(relay_addr, edge_addr));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"v6 upstream", relay_addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("reply within timeout")
+            .unwrap();
+        assert_eq!(&buf[..n], b"v6 upstream");
     }
 
     #[tokio::test]
