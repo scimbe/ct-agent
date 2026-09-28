@@ -347,18 +347,24 @@ where
     let mut tls = match terminator.acceptor().accept(client).await {
         Ok(tls) => tls,
         Err(e) => {
-            eprintln!("ct-agent: origin TLS terminate: handshake failed: {e}");
+            if crate::events::allow("origin_tls_handshake_failed").is_some() {
+                eprintln!("ct-agent: origin TLS terminate: handshake failed: {e}");
+            }
             return Err(format!("origin TLS terminate: handshake failed: {e}").into());
         }
     };
     let sni = tls.get_ref().1.server_name().map(str::to_string);
-    crate::events::emit(crate::events::ORIGIN_TLS_TERMINATED, serde_json::json!({ "sni": sni }));
+    crate::events::emit_limited(crate::events::ORIGIN_TLS_TERMINATED, serde_json::json!({ "sni": sni }));
     // scimbe/ct-agent#214: the owner-auth preamble, before a single byte reaches sshd. A refusal
     // is logged once and the stream dropped; the Origin is never dialed for it.
     if let crate::ssh_owner::OwnerAuth::Required(key) = terminator.owner_auth() {
         if let Err(e) = crate::ssh_owner::server_handshake(&mut tls, key).await {
-            eprintln!("ct-agent: origin TLS terminate: {e}; stream refused (#214)");
-            crate::events::emit(crate::events::SSH_OWNER_AUTH_REFUSED, serde_json::json!({ "sni": sni, "error": e }));
+            if crate::events::emit_limited(
+                crate::events::SSH_OWNER_AUTH_REFUSED,
+                serde_json::json!({ "sni": sni, "error": e }),
+            ) {
+                eprintln!("ct-agent: origin TLS terminate: {e}; stream refused (#214)");
+            }
             return Err(format!("origin TLS terminate: {e}").into());
         }
     }
@@ -1465,8 +1471,9 @@ fn check_direct_token(
     };
     let decision = policy.decide(&parse_direct_handshake_payload(payload));
     if let Some(line) = decision.refusal_line() {
-        eprintln!("{line}");
-        crate::events::emit(crate::events::DIRECT_REFUSED, serde_json::json!({ "reason": line }));
+        if crate::events::emit_limited(crate::events::DIRECT_REFUSED, serde_json::json!({ "reason": line })) {
+            eprintln!("{line}");
+        }
         return Err(DirectConnectRefused(decision));
     }
     if decision == DirectTokenDecision::ServeLegacy && policy.debug {
