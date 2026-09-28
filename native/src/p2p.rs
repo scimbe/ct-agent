@@ -54,7 +54,10 @@
 //! two-node put/get is exercised by the cargo gate; the real cross-host DHT bootstrap (a
 //! central node seeded as the bootstrap peer) is a **live** step, not the cargo gate.
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use crate::task_guard::{LiveGauge, TaskGuard, TASKS_LIVE};
 
 #[cfg(test)]
 use ct_common::channel::{
@@ -1275,13 +1278,16 @@ pub async fn connected_dcutr_stream_pair() -> Result<(P2pDuplex, P2pDuplex), Box
     // Client A reserves + accepts inbound substreams — via the production reserve/accept primitive
     // (#136 N136.1), extracted so the LIVE relay-only agent can call the identical logic against a
     // REAL relay. Awaiting it gates B's dial on A's reservation being live end to end.
-    let inbound_rx = dcutr_reserve_and_accept(client_a, relay_circuit).await?;
+    let (a_driver, inbound_rx) = dcutr_reserve_and_accept(client_a, relay_circuit).await?;
+    // The fixture's streams outlive this function; its swarms run for the test's lifetime.
+    a_driver.detach();
 
     // Client B dials A **through the relay** and opens the substream — via the production dialer
     // primitive (#136 N136.1), extracted so the LIVE agent path can call the identical logic
     // against a REAL relay instead of this in-process one.
     let client_b = build_dcutr_relay_client_swarm()?;
-    let dialer_stream = dcutr_dial_via_relay(client_b, a_via_relay, a_peer).await?;
+    let (b_driver, dialer_stream) = dcutr_dial_via_relay(client_b, a_via_relay, a_peer).await?;
+    b_driver.detach();
     let listener_stream = inbound_rx.await?;
     Ok((dialer_stream, listener_stream))
 }
@@ -1296,10 +1302,32 @@ pub async fn connected_dcutr_stream_pair() -> Result<(P2pDuplex, P2pDuplex), Box
 /// uses the identical logic against the real edge relay. Callers layer
 /// [`crate::a2a::establish_direct_over_duplex`] on top for auth + encryption (invariant #2); the
 /// `PeerId` only names/routes the hop, never authorizes (invariant #1).
+///
+/// Returns the swarm driver's [`TaskGuard`] with the receiver: the swarm must keep running
+/// while the delivered stream is in use (it carries the circuit and the DCUtR upgrade), and
+/// must stop once the caller is done with it. Hold the guard for the session's lifetime.
+/// The reservation wait is bounded by [`DCUTR_SETUP_TIMEOUT`]; on any error the driver is
+/// aborted with the dropped guard.
 pub(crate) async fn dcutr_reserve_and_accept(
+    client: Swarm<DcutrRelayClientBehaviour>,
+    relay_circuit: Multiaddr,
+) -> Result<(TaskGuard<()>, tokio::sync::oneshot::Receiver<P2pDuplex>), BoxError> {
+    dcutr_reserve_and_accept_on(&TASKS_LIVE, client, relay_circuit, DCUTR_SETUP_TIMEOUT).await
+}
+
+/// How long [`dcutr_reserve_and_accept`] waits for the relay to accept the reservation and
+/// [`dcutr_dial_via_relay`] for the channel stream to open. Both used to wait forever: a
+/// refused reservation or a dial that never reaches the target surfaces in this libp2p
+/// version only as a generic connection error, which the driver just logs.
+pub(crate) const DCUTR_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// [`dcutr_reserve_and_accept`] counted on `gauge`, with the setup bound as a parameter (tests).
+async fn dcutr_reserve_and_accept_on(
+    gauge: &'static LiveGauge,
     mut client: Swarm<DcutrRelayClientBehaviour>,
     relay_circuit: Multiaddr,
-) -> Result<tokio::sync::oneshot::Receiver<P2pDuplex>, BoxError> {
+    setup_timeout: Duration,
+) -> Result<(TaskGuard<()>, tokio::sync::oneshot::Receiver<P2pDuplex>), BoxError> {
     let mut incoming = client.behaviour().stream.new_control().accept(CT_CHANNEL_PROTOCOL)?;
     // #136: offer direct TCP+QUIC candidates so DCUtR can punch (else only the relay leg exists).
     add_direct_punch_listeners(&mut client)?;
@@ -1307,7 +1335,7 @@ pub(crate) async fn dcutr_reserve_and_accept(
     let (reserved_tx, reserved_rx) = tokio::sync::oneshot::channel();
     let (inbound_tx, inbound_rx) = tokio::sync::oneshot::channel();
     let dbg = crate::channel_run::debug_timing_enabled();
-    tokio::spawn(async move {
+    let driver = gauge.spawn(async move {
         let mut reserved_tx = Some(reserved_tx);
         let mut inbound_tx = Some(inbound_tx);
         loop {
@@ -1356,10 +1384,11 @@ pub(crate) async fn dcutr_reserve_and_accept(
             }
         }
     });
-    reserved_rx
-        .await
-        .map_err(|_| "client driver ended before its relay reservation was accepted")?;
-    Ok(inbound_rx)
+    match tokio::time::timeout(setup_timeout, reserved_rx).await {
+        Ok(Ok(())) => Ok((driver, inbound_rx)),
+        Ok(Err(_)) => Err("client driver ended before its relay reservation was accepted".into()),
+        Err(_) => Err(format!("relay reservation not accepted within {setup_timeout:?}").into()),
+    }
 }
 
 /// Dial a DCUtR-enabled peer **through a Circuit-Relay v2 relay** and open the `/ct/channel/1.0.0`
@@ -1375,11 +1404,26 @@ pub(crate) async fn dcutr_reserve_and_accept(
 /// per central's decision) instead of only in tests. Callers layer
 /// [`crate::a2a::establish_direct_over_duplex`] on top for auth + encryption (invariant #2); no
 /// `PeerId` is ever an authorization input (invariant #1) — it only names the dial/route target.
+///
+/// Returns the swarm driver's [`TaskGuard`] with the stream (see [`dcutr_reserve_and_accept`]:
+/// hold it for as long as the stream is used). Opening the stream is bounded by
+/// [`DCUTR_SETUP_TIMEOUT`].
 pub(crate) async fn dcutr_dial_via_relay(
+    client: Swarm<DcutrRelayClientBehaviour>,
+    peer_via_relay: Multiaddr,
+    target_peer: libp2p::PeerId,
+) -> Result<(TaskGuard<()>, P2pDuplex), BoxError> {
+    dcutr_dial_via_relay_on(&TASKS_LIVE, client, peer_via_relay, target_peer, DCUTR_SETUP_TIMEOUT).await
+}
+
+/// [`dcutr_dial_via_relay`] counted on `gauge`, with the setup bound as a parameter (tests).
+async fn dcutr_dial_via_relay_on(
+    gauge: &'static LiveGauge,
     mut client: Swarm<DcutrRelayClientBehaviour>,
     peer_via_relay: Multiaddr,
     target_peer: libp2p::PeerId,
-) -> Result<P2pDuplex, BoxError> {
+    setup_timeout: Duration,
+) -> Result<(TaskGuard<()>, P2pDuplex), BoxError> {
     let mut control = client.behaviour().stream.new_control();
     // #136: offer direct TCP+QUIC candidates so DCUtR can punch (else only the relay leg exists).
     add_direct_punch_listeners(&mut client)?;
@@ -1391,7 +1435,7 @@ pub(crate) async fn dcutr_dial_via_relay(
     if dbg {
         eprintln!("ct-agent channel: debug dcutr_dial_via_relay dialing {peer_via_relay} toward target {target_peer}");
     }
-    tokio::spawn(async move {
+    let driver = gauge.spawn(async move {
         if let Err(e) = client.dial(peer_via_relay) {
             eprintln!("ct-agent channel: dcutr_dial_via_relay dial failed to even start: {e}");
             return;
@@ -1461,7 +1505,11 @@ pub(crate) async fn dcutr_dial_via_relay(
             }
         }
     });
-    Ok(outbound_rx.await?.compat())
+    match tokio::time::timeout(setup_timeout, outbound_rx).await {
+        Ok(Ok(stream)) => Ok((driver, stream.compat())),
+        Ok(Err(_)) => Err(format!("channel stream to {target_peer} did not open through the relay").into()),
+        Err(_) => Err(format!("channel stream to {target_peer} not open within {setup_timeout:?}").into()),
+    }
 }
 
 /// **#136 N136.3 relay-pinning guard** — validate the peer-conveyed DCUtR upgrade address before the
@@ -1644,7 +1692,8 @@ where
             // DCUtR stream (from the responder's dial) arrives on `inbound_rx` later.
             let own_peer = *client.local_peer_id();
             let advertise = circuit_relay.clone().with(Protocol::P2p(own_peer)).to_string();
-            let inbound_rx = dcutr_reserve_and_accept(client, circuit_relay).await?;
+            // The swarm (relay reservation, circuit, DCUtR) runs until this session ends.
+            let (_swarm_driver, inbound_rx) = dcutr_reserve_and_accept(client, circuit_relay).await?;
             let coord = UpgradeCoordinator::with_backoff(Role::Initiator, 0, 1, 100);
             run_upgradable_session_initiator(
                 relay_send,
@@ -1667,6 +1716,11 @@ where
         }
         crate::channel_run::ChannelRole::Accept => {
             let coord = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
+            // The dial happens inside the upgrade closure, but its swarm must outlive the
+            // closure (it carries the direct stream the session goes on to use) and stop with
+            // the session: the closure parks the driver here.
+            let dial_driver: Arc<std::sync::Mutex<Option<TaskGuard<()>>>> = Arc::default();
+            let driver_slot = Arc::clone(&dial_driver);
             // ct-agent#11 (follow-up to CADS-Tunnel#416): the VERIFIED responder. The
             // unverified one accepts a session from any peer that completes a valid
             // Noise_IK handshake -- a real, unregistered peer, not merely an impostor
@@ -1695,7 +1749,11 @@ where
                     // Relay-pin the peer-conveyed circuit address, then dial the target through it.
                     let target = dcutr_upgrade_target(&ep, &circuit_relay)?;
                     let addr: Multiaddr = ep.parse().ok()?;
-                    let stream = dcutr_dial_via_relay(client, addr, target).await.ok()?;
+                    let (driver, stream) = dcutr_dial_via_relay(client, addr, target).await.ok()?;
+                    {
+                        use ct_common::sync::MutexExt;
+                        *driver_slot.lock_safe() = Some(driver);
+                    }
                     ct_common::a2a::establish_direct_over_duplex(stream, true, &direct_priv, &expected_peer)
                         .await
                         .ok()
@@ -2317,6 +2375,104 @@ mod tests {
         // No reflexive discovered (e.g. the edge's 'W' echo query failed/timed out) -> no
         // candidates at all, not a fallback to some other (wrong) address.
         assert!(relay_gate_reflexive_candidates(None).is_empty());
+    }
+
+    /// Wait (bounded) for `gauge` to fall to `want`: an aborted task drops its live ticket
+    /// only once the runtime has processed the abort.
+    async fn gauge_settles_at(gauge: &'static LiveGauge, want: u64) -> bool {
+        for _ in 0..100 {
+            if gauge.get() == want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        gauge.get() == want
+    }
+
+    /// An in-process Circuit-Relay v2 node on loopback, driven for the test's lifetime.
+    async fn loopback_relay() -> (Multiaddr, libp2p::PeerId) {
+        let mut relay = build_relay_swarm().unwrap();
+        let relay_peer = *relay.local_peer_id();
+        relay.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        let relay_addr: Multiaddr = loop {
+            if let Some(SwarmEvent::NewListenAddr { address, .. }) = relay.next().await {
+                break address;
+            }
+        };
+        relay.add_external_address(relay_addr.clone());
+        tokio::spawn(async move {
+            loop {
+                relay.next().await;
+            }
+        });
+        (relay_addr, relay_peer)
+    }
+
+    #[tokio::test]
+    async fn dcutr_swarm_drivers_live_exactly_as_long_as_their_guards() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        static GAUGE: LiveGauge = LiveGauge::new();
+        let (relay_addr, relay_peer) = loopback_relay().await;
+        let relay_circuit = relay_addr.with(Protocol::P2p(relay_peer)).with(Protocol::P2pCircuit);
+
+        let client_a = build_dcutr_relay_client_swarm().unwrap();
+        let a_peer = *client_a.local_peer_id();
+        let a_via_relay = relay_circuit.clone().with(Protocol::P2p(a_peer));
+        let (a_driver, inbound_rx) =
+            dcutr_reserve_and_accept_on(&GAUGE, client_a, relay_circuit, Duration::from_secs(10)).await.unwrap();
+        let client_b = build_dcutr_relay_client_swarm().unwrap();
+        let (b_driver, mut dialer) =
+            dcutr_dial_via_relay_on(&GAUGE, client_b, a_via_relay, a_peer, Duration::from_secs(10)).await.unwrap();
+        let mut listener = tokio::time::timeout(Duration::from_secs(10), inbound_rx).await.unwrap().unwrap();
+        assert_eq!(GAUGE.get(), 2, "both swarms are driven while the session holds their guards");
+
+        // The streams work while the guards are held.
+        dialer.write_all(b"ping").await.unwrap();
+        dialer.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), listener.read_exact(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf, b"ping");
+
+        // Session over: before the fix both drivers ran forever (plus their listeners and the
+        // relay connection); now they end with their guards.
+        drop(a_driver);
+        drop(b_driver);
+        assert!(gauge_settles_at(&GAUGE, 0).await, "a swarm driver outlived its session: {}", GAUGE.get());
+    }
+
+    #[tokio::test]
+    async fn a_relay_reservation_that_is_never_accepted_times_out_and_leaves_no_task() {
+        static GAUGE: LiveGauge = LiveGauge::new();
+        // A relay nobody listens on: the reservation can never be accepted.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let nobody = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
+        let relay_circuit: Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", closed.port())
+            .parse::<Multiaddr>()
+            .unwrap()
+            .with(Protocol::P2p(nobody))
+            .with(Protocol::P2pCircuit);
+        let client = build_dcutr_relay_client_swarm().unwrap();
+        let start = std::time::Instant::now();
+        let e = dcutr_reserve_and_accept_on(&GAUGE, client, relay_circuit, Duration::from_millis(500))
+            .await
+            .expect_err("no relay, no reservation");
+        assert!(start.elapsed() < Duration::from_secs(5), "bounded, not a hang ({e})");
+        assert!(gauge_settles_at(&GAUGE, 0).await, "the driver of a failed reservation is gone");
+    }
+
+    #[tokio::test]
+    async fn a_relayed_dial_that_never_reaches_its_target_times_out_and_leaves_no_task() {
+        static GAUGE: LiveGauge = LiveGauge::new();
+        // A real relay, but the target never reserved on it: the circuit can't form.
+        let (relay_addr, relay_peer) = loopback_relay().await;
+        let nobody = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
+        let via = relay_addr.with(Protocol::P2p(relay_peer)).with(Protocol::P2pCircuit).with(Protocol::P2p(nobody));
+        let client = build_dcutr_relay_client_swarm().unwrap();
+        let start = std::time::Instant::now();
+        let r = dcutr_dial_via_relay_on(&GAUGE, client, via, nobody, Duration::from_millis(500)).await;
+        assert!(r.is_err(), "no target, no stream");
+        assert!(start.elapsed() < Duration::from_secs(5), "bounded, not a hang");
+        assert!(gauge_settles_at(&GAUGE, 0).await, "the driver of a failed dial is gone");
     }
 
     #[tokio::test]
