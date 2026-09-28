@@ -3,7 +3,7 @@
 //! for their Type/Length/Context-ID fields.
 //!
 //! Production copy of the same framing this codebase already proved twice (ct-agent
-//! `spike-masque-h2/`, ADR-0024 M1; CADS-Tunnel `crates/masque-proxy`, M2) -- see
+//! ADR-0024 M1 spike, since removed; CADS-Tunnel `crates/masque-proxy`, M2) -- see
 //! CADS-Tunnel's `docs/adr/0024-masque-connect-udp-fallback.md` for the design.
 //!
 //! ct-agent#176: nothing in this module panics. An out-of-range value on the encode

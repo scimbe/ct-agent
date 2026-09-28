@@ -34,14 +34,13 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 // paths as before; `pub` now where some were `pub(crate)`/private, which only widens.
 // ---------------------------------------------------------------------------------------
 pub use ct_common::channel_wire::{
-    decode_hex_32, decode_hex_64, decode_refusal_category, error_names_park_expiry, is_refusal_token_shape,
-    parse_channel_ack, quic_park_expired_marker, ChannelJoinOutcome, DroppedLegBeforeAck, CHANNEL_ACK_MAX_BYTES,
-    PHASE_MARKER_RELAY, PHASE_MARKER_RENDEZVOUS, PHASE_PREAMBLE_MAGIC, POSSESSION_CHALLENGE_LEN,
-    REFUSAL_CATEGORY_MAX_LEN,
+    decode_hex_32, decode_refusal_category, error_names_park_expiry, ChannelJoinOutcome, PHASE_MARKER_RELAY,
+    PHASE_MARKER_RENDEZVOUS, REFUSAL_CATEGORY_MAX_LEN,
 };
+#[cfg(test)]
+pub(crate) use ct_common::channel_wire::PHASE_PREAMBLE_MAGIC;
 pub use ct_common::channel_wire::io::{
-    present_channel_join_on_stream, present_channel_relay_join_on_stream, read_refusal_tail_token,
-    ADMISSION_EXCHANGE_TIMEOUT, KA_PARK_INACTIVITY_BOUND, REFUSAL_TAIL_BOUND,
+    present_channel_join_on_stream, present_channel_relay_join_on_stream, ADMISSION_EXCHANGE_TIMEOUT,
 };
 pub use ct_common::channel_quic::{present_channel_join, present_channel_join_quic};
 
