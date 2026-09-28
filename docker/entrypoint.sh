@@ -13,8 +13,11 @@
 # to fix yet), so this never costs a new deployment anything.
 set -e
 
+# Only a directory the agent does not own yet is migrated: `/shared` may be a volume other
+# containers write too, and re-owning their files on every start would hand this uid their
+# secrets. Once the top is 65532 the migration has happened; files added later are left alone.
 for dir in "${CT_AGENT_STATE_DIR:-}" /shared; do
-    if [ -n "$dir" ] && [ -d "$dir" ]; then
+    if [ -n "$dir" ] && [ -d "$dir" ] && [ "$(stat -c %u "$dir")" != 65532 ]; then
         chown -R 65532:65532 "$dir" 2>/dev/null || true
     fi
 done

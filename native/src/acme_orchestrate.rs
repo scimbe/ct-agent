@@ -190,6 +190,8 @@ async fn notify_issuance_complete(http: &reqwest::Client, cp_url: &str, token: &
     note_legacy_route_in_use("acme-issuance-complete");
     let legacy_url = format!("{base}/agent/acme-issuance-complete/{token}/{hostname}");
     if let Err(e) = http.post(&legacy_url).timeout(ADMISSION_REQUEST_TIMEOUT).send().await {
+        // The legacy URL carries the routing token in its path: never let reqwest's Display print it.
+        let e = e.without_url();
         eprintln!("ct-agent: acme-issuance-complete callback failed (non-fatal, cert is already written): {e}");
     }
 }

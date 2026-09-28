@@ -142,7 +142,10 @@ async fn run_with_cap(listen: SocketAddr, upstream: SocketAddr, max_clients: usi
             } else {
                 // First datagram from this local client: open its dedicated upstream socket
                 // and spawn the upstream->local return-path forwarder for it.
-                let sock = match UdpSocket::bind(crate::transport::unspecified_for(upstream)).await {
+                // Connected to the upstream: the kernel then drops datagrams from any other
+                // source, so nobody who finds this ephemeral port can inject into the LAN client
+                // or keep its mapping alive.
+                let sock = match connected_upstream_socket(upstream).await {
                     Ok(s) => Arc::new(s),
                     Err(e) => {
                         eprintln!("ct-agent super-peer: failed to open an upstream socket for {from}: {e}");
@@ -155,10 +158,16 @@ async fn run_with_cap(listen: SocketAddr, upstream: SocketAddr, max_clients: usi
                 sock
             }
         };
-        if let Err(e) = upstream_sock.send_to(&buf[..n], upstream).await {
+        if let Err(e) = upstream_sock.send(&buf[..n]).await {
             eprintln!("ct-agent super-peer: forward to upstream failed for {from}: {e}");
         }
     }
+}
+
+async fn connected_upstream_socket(upstream: SocketAddr) -> std::io::Result<UdpSocket> {
+    let sock = UdpSocket::bind(crate::transport::unspecified_for(upstream)).await?;
+    sock.connect(upstream).await?;
+    Ok(sock)
 }
 
 /// The upstream->local return path for one LAN client's dedicated socket: read whatever the
@@ -182,8 +191,8 @@ fn spawn_return_path(
     TaskGuard::spawn(async move {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         loop {
-            match tokio::time::timeout(IDLE_TIMEOUT, upstream_sock.recv_from(&mut buf)).await {
-                Ok(Ok((n, _upstream_peer))) => {
+            match tokio::time::timeout(IDLE_TIMEOUT, upstream_sock.recv(&mut buf)).await {
+                Ok(Ok(n)) => {
                     if let Err(e) = front.send_to(&buf[..n], client_addr).await {
                         eprintln!("ct-agent super-peer: forward to LAN client {client_addr} failed: {e}");
                         break;
@@ -205,6 +214,19 @@ fn spawn_return_path(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn the_upstream_socket_only_hears_the_upstream() {
+        // Anyone who finds a client's ephemeral upstream port must not be able to inject into it.
+        let edge = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let sock = connected_upstream_socket(edge.local_addr().unwrap()).await.unwrap();
+        let stranger = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        stranger.send_to(b"injected", sock.local_addr().unwrap()).await.unwrap();
+        edge.send_to(b"from-edge", sock.local_addr().unwrap()).await.unwrap();
+        let mut buf = [0u8; 32];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), sock.recv(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf[..n], b"from-edge", "the stranger's datagram was filtered by the kernel");
+    }
+
     use super::*;
     use tokio::net::UdpSocket as TokioUdp;
 

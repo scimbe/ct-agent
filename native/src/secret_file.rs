@@ -64,6 +64,17 @@ pub fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// over `path`, then `fsync` the directory. Writing `path` in place with `truncate` left an
 /// empty or half-written file behind on a crash -- for a rotated OIDC refresh token or the
 /// local-auth credential that is a manual re-login on an unattended host.
+/// `create_dir_all`, except that every directory it CREATES is `0700` (Unix): the state dir holds
+/// secrets, and whichever writer runs first must not leave it listable at the umask. Existing
+/// directories are left exactly as they are.
+pub fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)
+}
+
 fn replace_atomically(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     use std::io::Write;
     let tmp = temp_sibling(path);
@@ -117,6 +128,21 @@ pub fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn created_state_dirs_are_private_and_existing_ones_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("a").join("b");
+        create_private_dir_all(&nested).unwrap();
+        for d in [root.path().join("a"), nested.clone()] {
+            assert_eq!(std::fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700, "{d:?}");
+        }
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dir_all(root.path()).unwrap();
+        assert_eq!(std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o777, 0o755);
+    }
+
     use super::*;
 
     /// Same idiom as the #31 test this file absorbed: a per-process scratch dir, so no

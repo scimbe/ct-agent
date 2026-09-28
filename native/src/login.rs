@@ -376,7 +376,7 @@ fn token_store_path(f: impl Fn(&str) -> Option<String>) -> Result<PathBuf, Strin
 
 fn persist_stored_token(path: &Path, tok: &StoredToken) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::secret_file::create_private_dir_all(parent)?;
     }
     // StoredToken has no non-serializable fields (all String/Option<u64>), so this
     // cannot fail in practice; surfaced as an io error rather than a panic (ct-agent#176).
