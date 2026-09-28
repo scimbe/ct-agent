@@ -145,11 +145,6 @@ impl AgentStatus {
         self.inner.read_safe().reconnects
     }
 
-    /// Seconds since the last liveness observation, `None` before the first.
-    pub fn last_seen_secs_ago_at(&self, now: u64) -> Option<u64> {
-        self.inner.read_safe().last_seen.map(|t| now.saturating_sub(t))
-    }
-
     /// The `/status` document at `now` with the given process facts.
     pub fn snapshot_at(&self, now: u64, facts: &ProcessFacts) -> Value {
         let s = self.inner.read_safe().clone();

@@ -14,7 +14,6 @@ use std::time::Duration;
 
 use std::path::Path;
 
-use ct_common::credential::SignedCredential;
 use ct_common::RoutingToken;
 use quinn::{Connection, Endpoint};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -85,39 +84,6 @@ pub async fn advertise_direct_listener(
     } else {
         Err("direct-listener advertisement rejected".into())
     }
-}
-
-/// Transport the Agent uses to reach the Edge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Transport {
-    /// Primary: QUIC over UDP/443.
-    Quic,
-    /// Fallback when outbound UDP is blocked: HTTP/2 over TCP/443.
-    TcpFallback,
-}
-
-/// Select the transport given whether outbound UDP is reachable. QUIC is
-/// preferred; TCP fallback is used only when UDP is blocked (ADR-0004).
-pub fn select_transport(udp_reachable: bool) -> Transport {
-    if udp_reachable {
-        Transport::Quic
-    } else {
-        Transport::TcpFallback
-    }
-}
-
-/// Probe whether outbound QUIC/UDP to `edge` works (M12.1): attempt a QUIC
-/// handshake within `timeout`. Returns `true` if it connects — the input to
-/// [`select_transport`] (QUIC vs the TCP fallback when UDP is blocked).
-pub async fn probe_udp_reachable(
-    edge: SocketAddr,
-    edge_cert: CertificateDer<'static>,
-    timeout: Duration,
-) -> bool {
-    matches!(
-        tokio::time::timeout(timeout, dial_quic(edge, edge_cert)).await,
-        Ok(Ok(_))
-    )
 }
 
 pub(crate) fn install_crypto_provider() {
@@ -237,20 +203,6 @@ pub async fn dial_quic_or_blocked_error(
             edge_addr.port()
         )
         .into()),
-    }
-}
-
-/// Present `signed` to the Edge over a fresh bidirectional stream and await the
-/// Edge's decision. Returns `Ok(())` only if the Edge accepted the credential.
-pub async fn present_credential(
-    conn: &Connection,
-    signed: &SignedCredential,
-) -> Result<(), BoxError> {
-    let ack = quic_control_exchange(conn, &signed.encode(), 64, "credential", REGISTER_ACK_TIMEOUT).await?;
-    if ack == b"OK" {
-        Ok(())
-    } else {
-        Err("edge rejected credential".into())
     }
 }
 
@@ -859,11 +811,6 @@ pub fn load_cert(path: impl AsRef<Path>) -> std::io::Result<CertificateDer<'stat
 mod tests {
     use super::*;
 
-    #[test]
-    fn prefers_quic_when_udp_reachable() {
-        assert_eq!(select_transport(true), Transport::Quic);
-    }
-
     #[tokio::test]
     async fn apply_tcp_keepalive_actually_sets_the_socket_option() {
         // #229: a parked TLS-TCP fallback connection is otherwise a plain,
@@ -979,40 +926,6 @@ mod tests {
         assert_eq!(echoed, b"direct-hello", "direct listener accepts and echoes");
         conn.close(0u32.into(), b"done");
         let _ = srv.await;
-    }
-
-    #[test]
-    fn falls_back_to_tcp_when_udp_blocked() {
-        assert_eq!(select_transport(false), Transport::TcpFallback);
-    }
-
-    #[tokio::test]
-    async fn probe_reachable_edge_selects_quic() {
-        let (server, cert) =
-            ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
-        let addr = server.local_addr().expect("addr");
-        let accept = tokio::spawn(async move {
-            if let Some(inc) = server.accept().await {
-                let _ = inc.await;
-            }
-        });
-        let reachable = probe_udp_reachable(addr, cert, Duration::from_secs(2)).await;
-        assert!(reachable, "QUIC to a live edge is reachable");
-        assert_eq!(select_transport(reachable), Transport::Quic);
-        accept.abort();
-    }
-
-    #[tokio::test]
-    async fn probe_dead_udp_selects_tcp_fallback() {
-        // Nothing listening at this UDP address → probe times out.
-        let (_ep, cert) =
-            build_direct_listener_at((Ipv4Addr::LOCALHOST, 0).into()).expect("cert");
-        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let dead_addr = dead.local_addr().unwrap();
-        drop(dead);
-        let reachable = probe_udp_reachable(dead_addr, cert, Duration::from_millis(400)).await;
-        assert!(!reachable, "blocked UDP is not reachable");
-        assert_eq!(select_transport(reachable), Transport::TcpFallback);
     }
 
     #[tokio::test]
@@ -1902,74 +1815,6 @@ mod tests {
 
         conn.close(0u32.into(), b"done");
         server_task.await.expect("edge task join");
-    }
-
-    // --- P1.4d-ii: credential handshake over QUIC ---
-
-    use crate::identity::AgentIdentity;
-    use ct_common::{AgentId, TenantId};
-    use ct_control_plane::credential::CredentialIssuer;
-    use ct_control_plane::enrollment::Enrollment;
-    use ct_control_plane::issuance::mint_for_enrolled;
-
-    fn enrolled_credential(
-        expires_at: u64,
-    ) -> (ct_common::credential::SignedCredential, [u8; 32]) {
-        let issuer = CredentialIssuer::generate();
-        let mut enrollment = Enrollment::new();
-        let tenant = TenantId("tenant-1".into());
-        let token = enrollment.issue_join_token(tenant);
-        let identity = AgentIdentity::generate();
-        let agent_id = AgentId("agent-1".into());
-        enrollment
-            .redeem(&token, agent_id.clone(), identity.public_key_bytes())
-            .unwrap();
-        let signed = mint_for_enrolled(&issuer, &enrollment, &agent_id, expires_at).unwrap();
-        (signed, issuer.public_key_bytes())
-    }
-
-    #[tokio::test]
-    async fn agent_authenticates_to_edge_with_valid_credential() {
-        let (signed, issuer_pk) = enrolled_credential(1_000);
-        let (server, cert) =
-            ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
-        let addr = server.local_addr().expect("addr");
-
-        let server_task = tokio::spawn(async move {
-            let conn = ct_edge::auth::accept_and_authenticate(&server, &issuer_pk, 500)
-                .await
-                .map_err(|e| e.to_string())?;
-            conn.closed().await;
-            Ok::<(), String>(())
-        });
-
-        let conn = dial_quic(addr, cert).await.expect("dial");
-        present_credential(&conn, &signed)
-            .await
-            .expect("edge accepts valid credential");
-        conn.close(0u32.into(), b"done");
-        server_task.await.expect("join").expect("edge auth ok");
-    }
-
-    #[tokio::test]
-    async fn edge_rejects_expired_credential() {
-        let (signed, issuer_pk) = enrolled_credential(100); // expires at 100
-        let (server, cert) =
-            ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
-        let addr = server.local_addr().expect("addr");
-
-        let server_task = tokio::spawn(async move {
-            // now = 500 >= 100 → expired → Err
-            ct_edge::auth::accept_and_authenticate(&server, &issuer_pk, 500)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        });
-
-        let conn = dial_quic(addr, cert).await.expect("dial");
-        let result = present_credential(&conn, &signed).await;
-        assert!(result.is_err(), "expired credential must be rejected");
-        let _ = server_task.await;
     }
 
     #[tokio::test]

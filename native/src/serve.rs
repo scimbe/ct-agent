@@ -382,8 +382,8 @@ where
 /// timeout before a Client ever arrives, so the very first real request lands
 /// on an already-dead connection and never completes, even though the
 /// Client↔Edge TLS layer works perfectly every time. Since this relay only
-/// ever carries request/response protocols (HTTP, or the Noise handshake in
-/// [`serve_noise_bridge`]), the Client always speaks first, so waiting for
+/// ever carries request/response protocols (HTTP, or a Noise handshake), the
+/// Client always speaks first, so waiting for
 /// its first chunk before dialing costs nothing.
 ///
 /// scimbe/ct-agent#204: with a `terminator` (`CT_AGENT_ORIGIN_TLS=terminate`) and a
@@ -857,55 +857,6 @@ where
             writer.await
         }
     }
-}
-
-/// Serve one relayed stream as the Origin's Noise responder (M8.3): terminate
-/// the `Noise_IK` handshake with the Origin private key, then bridge one
-/// request/response to the local `origin` — decrypt the Client's frame, forward
-/// the plaintext to the Origin (TCP), read its reply, and return it encrypted.
-///
-/// Generic over the byte transport so it drives a QUIC stream in the live path
-/// (M8.4) and an in-memory duplex in tests. The Edge only ever relays the
-/// encrypted frames.
-pub async fn serve_noise_bridge<S, R>(
-    send: &mut S,
-    recv: &mut R,
-    origin: SocketAddr,
-    origin_private: &[u8; 32],
-) -> Result<(), BoxError>
-where
-    S: AsyncWrite + Unpin,
-    R: AsyncRead + Unpin,
-{
-    let mut hs = origin_handshake(origin_private)?;
-    let mut buf = vec![0u8; 65535];
-    let mut tmp = vec![0u8; 65535];
-
-    // <- handshake message 1, -> handshake message 2
-    let m1 = read_frame(recv).await?;
-    hs.read_message(&m1, &mut tmp)?;
-    let n = hs.write_message(&[], &mut buf)?;
-    send.write_all(&frame(&buf[..n])).await?;
-    send.flush().await?;
-
-    let mut transport = hs.into_transport_mode()?;
-
-    // Decrypt the Client's request and forward the plaintext to the Origin.
-    let req_ct = read_frame(recv).await?;
-    let n = transport.read_message(&req_ct, &mut tmp)?;
-    let request = tmp[..n].to_vec();
-
-    let mut tcp = connect_origin(origin).await?;
-    tcp.write_all(&request).await?;
-    tcp.shutdown().await?;
-    let mut response = Vec::new();
-    tcp.read_to_end(&mut response).await?;
-
-    // Encrypt the Origin's response back to the Client.
-    let n = transport.write_message(&response, &mut buf)?;
-    send.write_all(&frame(&buf[..n])).await?;
-    send.flush().await?;
-    Ok(())
 }
 
 /// Encrypt `plaintext` as one Noise frame and write it to `send` -- the one
@@ -3899,55 +3850,6 @@ mod tests {
 
         let echoed = edge.await.unwrap();
         assert_eq!(echoed, b"ping", "edge gets the origin's echo through the agent");
-        let _ = origin.await;
-    }
-
-    #[tokio::test]
-    async fn noise_bridge_decrypts_to_origin_and_reencrypts() {
-        use ct_common::noise::{client_handshake_for, frame, generate_static_keypair};
-        use ct_common::{Capability, OriginIdentity, RoutingToken};
-
-        // A real TCP echo Origin — it only ever sees plaintext.
-        let (origin_addr, origin) = echo_origin().await;
-
-        let origin_kp = generate_static_keypair();
-        let client_kp = generate_static_keypair();
-        let cap = Capability {
-            token: RoutingToken([0u8; 32]),
-            origin: OriginIdentity(origin_kp.public),
-            edge_addr: "edge:443".into(),
-        };
-
-        let (client_io, server_io) = tokio::io::duplex(8192);
-        let (mut c_read, mut c_write) = tokio::io::split(client_io);
-
-        // Agent-side responder bridge (the code under test).
-        let origin_priv = origin_kp.private;
-        let bridge = tokio::spawn(async move {
-            let (mut s_read, mut s_write) = tokio::io::split(server_io);
-            serve_noise_bridge(&mut s_write, &mut s_read, origin_addr, &origin_priv).await
-        });
-
-        // Inline Client initiator (mirrors ct-client::noise::client_noise_exchange).
-        let mut hs = client_handshake_for(&client_kp.private, &cap).expect("initiator");
-        let mut buf = vec![0u8; 65535];
-        let mut tmp = vec![0u8; 65535];
-        let n = hs.write_message(&[], &mut buf).unwrap();
-        c_write.write_all(&frame(&buf[..n])).await.unwrap();
-        let m2 = read_frame(&mut c_read).await.unwrap();
-        hs.read_message(&m2, &mut tmp).unwrap();
-        let mut transport = hs.into_transport_mode().unwrap();
-        let n = transport.write_message(b"secret-request", &mut buf).unwrap();
-        c_write.write_all(&frame(&buf[..n])).await.unwrap();
-        let resp_ct = read_frame(&mut c_read).await.unwrap();
-        let n = transport.read_message(&resp_ct, &mut tmp).unwrap();
-
-        assert_eq!(
-            &tmp[..n],
-            b"secret-request",
-            "agent decrypted to origin, origin echoed, agent re-encrypted"
-        );
-        bridge.await.unwrap().expect("bridge ok");
         let _ = origin.await;
     }
 

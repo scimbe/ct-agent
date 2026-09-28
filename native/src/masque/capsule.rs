@@ -4,7 +4,7 @@
 //! (unlike HTTP/3's QUIC DATAGRAM frame).
 //!
 //! Production copy of the same framing this codebase already proved twice (ct-agent
-//! `spike-masque-h2/`, ADR-0024 M1; CADS-Tunnel `crates/masque-proxy`, M2).
+//! ADR-0024 M1 spike, since removed; CADS-Tunnel `crates/masque-proxy`, M2).
 
 use super::varint;
 
