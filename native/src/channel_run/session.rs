@@ -169,6 +169,23 @@ pub(crate) async fn open_channel_streams(
     ct_common::channel_quic::open_channel_streams(conn, matches!(role, ChannelRole::Initiate), setup_timeout).await
 }
 
+/// The relay-leg twin of [`open_channel_streams`]: after `Admitted` the partner is paired, so the
+/// stream opens at once, and a live-but-silent relay would otherwise hold the session (and a serve
+/// slot) forever. Bounded by the same #139 limit; a timeout is reported as a *relay* stall, since
+/// ct_common's message names the direct leg.
+pub(crate) async fn open_relay_channel_streams(
+    relay_conn: &Connection,
+    role: ChannelRole,
+) -> io::Result<(quinn::SendStream, quinn::RecvStream)> {
+    open_channel_streams(relay_conn, role, DIRECT_STREAM_SETUP_TIMEOUT).await.map_err(|e| {
+        if e.kind() == io::ErrorKind::TimedOut {
+            io::Error::new(io::ErrorKind::TimedOut, "relay channel stream setup stalled after admission (#139)")
+        } else {
+            e
+        }
+    })
+}
+
 /// Run one side of an A2A channel session over the established `conn`, then pump
 /// `local` (the CLI's stdio, or any duplex) over the encrypted tunnel until either
 /// end closes (#72 AF4-session-wire). `role` selects initiator/responder;
