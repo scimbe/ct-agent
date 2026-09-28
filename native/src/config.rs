@@ -52,8 +52,10 @@ pub const DEFAULT_ACME_CERT_OUT_DIR: &str = "/shared/acme-cert";
 /// and forwards plaintext to `CT_AGENT_ORIGIN`. That is what `ct-agent ssh` (an OpenSSH
 /// ProxyCommand speaking SSH-over-TLS, like cloudflared's) connects to. In Gelb the Edge has
 /// already stripped TLS and the relayed bytes arrive plain -- the serve path sniffs the first
-/// bytes for a TLS ClientHello before terminating, so a Gelb deployment with this set on keeps
-/// working unchanged, and an HTTPS Origin behind a `passthrough` Agent is untouched.
+/// bytes for a TLS ClientHello before terminating. A plain stream is forwarded raw only with
+/// SSH owner auth explicitly off; with it on (the default, #214) a stream that never reached the
+/// Agent as TLS cannot run the preamble and is refused. An HTTPS Origin behind a `passthrough`
+/// Agent is untouched.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum OriginTls {
     /// Forward the stream verbatim; TLS (if any) terminates at the Origin. The default.
@@ -61,7 +63,7 @@ pub enum OriginTls {
     Passthrough,
     /// Terminate TLS at the Agent with this PEM certificate chain and private key, then forward
     /// the plaintext to the Origin. Only streams that begin with a TLS ClientHello are
-    /// terminated; anything else is still forwarded raw.
+    /// terminated; anything else is forwarded raw when owner auth is off, refused otherwise.
     Terminate {
         /// PEM certificate chain (`fullchain.pem`), leaf first.
         cert: PathBuf,
