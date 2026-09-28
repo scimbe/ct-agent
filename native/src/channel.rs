@@ -67,7 +67,7 @@ pub(crate) fn phase_marker_enabled() -> bool {
 /// disable the marker — unset, empty, or anything else keeps the default (on),
 /// so a typo can never silently drop the marker generation.
 pub(crate) fn phase_marker_enabled_from(v: Option<&str>) -> bool {
-    !matches!(v.map(str::trim), Some("off") | Some("0"))
+    crate::envflag::flag(v, true)
 }
 
 /// #495 2a: the ONE gate for sending a `[0xFF, phase]` preamble on a `:443` TLS
@@ -132,14 +132,15 @@ mod tests {
     }
 
     #[test]
-    fn phase_marker_switch_disables_only_on_explicit_off_or_zero() {
+    fn phase_marker_switch_disables_only_on_an_explicit_off_spelling() {
         // #495 measurement isolation: only the explicit opt-outs disable the marker —
         // unset/empty/typos keep the default ON, so the marker generation can never be
         // dropped by accident.
         assert!(phase_marker_enabled_from(None), "unset -> on");
         assert!(phase_marker_enabled_from(Some("")), "empty -> on");
         assert!(phase_marker_enabled_from(Some("on")), "explicit on -> on");
-        assert!(phase_marker_enabled_from(Some("false")), "unknown word -> on (no silent opt-out)");
+        assert!(phase_marker_enabled_from(Some("offf")), "a typo -> on (no silent opt-out)");
+        assert!(!phase_marker_enabled_from(Some("false")), "false -> disabled, as for every other flag");
         assert!(!phase_marker_enabled_from(Some("off")), "off -> disabled");
         assert!(!phase_marker_enabled_from(Some("0")), "0 -> disabled");
         assert!(!phase_marker_enabled_from(Some(" off ")), "trimmed -> disabled");

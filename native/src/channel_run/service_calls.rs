@@ -930,10 +930,7 @@ pub(crate) fn run_service_handler(
 /// empty, or anything else keeps the session mode, so a typo can never silently
 /// reintroduce the one-pairing-per-call cost this flip removes.
 pub(crate) fn call_persistent_enabled_from(v: Option<&str>) -> bool {
-    !matches!(
-        v.map(str::trim),
-        Some(s) if s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("no")
-    )
+    crate::envflag::flag(v, true)
 }
 
 /// ct-agent#94: the warning to print (if any) when `CT_CHANNEL_CALL_SERVICE` is in effect and
@@ -1643,12 +1640,9 @@ pub(crate) fn channel_local(peer: Option<[u8; 32]>) -> ChannelLocal {
         eprintln!("ct-agent channel: --call {method} (one MCP request over the channel, then exit)");
         return ChannelLocal::Serve(call_local(method, params));
     }
-    let serve = std::env::var("CT_CHANNEL_SERVE")
-        .map(|v| {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true")
-        })
-        .unwrap_or(false);
+    // The same reading as `should_serve_loop`: with `yes` there the process ran the serve
+    // loop while every session here fell back to a bare stdin/stdout pipe.
+    let serve = crate::envflag::env_flag("CT_CHANNEL_SERVE", false);
     if serve {
         // ct-agent#220: a streaming handler is an EXCLUSIVE mode for this session -- a raw,
         // unframed duplex can't be multiplexed with the MCP/JSON-RPC tool dispatch below on

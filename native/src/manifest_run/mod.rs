@@ -134,10 +134,7 @@ fn require_manifest_location(location: &str, allow_local_path: bool) -> Result<(
 
 /// `1`/`true`/`yes` (case-insensitive, trimmed) is set; anything else -- including unset -- is not.
 fn flag_set(v: Option<String>) -> bool {
-    matches!(
-        v.as_deref().map(str::trim),
-        Some(s) if s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
-    )
+    crate::envflag::flag(v.as_deref(), false)
 }
 
 /// Decode exactly 64 ASCII hex characters into 32 bytes.

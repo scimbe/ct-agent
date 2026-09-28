@@ -452,6 +452,19 @@ pub fn state_dir() -> Option<PathBuf> {
     state_dir_from(|k| std::env::var(k).ok())
 }
 
+/// `CT_AGENT_STATE_DIR` exactly as configured (trimmed), `None` when unset **or blank**
+/// -- with no `$HOME` fallback, for the callers whose behaviour depends on whether the
+/// operator configured one. A blank value (`${VAR:-}` in Compose) used to reach them as
+/// `Path::new("")`, i.e. the working directory, while [`state_dir`] went to `$HOME`.
+pub fn configured_state_dir() -> Option<String> {
+    configured_state_dir_from(|k| std::env::var(k).ok())
+}
+
+/// Pure core of [`configured_state_dir`].
+pub fn configured_state_dir_from(f: impl Fn(&str) -> Option<String>) -> Option<String> {
+    f("CT_AGENT_STATE_DIR").map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// Pure core of [`state_dir`]: `f` is the env lookup.
 pub fn state_dir_from(f: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     if let Some(dir) = f("CT_AGENT_STATE_DIR").filter(|s| !s.trim().is_empty()) {
@@ -480,6 +493,14 @@ pub fn ring_write_errors() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_blank_state_dir_is_treated_as_unset() {
+        let env = |v: &'static str| move |k: &str| (k == "CT_AGENT_STATE_DIR").then(|| v.to_string());
+        assert_eq!(configured_state_dir_from(env("")), None);
+        assert_eq!(configured_state_dir_from(env("   ")), None);
+        assert_eq!(configured_state_dir_from(env(" /var/lib/ct ")), Some("/var/lib/ct".to_string()));
+        assert_eq!(configured_state_dir_from(|_: &str| None), None);
+    }
     use super::*;
     use serde_json::json;
 
