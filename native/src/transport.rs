@@ -69,18 +69,17 @@ pub async fn advertise_direct_listener(
     addr: SocketAddr,
     cert: &CertificateDer<'_>,
 ) -> Result<(), BoxError> {
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(b"D").await?;
-    send.write_all(&token.0).await?;
     let a = addr.to_string();
     let ab = a.as_bytes();
-    send.write_all(&[ab.len() as u8]).await?;
-    send.write_all(ab).await?;
     let cb = cert.as_ref();
-    send.write_all(&(cb.len() as u16).to_be_bytes()).await?;
-    send.write_all(cb).await?;
-    send.finish()?;
-    let ack = recv.read_to_end(8).await?;
+    let mut msg = Vec::with_capacity(1 + 32 + 1 + ab.len() + 2 + cb.len());
+    msg.push(b'D');
+    msg.extend_from_slice(&token.0);
+    msg.push(ab.len() as u8);
+    msg.extend_from_slice(ab);
+    msg.extend_from_slice(&(cb.len() as u16).to_be_bytes());
+    msg.extend_from_slice(cb);
+    let ack = quic_control_exchange(conn, &msg, 8, "direct-listener advertisement", REGISTER_ACK_TIMEOUT).await?;
     if ack == b"OK" {
         Ok(())
     } else {
@@ -236,10 +235,7 @@ pub async fn present_credential(
     conn: &Connection,
     signed: &SignedCredential,
 ) -> Result<(), BoxError> {
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(&signed.encode()).await?;
-    send.finish()?;
-    let ack = recv.read_to_end(64).await?;
+    let ack = quic_control_exchange(conn, &signed.encode(), 64, "credential", REGISTER_ACK_TIMEOUT).await?;
     if ack == b"OK" {
         Ok(())
     } else {
@@ -300,12 +296,9 @@ pub fn is_registration_refusal(e: &BoxError) -> bool {
 /// untyped error, so only the Edge's literal refusal vocabulary is ever
 /// classified as a refusal.
 pub async fn register_tunnel(conn: &Connection, token: &RoutingToken) -> Result<(), BoxError> {
-    let (mut send, mut recv) = conn.open_bi().await?;
     let mut msg = vec![b'A'];
     msg.extend_from_slice(&token.0);
-    send.write_all(&msg).await?;
-    send.finish()?;
-    let ack = recv.read_to_end(8).await?;
+    let ack = quic_control_exchange(conn, &msg, 8, "tunnel registration", REGISTER_ACK_TIMEOUT).await?;
     if ack == b"OK" {
         Ok(())
     } else if ack.starts_with(b"NO") {
@@ -327,13 +320,12 @@ pub async fn bind_hostname(
     if hb.is_empty() || hb.len() > 253 {
         return Err("hostname length out of range (1..=253)".into());
     }
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(b"H").await?;
-    send.write_all(&token.0).await?;
-    send.write_all(&(hb.len() as u16).to_be_bytes()).await?;
-    send.write_all(hb).await?;
-    send.finish()?;
-    let ack = recv.read_to_end(8).await?;
+    let mut msg = Vec::with_capacity(1 + 32 + 2 + hb.len());
+    msg.push(b'H');
+    msg.extend_from_slice(&token.0);
+    msg.extend_from_slice(&(hb.len() as u16).to_be_bytes());
+    msg.extend_from_slice(hb);
+    let ack = quic_control_exchange(conn, &msg, 8, "hostname binding", REGISTER_ACK_TIMEOUT).await?;
     if ack == b"OK" {
         Ok(())
     } else {
@@ -408,6 +400,27 @@ where
 /// normally sub-second; 15s is generous headroom for a loaded edge or a slow
 /// path, while still being finite so the ladder can recover on its own.
 const REGISTER_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// One request/ack round trip on a fresh QUIC control stream, bounded by
+/// [`REGISTER_ACK_TIMEOUT`]. The agent's own QUIC keepalive keeps the connection
+/// alive, so an edge handler that stalls would otherwise never let the ack read
+/// return -- the same hang #589 fixed on the TCP path.
+async fn quic_control_exchange(
+    conn: &Connection,
+    msg: &[u8],
+    max_ack: usize,
+    what: &str,
+    bound: Duration,
+) -> Result<Vec<u8>, BoxError> {
+    tokio::time::timeout(bound, async {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send.write_all(msg).await?;
+        send.finish()?;
+        Ok::<Vec<u8>, BoxError>(recv.read_to_end(max_ack).await?)
+    })
+    .await
+    .map_err(|_| -> BoxError { format!("{what} ack timed out after {bound:?}").into() })?
+}
 
 /// Shared body of the `'A'`/`'K'` TCP-fallback registration: both roles have a
 /// byte-identical wire format (`role(1) | token(32)` → 2-byte `OK`/`NO` ack), so
@@ -1987,6 +2000,30 @@ mod tests {
         let loaded = load_cert(&path).expect("load");
         assert_eq!(loaded, cert, "agent loads the edge cert from the shared file");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_quic_control_ack_that_never_comes_times_out_instead_of_hanging() {
+        // The edge reads the request and then goes silent while the connection stays
+        // up (quinn keeps it alive): without a bound the ack read never returns.
+        let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let edge = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let (_send, mut recv) = conn.accept_bi().await.unwrap();
+            let _ = recv.read_to_end(8192).await.unwrap();
+            conn.closed().await;
+        });
+        let conn = dial_quic(addr, cert).await.expect("dial");
+        let bound = Duration::from_millis(300);
+        let start = std::time::Instant::now();
+        let e = quic_control_exchange(&conn, b"Axxxx", 8, "tunnel registration", bound)
+            .await
+            .expect_err("a silent edge must not hang the ack read");
+        assert!(e.to_string().contains("tunnel registration ack timed out"), "{e}");
+        assert!(start.elapsed() < Duration::from_secs(5), "returned at the bound, not later");
+        conn.close(0u32.into(), b"done");
+        let _ = edge.await;
     }
 
     // #20 TC3: a mock edge that reads one bi-stream request and replies with a
