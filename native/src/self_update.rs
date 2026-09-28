@@ -805,7 +805,9 @@ pub(crate) async fn perform_update_into(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("removing stale {tmp_path:?}: {e}")),
     }
-    std::fs::write(&tmp_path, &bytes).map_err(|e| format!("writing {tmp_path:?}: {e}"))?;
+    // Synced before the rename: a power loss must not leave a zero-length binary at the
+    // exe path, which the supervisor would then crash-loop on with no remote recovery.
+    crate::secret_file::write_durable(&tmp_path, &bytes).map_err(|e| format!("writing {tmp_path:?}: {e}"))?;
 
     #[cfg(unix)]
     {
@@ -813,6 +815,7 @@ pub(crate) async fn perform_update_into(
         std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("chmod {tmp_path:?}: {e}"))?;
         std::fs::rename(&tmp_path, current_exe).map_err(|e| format!("replacing {current_exe:?}: {e}"))?;
+        crate::secret_file::sync_parent_dir(current_exe).map_err(|e| format!("syncing {current_exe:?}: {e}"))?;
     }
     #[cfg(windows)]
     {
