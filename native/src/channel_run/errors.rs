@@ -19,11 +19,7 @@ use super::BoxError;
 /// which -- unlike the network-level reconnect loop -- were deterministic. Pure: the caller
 /// supplies the randomness (`rand::random::<f64>()` at the call sites, mirroring
 /// `serve.rs`'s existing convention for the reconnect loop's own jitter).
-pub(crate) fn equal_jitter(d: std::time::Duration, rand01: f64) -> std::time::Duration {
-    let half = d / 2;
-    let span = d - half;
-    half + span.mul_f64(rand01.clamp(0.0, 1.0))
-}
+pub(crate) use crate::reconnect::equal_jitter;
 
 /// #231: ceiling on the exponential backoff a persistent serve loop applies after consecutive
 /// **refused** (not transient) admission attempts — see [`serve_loop_concurrent`].

@@ -560,10 +560,7 @@ fn header_str(resp: &reqwest::Response, name: &str) -> Option<String> {
     resp.headers().get(name)?.to_str().ok().map(str::to_string)
 }
 
-fn base64_url(bytes: &[u8]) -> String {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    URL_SAFE_NO_PAD.encode(bytes)
-}
+use crate::codec::base64url as base64_url;
 
 #[cfg(test)]
 mod tests {

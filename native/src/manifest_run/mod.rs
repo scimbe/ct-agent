@@ -29,6 +29,7 @@
 //! semantics lives); and `plan` computes what `activate` WOULD do on this host -- backend, argv
 //! preview, compose hardening, every refusal -- without fetching a bundle or running anything.
 
+use crate::codec::hex_encode;
 use ed25519_dalek::SigningKey;
 use installer_engine::allowlist::TrustAllowlist;
 use installer_engine::{ActivateOptions, GuardrailPolicy, InstallReport, Plan, PlanOptions};
@@ -148,17 +149,7 @@ fn flag_set(v: Option<String>) -> bool {
 /// values (env vars, JSON) are attacker-influenceable. `manifest-core::hex` and
 /// `installer-engine::allowlist` apply the same discipline on their side of the boundary.
 fn hex32(s: &str) -> Option<[u8; 32]> {
-    let digits = s.trim().as_bytes();
-    if digits.len() != 64 || !digits.iter().all(u8::is_ascii_hexdigit) {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let hi = (digits[2 * i] as char).to_digit(16)?;
-        let lo = (digits[2 * i + 1] as char).to_digit(16)?;
-        *byte = (hi * 16 + lo) as u8;
-    }
-    Some(out)
+    crate::codec::hex_decode(s.trim())
 }
 
 /// A required env value: present and non-blank, or the `X required (…)` error.
@@ -545,15 +536,6 @@ async fn run_publish_to_registry<F: Fn(&str) -> Option<String>>(f: &F, registry_
     }
     eprintln!("published manifest {} to registry {registry_url}: {}", hex_encode(&manifest.manifest_id), text.trim());
     Ok(())
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 /// `ct-agent manifest activate`: env config for [`installer_engine::activate`].

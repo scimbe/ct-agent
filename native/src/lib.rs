@@ -25,6 +25,7 @@ pub mod acme_orchestrate;
 pub mod capability;
 pub mod channel;
 pub mod channel_run;
+pub mod codec;
 pub mod config;
 pub mod dns01_authoritative;
 pub mod dns01_propagation;

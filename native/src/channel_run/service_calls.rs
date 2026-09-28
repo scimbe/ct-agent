@@ -1202,14 +1202,7 @@ fn hex_prefix(id: &[u8; 32]) -> String {
 /// repeatedly on malformed hex input (a naive `s[i..i+2]` slice panics if a multi-byte UTF-8
 /// char straddles the boundary; chunking bytes first can't ever split one).
 pub(crate) fn decode_hex_32_bridge_peer(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
-    }
-    Some(out)
+    crate::codec::hex_decode(s)
 }
 
 /// ct-agent#178: every bridge tool is wrapped so ONE `bridge_call {tool, ok}` event is emitted

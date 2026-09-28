@@ -26,11 +26,11 @@
 //! plus the kind's own fields. `serde_json` is the only dependency; `tracing` is
 //! deliberately not pulled in for this.
 
+use crate::codec::now_unix;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use ct_common::sync::MutexExt;
 use serde_json::{Map, Value};
@@ -207,10 +207,6 @@ pub fn emit(kind: &'static str, fields: Value) {
 /// are rare) so a test or a re-exec sees the current environment.
 fn stderr_json() -> bool {
     std::env::var(LOG_FORMAT_ENV).map(|v| v.trim().eq_ignore_ascii_case("json")).unwrap_or(false)
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 // ---- process session + connection ids ---------------------------------------------

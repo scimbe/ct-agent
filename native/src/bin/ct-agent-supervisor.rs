@@ -395,14 +395,7 @@ fn is_valid_status_token(s: &str) -> bool {
 /// caller-supplied value of any length, not a timing-sensitive comparison itself since token
 /// length isn't secret.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    ct_agent::codec::ct_eq(a, b)
 }
 
 /// Checks the `Authorization: Bearer <token>` header against the configured status token

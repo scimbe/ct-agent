@@ -51,6 +51,7 @@
 //!      the actionable message. The first time the credential is found expired and
 //!      not refreshable, one structured line goes to stderr (once per process).
 
+use crate::codec::now_unix;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -156,10 +157,6 @@ fn device_auth_url(issuer: &str) -> String {
 /// `{issuer}/protocol/openid-connect/token` — same derivation as `device_auth_url`.
 fn token_url(issuer: &str) -> String {
     format!("{}/protocol/openid-connect/token", issuer.trim_end_matches('/'))
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// `POST {device_auth_url}`: `client_id` + `scope=openid`, per RFC 8628 §3.1. Public

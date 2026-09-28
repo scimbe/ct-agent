@@ -337,12 +337,7 @@ pub(crate) fn check_activation_marker(
 }
 
 fn hex32(b: &[u8; 32]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(64);
-    for byte in b {
-        let _ = write!(s, "{byte:02x}");
-    }
-    s
+    crate::codec::hex_encode(b)
 }
 
 #[cfg(test)]

@@ -1400,7 +1400,7 @@ impl DirectTokenPolicy {
 /// that gates the tunnel, so its comparison must not leak how many leading
 /// bytes a guess got right (`RoutingToken`'s derived `PartialEq` short-circuits).
 fn routing_token_eq_ct(a: &RoutingToken, b: &RoutingToken) -> bool {
-    a.0.iter().zip(b.0.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    crate::codec::ct_eq(&a.0, &b.0)
 }
 
 /// Apply `policy` to the payload the initiator put into Noise message 1 and

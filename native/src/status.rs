@@ -9,6 +9,7 @@
 //! test builds its own [`AgentStatus`] and its own facts and never touches the
 //! process-wide instance.
 
+use crate::codec::now_unix;
 use std::sync::RwLock;
 
 use ct_common::sync::RwLockExt;
@@ -230,13 +231,6 @@ impl Default for AgentStatus {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 // ---- process-wide convenience wrappers ------------------------------------------------
