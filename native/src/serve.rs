@@ -347,8 +347,11 @@ where
     let mut tls = match terminator.acceptor().accept(client).await {
         Ok(tls) => tls,
         Err(e) => {
-            if crate::events::allow("origin_tls_handshake_failed").is_some() {
-                eprintln!("ct-agent: origin TLS terminate: handshake failed: {e}");
+            // Throttled like the events below, but never blind: the next written line says how
+            // many were dropped, so an operator's own failure (the reason above) stays findable.
+            if let Some(suppressed) = crate::events::allow("origin_tls_handshake_failed") {
+                let dropped = if suppressed > 0 { format!(" ({suppressed} earlier ones not logged)") } else { String::new() };
+                eprintln!("ct-agent: origin TLS terminate: handshake failed: {e}{dropped}");
             }
             return Err(format!("origin TLS terminate: handshake failed: {e}").into());
         }

@@ -261,12 +261,19 @@ static BUDGETS: std::sync::Mutex<Option<std::collections::HashMap<&'static str, 
 /// Anyone who can reach a public hostname or the direct listener can trigger these lines
 /// once per connection; without a budget a connection flood rotates the event ring (the
 /// forensic history) within seconds and blocks runtime threads on its file I/O.
+///
+/// The budget is **global per key, not per peer**: none of the throttled events carries the
+/// remote address, so there is nothing to key a per-peer budget on. One peer can therefore
+/// use up a key's budget and hide a later, more interesting line of the same key for the rest
+/// of the window. Under load the counters on `/metrics` (always bumped, see [`emit_limited`])
+/// are the reliable record; the lines and the ring are a sample. A `suppressed` count is
+/// reported only with the next written line of the same key, so a flood that ends inside a
+/// window leaves its count unreported until that key fires again (or lost on restart).
 pub fn allow(key: &'static str) -> Option<u64> {
     allow_at(key, std::time::Instant::now())
 }
 
 fn allow_at(key: &'static str, now: std::time::Instant) -> Option<u64> {
-    use ct_common::sync::MutexExt;
     let mut guard = BUDGETS.lock_safe();
     let b = guard.get_or_insert_with(Default::default).entry(key).or_insert(Budget {
         window_start: now,
