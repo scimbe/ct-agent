@@ -93,9 +93,40 @@ impl Drop for StreamHandlerProcess {
         // so this can't block a drop. A handler that already exited on its own (e.g. on stdin
         // EOF, once the session tears down its send side) simply errors here, which is fine --
         // nothing left to kill.
+        // #183 parity: the handler runs in its own process group, so its pipeline and
+        // backgrounded grandchildren go with it. `id()` is None once the child was reaped,
+        // so a recycled pid is never signalled.
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
         let _ = self.child.start_kill();
     }
 }
+
+/// Agent secrets a handler never needs. Handlers run LLM CLIs on peer-controlled input,
+/// so anything left in their environment is one prompt injection away from the peer.
+const HANDLER_SECRET_ENV: &[&str] = &[
+    "CT_BOOTSTRAP",
+    "CT_AGENT_TOKEN",
+    "CT_AGENT_JOIN_TOKEN",
+    "CT_AGENT_MASQUE_TOKEN",
+    "CT_AGENT_ORIGIN_KEY",
+    "CT_AGENT_SSH_OWNER_KEY",
+    "CT_AGENT_SUPERVISOR_STATUS_TOKEN",
+    "CT_CHANNEL_HOLDER_KEY",
+    "CT_CHANNEL_NOISE_KEY",
+    "CT_CHANNEL_OPERATOR_KEY",
+    "CT_CP_EDGE_ADMIN_TOKEN",
+    "CT_DEBUG_DIRECT_TOKEN",
+    "CT_LOCAL_AUTH_PASSWORD",
+    "CT_MANIFEST_HOLDER_KEY",
+    "CT_MANIFEST_REGISTRY_WRITE_TOKEN",
+    "CT_OIDC_TOKEN",
+    "CT_RELAY_NODE_KEY",
+];
 
 impl AsyncRead for StreamHandlerProcess {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
@@ -123,14 +154,20 @@ impl AsyncWrite for StreamHandlerProcess {
 /// handler's bounded/prefixed forwarding; tightening this to match #105 is a reasonable
 /// follow-up, not required for a correct first cut).
 pub(crate) fn spawn_stream_handler(cmd: &str, service: &str) -> io::Result<StreamHandlerProcess> {
-    let mut child = tokio::process::Command::new("sh")
+    let mut command = tokio::process::Command::new("sh");
+    command
         .arg("-c")
         .arg(cmd)
         .env("CT_SERVICE_TYPE", service)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()?;
+        .stderr(std::process::Stdio::inherit());
+    for key in HANDLER_SECRET_ENV {
+        command.env_remove(key);
+    }
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn()?;
     // `.take()` on a freshly spawned `Child` whose stdin/stdout were both just requested as
     // `Stdio::piped()` above cannot actually be `None` -- but this crate's panic-free gate
     // (clippy::expect_used, native/src/lib.rs) forbids asserting that with `.expect()`, so a
@@ -731,6 +768,54 @@ pub(crate) fn run_service_handler_with_timeout(
 /// this path.
 pub(crate) const HANDLER_STDERR_PASSTHROUGH_MAX: usize = 64 * 1024;
 
+/// A JSON-RPC 2.0 internal-error response (-32603) carrying `request`'s id when it has one.
+pub(crate) fn jsonrpc_error_for(request: &[u8], message: &str) -> Vec<u8> {
+    let id = serde_json::from_slice::<serde_json::Value>(request)
+        .ok()
+        .and_then(|v| v.get("id").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32603, "message": message },
+    }))
+    .unwrap_or_default()
+}
+
+/// A handler result larger than one channel message can never be delivered.
+const HANDLER_STDOUT_MAX: usize = ct_common::a2a::MAX_MESSAGE_BYTES;
+/// How much of a handler's stderr is kept in memory (its tail); the forwarding and
+/// peer-facing renderings cut further.
+const HANDLER_STDERR_KEEP: usize = 1024 * 1024;
+
+/// Up to `cap` leading bytes of `r`, then drain the rest unbuffered.
+fn read_head(r: &mut impl std::io::Read, cap: usize) -> Vec<u8> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    let _ = r.by_ref().take(cap as u64).read_to_end(&mut head);
+    let _ = std::io::copy(r, &mut std::io::sink());
+    head
+}
+
+/// The last `cap` bytes of `r`, read to EOF in fixed-size chunks.
+fn read_tail(r: &mut impl std::io::Read, cap: usize) -> Vec<u8> {
+    let mut tail: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                tail.extend(&chunk[..n]);
+                let excess = tail.len().saturating_sub(cap);
+                tail.drain(..excess);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    tail.into()
+}
+
 /// [`run_service_handler_with_timeout`] with the diagnostic sink made explicit (ct-agent#105):
 /// everything the handler child wrote to its stderr is forwarded to `diag`, line by line,
 /// prefixed `service handler[<slug>] stderr: `, on BOTH the success and the non-zero-exit path.
@@ -764,6 +849,9 @@ pub(crate) fn run_service_handler_with_timeout_to(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for key in HANDLER_SECRET_ENV {
+        command.env_remove(key);
+    }
     // #183: put the child in its OWN process group (pgid == its pid) on Unix so the timeout
     // kill below can signal the WHOLE subtree, not just the immediate `sh -c`. The handler
     // scripts shell out to a real LLM CLI as a GRANDCHILD; killing only the `sh` pid leaves an
@@ -796,9 +884,19 @@ pub(crate) fn run_service_handler_with_timeout_to(
     // bounded: recv_timeout enforces SERVICE_HANDLER_TIMEOUT, and on timeout we kill the child by
     // pid (captured above, before ownership moved into the thread) so the still-running background
     // wait unblocks on its own rather than leaking a wedged process.
+    // Bounded instead of `wait_with_output`: a runaway handler must not grow this process
+    // without limit. stdout keeps its head (anything past the wire ceiling is an error
+    // anyway), stderr its tail; both pipes are drained to EOF so the child never blocks.
+    let mut stdout_pipe = child.stdout.take().ok_or("service handler: no stdout pipe")?;
+    let mut stderr_pipe = child.stderr.take().ok_or("service handler: no stderr pipe")?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
+        let out = std::thread::spawn(move || read_head(&mut stdout_pipe, HANDLER_STDOUT_MAX + 1));
+        let err = std::thread::spawn(move || read_tail(&mut stderr_pipe, HANDLER_STDERR_KEEP));
+        let status = child.wait();
+        let stdout = out.join().unwrap_or_default();
+        let stderr = err.join().unwrap_or_default();
+        let _ = tx.send(status.map(|status| std::process::Output { status, stdout, stderr }));
     });
     let output = match rx.recv_timeout(timeout) {
         Ok(result) => result.map_err(|e| format!("service handler wait failed: {e}"))?,
@@ -840,6 +938,11 @@ pub(crate) fn run_service_handler_with_timeout_to(
             "service handler exited {}: {}",
             output.status,
             peer_facing_stderr_tail(&output.stderr)
+        ));
+    }
+    if output.stdout.len() > HANDLER_STDOUT_MAX {
+        return Err(format!(
+            "service handler output exceeds {HANDLER_STDOUT_MAX} bytes (the channel message ceiling)"
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -898,21 +1001,28 @@ pub(crate) fn peer_facing_stderr_tail(stderr: &[u8]) -> String {
     if stderr.is_empty() {
         return String::new();
     }
-    let (tail, cut) = if stderr.len() > HANDLER_STDERR_PEER_TAIL_MAX {
-        (&stderr[stderr.len() - HANDLER_STDERR_PEER_TAIL_MAX..], true)
-    } else {
-        (stderr, false)
-    };
-    let text = redact_secrets(String::from_utf8_lossy(tail).trim_end());
-    if cut {
-        format!(
-            "[... {} bytes cut, last {HANDLER_STDERR_PEER_TAIL_MAX} shown] {text}",
-            stderr.len() - HANDLER_STDERR_PEER_TAIL_MAX
-        )
-    } else {
-        text
+    // Redact BEFORE cutting: a cut that lands between `api_key=` and its value would
+    // otherwise leave a bare value the keyword rules no longer recognise. The extra
+    // look-back gives the keyword of a value straddling the cut a chance to be seen.
+    let window_len = (HANDLER_STDERR_PEER_TAIL_MAX + HANDLER_STDERR_REDACT_LOOKBACK).min(stderr.len());
+    let window = &stderr[stderr.len() - window_len..];
+    let text = redact_secrets(String::from_utf8_lossy(window).trim_end());
+    if stderr.len() <= HANDLER_STDERR_PEER_TAIL_MAX {
+        return text;
     }
+    let mut start = text.len().saturating_sub(HANDLER_STDERR_PEER_TAIL_MAX);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!(
+        "[... {} bytes cut, last {HANDLER_STDERR_PEER_TAIL_MAX} shown] {}",
+        stderr.len() - HANDLER_STDERR_PEER_TAIL_MAX,
+        &text[start..]
+    )
 }
+
+/// How far before the peer-facing cut [`peer_facing_stderr_tail`] still redacts.
+const HANDLER_STDERR_REDACT_LOOKBACK: usize = 1024;
 
 /// [`run_service_handler_with_timeout`] bound to the real [`SERVICE_HANDLER_TIMEOUT`] — the seam
 /// every non-test call site uses.
@@ -1844,9 +1954,21 @@ pub(crate) fn channel_local(peer: Option<[u8; 32]>) -> ChannelLocal {
             // the async worker stays free to keep pumping bytes and servicing other
             // connections while the handler subprocess runs.
             async move {
-                tokio::task::spawn_blocking(move || registry.dispatch_ctx(&ctx, &req))
-                    .await
-                    .unwrap_or_default()
+                let req_for_error = req.clone();
+                match tokio::task::spawn_blocking(move || registry.dispatch_ctx(&ctx, &req)).await {
+                    // Past the wire ceiling `write_message` would reject the frame and end the
+                    // whole session with a bare EOF at the caller; answer this call instead.
+                    Ok(resp) if resp.len() > ct_common::a2a::MAX_MESSAGE_BYTES => jsonrpc_error_for(
+                        &req_for_error,
+                        &format!(
+                            "response of {} bytes exceeds the channel message ceiling ({} bytes)",
+                            resp.len(),
+                            ct_common::a2a::MAX_MESSAGE_BYTES
+                        ),
+                    ),
+                    Ok(resp) => resp,
+                    Err(_) => jsonrpc_error_for(&req_for_error, "tool handler panicked"),
+                }
             }
         }))
     } else {
