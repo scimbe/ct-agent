@@ -226,7 +226,26 @@ function Install-Direct {
   $asset = "ct-agent-windows-$($script:Arch).exe"
   $url = "$ReleaseBase/$asset"
   Log "downloading $asset"
-  Invoke-WebRequest -Uri $url -OutFile .\ct-agent.exe -UseBasicParsing
+  Invoke-WebRequest -Uri $url -OutFile .\ct-agent.exe.download -UseBasicParsing
+  # The binary must hash to its published .sha256 before it replaces anything. (The signed
+  # release manifest is verified by scripts/setup.sh and `ct-agent update`; Windows PowerShell
+  # has no built-in ed25519, so this path checks the checksum only.)
+  try {
+    $sumText = (Invoke-WebRequest -Uri "$url.sha256" -UseBasicParsing).Content
+    if ($sumText -is [byte[]]) { $sumText = [System.Text.Encoding]::ASCII.GetString($sumText) }
+  } catch {
+    Remove-Item .\ct-agent.exe.download -ErrorAction SilentlyContinue
+    Die "no $asset.sha256 at $ReleaseBase -- refusing to install an unverified binary"
+  }
+  $expected = (($sumText -split '\s+') | Where-Object { $_ } | Select-Object -First 1)
+  $actual = (Get-FileHash .\ct-agent.exe.download -Algorithm SHA256).Hash
+  if (-not $expected -or $expected -notmatch '^[0-9a-fA-F]{64}$' -or $actual -ne $expected.ToUpperInvariant()) {
+    Remove-Item .\ct-agent.exe.download -ErrorAction SilentlyContinue
+    Die "$asset does not match its .sha256 -- refusing to install it"
+  }
+  Move-Item -Force .\ct-agent.exe.download .\ct-agent.exe
+  Ok "checksum verified"
+  Warn "release signature not verified on Windows (checksum only)"
   Ok "ct-agent binary ready"
 
   $fresh = -not ((Test-Path $StateDir) -and (Get-ChildItem $StateDir -ErrorAction SilentlyContinue))
@@ -281,7 +300,7 @@ function Install-Docker {
   # TARGETOS/TARGETARCH build args are only auto-populated by buildx, and a
   # plain `docker build` leaves them empty, failing with "unsupported
   # TARGETARCH: " on every platform (#3).
-  docker buildx build --load -t ct-agent:local "https://github.com/scimbe/ct-agent.git#${latestTag}:docker"
+  docker buildx build --load -t ct-agent:local --build-arg "CT_AGENT_RELEASE=$latestTag" "https://github.com/scimbe/ct-agent.git#${latestTag}:docker"
   if ($LASTEXITCODE -ne 0) { Die "docker build failed" }
   Log "starting the container"
   docker rm -f ct-agent 2>$null | Out-Null

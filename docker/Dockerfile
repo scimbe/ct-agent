@@ -5,6 +5,11 @@
 # one is what an end customer's `scripts/setup.sh --docker` actually runs.
 #
 #   docker build -t ct-agent:local https://github.com/scimbe/ct-agent.git#main:docker
+#
+# The build context is this `docker/` directory (the `:docker` suffix above), so COPY paths are
+# relative to it. CT_AGENT_RELEASE pins the binary to a release tag (scripts/setup.sh passes the
+# tag it built the image from); the default `latest` takes the newest release. Either way the
+# binary is verified (checksum + signed release manifest) before it is installed.
 
 FROM ubuntu:24.04
 # Must match the glibc the release binaries are actually linked against: the
@@ -26,6 +31,9 @@ RUN apt-get update \
 # instead of `su`/`gosu`, both of which would need either a passwd entry or an
 # extra downloaded binary.
 RUN groupadd --gid 65532 ctagent
+
+ARG CT_AGENT_RELEASE=latest
+COPY verify-release.sh /usr/local/bin/verify-release.sh
 
 # Detect the platform via `uname` at RUN time rather than relying on the
 # `TARGETARCH`/`TARGETOS` build ARGs (#3): those are only auto-populated by
@@ -49,11 +57,18 @@ RUN arch="$(uname -m)" \
       linux) rel_os=linux ;; \
       *) echo "unsupported OS: ${os} (this image targets Linux containers)" >&2; exit 1 ;; \
     esac \
-    && curl -fsSL "https://github.com/scimbe/ct-agent/releases/latest/download/ct-agent-${rel_os}-${rel_arch}" \
-       -o /usr/local/bin/ct-agent \
-    && chmod +x /usr/local/bin/ct-agent
+    && case "${CT_AGENT_RELEASE}" in \
+      latest) base="https://github.com/scimbe/ct-agent/releases/latest/download" ;; \
+      v[0-9]*) base="https://github.com/scimbe/ct-agent/releases/download/${CT_AGENT_RELEASE}" ;; \
+      *) echo "CT_AGENT_RELEASE must be 'latest' or a vX.Y.Z tag, got: ${CT_AGENT_RELEASE}" >&2; exit 1 ;; \
+    esac \
+    && asset="ct-agent-${rel_os}-${rel_arch}" \
+    && curl -fsSL "${base}/${asset}" -o /tmp/ct-agent \
+    && bash /usr/local/bin/verify-release.sh /tmp/ct-agent "${asset}" "${base}" \
+    && install -m 0755 /tmp/ct-agent /usr/local/bin/ct-agent \
+    && rm -f /tmp/ct-agent
 
-COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # The container still STARTS as root (entrypoint.sh's own job is to migrate any
