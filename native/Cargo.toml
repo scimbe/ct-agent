@@ -92,6 +92,10 @@ rcgen = "0.13"
 # rcgen/libp2p; no new crate).
 x509-parser = "0.17"
 axum = "0.7"
+# observe.rs serves its listener through hyper directly (not `axum::serve`) to bound
+# connections and header reads. Both are already in the tree via axum at these versions.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "service", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
