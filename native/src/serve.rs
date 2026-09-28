@@ -1897,15 +1897,22 @@ pub async fn run_agent(
     // #16 escape hatch: CT_AGENT_REGISTER_TCP_ONLY pins the agent to the TLS-TCP
     // fallback permanently — no QUIC dial, no probing, no upgrade. For operators
     // whose UDP path is known-flaky and who prefer the stable transport outright.
+    let fallback_ctx = FallbackCtx {
+        config: config.clone(),
+        edge_cert: edge_cert.clone(),
+        token: token.clone(),
+        origin_keys: Arc::clone(&origin_keys),
+        gate: Arc::clone(&gate),
+        revocation: Arc::clone(&revocation),
+        terminator: terminator.clone(),
+        metrics: Arc::clone(&metrics),
+    };
     if config.register_tcp_only {
         eprintln!(
             "ct-agent: CT_AGENT_REGISTER_TCP_ONLY set — registering over TLS-TCP exclusively (no QUIC)"
         );
         switch_transport("tcp-fallback");
-        return run_agent_tcp_fallback_with_revocation(
-            config, edge_cert, token, origin_keys, gate, revocation, terminator,
-        )
-        .await;
+        return run_agent_tcp_fallback_with_ctx(&fallback_ctx).await;
     }
     let (reconnect_base, reconnect_max) = reconnect_backoff_bounds();
     // ct-agent#179: the retry policy is a value (`reconnect::ReconnectPolicy`), so the
@@ -1960,13 +1967,7 @@ pub async fn run_agent(
                         );
                         switch_transport("tcp-fallback");
                         match run_agent_tcp_fallback_until_quic_recovers(
-                            config,
-                            edge_cert.clone(),
-                            token.clone(),
-                            Arc::clone(&origin_keys),
-                            Arc::clone(&gate),
-                            Arc::clone(&revocation),
-                            terminator.clone(),
+                            &fallback_ctx,
                             reprobe_policy_after(quic_flaps),
                         )
                         .await
@@ -2398,7 +2399,7 @@ async fn serve_quic_connection(
 /// probe racing the assertion).
 ///
 /// #45 slice 3: production now enters through
-/// [`run_agent_tcp_fallback_with_revocation`] (it needs the shared revocation view);
+/// [`run_agent_tcp_fallback_with_ctx`] (it needs the shared revocation view);
 /// this argument-compatible wrapper stays for the e2e tests only.
 #[cfg(test)]
 async fn run_agent_tcp_fallback(
@@ -2408,16 +2409,7 @@ async fn run_agent_tcp_fallback(
     origin_keys: Arc<Vec<[u8; 32]>>,
     gate: Arc<local_auth::LocalAuthGate>,
 ) -> Result<(), BoxError> {
-    run_agent_tcp_fallback_with_revocation(
-        config,
-        edge_cert,
-        token,
-        origin_keys,
-        gate,
-        Arc::new(RevocationView::default()),
-        None,
-    )
-    .await
+    run_agent_tcp_fallback_with_ctx(&FallbackCtx::for_test(config, edge_cert, token, origin_keys, gate)).await
 }
 
 /// [`run_agent_tcp_fallback`] sharing `revocation` with [`run_agent`]'s
@@ -2431,32 +2423,13 @@ async fn run_agent_tcp_fallback(
 /// budget and spawn a fresh pool; only that outer budget running out returns
 /// `Err`. With the default unbounded budget none of this ever ends. Before #180,
 /// ONE worker's exhaustion returned `Err` from here -- and exited the process.
-async fn run_agent_tcp_fallback_with_revocation(
-    config: &AgentConfig,
-    edge_cert: CertificateDer<'static>,
-    token: RoutingToken,
-    origin_keys: Arc<Vec<[u8; 32]>>,
-    gate: Arc<local_auth::LocalAuthGate>,
-    revocation: Arc<RevocationView>,
-    terminator: Option<Arc<OriginTerminator>>,
-) -> Result<(), BoxError> {
+async fn run_agent_tcp_fallback_with_ctx(ctx: &FallbackCtx) -> Result<(), BoxError> {
     let (reconnect_base, reconnect_max) = reconnect_backoff_bounds();
     let mut outer = Backoff::new(reconnect_base, reconnect_max, reconnect_max_attempts());
     loop {
         // No reprobe: this is the permanent (CT_AGENT_REGISTER_TCP_ONLY / e2e) mode,
         // so the pool only ever ends with every worker gone.
-        let _exit = run_tcp_fallback_pool(
-            config,
-            edge_cert.clone(),
-            token.clone(),
-            Arc::clone(&origin_keys),
-            Arc::clone(&gate),
-            Arc::clone(&revocation),
-            terminator.clone(),
-            FallbackBudget::from_env(),
-            None,
-        )
-        .await;
+        let _exit = run_tcp_fallback_pool(ctx, FallbackBudget::from_env(), None).await;
         crate::events::emit(crate::events::FALLBACK_EXHAUSTED, serde_json::json!({}));
         crate::status::set_registered(None);
         match outer.next_delay_jittered(rand::random::<f64>()) {
@@ -2575,6 +2548,44 @@ impl FallbackBudget {
     }
 }
 
+/// Everything a TLS-TCP fallback worker serves with, shared by the pool (cheap to
+/// clone: handles and `Arc`s). `metrics` is `run_agent`'s own, so tunnels served
+/// over the fallback show up on the `/metrics` scrape like QUIC ones.
+#[derive(Clone)]
+pub(crate) struct FallbackCtx {
+    pub(crate) config: AgentConfig,
+    pub(crate) edge_cert: CertificateDer<'static>,
+    pub(crate) token: RoutingToken,
+    pub(crate) origin_keys: Arc<Vec<[u8; 32]>>,
+    pub(crate) gate: Arc<local_auth::LocalAuthGate>,
+    pub(crate) revocation: Arc<RevocationView>,
+    pub(crate) terminator: Option<Arc<OriginTerminator>>,
+    pub(crate) metrics: Arc<TunnelMetrics>,
+}
+
+#[cfg(test)]
+impl FallbackCtx {
+    /// A pool context with no revocation history, no terminator and its own metrics.
+    pub(crate) fn for_test(
+        config: &AgentConfig,
+        edge_cert: CertificateDer<'static>,
+        token: RoutingToken,
+        origin_keys: Arc<Vec<[u8; 32]>>,
+        gate: Arc<local_auth::LocalAuthGate>,
+    ) -> Self {
+        Self {
+            config: config.clone(),
+            edge_cert,
+            token,
+            origin_keys,
+            gate,
+            revocation: Arc::new(RevocationView::default()),
+            terminator: None,
+            metrics: Arc::new(TunnelMetrics::new()),
+        }
+    }
+}
+
 /// [`run_agent_tcp_fallback`], but temporary (#16): serve over the TLS-TCP
 /// fallback pool while probing UDP/QUIC per `reprobe`, and return
 /// [`FallbackExit::QuicRecovered`] as soon as the probe policy is satisfied AND
@@ -2588,30 +2599,8 @@ impl FallbackBudget {
 /// ct-agent#180: a worker that gives up ends that worker only; the pool returns
 /// [`FallbackExit::AllWorkersGaveUp`] once none is left, and `run_agent` treats
 /// that as one step of ITS reconnect budget rather than a process exit.
-// the pool's signature plus the #799 reprobe policy; refactor tracked separately
-#[allow(clippy::too_many_arguments)]
-async fn run_agent_tcp_fallback_until_quic_recovers(
-    config: &AgentConfig,
-    edge_cert: CertificateDer<'static>,
-    token: RoutingToken,
-    origin_keys: Arc<Vec<[u8; 32]>>,
-    gate: Arc<local_auth::LocalAuthGate>,
-    revocation: Arc<RevocationView>,
-    terminator: Option<Arc<OriginTerminator>>,
-    reprobe: ReprobePolicy,
-) -> FallbackExit {
-    run_tcp_fallback_pool(
-        config,
-        edge_cert,
-        token,
-        origin_keys,
-        gate,
-        revocation,
-        terminator,
-        FallbackBudget::from_env(),
-        Some(reprobe),
-    )
-    .await
+async fn run_agent_tcp_fallback_until_quic_recovers(ctx: &FallbackCtx, reprobe: ReprobePolicy) -> FallbackExit {
+    run_tcp_fallback_pool(ctx, FallbackBudget::from_env(), Some(reprobe)).await
 }
 
 /// The TLS-TCP fallback pool itself (#229, ct-agent#180, CADS-Tunnel#799):
@@ -2630,32 +2619,8 @@ async fn run_agent_tcp_fallback_until_quic_recovers(
 /// and is otherwise NOT an event: the mode stays up on the remaining workers
 /// (before #180 it was fatal to the whole mode). A given-up worker is not
 /// replaced, so a finite budget still ends the pool.
-// pre-existing pool signature plus the two #180 parameters; refactor tracked separately
-#[allow(clippy::too_many_arguments)]
-async fn run_tcp_fallback_pool(
-    config: &AgentConfig,
-    edge_cert: CertificateDer<'static>,
-    token: RoutingToken,
-    origin_keys: Arc<Vec<[u8; 32]>>,
-    gate: Arc<local_auth::LocalAuthGate>,
-    revocation: Arc<RevocationView>,
-    terminator: Option<Arc<OriginTerminator>>,
-    budget: FallbackBudget,
-    reprobe: Option<ReprobePolicy>,
-) -> FallbackExit {
-    run_tcp_fallback_pool_on(
-        &TASKS_LIVE,
-        config,
-        edge_cert,
-        token,
-        origin_keys,
-        gate,
-        revocation,
-        terminator,
-        budget,
-        reprobe,
-    )
-    .await
+async fn run_tcp_fallback_pool(ctx: &FallbackCtx, budget: FallbackBudget, reprobe: Option<ReprobePolicy>) -> FallbackExit {
+    run_tcp_fallback_pool_on(&TASKS_LIVE, ctx, budget, reprobe).await
 }
 
 /// CADS-Tunnel#799: a worker's way of telling its pool "the edge consumed my
@@ -2681,20 +2646,13 @@ impl ConsumedSignal {
 /// process-wide [`TASKS_LIVE`] (ct-agent#179): the soak harness asserts that weeks
 /// of worker churn leak no task, on a gauge of its own so no other test's tasks
 /// can skew the sample. Production only ever calls it through the wrapper above.
-// the wrapper's signature plus the gauge; refactor tracked separately
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tcp_fallback_pool_on(
     gauge: &'static LiveGauge,
-    config: &AgentConfig,
-    edge_cert: CertificateDer<'static>,
-    token: RoutingToken,
-    origin_keys: Arc<Vec<[u8; 32]>>,
-    gate: Arc<local_auth::LocalAuthGate>,
-    revocation: Arc<RevocationView>,
-    terminator: Option<Arc<OriginTerminator>>,
+    ctx: &FallbackCtx,
     budget: FallbackBudget,
     reprobe: Option<ReprobePolicy>,
 ) -> FallbackExit {
+    let config = &ctx.config;
     use std::collections::{HashMap, HashSet};
 
     let n = config.tcp_fallback_pool_size.max(1);
@@ -2710,27 +2668,11 @@ pub(crate) async fn run_tcp_fallback_pool_on(
     // ct-agent#180: a worker that burned its budget is not replaced.
     let mut given_up = 0usize;
     let spawn_one = |workers: &mut tokio::task::JoinSet<(usize, Result<(), BoxError>)>, id: usize| {
-        let config = config.clone();
-        let edge_cert = edge_cert.clone();
-        let token = token.clone();
-        let origin_keys = Arc::clone(&origin_keys);
-        let gate = Arc::clone(&gate);
-        let tracker = RevocationTracker::new(Arc::clone(&revocation));
-        let terminator = terminator.clone();
+        let ctx = ctx.clone();
+        let tracker = RevocationTracker::new(Arc::clone(&ctx.revocation));
         let consumed = ConsumedSignal { id, tx: Some(consumed_tx.clone()) };
         workers.spawn(gauge.track(async move {
-            let r = run_agent_tcp_fallback_worker(
-                &config,
-                edge_cert,
-                token,
-                origin_keys,
-                gate,
-                tracker,
-                terminator,
-                budget,
-                consumed,
-            )
-            .await;
+            let r = run_agent_tcp_fallback_worker(&ctx, tracker, budget, consumed).await;
             (id, r)
         }))
     };
@@ -2829,7 +2771,7 @@ pub(crate) async fn run_tcp_fallback_pool_on(
                 next_probe = Some(tokio::time::Instant::now() + policy.interval);
                 let conn = match tokio::time::timeout(
                     Duration::from_secs(5),
-                    dial_quic(config.edge, edge_cert.clone()),
+                    dial_quic(config.edge, ctx.edge_cert.clone()),
                 )
                 .await
                 {
@@ -2855,7 +2797,7 @@ pub(crate) async fn run_tcp_fallback_pool_on(
                 // connection while every TCP slot is still parked. Only once the
                 // edge has accepted that registration do the parked slots go.
                 crate::events::next_conn_id();
-                match register_tunnel(&conn, &token).await {
+                match register_tunnel(&conn, &ctx.token).await {
                     Ok(()) => {
                         let parked = handles.len() - serving.len();
                         eprintln!(
@@ -2968,20 +2910,13 @@ impl TcpAttemptEnd {
 /// registration the edge ends without a Client is re-registered immediately
 /// (see [`TcpAttemptEnd`]); a plain ('A'/'B') registration re-registers after
 /// its tunnel as before.
-// pre-existing signature plus the #204 terminator and the #799 signal; refactor tracked separately
-#[allow(clippy::too_many_arguments)]
 async fn run_agent_tcp_fallback_worker(
-    config: &AgentConfig,
-    edge_cert: CertificateDer<'static>,
-    token: RoutingToken,
-    origin_keys: Arc<Vec<[u8; 32]>>,
-    gate: Arc<local_auth::LocalAuthGate>,
+    ctx: &FallbackCtx,
     mut revocation: RevocationTracker,
-    terminator: Option<Arc<OriginTerminator>>,
     budget: FallbackBudget,
     consumed: ConsumedSignal,
 ) -> Result<(), BoxError> {
-    let metrics = Arc::new(TunnelMetrics::new());
+    let config = &ctx.config;
     // Reconnect loop (issue #5 / P1.2b): re-register and serve again after each
     // single tunnel ends or the connection drops, with backoff on failure. The
     // budget is the pool's (`FallbackBudget::from_env` in production).
@@ -3002,19 +2937,7 @@ async fn run_agent_tcp_fallback_worker(
         for addr in &rungs {
             // ct-agent#178: every rung is one registration attempt (see the QUIC loop).
             crate::events::next_conn_id();
-            match tcp_connect_register_serve(
-                config,
-                *addr,
-                &edge_cert,
-                &token,
-                &origin_keys,
-                &metrics,
-                &gate,
-                &mut revocation,
-                terminator.clone(),
-                &consumed,
-            )
-            .await
+            match tcp_connect_register_serve(ctx, *addr, &mut revocation, &consumed).await
             {
                 // The relayed Client is done; the pool parked a replacement the
                 // moment this registration was consumed. This worker is finished.
@@ -3116,20 +3039,14 @@ async fn run_agent_tcp_fallback_worker(
 /// CADS-Tunnel#799: failures before and after the edge accepted the
 /// registration are told apart in the error (see [`TcpAttemptEnd`]), and the
 /// STOP byte that ends the ping phase fires `consumed` so the pool re-parks.
-// pre-existing signature; refactor tracked separately
-#[allow(clippy::too_many_arguments)]
 async fn tcp_connect_register_serve(
-    config: &AgentConfig,
+    ctx: &FallbackCtx,
     target: SocketAddr,
-    edge_cert: &CertificateDer<'static>,
-    token: &RoutingToken,
-    origin_keys: &[[u8; 32]],
-    metrics: &Arc<TunnelMetrics>,
-    gate: &local_auth::LocalAuthGate,
     revocation: &mut RevocationTracker,
-    terminator: Option<Arc<OriginTerminator>>,
     consumed: &ConsumedSignal,
 ) -> Result<TcpServed, TcpAttemptEnd> {
+    let FallbackCtx { config, edge_cert, token, origin_keys, gate, terminator, metrics, .. } = ctx;
+    let terminator = terminator.clone();
     let mut stream = tcp_tls_connect(target, edge_cert.clone()).await?;
     // Browser Plane over the TCP fallback (#41 FB3): register+bind the public
     // hostname in one 'B' frame, then raw-forward the relayed browser stream to
@@ -3671,6 +3588,138 @@ mod tests {
             "cross-host TCP-fallback Noise round-trip succeeds"
         );
 
+        agent.abort();
+        edge.abort();
+    }
+
+    /// The pool serves with `run_agent`'s metrics, so the scrape sees fallback tunnels.
+    #[tokio::test]
+    async fn tunnels_served_over_the_fallback_reach_the_agents_metrics() {
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::pow::Challenge;
+        use ct_common::{Capability, OriginIdentity};
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use ct_edge::serve::serve_tcp_connection;
+        use ct_edge::state::EdgeState;
+        use quinn::Connection;
+        use std::net::Ipv4Addr;
+
+        // Real dual edge (TCP + QUIC); we exercise only the TCP fallback side.
+        let ca = Ca::new("e2e-ca").unwrap();
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let token = RoutingToken([0x33; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        // Edge: accept each TCP connection and serve it ('A' parks, 'C' delivers).
+        //
+        // ct-agent#15: this is the REAL pinned ct-edge, which predates role 'K'
+        // and rejects an unknown role byte by erroring out and dropping the
+        // connection with no ack. That makes this test a genuine end-to-end proof
+        // of the legacy-Edge fallback: the Agent's 'K' attempt gets dropped
+        // ack-less, it redials and registers with plain 'A', and the tunnel works
+        // exactly as before. Accept in an unbounded loop rather than a fixed count
+        // so the extra probe dial isn't a brittle magic number.
+        let state_e = state.clone();
+        let edge = tokio::spawn(async move {
+            loop {
+                let (tcp, peer) = tcp_listener.accept().await.unwrap();
+                let (acc, st, ch) = (acceptor.clone(), state_e.clone(), challenge.clone());
+                tokio::spawn(async move {
+                    if let Ok(tls) = acc.accept(tcp).await {
+                        // The trailing None is ct-edge's per-connection cap (no cap in this
+                        // test); peer.ip() (#603) is the real accept()-time address.
+                        let _ = serve_tcp_connection(tls, &st, &ch, None, peer.ip()).await;
+                    }
+                });
+            }
+        });
+
+        // Origin: a streaming TCP echo (copy) — echoes bytes as they arrive, so
+        // the round-trip does not depend on a half-close propagating through the
+        // relay chain (matches the known-good TCP-fallback harness).
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = origin_listener.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+            let _ = w.shutdown().await;
+        });
+
+        // The agent holds the origin private key; the Capability pins its public.
+        let origin_kp = generate_static_keypair();
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: tcp_addr.to_string(),
+        };
+
+        // Agent: run the TCP fallback (connect + register + serve one tunnel).
+        // Pool size 1: the real edge parks one registration per token, and a
+        // larger pool would just have the Agent's own workers supersede each
+        // other's park slot before the Client arrives.
+        let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), &origin_addr.to_string()).unwrap();
+        cfg.tcp_fallback_pool_size = 1;
+        let ca_root_a = ca_root.clone();
+        let a_token = token.clone();
+        let metrics = Arc::new(TunnelMetrics::new());
+        let ctx_metrics = Arc::clone(&metrics);
+        let agent = tokio::spawn(async move {
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let mut ctx = FallbackCtx::for_test(
+                &cfg,
+                ca_root_a,
+                a_token,
+                std::sync::Arc::new(vec![origin_kp.private]),
+                std::sync::Arc::new(gate),
+            );
+            ctx.metrics = ctx_metrics;
+            let _ = run_agent_tcp_fallback_with_ctx(&ctx).await;
+        });
+
+        // Wait until the agent has registered (parked) at the edge.
+        for _ in 0..200 {
+            if state.has_tcp_agent(&token) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(state.has_tcp_agent(&token), "agent parked over TLS-TCP");
+
+        // Client: tunnel over TLS-TCP through the edge to the origin, expect echo.
+        let client_kp = generate_static_keypair();
+        let client_stream = ct_client::transport::tcp_tls_connect(tcp_addr, ca_root)
+            .await
+            .unwrap();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(15),
+            ct_client::transport::client_tunnel_noise_tcp(
+                client_stream,
+                &token,
+                &cap,
+                &client_kp.private,
+                b"hello-tcp-fallback",
+            ),
+        )
+        .await
+        .expect("round-trip timed out (relay/serve deadlock)")
+        .unwrap();
+        assert_eq!(
+            resp, b"hello-tcp-fallback",
+            "cross-host TCP-fallback Noise round-trip succeeds"
+        );
+
+        assert!(metrics.tunnels_opened.get() >= 1, "the fallback tunnel was counted in the shared metrics");
+        assert!(metrics.bytes_to_origin.get() > 0, "and its bytes");
         agent.abort();
         edge.abort();
     }
@@ -6426,13 +6475,7 @@ mod tests {
         let pool = tokio::spawn(async move {
             let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
             run_tcp_fallback_pool(
-                &cfg,
-                ca_root,
-                RoutingToken([0x18u8; 32]),
-                Arc::new(vec![[0u8; 32]]),
-                Arc::new(gate),
-                Arc::new(RevocationView::default()),
-                None,
+                &FallbackCtx::for_test(&cfg, ca_root, RoutingToken([0x18u8; 32]), Arc::new(vec![[0u8; 32]]), Arc::new(gate)),
                 budget,
                 None,
             )
@@ -6512,13 +6555,7 @@ mod tests {
         let exit = tokio::time::timeout(
             Duration::from_secs(10),
             run_tcp_fallback_pool(
-                &cfg,
-                ca_root,
-                RoutingToken([0x19u8; 32]),
-                Arc::new(vec![[0u8; 32]]),
-                Arc::new(gate),
-                Arc::new(RevocationView::default()),
-                None,
+                &FallbackCtx::for_test(&cfg, ca_root, RoutingToken([0x19u8; 32]), Arc::new(vec![[0u8; 32]]), Arc::new(gate)),
                 budget,
                 None,
             ),
@@ -6584,13 +6621,7 @@ mod tests {
         let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
         let agent = tokio::spawn(async move {
             let _ = run_tcp_fallback_pool(
-                &cfg,
-                ca_root,
-                RoutingToken([0x79u8; 32]),
-                Arc::new(vec![[0u8; 32]]),
-                Arc::new(gate),
-                Arc::new(RevocationView::default()),
-                None,
+                &FallbackCtx::for_test(&cfg, ca_root, RoutingToken([0x79u8; 32]), Arc::new(vec![[0u8; 32]]), Arc::new(gate)),
                 budget,
                 None,
             )
@@ -6670,13 +6701,7 @@ mod tests {
         let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
         let agent = tokio::spawn(async move {
             let _ = run_tcp_fallback_pool(
-                &cfg,
-                ca_root,
-                RoutingToken([0x7au8; 32]),
-                Arc::new(vec![[0u8; 32]]),
-                Arc::new(gate),
-                Arc::new(RevocationView::default()),
-                None,
+                &FallbackCtx::for_test(&cfg, ca_root, RoutingToken([0x7au8; 32]), Arc::new(vec![[0u8; 32]]), Arc::new(gate)),
                 FallbackBudget { base: Duration::from_secs(10), max: Duration::from_secs(20), attempts: 5 },
                 None,
             )
@@ -6745,13 +6770,7 @@ mod tests {
         let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
         let agent = tokio::spawn(async move {
             let _ = run_tcp_fallback_pool(
-                &cfg,
-                ca_root,
-                RoutingToken([0x7bu8; 32]),
-                Arc::new(vec![[0u8; 32]]),
-                Arc::new(gate),
-                Arc::new(RevocationView::default()),
-                None,
+                &FallbackCtx::for_test(&cfg, ca_root, RoutingToken([0x7bu8; 32]), Arc::new(vec![[0u8; 32]]), Arc::new(gate)),
                 FallbackBudget { base: Duration::from_secs(10), max: Duration::from_secs(20), attempts: 5 },
                 None,
             )
