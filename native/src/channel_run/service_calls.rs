@@ -1604,7 +1604,7 @@ pub(crate) fn channel_local(peer: Option<[u8; 32]>) -> ChannelLocal {
         // modes (their per-attempt channel_local() re-entry would contend for the single
         // stdin feed -- the #248 trap class below); the arena/front-door path this exists
         // for calls channel_local() exactly once.
-        if call_persistent_enabled_from(std::env::var("CT_CHANNEL_CALL_PERSISTENT").ok().as_deref()) {
+        if call_persistent_enabled_from(crate::envflag::env_value("CT_CHANNEL_CALL_PERSISTENT", true).as_deref()) {
             eprintln!(
                 "ct-agent channel: --call-service {slug} (persistent: one held session, NDJSON calls over stdio until EOF, #19)"
             );

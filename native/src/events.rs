@@ -460,6 +460,18 @@ pub fn configured_state_dir() -> Option<String> {
     configured_state_dir_from(|k| std::env::var(k).ok())
 }
 
+/// The startup warning for a set-but-blank `CT_AGENT_STATE_DIR`, which is now read like an
+/// unset one. Before, it meant the working directory (relative paths); an install that relied
+/// on that silently loses its identity, share links and local-auth hash there. Pure.
+pub fn blank_state_dir_warning(f: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let v = f("CT_AGENT_STATE_DIR")?;
+    v.trim().is_empty().then(|| {
+        "ct-agent: WARNING: CT_AGENT_STATE_DIR is set but empty -- treated as unset (earlier \
+         releases read it as the working directory; state kept there is NOT used now)"
+            .to_string()
+    })
+}
+
 /// Pure core of [`configured_state_dir`].
 pub fn configured_state_dir_from(f: impl Fn(&str) -> Option<String>) -> Option<String> {
     f("CT_AGENT_STATE_DIR").map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
@@ -493,6 +505,15 @@ pub fn ring_write_errors() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_set_but_blank_state_dir_is_warned_about() {
+        let env = |v: Option<&'static str>| move |k: &str| (k == "CT_AGENT_STATE_DIR").then_some(v).flatten().map(String::from);
+        assert!(super::blank_state_dir_warning(env(Some(""))).is_some());
+        assert!(super::blank_state_dir_warning(env(Some("  "))).is_some());
+        assert!(super::blank_state_dir_warning(env(None)).is_none());
+        assert!(super::blank_state_dir_warning(env(Some("/var/lib/ct"))).is_none());
+    }
+
     #[test]
     fn a_blank_state_dir_is_treated_as_unset() {
         let env = |v: &'static str| move |k: &str| (k == "CT_AGENT_STATE_DIR").then(|| v.to_string());

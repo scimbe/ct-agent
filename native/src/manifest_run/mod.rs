@@ -132,7 +132,7 @@ fn require_manifest_location(location: &str, allow_local_path: bool) -> Result<(
     ))
 }
 
-/// `1`/`true`/`yes` (case-insensitive, trimmed) is set; anything else -- including unset -- is not.
+/// `1`/`true`/`yes`/`on` (case-insensitive, trimmed) is set; anything else -- including unset -- is not.
 fn flag_set(v: Option<String>) -> bool {
     crate::envflag::flag(v.as_deref(), false)
 }

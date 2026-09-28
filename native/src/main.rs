@@ -322,6 +322,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // subscriber installed they go nowhere no matter what env var is set. `RUST_LOG`
     // absent -> zero behavior change (no subscriber installed at all), same off-by-default
     // pattern as `CT_DEBUG_A2A_TIMING`.
+    if let Some(warning) = ct_agent::events::blank_state_dir_warning(|k| std::env::var(k).ok()) {
+        eprintln!("{warning}");
+    }
     if std::env::var_os("RUST_LOG").is_some() {
         tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())

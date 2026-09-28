@@ -55,17 +55,17 @@ pub use ct_common::channel_quic::{present_channel_join, present_channel_join_qui
 /// length prefix (it would mean a >=65280-byte join, refused as len-oob by every edge
 /// since the field existed).
 /// #495 measurement isolation (requested by the tester after the 2a series proved
-/// unrunnable with published binaries): `CT_CHANNEL_PHASE_MARKER=off` (or `0`)
+/// unrunnable with published binaries): `CT_CHANNEL_PHASE_MARKER=off` (or `0`/`false`/`no`)
 /// suppresses the phase preamble on EVERY transport while keeping everything else
 /// identical — the only way to vary the marker as a SINGLE variable, since every marked
 /// release also carries the #494 ack-reader fix. Default: markers on.
 pub(crate) fn phase_marker_enabled() -> bool {
-    phase_marker_enabled_from(std::env::var("CT_CHANNEL_PHASE_MARKER").ok().as_deref())
+    phase_marker_enabled_from(crate::envflag::env_value("CT_CHANNEL_PHASE_MARKER", true).as_deref())
 }
 
-/// Pure core of [`phase_marker_enabled`]: only the explicit strings `off`/`0`
-/// disable the marker — unset, empty, or anything else keeps the default (on),
-/// so a typo can never silently drop the marker generation.
+/// Pure core of [`phase_marker_enabled`]: only an explicit off spelling (`off`/`0`/`false`/`no`,
+/// see [`crate::envflag`]) disables the marker — unset, empty, or anything else keeps the
+/// default (on), so a typo can never silently drop the marker generation.
 pub(crate) fn phase_marker_enabled_from(v: Option<&str>) -> bool {
     crate::envflag::flag(v, true)
 }

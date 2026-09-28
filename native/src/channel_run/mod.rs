@@ -530,7 +530,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // hiccup the plain path tolerates fine) and, before this fix, that killed an otherwise
     // perfectly healthy long-lived --serve process instead of just re-admitting. `Initiate`
     // (and `Accept` without `--serve`) stay single-attempt, matching every other one-shot path.
-    let serve_loop = should_serve_loop(cfg.role, std::env::var("CT_CHANNEL_SERVE").ok().as_deref());
+    let serve_loop = should_serve_loop(cfg.role, crate::envflag::env_value("CT_CHANNEL_SERVE", false).as_deref());
     // #248: a one-shot Initiate (or non-serve Accept) on the relay-gate/circuit-relay DCUtR
     // path shouldn't fail on the very first #140 stall either -- live-reproduced on the
     // a2a-demo's plain "bob" scenario (previously thought stable, now exercising this same
@@ -633,7 +633,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
         // accept, and non-reconnect persistent CALL mode) keeps exactly one session, unchanged.
         if let Ok(slug) = std::env::var("CT_CHANNEL_CALL_SERVICE") {
             if cfg.call_reconnect
-                && call_persistent_enabled_from(std::env::var("CT_CHANNEL_CALL_PERSISTENT").ok().as_deref())
+                && call_persistent_enabled_from(crate::envflag::env_value("CT_CHANNEL_CALL_PERSISTENT", true).as_deref())
             {
                 return run_persistent_call_reconnect_loop(
                     slug.trim().to_string(),

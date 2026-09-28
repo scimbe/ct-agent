@@ -444,7 +444,7 @@ fn parse_masque_fallback(
 
 /// A boolean `CT_AGENT_*` flag, off by default (see [`crate::envflag`]).
 fn truthy(get: &impl Fn(&str) -> Option<String>, key: &str) -> bool {
-    crate::envflag::flag(get(key).as_deref(), false)
+    crate::envflag::flag_named(key, get(key).as_deref(), false)
 }
 
 /// See [`AgentConfig::tcp_fallback_pool_size`].
@@ -575,6 +575,10 @@ mod tests {
         assert!(!base(Some("")), "empty -> off");
         assert!(base(Some("1")), "1 -> on");
         assert!(base(Some("true")), "true -> on");
+        // Pinned on purpose: an unrecognised spelling falls back to the default (off) and is
+        // warned about at start -- it must not quietly become "on" either ("garbage = on is
+        // safer" would make every typo in every other flag switch a feature on).
+        assert!(!base(Some("enforce")), "unrecognised -> default (off), with a startup warning");
     }
 
     #[test]
