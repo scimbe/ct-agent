@@ -451,12 +451,13 @@ pub async fn obtain_or_renew(config: &AcmeCertConfig) -> Result<bool, BoxError> 
     let key_tmp = PathBuf::from(format!("{}.new", key_path.display()));
     let cert_tmp = PathBuf::from(format!("{}.new", cert_path.display()));
     write_private(&key_tmp, issued.key_pem.as_bytes())?;
-    if let Err(e) = std::fs::write(&cert_tmp, issued.cert_chain_pem.as_bytes()) {
+    if let Err(e) = crate::secret_file::write_durable(&cert_tmp, issued.cert_chain_pem.as_bytes()) {
         let _ = std::fs::remove_file(&key_tmp);
         return Err(e.into());
     }
     std::fs::rename(&key_tmp, &key_path)?;
     std::fs::rename(&cert_tmp, &cert_path)?;
+    crate::secret_file::sync_parent_dir(&cert_path)?;
     eprintln!(
         "ct-agent: obtained a certificate for {} ({} -> {})",
         config.hostname,
