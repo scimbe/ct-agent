@@ -394,11 +394,10 @@ where
     };
     // The DCUtR session runs the Noise_IK over the relay bi-stream as its base leg, punching to
     // direct in the background. Initiator opens the bi-stream; acceptor accepts the edge-opened one.
-    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::other(e.to_string());
-    let (relay_send, relay_recv) = match role {
-        ChannelRole::Initiate => relay_conn.open_bi().await.map_err(|e| map_err(Box::new(e)))?,
-        ChannelRole::Accept => relay_conn.accept_bi().await.map_err(|e| map_err(Box::new(e)))?,
-    };
+    // Bounded (#139): after `Admitted` the partner is paired, so the stream opens at once;
+    // a live-but-silent relay would otherwise hold this session (and a serve slot) forever.
+    let (relay_send, relay_recv) =
+        open_channel_streams(relay_conn, role, ct_common::channel_quic::DIRECT_STREAM_SETUP_TIMEOUT).await?;
     let client = crate::p2p::build_dcutr_relay_client_swarm()?;
     crate::p2p::run_channel_session_upgradable_dcutr(
         relay_send,

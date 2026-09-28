@@ -6752,3 +6752,32 @@ fn jsonrpc_error_for_echoes_the_request_id() {
     let v: serde_json::Value = serde_json::from_slice(&e).unwrap();
     assert!(v["id"].is_null());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_serve_member_retries_a_dial_failure_instead_of_exiting() {
+    // An outer Err is a dial/setup failure (an edge restart). A persistent serve member must
+    // come back for another attempt; a one-shot join still ends on it.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = std::sync::Arc::new(AtomicU32::new(0));
+    let c = calls.clone();
+    let serve = tokio::spawn(async move {
+        run_dcutr_join_loop::<(), _, _>("test", true, || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Err::<Result<(), BoxError>, BoxError>("edge unreachable".into())
+            }
+        })
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+    assert!(calls.load(Ordering::SeqCst) >= 2, "the serve loop dialed again after the failure");
+    assert!(!serve.is_finished(), "and did not end the serve process");
+    serve.abort();
+
+    let one_shot = run_dcutr_join_loop::<(), _, _>("test", false, || async {
+        Err::<Result<(), BoxError>, BoxError>("edge unreachable".into())
+    })
+    .await;
+    assert!(one_shot.is_err(), "a one-shot join still ends on a dial failure");
+}
