@@ -26,6 +26,7 @@
 //! resulting routing token; the operator (or a wrapper script) sets `CT_AGENT_TOKEN`
 //! and runs `ct-agent` normally to actually start serving.
 
+use crate::codec::hex_encode;
 use ct_control_plane::client::{ControlPlaneClient, CpError, SignupResult};
 
 /// Best-effort machine identifier, platform-specific:
@@ -101,10 +102,6 @@ pub fn device_fingerprint() -> Option<String> {
     hasher.update(b"\0");
     hasher.update(user.as_bytes());
     Some(hex_encode(&hasher.finalize()))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Run `ct-agent signup <name>`: resolve a bearer token (env `CT_OIDC_TOKEN`, else

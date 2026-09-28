@@ -9,6 +9,15 @@
 
 use std::time::Duration;
 
+/// "Equal jitter": a delay in `[d/2, d]`, `rand01` in `[0, 1]` supplied by the caller so
+/// the backoffs stay pure. Keeps the exponential growth and never exceeds `d`.
+pub fn equal_jitter(d: Duration, rand01: f64) -> Duration {
+    let half = d / 2;
+    // span == d - half (half for even nanos, +1ns otherwise); result lands in [half, d].
+    let span = d - half;
+    half + span.mul_f64(rand01.clamp(0.0, 1.0))
+}
+
 /// Bounded exponential backoff for reconnect attempts.
 pub struct Backoff {
     base: Duration,
@@ -55,11 +64,7 @@ impl Backoff {
     /// give-up after `max_attempts`. The caller supplies the randomness, so `Backoff`
     /// stays pure and deterministically unit-testable.
     pub fn next_delay_jittered(&mut self, rand01: f64) -> Option<Duration> {
-        let d = self.next_delay()?;
-        let half = d / 2;
-        // span == d - half (half for even nanos, +1ns otherwise); result lands in [half, d].
-        let span = d - half;
-        Some(half + span.mul_f64(rand01.clamp(0.0, 1.0)))
+        self.next_delay().map(|d| equal_jitter(d, rand01))
     }
 
     /// Reset the counter after a successful (re)connection, so the next drop

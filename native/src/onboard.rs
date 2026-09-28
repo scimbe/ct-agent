@@ -26,15 +26,7 @@ use std::path::Path;
 /// land mid-character and panic during onboarding instead of returning the
 /// intended error.
 fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
-    let s = s.trim();
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
-    }
-    Some(out)
+    crate::codec::hex_decode(s.trim())
 }
 
 /// Inputs for one-command onboarding, gathered so the agent can be brought up

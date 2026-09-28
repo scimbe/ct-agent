@@ -52,6 +52,7 @@
 //! forever" for "silently stopped after the next update" -- also bad, just
 //! differently. Off by default, and its own startup notice says so.
 
+use crate::codec::hex_encode;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -254,10 +255,6 @@ pub async fn check_latest(current_version: &str) -> Result<UpdateCheck, String> 
     })
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Decode exactly 64 hex chars into 32 bytes, naming what's wrong otherwise
 /// (`what` says which kind of value it was: a digest, a public key). Only a
 /// short prefix of the offending token is echoed back -- it may be anything a
@@ -273,11 +270,7 @@ fn decode_hex_32(s: &str, what: &str) -> Result<[u8; 32], String> {
     if let Some(bad) = s.chars().find(|c| !c.is_ascii_hexdigit()) {
         return Err(format!("{what} {shown:?}.. is not hex (contains {bad:?})"));
     }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
-    }
-    Ok(out)
+    crate::codec::hex_decode(s).ok_or_else(|| format!("{what} {shown:?}.. is not hex"))
 }
 
 /// Decode exactly 64 hex chars into a SHA-256 digest.
