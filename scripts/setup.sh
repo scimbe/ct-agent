@@ -53,6 +53,9 @@ USAGE
 }
 
 RELEASE_BASE="${CT_RELEASE_BASE:-https://github.com/scimbe/ct-agent/releases/latest/download}"
+# The release signing key(s) (hex ed25519, space-separated during a rotation) -- the same key
+# native/src/self_update.rs pins, so the first install is held to what `ct-agent update` is.
+RELEASE_PUBKEYS="${CT_AGENT_RELEASE_PUBKEY:-73706122db4e9186743ab3aabdf55d80ecf7f08ddc6c5243c9887f7d9bcc9a78}"
 MODE="direct"
 ASSUME_YES=0
 WANT_TEMPLATE=0
@@ -288,9 +291,73 @@ download_binary() {
   local asset="ct-agent-${os}-${arch}"
   local url="${RELEASE_BASE%/}/${asset}"
   log "downloading $asset"
-  curl -fsSL "$url" -o ./ct-agent -w '' || die "download failed: $url"
-  chmod +x ./ct-agent
+  curl -fsSL "$url" -o ./ct-agent.download -w '' || { rm -f ./ct-agent.download; die "download failed: $url"; }
+  verify_release_asset ./ct-agent.download "$asset" || { rm -f ./ct-agent.download; die "refusing to install $asset"; }
+  chmod +x ./ct-agent.download
+  mv -f ./ct-agent.download ./ct-agent
   ok "ct-agent binary ready"
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# Check a downloaded release asset before it is installed, like `ct-agent update` does:
+#  1. it must hash to its published <asset>.sha256 (always);
+#  2. the signed release-manifest.json must verify against the pinned release key and list the
+#     same digest for this asset. Needs OpenSSL >= 3 (ed25519 `pkeyutl -rawin`); without it the
+#     signature is skipped with a warning. CT_AGENT_UPDATE_SKIP_VERIFY=1 skips step 2 on purpose.
+verify_release_asset() {
+  local tmp
+  tmp="$(mktemp -d)" || return 1
+  if verify_release_asset_in "$tmp" "$@"; then rm -rf "$tmp"; return 0; fi
+  rm -rf "$tmp"
+  return 1
+}
+
+verify_release_asset_in() {
+  local tmp="$1" file="$2" asset="$3" base="${RELEASE_BASE%/}" expected actual
+  curl -fsSL "$base/$asset.sha256" -o "$tmp/sum" || { warn "no $asset.sha256 at $base"; return 1; }
+  expected="$(tr -d '\r' < "$tmp/sum" | awk 'NF { print tolower($1); exit }')"
+  case "$expected" in
+    *[!0-9a-f]*|"") warn "$asset.sha256 holds no SHA-256 digest"; return 1 ;;
+  esac
+  [ "${#expected}" -eq 64 ] || { warn "$asset.sha256 holds no SHA-256 digest"; return 1; }
+  actual="$(sha256_of "$file")"
+  [ "$actual" = "$expected" ] || { warn "$asset does not match its .sha256 (got $actual)"; return 1; }
+  ok "checksum verified"
+
+  case "${CT_AGENT_UPDATE_SKIP_VERIFY:-}" in
+    1|true|yes|on) warn "CT_AGENT_UPDATE_SKIP_VERIFY is set: release signature NOT verified"; return 0 ;;
+  esac
+  if ! command -v openssl >/dev/null 2>&1 || ! openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
+    warn "OpenSSL >= 3 not found: the release signature was NOT verified (checksum only)"
+    return 0
+  fi
+  curl -fsSL "$base/release-manifest.json" -o "$tmp/manifest" \
+    || { warn "the release publishes no release-manifest.json"; return 1; }
+  curl -fsSL "$base/release-manifest.sig" -o "$tmp/sig.b64" \
+    || { warn "the release publishes no release-manifest.sig"; return 1; }
+  openssl base64 -d -A -in "$tmp/sig.b64" -out "$tmp/sig" 2>/dev/null \
+    || { warn "release-manifest.sig is not base64"; return 1; }
+  local key verified=0
+  for key in $RELEASE_PUBKEYS; do
+    case "$key" in *[!0-9a-fA-F]*) continue ;; esac
+    [ "${#key}" -eq 64 ] || continue
+    # SubjectPublicKeyInfo for a raw ed25519 key: the fixed 12-byte DER prefix, then the key.
+    printf "$(printf '302a300506032b6570032100%s' "$key" | sed 's/../\\x&/g')" > "$tmp/pub.der"
+    openssl pkey -pubin -inform DER -in "$tmp/pub.der" -out "$tmp/pub.pem" 2>/dev/null || continue
+    if openssl pkeyutl -verify -pubin -inkey "$tmp/pub.pem" -rawin -in "$tmp/manifest" \
+         -sigfile "$tmp/sig" >/dev/null 2>&1; then
+      verified=1
+      break
+    fi
+  done
+  [ "$verified" -eq 1 ] || { warn "release-manifest.json does not verify against the pinned release key"; return 1; }
+  grep -qF "\"$asset\":\"$expected\"" "$tmp/manifest" \
+    || { warn "the signed release-manifest.json does not list $asset with this digest"; return 1; }
+  ok "release signature verified"
 }
 
 install_direct() {
@@ -354,7 +421,8 @@ install_docker() {
   # Build straight from this repo's git history (docker supports git-URL build
   # contexts natively) rather than a local ../docker path -- this script is
   # commonly run via `curl ... | bash`, where no local checkout exists.
-  docker buildx build --load -t ct-agent:local "https://github.com/scimbe/ct-agent.git#${latest_tag}:docker" \
+  docker buildx build --load -t ct-agent:local --build-arg "CT_AGENT_RELEASE=${latest_tag}" \
+    "https://github.com/scimbe/ct-agent.git#${latest_tag}:docker" \
     || die "docker build failed"
   log "starting the container"
   docker rm -f ct-agent >/dev/null 2>&1 || true

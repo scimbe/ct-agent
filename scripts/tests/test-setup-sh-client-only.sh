@@ -20,10 +20,14 @@ os="$(uname -s | tr '[:upper:]' '[:lower:]')"
 
 mirror="$(mktemp -d)"
 printf '#!/bin/sh\necho fake-ct-agent\n' > "$mirror/ct-agent-${os}-${arch}"
+# The installer verifies downloads (test-setup-sh-verify.sh covers that); here only the checksum
+# is published and the signature step is skipped explicitly.
+(cd "$mirror" && { sha256sum "ct-agent-${os}-${arch}" 2>/dev/null || shasum -a 256 "ct-agent-${os}-${arch}"; } \
+  > "ct-agent-${os}-${arch}.sha256")
 
 # --- case 1: piped, no .env, no TTY, no --yes -- must still install the binary.
 dir1="$(mktemp -d)"
-out1=$(cd "$dir1" && env -i PATH="$PATH" HOME="$dir1" CT_RELEASE_BASE="file://$mirror" \
+out1=$(cd "$dir1" && env -i PATH="$PATH" HOME="$dir1" CT_RELEASE_BASE="file://$mirror" CT_AGENT_UPDATE_SKIP_VERIFY=1 \
   bash -s -- --client-only < "$SETUP_SH" 2>&1)
 rc1=$?
 [ "$rc1" -eq 0 ] && echo "ok: case 1 exited 0" || { echo "FAIL: case 1 rc=$rc1 output: $out1" >&2; fail=1; }
