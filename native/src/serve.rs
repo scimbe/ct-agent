@@ -331,6 +331,10 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Prefixed<T> {
     }
 }
 
+/// How long a client has to complete the TLS handshake the terminator runs. Its own constant
+/// (the same 10 s as the SSH owner-auth preamble today) so tuning one never moves the other.
+const ORIGIN_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Terminate the client's TLS on `client` (whose sniffed first bytes are replayed by the
 /// [`Prefixed`] wrapper), then relay the plaintext to the Origin. The handshake failure is
 /// logged here, once, with the rustls reason: it is the one failure an operator will hit
@@ -344,11 +348,21 @@ async fn terminate_tls_then_forward<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut tls = match terminator.acceptor().accept(client).await {
-        Ok(tls) => tls,
-        Err(e) => {
+    // Bounded like the SSH owner preamble: a client that stalls mid-handshake would
+    // otherwise hold a serving slot (a parked fallback registration, a QUIC stream).
+    let handshake = tokio::time::timeout(ORIGIN_TLS_HANDSHAKE_TIMEOUT, terminator.acceptor().accept(client));
+    let mut tls = match handshake.await {
+        Ok(Ok(tls)) => tls,
+        Ok(Err(e)) => {
             eprintln!("ct-agent: origin TLS terminate: handshake failed: {e}");
             return Err(format!("origin TLS terminate: handshake failed: {e}").into());
+        }
+        Err(_) => {
+            return Err(format!(
+                "origin TLS terminate: no handshake within {}s",
+                ORIGIN_TLS_HANDSHAKE_TIMEOUT.as_secs()
+            )
+            .into())
         }
     };
     let sni = tls.get_ref().1.server_name().map(str::to_string);
@@ -1469,7 +1483,62 @@ where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    serve_noise_stream_with_policy(send, recv, origin, origin_keys, metrics, gate, None).await
+    serve_noise_stream_with_policy(send, recv, origin, origin_keys, metrics, gate, None, None).await
+}
+
+/// A stream half that fails with `TimedOut` once `deadline` has passed, until [`PreAuth::lift`]
+/// -- how the direct path bounds everything before a peer is authenticated without threading a
+/// timeout through every read and write of the handshake and the local-auth gate. `None` never
+/// times out (the relayed paths, whose pre-auth phase the Edge already bounds).
+struct PreAuth<T> {
+    inner: T,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<T> PreAuth<T> {
+    fn new(inner: T, deadline: Option<tokio::time::Instant>) -> Self {
+        Self { inner, deadline: deadline.map(|d| Box::pin(tokio::time::sleep_until(d))) }
+    }
+
+    /// The peer is authenticated: no deadline from here on.
+    fn lift(&mut self) {
+        self.deadline = None;
+    }
+
+    fn expired(&mut self, cx: &mut Context<'_>) -> bool {
+        self.deadline.as_mut().is_some_and(|d| std::future::Future::poll(d.as_mut(), cx).is_ready())
+    }
+}
+
+fn preauth_timed_out() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "direct connection not authenticated in time")
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for PreAuth<T> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if self.expired(cx) {
+            return Poll::Ready(Err(preauth_timed_out()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for PreAuth<T> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        if self.expired(cx) {
+            return Poll::Ready(Err(preauth_timed_out()));
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.expired(cx) {
+            return Poll::Ready(Err(preauth_timed_out()));
+        }
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// [`serve_noise_stream`] with the direct-connect routing-token check
@@ -1479,20 +1548,27 @@ where
 /// before message 2 is written; a refusal returns [`DirectConnectRefused`]
 /// without ever dialing the Origin. `None` is the relayed path, where the Edge
 /// has already checked the token: the payload is ignored, exactly as before.
+// The relayed wrapper above passes `None` for the two direct-only arguments.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_noise_stream_with_policy<S, R>(
-    mut send: S,
-    mut recv: R,
+    send: S,
+    recv: R,
     origin: SocketAddr,
     origin_keys: &[[u8; 32]],
     metrics: Arc<TunnelMetrics>,
     gate: &local_auth::LocalAuthGate,
     direct_policy: Option<&DirectTokenPolicy>,
+    preauth_deadline: Option<tokio::time::Instant>,
 ) -> Result<(), BoxError>
 where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
     let mut buf = vec![0u8; 65535];
+    // The direct path bounds everything before the peer is authenticated -- handshake and
+    // local-auth gate -- by one deadline (see `DirectLimits::setup_timeout`); lifted below.
+    let mut send = PreAuth::new(send, preauth_deadline);
+    let mut recv = PreAuth::new(recv, preauth_deadline);
 
     // <- handshake message 1, -> handshake message 2. Time it and count the
     // outcome for observability (M14.1b). During a key rotation (#12) the Agent
@@ -1554,6 +1630,8 @@ where
         // A share link's 302 (#185) already answered this connection.
         GateOutcome::Closed => return Ok(()),
     };
+    send.lift();
+    recv.lift();
 
     // Bridge the Noise session <-> the Origin TCP socket, both ways, streaming.
     // Meter the Origin socket: bytes read from it flow back to the Client
@@ -1592,7 +1670,7 @@ where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    serve_noise_udp_with_policy(send, recv, origin, origin_keys, None).await
+    serve_noise_udp_with_policy(send, recv, origin, origin_keys, None, None).await
 }
 
 /// [`serve_noise_udp`] with the direct-connect routing-token check (ct-agent#45
@@ -1600,17 +1678,21 @@ where
 /// on the direct path judges the handshake payload before message 2, `None`
 /// (relayed) ignores it.
 pub async fn serve_noise_udp_with_policy<S, R>(
-    mut send: S,
-    mut recv: R,
+    send: S,
+    recv: R,
     origin: SocketAddr,
     origin_keys: &[[u8; 32]],
     direct_policy: Option<&DirectTokenPolicy>,
+    preauth_deadline: Option<tokio::time::Instant>,
 ) -> Result<(), BoxError>
 where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
     let mut hbuf = vec![0u8; 65535];
+    // See serve_noise_stream_with_policy: the handshake is bounded on the direct path.
+    let mut send = PreAuth::new(send, preauth_deadline);
+    let mut recv = PreAuth::new(recv, preauth_deadline);
     let m1 = read_frame(&mut recv).await?;
     let (mut hs, hs_payload) = origin_handshake_any_with_payload(origin_keys, &m1)
         .ok_or("no origin identity matched the client handshake")?;
@@ -1620,6 +1702,8 @@ where
     send.write_all(&frame(&hbuf[..n])).await?;
     send.flush().await?;
     let transport = hs.into_transport_mode()?;
+    send.lift();
+    recv.lift();
 
     let udp = UdpSocket::bind(crate::transport::unspecified_for(origin)).await?;
     udp.connect(origin).await?;
@@ -1694,6 +1778,44 @@ pub async fn serve_direct(
     gate: Arc<local_auth::LocalAuthGate>,
     token_policy: Arc<DirectTokenPolicy>,
 ) -> Result<(), BoxError> {
+    serve_direct_within(listener, origin, origin_keys, proto, metrics, gate, token_policy, DirectLimits::DEFAULT)
+        .await
+}
+
+/// Bounds on the direct listener, which anyone who knows the address can reach before
+/// any authentication has happened.
+#[derive(Clone, Copy)]
+pub(crate) struct DirectLimits {
+    /// Connections served at once; further ones are refused at the QUIC layer.
+    pub(crate) max_connections: usize,
+    /// From an accepted connection to its first bi-stream: a peer that connects and
+    /// never opens one would otherwise hold its slot for the connection's whole life.
+    pub(crate) setup_timeout: Duration,
+    /// After the stream was served, how long the client gets to close the connection
+    /// itself (a clean close keeps unacknowledged tail bytes) before the agent does.
+    pub(crate) linger: Duration,
+}
+
+impl DirectLimits {
+    pub(crate) const DEFAULT: Self = Self {
+        max_connections: 256,
+        setup_timeout: Duration::from_secs(10),
+        linger: Duration::from_secs(30),
+    };
+}
+
+// `serve_direct`'s signature plus the limits; the test seam for them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_direct_within(
+    listener: Endpoint,
+    origin: SocketAddr,
+    origin_keys: Arc<Vec<[u8; 32]>>,
+    proto: OriginProto,
+    metrics: Arc<TunnelMetrics>,
+    gate: Arc<local_auth::LocalAuthGate>,
+    token_policy: Arc<DirectTokenPolicy>,
+    limits: DirectLimits,
+) -> Result<(), BoxError> {
     let mut conns = tokio::task::JoinSet::new();
     loop {
         let incoming = tokio::select! {
@@ -1705,45 +1827,88 @@ pub async fn serve_direct(
             // simply disabled for the round (`accept` is what the loop waits on).
             Some(_) = conns.join_next() => continue,
         };
+        while conns.try_join_next().is_some() {}
+        if conns.len() >= limits.max_connections {
+            incoming.refuse();
+            note_direct_refused_at_capacity(limits.max_connections);
+            continue;
+        }
         let metrics = Arc::clone(&metrics);
         let keys = Arc::clone(&origin_keys);
         let gate = Arc::clone(&gate);
         let policy = Arc::clone(&token_policy);
         conns.spawn(tracked(async move {
-            if let Ok(conn) = incoming.await {
-                if let Ok((send, recv)) = conn.accept_bi().await {
-                    let served = match proto {
-                        OriginProto::Tcp => {
-                            serve_noise_stream_with_policy(
-                                send,
-                                recv,
-                                origin,
-                                &keys,
-                                metrics,
-                                &gate,
-                                Some(&policy),
-                            )
-                            .await
-                        }
-                        OriginProto::Udp => {
-                            serve_noise_udp_with_policy(send, recv, origin, &keys, Some(&policy))
-                                .await
-                        }
-                    };
-                    if let Err(e) = &served {
-                        if e.downcast_ref::<DirectConnectRefused>().is_some() {
-                            conn.close(
-                                DIRECT_REFUSED_CLOSE_CODE.into(),
-                                b"direct-connect refused (#45)",
-                            );
-                        }
+            // One deadline for everything before the peer is authenticated: the QUIC/TLS
+            // handshake, its first bi-stream, the Noise handshake and the local-auth gate. A
+            // peer that stalls anywhere in there gives its slot back when it passes.
+            let deadline = tokio::time::Instant::now() + limits.setup_timeout;
+            let setup = tokio::time::timeout_at(deadline, async {
+                let conn = incoming.await.ok()?;
+                match conn.accept_bi().await {
+                    Ok(streams) => Some((conn, streams)),
+                    Err(_) => None,
+                }
+            })
+            .await;
+            let Ok(Some((conn, (send, recv)))) = setup else {
+                return; // dropping an unfinished handshake or connection closes it
+            };
+            let served = match proto {
+                OriginProto::Tcp => {
+                    serve_noise_stream_with_policy(send, recv, origin, &keys, metrics, &gate, Some(&policy), Some(deadline))
+                        .await
+                }
+                OriginProto::Udp => {
+                    serve_noise_udp_with_policy(send, recv, origin, &keys, Some(&policy), Some(deadline)).await
+                }
+            };
+            match &served {
+                // A failed or refused session gets no linger: close at once, so a stream of
+                // garbage handshakes cannot keep the slots full for `linger` each.
+                Err(e) if e.downcast_ref::<DirectConnectRefused>().is_some() => {
+                    conn.close(DIRECT_REFUSED_CLOSE_CODE.into(), b"direct-connect refused (#45)");
+                }
+                Err(_) => conn.close(0u32.into(), b"failed"),
+                // A served one lets the client close first (a clean close keeps unacknowledged
+                // tail bytes), for at most `linger`.
+                Ok(()) => {
+                    if tokio::time::timeout(limits.linger, conn.closed()).await.is_err() {
+                        conn.close(0u32.into(), b"served");
                     }
                 }
-                conn.closed().await;
             }
         }));
     }
     Ok(())
+}
+
+/// Direct connections refused because [`DirectLimits::max_connections`] were in use.
+static DIRECT_REFUSED_AT_CAPACITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count a refusal at the cap and say so at most once a minute: a limit whose triggering
+/// nobody can see is undiagnosable ("clients do not get through").
+fn note_direct_refused_at_capacity(max: usize) {
+    use std::sync::atomic::Ordering;
+    static LAST_LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let total = DIRECT_REFUSED_AT_CAPACITY.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let last = LAST_LOGGED.load(Ordering::Relaxed);
+    if now >= last + 60 && LAST_LOGGED.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        eprintln!(
+            "ct-agent: direct listener at its connection cap ({max}); refusing new direct connections \
+             ({total} refused so far, ct_agent_direct_refused_at_capacity_total)"
+        );
+    }
+}
+
+/// The `/metrics` series for [`note_direct_refused_at_capacity`].
+pub(crate) fn render_direct_refused_prometheus() -> String {
+    format!(
+        "# HELP ct_agent_direct_refused_at_capacity_total Direct connections refused because the listener was at its connection cap.\n\
+         # TYPE ct_agent_direct_refused_at_capacity_total counter\n\
+         ct_agent_direct_refused_at_capacity_total {}\n",
+        DIRECT_REFUSED_AT_CAPACITY.load(std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 /// Everything the direct-connect accept loop needs, kept by [`run_agent`] so the
@@ -1838,7 +2003,7 @@ pub async fn run_agent(
     // by THIS scope -- see `DirectListener` for the intended lifetime.
     let mut direct: Option<(DirectListener, TaskGuard<()>)> = None;
     if let Some(ip) = config.direct_advertise_ip {
-        if let Ok((listener, cert)) = crate::transport::build_direct_listener() {
+        if let Ok((listener, cert)) = crate::transport::build_tunnel_direct_listener() {
             if let Ok(bound) = listener.local_addr() {
                 let advertised = SocketAddr::new(ip, bound.port());
                 if let Ok(adv) = dial_quic(config.edge, edge_cert.clone()).await {
@@ -4462,6 +4627,97 @@ mod tests {
         let _ = origin.await;
     }
 
+    /// A direct listener with `limits`, serving nothing useful (origin :9); returns its
+    /// address and the client endpoint that trusts it.
+    async fn direct_listener_with(limits: DirectLimits) -> (SocketAddr, quinn::Endpoint, tokio::task::JoinHandle<()>) {
+        use crate::transport::build_direct_listener_at;
+        use std::net::Ipv4Addr;
+        let (listener, cert) = build_direct_listener_at((Ipv4Addr::LOCALHOST, 0).into()).expect("listener");
+        let laddr = listener.local_addr().expect("laddr");
+        let srv = tokio::spawn(async move {
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ = serve_direct_within(
+                listener,
+                "127.0.0.1:9".parse().unwrap(),
+                std::sync::Arc::new(vec![[0u8; 32]]),
+                OriginProto::Tcp,
+                std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new()),
+                std::sync::Arc::new(gate),
+                std::sync::Arc::new(DirectTokenPolicy::new(RoutingToken([0u8; 32]), false)),
+                limits,
+            )
+            .await;
+        });
+        let client = ct_edge::transport::build_client_endpoint(cert).expect("client");
+        (laddr, client, srv)
+    }
+
+    #[tokio::test]
+    async fn the_direct_listener_refuses_connections_beyond_its_cap() {
+        let limits = DirectLimits { max_connections: 1, setup_timeout: Duration::from_secs(20), linger: Duration::from_secs(30) };
+        let (laddr, client, srv) = direct_listener_with(limits).await;
+        // Holds the one slot: connected, never opens a stream.
+        let first = client.connect(laddr, "localhost").unwrap().await.expect("first connection accepted");
+        let second = tokio::time::timeout(Duration::from_secs(5), client.connect(laddr, "localhost").unwrap())
+            .await
+            .expect("the refusal is immediate, not a hang");
+        assert!(second.is_err(), "a connection beyond the cap is refused");
+        assert!(
+            !render_direct_refused_prometheus().contains("ct_agent_direct_refused_at_capacity_total 0\n"),
+            "and the refusal is counted on /metrics"
+        );
+        first.close(0u32.into(), b"done");
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn a_direct_peer_that_stalls_inside_the_handshake_is_closed() {
+        // Review on #240: the setup bound ended at accept_bi, so a peer that opened a stream
+        // and then went silent held its slot in read_frame forever (QUIC keepalive keeps the
+        // connection itself alive). The bound now covers the Noise handshake and gate too.
+        let limits = DirectLimits { max_connections: 8, setup_timeout: Duration::from_millis(300), linger: Duration::from_secs(30) };
+        let (laddr, client, srv) = direct_listener_with(limits).await;
+        let conn = client.connect(laddr, "localhost").unwrap().await.expect("connected");
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[0u8]).await.unwrap(); // half a frame length: accept_bi fires, read_frame waits
+        tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("the agent closed the stalled connection instead of holding it");
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_direct_session_frees_its_slot_at_once() {
+        // Review on #240: every exit used to linger up to 30 s, so a garbage handshake held a
+        // slot for the whole linger. A failed session is now closed at once, and the cap
+        // recovers: the next connection is accepted.
+        let limits = DirectLimits { max_connections: 1, setup_timeout: Duration::from_secs(20), linger: Duration::from_secs(30) };
+        let (laddr, client, srv) = direct_listener_with(limits).await;
+        let first = client.connect(laddr, "localhost").unwrap().await.expect("first connection accepted");
+        let (mut send, _recv) = first.open_bi().await.unwrap();
+        send.write_all(&[0, 4, 1, 2, 3, 4]).await.unwrap(); // a frame no origin key accepts
+        tokio::time::timeout(Duration::from_secs(5), first.closed())
+            .await
+            .expect("the failed session was closed at once, not lingered");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second = tokio::time::timeout(Duration::from_secs(5), client.connect(laddr, "localhost").unwrap())
+            .await
+            .expect("no hang");
+        assert!(second.is_ok(), "the slot came back: the next connection is accepted");
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn a_direct_connection_that_never_opens_a_stream_is_closed() {
+        let limits = DirectLimits { max_connections: 8, setup_timeout: Duration::from_millis(300), linger: Duration::from_secs(30) };
+        let (laddr, client, srv) = direct_listener_with(limits).await;
+        let conn = client.connect(laddr, "localhost").unwrap().await.expect("connected");
+        tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("the agent closed the idle connection instead of holding it");
+        srv.abort();
+    }
+
     // ---- ct-agent#45 slice 1: the RoutingToken in the direct-connect handshake ----
 
     #[test]
@@ -4774,6 +5030,7 @@ mod tests {
                 m,
                 &gate,
                 policy.as_ref(),
+                None,
             )
             .await
         });
@@ -4980,7 +5237,7 @@ mod tests {
         let (a_read, a_write) = tokio::io::split(agent_cipher);
         let origin_priv = origin_kp.private;
         let agent = tokio::spawn(async move {
-            serve_noise_udp_with_policy(a_write, a_read, origin_addr, &[origin_priv], Some(&policy))
+            serve_noise_udp_with_policy(a_write, a_read, origin_addr, &[origin_priv], Some(&policy), None)
                 .await
         });
 

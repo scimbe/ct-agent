@@ -44,6 +44,31 @@ pub fn build_direct_listener_at(
     Ok((endpoint, cert))
 }
 
+/// The tunnel's own direct-path listener (`serve.rs`): like [`build_direct_listener`], but quinn is
+/// told that one bi-stream per connection is all it will ever serve. With the defaults a peer
+/// could open 100 streams and have quinn buffer data on each of them, against a connection
+/// window that is practically unbounded -- per unauthenticated connection. One bidi stream, no
+/// uni streams, and a connection window equal to the stream window (quinn's default, so the
+/// served stream's throughput is unchanged) bound that to one stream window per connection.
+pub fn build_tunnel_direct_listener() -> Result<(Endpoint, CertificateDer<'static>), BoxError> {
+    install_crypto_provider();
+    let (cert, key) = self_signed()?;
+    let mut server_config = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key)?;
+    server_config.transport_config(std::sync::Arc::new(tunnel_direct_transport()));
+    let endpoint = Endpoint::server(server_config, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
+    Ok((endpoint, cert))
+}
+
+fn tunnel_direct_transport() -> quinn::TransportConfig {
+    const STREAM_WINDOW: u32 = 1_250_000; // quinn's default stream_receive_window
+    let mut t = quinn::TransportConfig::default();
+    t.max_concurrent_bidi_streams(1u32.into());
+    t.max_concurrent_uni_streams(0u32.into());
+    t.stream_receive_window(STREAM_WINDOW.into());
+    t.receive_window(STREAM_WINDOW.into());
+    t
+}
+
 /// Build the direct-path listener on `0.0.0.0:0` (reachable on the container's
 /// bridge IP, ephemeral port).
 pub fn build_direct_listener() -> Result<(Endpoint, CertificateDer<'static>), BoxError> {

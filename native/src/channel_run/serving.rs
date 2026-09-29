@@ -406,13 +406,7 @@ where
 /// side in **serve** mode (`CT_CHANNEL_SERVE` truthy) — the parking side of a role a pipeline dials
 /// repeatedly. An initiator (or a non-serve accept) does exactly one session and exits. Pure.
 pub(crate) fn should_serve_loop(role: ChannelRole, serve_env: Option<&str>) -> bool {
-    role == ChannelRole::Accept
-        && serve_env
-            .map(|v| {
-                let t = v.trim();
-                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
-            })
-            .unwrap_or(false)
+    role == ChannelRole::Accept && crate::envflag::flag(serve_env, false)
 }
 
 /// One admit→serve cycle of the plane-brokered flow: re-present the grant to the broker (a fresh

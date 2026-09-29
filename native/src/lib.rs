@@ -30,6 +30,7 @@ pub mod config;
 pub mod dns01_authoritative;
 pub mod dns01_propagation;
 pub mod doctor;
+pub mod envflag;
 pub mod events;
 pub mod harness_run;
 pub mod http;
