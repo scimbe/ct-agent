@@ -17,9 +17,7 @@ use serde_json::Value;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-fn b64url(bytes: &[u8]) -> String {
-    URL_SAFE_NO_PAD.encode(bytes)
-}
+use crate::codec::base64url as b64url;
 
 /// The two constant JWK members of an ES256 account key (RFC 7518 §6.2.1).
 const JWK_KTY: &str = "EC";

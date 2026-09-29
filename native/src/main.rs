@@ -322,6 +322,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // subscriber installed they go nowhere no matter what env var is set. `RUST_LOG`
     // absent -> zero behavior change (no subscriber installed at all), same off-by-default
     // pattern as `CT_DEBUG_A2A_TIMING`.
+    if let Some(warning) = ct_agent::events::blank_state_dir_warning(|k| std::env::var(k).ok()) {
+        eprintln!("{warning}");
+    }
     if std::env::var_os("RUST_LOG").is_some() {
         tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -531,8 +534,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // writable dir -- but CT_AGENT_STATE_DIR is what the live serve path
     // reads back, so anywhere else silently would not take effect).
     if std::env::args().nth(1).as_deref() == Some("local-auth") {
-        let state_dir = std::env::var("CT_AGENT_STATE_DIR")
-            .map_err(|_| "ct-agent local-auth requires CT_AGENT_STATE_DIR")?;
+        let state_dir = ct_agent::events::configured_state_dir()
+            .ok_or("ct-agent local-auth requires CT_AGENT_STATE_DIR")?;
         let state_dir = std::path::Path::new(&state_dir);
         match std::env::args().nth(2).as_deref() {
             Some("set") => {
@@ -638,9 +641,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // ct-agent#173: the warning above is now enforced. A non-internal listen address is
         // refused unless CT_RELAY_ALLOW_PUBLIC_BIND=1 says the operator meant it; either way
         // the decision is logged so a public relay never appears by accident.
-        let allow_public = std::env::var(ct_agent::p2p::RELAY_ALLOW_PUBLIC_BIND_ENV)
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+        let allow_public = ct_agent::envflag::env_flag(ct_agent::p2p::RELAY_ALLOW_PUBLIC_BIND_ENV, false);
         match ct_agent::p2p::relay_listen_policy(&listen, allow_public) {
             Ok(true) => eprintln!("ct-agent relay-node: binding {listen} (internal address, ct-agent#173 policy: ok)"),
             Ok(false) => eprintln!(
@@ -1146,7 +1147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // FIRST boot redeems + persists the bound identity/tenant there and every
         // later boot RESTORES it — so a container restart never replays the spent
         // token into a crash-loop (the help-agent outage). Unset ⇒ prior always-redeem.
-        let state_dir = std::env::var("CT_AGENT_STATE_DIR").ok();
+        let state_dir = ct_agent::events::configured_state_dir();
         let run = async move {
             match state_dir.as_deref() {
                 Some(dir) => onboard_or_restore(
@@ -1357,7 +1358,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // CT_AGENT_STATE_DIR directly rather than reusing the onboarding branch's
     // local (out of scope here) -- both reads are the same env var and this
     // one is the only copy needed post-onboarding.
-    let state_dir = std::env::var("CT_AGENT_STATE_DIR").ok().map(std::path::PathBuf::from);
+    let state_dir = ct_agent::events::configured_state_dir().map(std::path::PathBuf::from);
     let (local_auth_gate, local_auth_notice) =
         ct_agent::local_auth::LocalAuthGate::from_env(state_dir.as_deref(), |k| std::env::var(k).ok())
             .map_err(|e| format!("ct-agent: CT_AGENT_LOCAL_AUTH config error: {e}"))?;

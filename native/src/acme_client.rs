@@ -50,7 +50,27 @@ fn is_dns01_failure(e: &BoxError) -> bool {
     m.contains("DNS-01 authoritative check failed")
         || m.contains("DNS-01 propagation check failed")
         || m.contains("publishing the DNS-01 challenge record failed")
-        || (m.contains("became invalid") && m.contains("dns"))
+        || m.contains(DNS01_VALIDATION_FAILED)
+}
+
+/// Marker [`complete_challenge`](AcmeClient::complete_challenge) puts into an invalid
+/// authorization's error when the CA's reason is one a fresh order can fix.
+const DNS01_VALIDATION_FAILED: &str = "DNS-01 validation failed";
+
+/// Whether an `invalid` authorization failed for a reason the propagation race explains:
+/// the CA's resolver saw no or a stale TXT record (`dns`, or `unauthorized` for a TXT
+/// mismatch). CAA, `rejectedIdentifier` and the like fail the same way on every order,
+/// and every extra order burns the CA's failed-validation budget. The whole authz JSON is
+/// no guide -- it always names `"type":"dns"` identifiers and `dns-01` challenges.
+fn invalid_authz_is_dns01_race(authz: &serde_json::Value) -> bool {
+    const RETRYABLE: [&str; 2] = ["urn:ietf:params:acme:error:dns", "urn:ietf:params:acme:error:unauthorized"];
+    authz
+        .get("challenges")
+        .and_then(|c| c.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.pointer("/error/type").and_then(|t| t.as_str()))
+        .any(|t| RETRYABLE.contains(&t))
 }
 
 /// A successfully issued certificate: the PEM chain plus the private key that
@@ -476,6 +496,9 @@ impl AcmeClient {
             let authz = self.post_as_get(authz_url).await?;
             match authz.get("status").and_then(|s| s.as_str()) {
                 Some("valid") => return Ok(()),
+                Some("invalid") if invalid_authz_is_dns01_race(&authz) => {
+                    return Err(format!("authorization {authz_url} became invalid ({DNS01_VALIDATION_FAILED}): {authz}").into())
+                }
                 Some("invalid") => return Err(format!("authorization {authz_url} became invalid: {authz}").into()),
                 _ if std::time::Instant::now() >= deadline => {
                     return Err(format!("authorization {authz_url} did not validate within {POLL_TIMEOUT:?}").into())
@@ -537,10 +560,7 @@ fn header_str(resp: &reqwest::Response, name: &str) -> Option<String> {
     resp.headers().get(name)?.to_str().ok().map(str::to_string)
 }
 
-fn base64_url(bytes: &[u8]) -> String {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    URL_SAFE_NO_PAD.encode(bytes)
-}
+use crate::codec::base64url as base64_url;
 
 #[cfg(test)]
 mod tests {
@@ -830,7 +850,6 @@ mod tests {
             "DNS-01 authoritative check failed: TXT ... still missing from: ns2.desec.org".into(),
             "DNS-01 propagation check failed: did not become publicly resolvable".into(),
             "publishing the DNS-01 challenge record failed: control plane returned 502".into(),
-            "authorization https://acme/authz/1 became invalid: {\"type\":\"urn:ietf:params:acme:error:dns\"}".into(),
         ];
         for e in &retryable {
             assert!(is_dns01_failure(e), "should retry: {e}");
@@ -846,6 +865,39 @@ mod tests {
         for e in &fatal {
             assert!(!is_dns01_failure(e), "must NOT retry: {e}");
         }
+    }
+
+    /// Real-shaped authorizations: the identifier is always `dns` and the challenge always
+    /// `dns-01`, so only the challenge's error type may decide.
+    fn invalid_authz(error_type: &str) -> serde_json::Value {
+        serde_json::json!({
+            "identifier": { "type": "dns", "value": "shop.example.test" },
+            "status": "invalid",
+            "challenges": [{
+                "type": "dns-01",
+                "status": "invalid",
+                "error": { "type": error_type, "detail": "..." }
+            }]
+        })
+    }
+
+    #[test]
+    fn an_invalid_authorization_retries_only_for_a_dns_propagation_reason() {
+        assert!(invalid_authz_is_dns01_race(&invalid_authz("urn:ietf:params:acme:error:dns")));
+        assert!(invalid_authz_is_dns01_race(&invalid_authz("urn:ietf:params:acme:error:unauthorized")));
+        for fatal in [
+            "urn:ietf:params:acme:error:caa",
+            "urn:ietf:params:acme:error:rejectedIdentifier",
+            "urn:ietf:params:acme:error:rateLimited",
+        ] {
+            let authz = invalid_authz(fatal);
+            assert!(!invalid_authz_is_dns01_race(&authz), "{fatal} must not retry");
+            let e: BoxError = format!("authorization https://acme/authz/1 became invalid: {authz}").into();
+            assert!(!is_dns01_failure(&e), "the authz JSON alone must not make {fatal} retryable");
+        }
+        let e: BoxError =
+            format!("authorization https://acme/authz/1 became invalid ({DNS01_VALIDATION_FAILED}): {{}}").into();
+        assert!(is_dns01_failure(&e));
     }
 
     #[tokio::test]

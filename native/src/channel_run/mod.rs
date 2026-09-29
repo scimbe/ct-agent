@@ -394,11 +394,10 @@ where
     };
     // The DCUtR session runs the Noise_IK over the relay bi-stream as its base leg, punching to
     // direct in the background. Initiator opens the bi-stream; acceptor accepts the edge-opened one.
-    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::other(e.to_string());
-    let (relay_send, relay_recv) = match role {
-        ChannelRole::Initiate => relay_conn.open_bi().await.map_err(|e| map_err(Box::new(e)))?,
-        ChannelRole::Accept => relay_conn.accept_bi().await.map_err(|e| map_err(Box::new(e)))?,
-    };
+    // Bounded (#139): after `Admitted` the partner is paired, so the stream opens at once;
+    // a live-but-silent relay would otherwise hold this session (and a serve slot) forever.
+    let (relay_send, relay_recv) =
+        open_channel_streams(relay_conn, role, ct_common::channel_quic::DIRECT_STREAM_SETUP_TIMEOUT).await?;
     let client = crate::p2p::build_dcutr_relay_client_swarm()?;
     crate::p2p::run_channel_session_upgradable_dcutr(
         relay_send,
@@ -530,7 +529,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // hiccup the plain path tolerates fine) and, before this fix, that killed an otherwise
     // perfectly healthy long-lived --serve process instead of just re-admitting. `Initiate`
     // (and `Accept` without `--serve`) stay single-attempt, matching every other one-shot path.
-    let serve_loop = should_serve_loop(cfg.role, std::env::var("CT_CHANNEL_SERVE").ok().as_deref());
+    let serve_loop = should_serve_loop(cfg.role, crate::envflag::env_value("CT_CHANNEL_SERVE", false).as_deref());
     // #248: a one-shot Initiate (or non-serve Accept) on the relay-gate/circuit-relay DCUtR
     // path shouldn't fail on the very first #140 stall either -- live-reproduced on the
     // a2a-demo's plain "bob" scenario (previously thought stable, now exercising this same
@@ -633,7 +632,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
         // accept, and non-reconnect persistent CALL mode) keeps exactly one session, unchanged.
         if let Ok(slug) = std::env::var("CT_CHANNEL_CALL_SERVICE") {
             if cfg.call_reconnect
-                && call_persistent_enabled_from(std::env::var("CT_CHANNEL_CALL_PERSISTENT").ok().as_deref())
+                && call_persistent_enabled_from(crate::envflag::env_value("CT_CHANNEL_CALL_PERSISTENT", true).as_deref())
             {
                 return run_persistent_call_reconnect_loop(
                     slug.trim().to_string(),

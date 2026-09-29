@@ -302,7 +302,9 @@ where
     );
     // #248: unconditional (no debug flag) periodic status while this session's pump runs —
     // aborted the moment the pump finishes, one way or another, via the handle drop below.
-    let ticker = tokio::spawn(async {
+    // Guarded (ct-agent#180): when this future is dropped mid-pump -- a caller's select!
+    // taking another branch -- a bare spawn kept printing every interval, forever.
+    let ticker = crate::task_guard::TaskGuard::spawn(async {
         loop {
             tokio::time::sleep(TRAFFIC_STATUS_INTERVAL).await;
             eprintln!("{}", traffic_status_line());
@@ -316,7 +318,7 @@ where
     // waits (bounded) for the peer to close, keeping the process + netns alive until our tail is
     // delivered. (The QUIC path keeps its stronger `stopped()` ack-wait in `run_channel_session`.)
     let pumped = noise_pump(session, BiStream { send: &mut send, recv: &mut recv }, local).await;
-    ticker.abort();
+    drop(ticker);
     graceful_stream_drain(&mut send, &mut recv, RELAY_DRAIN_TIMEOUT).await;
     eprintln!("{}", traffic_status_line());
     crate::events::emit(

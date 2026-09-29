@@ -565,6 +565,7 @@ dependencies = [
  "tower",
  "tracing-subscriber",
  "webpki-roots 0.26.11",
+ "x509-parser",
 ]
 
 [[package]]
@@ -3461,16 +3462,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spike-masque-h2"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "h2",
- "http",
- "tokio",
-]
-
-[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3704,7 +3695,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2 0.6.5",

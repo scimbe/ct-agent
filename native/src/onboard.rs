@@ -26,15 +26,7 @@ use std::path::Path;
 /// land mid-character and panic during onboarding instead of returning the
 /// intended error.
 fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
-    let s = s.trim();
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
-    }
-    Some(out)
+    crate::codec::hex_decode(s.trim())
 }
 
 /// Inputs for one-command onboarding, gathered so the agent can be brought up
@@ -241,8 +233,8 @@ impl OnboardedAgent {
         let staged = self
             .identity
             .save_secret_to(&identity_tmp)
-            .and_then(|()| std::fs::write(&agent_tmp, &self.agent_id.0))
-            .and_then(|()| std::fs::write(&tenant_tmp, &self.tenant.0));
+            .and_then(|()| crate::secret_file::write_durable(&agent_tmp, self.agent_id.0.as_bytes()))
+            .and_then(|()| crate::secret_file::write_durable(&tenant_tmp, self.tenant.0.as_bytes()));
         if let Err(e) = staged {
             // Best-effort cleanup so a failed persist doesn't leave partial `.new`
             // files (one of which may hold key material) lying around forever.
@@ -255,6 +247,7 @@ impl OnboardedAgent {
         std::fs::rename(&identity_tmp, &identity_path)?;
         std::fs::rename(&agent_tmp, &agent_path)?;
         std::fs::rename(&tenant_tmp, &tenant_path)?;
+        crate::secret_file::sync_parent_dir(&tenant_path)?;
         Ok(())
     }
 

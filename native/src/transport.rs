@@ -14,7 +14,6 @@ use std::time::Duration;
 
 use std::path::Path;
 
-use ct_common::credential::SignedCredential;
 use ct_common::RoutingToken;
 use quinn::{Connection, Endpoint};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -45,6 +44,31 @@ pub fn build_direct_listener_at(
     Ok((endpoint, cert))
 }
 
+/// The tunnel's own direct-path listener (`serve.rs`): like [`build_direct_listener`], but quinn is
+/// told that one bi-stream per connection is all it will ever serve. With the defaults a peer
+/// could open 100 streams and have quinn buffer data on each of them, against a connection
+/// window that is practically unbounded -- per unauthenticated connection. One bidi stream, no
+/// uni streams, and a connection window equal to the stream window (quinn's default, so the
+/// served stream's throughput is unchanged) bound that to one stream window per connection.
+pub fn build_tunnel_direct_listener() -> Result<(Endpoint, CertificateDer<'static>), BoxError> {
+    install_crypto_provider();
+    let (cert, key) = self_signed()?;
+    let mut server_config = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key)?;
+    server_config.transport_config(std::sync::Arc::new(tunnel_direct_transport()));
+    let endpoint = Endpoint::server(server_config, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
+    Ok((endpoint, cert))
+}
+
+fn tunnel_direct_transport() -> quinn::TransportConfig {
+    const STREAM_WINDOW: u32 = 1_250_000; // quinn's default stream_receive_window
+    let mut t = quinn::TransportConfig::default();
+    t.max_concurrent_bidi_streams(1u32.into());
+    t.max_concurrent_uni_streams(0u32.into());
+    t.stream_receive_window(STREAM_WINDOW.into());
+    t.receive_window(STREAM_WINDOW.into());
+    t
+}
+
 /// Build the direct-path listener on `0.0.0.0:0` (reachable on the container's
 /// bridge IP, ephemeral port).
 pub fn build_direct_listener() -> Result<(Endpoint, CertificateDer<'static>), BoxError> {
@@ -69,56 +93,22 @@ pub async fn advertise_direct_listener(
     addr: SocketAddr,
     cert: &CertificateDer<'_>,
 ) -> Result<(), BoxError> {
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(b"D").await?;
-    send.write_all(&token.0).await?;
     let a = addr.to_string();
     let ab = a.as_bytes();
-    send.write_all(&[ab.len() as u8]).await?;
-    send.write_all(ab).await?;
     let cb = cert.as_ref();
-    send.write_all(&(cb.len() as u16).to_be_bytes()).await?;
-    send.write_all(cb).await?;
-    send.finish()?;
-    let ack = recv.read_to_end(8).await?;
+    let mut msg = Vec::with_capacity(1 + 32 + 1 + ab.len() + 2 + cb.len());
+    msg.push(b'D');
+    msg.extend_from_slice(&token.0);
+    msg.push(ab.len() as u8);
+    msg.extend_from_slice(ab);
+    msg.extend_from_slice(&(cb.len() as u16).to_be_bytes());
+    msg.extend_from_slice(cb);
+    let ack = quic_control_exchange(conn, &msg, 8, "direct-listener advertisement", REGISTER_ACK_TIMEOUT).await?;
     if ack == b"OK" {
         Ok(())
     } else {
         Err("direct-listener advertisement rejected".into())
     }
-}
-
-/// Transport the Agent uses to reach the Edge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Transport {
-    /// Primary: QUIC over UDP/443.
-    Quic,
-    /// Fallback when outbound UDP is blocked: HTTP/2 over TCP/443.
-    TcpFallback,
-}
-
-/// Select the transport given whether outbound UDP is reachable. QUIC is
-/// preferred; TCP fallback is used only when UDP is blocked (ADR-0004).
-pub fn select_transport(udp_reachable: bool) -> Transport {
-    if udp_reachable {
-        Transport::Quic
-    } else {
-        Transport::TcpFallback
-    }
-}
-
-/// Probe whether outbound QUIC/UDP to `edge` works (M12.1): attempt a QUIC
-/// handshake within `timeout`. Returns `true` if it connects — the input to
-/// [`select_transport`] (QUIC vs the TCP fallback when UDP is blocked).
-pub async fn probe_udp_reachable(
-    edge: SocketAddr,
-    edge_cert: CertificateDer<'static>,
-    timeout: Duration,
-) -> bool {
-    matches!(
-        tokio::time::timeout(timeout, dial_quic(edge, edge_cert)).await,
-        Ok(Ok(_))
-    )
 }
 
 pub(crate) fn install_crypto_provider() {
@@ -133,8 +123,18 @@ pub(crate) fn install_crypto_provider() {
 const AGENT_KEEPALIVE: Duration = Duration::from_secs(5);
 const AGENT_MAX_IDLE: Duration = Duration::from_secs(30);
 
-fn client_endpoint(edge_cert: CertificateDer<'static>) -> Result<Endpoint, BoxError> {
-    client_endpoint_with(edge_cert, Some(AGENT_KEEPALIVE), AGENT_MAX_IDLE)
+fn client_endpoint(edge_cert: CertificateDer<'static>, edge_addr: SocketAddr) -> Result<Endpoint, BoxError> {
+    client_endpoint_with(edge_cert, Some(AGENT_KEEPALIVE), AGENT_MAX_IDLE, edge_addr)
+}
+
+/// The wildcard address of `peer`'s own family, port 0: a socket bound to
+/// `0.0.0.0` cannot reach an IPv6 peer (and `resolve_addr` may well return one
+/// for a hostname), so every socket that talks to a configured peer binds this.
+pub(crate) fn unspecified_for(peer: SocketAddr) -> SocketAddr {
+    match peer {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
+    }
 }
 
 /// Build the `quinn::ClientConfig` trusting `edge_cert`, applying a
@@ -176,10 +176,11 @@ fn client_endpoint_with(
     edge_cert: CertificateDer<'static>,
     keep_alive: Option<Duration>,
     max_idle: Duration,
+    edge_addr: SocketAddr,
 ) -> Result<Endpoint, BoxError> {
     let cfg = quic_client_config(edge_cert, keep_alive, max_idle)?;
     // Bind all interfaces (not loopback) so the Agent can reach a non-local Edge.
-    let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
+    let mut endpoint = Endpoint::client(unspecified_for(edge_addr))?;
     endpoint.set_default_client_config(cfg);
     Ok(endpoint)
 }
@@ -197,7 +198,7 @@ pub async fn dial_quic(
     edge_addr: SocketAddr,
     edge_cert: CertificateDer<'static>,
 ) -> Result<Connection, BoxError> {
-    let endpoint = client_endpoint(edge_cert)?;
+    let endpoint = client_endpoint(edge_cert, edge_addr)?;
     let conn = endpoint.connect(edge_addr, "localhost")?.await?;
     Ok(conn)
 }
@@ -227,23 +228,6 @@ pub async fn dial_quic_or_blocked_error(
             edge_addr.port()
         )
         .into()),
-    }
-}
-
-/// Present `signed` to the Edge over a fresh bidirectional stream and await the
-/// Edge's decision. Returns `Ok(())` only if the Edge accepted the credential.
-pub async fn present_credential(
-    conn: &Connection,
-    signed: &SignedCredential,
-) -> Result<(), BoxError> {
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(&signed.encode()).await?;
-    send.finish()?;
-    let ack = recv.read_to_end(64).await?;
-    if ack == b"OK" {
-        Ok(())
-    } else {
-        Err("edge rejected credential".into())
     }
 }
 
@@ -300,12 +284,9 @@ pub fn is_registration_refusal(e: &BoxError) -> bool {
 /// untyped error, so only the Edge's literal refusal vocabulary is ever
 /// classified as a refusal.
 pub async fn register_tunnel(conn: &Connection, token: &RoutingToken) -> Result<(), BoxError> {
-    let (mut send, mut recv) = conn.open_bi().await?;
     let mut msg = vec![b'A'];
     msg.extend_from_slice(&token.0);
-    send.write_all(&msg).await?;
-    send.finish()?;
-    let ack = recv.read_to_end(8).await?;
+    let ack = quic_control_exchange(conn, &msg, 8, "tunnel registration", REGISTER_ACK_TIMEOUT).await?;
     if ack == b"OK" {
         Ok(())
     } else if ack.starts_with(b"NO") {
@@ -327,13 +308,12 @@ pub async fn bind_hostname(
     if hb.is_empty() || hb.len() > 253 {
         return Err("hostname length out of range (1..=253)".into());
     }
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(b"H").await?;
-    send.write_all(&token.0).await?;
-    send.write_all(&(hb.len() as u16).to_be_bytes()).await?;
-    send.write_all(hb).await?;
-    send.finish()?;
-    let ack = recv.read_to_end(8).await?;
+    let mut msg = Vec::with_capacity(1 + 32 + 2 + hb.len());
+    msg.push(b'H');
+    msg.extend_from_slice(&token.0);
+    msg.extend_from_slice(&(hb.len() as u16).to_be_bytes());
+    msg.extend_from_slice(hb);
+    let ack = quic_control_exchange(conn, &msg, 8, "hostname binding", REGISTER_ACK_TIMEOUT).await?;
     if ack == b"OK" {
         Ok(())
     } else {
@@ -408,6 +388,27 @@ where
 /// normally sub-second; 15s is generous headroom for a loaded edge or a slow
 /// path, while still being finite so the ladder can recover on its own.
 const REGISTER_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// One request/ack round trip on a fresh QUIC control stream, bounded by
+/// [`REGISTER_ACK_TIMEOUT`]. The agent's own QUIC keepalive keeps the connection
+/// alive, so an edge handler that stalls would otherwise never let the ack read
+/// return -- the same hang #589 fixed on the TCP path.
+async fn quic_control_exchange(
+    conn: &Connection,
+    msg: &[u8],
+    max_ack: usize,
+    what: &str,
+    bound: Duration,
+) -> Result<Vec<u8>, BoxError> {
+    tokio::time::timeout(bound, async {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send.write_all(msg).await?;
+        send.finish()?;
+        Ok::<Vec<u8>, BoxError>(recv.read_to_end(max_ack).await?)
+    })
+    .await
+    .map_err(|_| -> BoxError { format!("{what} ack timed out after {bound:?}").into() })?
+}
 
 /// Shared body of the `'A'`/`'K'` TCP-fallback registration: both roles have a
 /// byte-identical wire format (`role(1) | token(32)` → 2-byte `OK`/`NO` ack), so
@@ -835,11 +836,6 @@ pub fn load_cert(path: impl AsRef<Path>) -> std::io::Result<CertificateDer<'stat
 mod tests {
     use super::*;
 
-    #[test]
-    fn prefers_quic_when_udp_reachable() {
-        assert_eq!(select_transport(true), Transport::Quic);
-    }
-
     #[tokio::test]
     async fn apply_tcp_keepalive_actually_sets_the_socket_option() {
         // #229: a parked TLS-TCP fallback connection is otherwise a plain,
@@ -955,40 +951,6 @@ mod tests {
         assert_eq!(echoed, b"direct-hello", "direct listener accepts and echoes");
         conn.close(0u32.into(), b"done");
         let _ = srv.await;
-    }
-
-    #[test]
-    fn falls_back_to_tcp_when_udp_blocked() {
-        assert_eq!(select_transport(false), Transport::TcpFallback);
-    }
-
-    #[tokio::test]
-    async fn probe_reachable_edge_selects_quic() {
-        let (server, cert) =
-            ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
-        let addr = server.local_addr().expect("addr");
-        let accept = tokio::spawn(async move {
-            if let Some(inc) = server.accept().await {
-                let _ = inc.await;
-            }
-        });
-        let reachable = probe_udp_reachable(addr, cert, Duration::from_secs(2)).await;
-        assert!(reachable, "QUIC to a live edge is reachable");
-        assert_eq!(select_transport(reachable), Transport::Quic);
-        accept.abort();
-    }
-
-    #[tokio::test]
-    async fn probe_dead_udp_selects_tcp_fallback() {
-        // Nothing listening at this UDP address → probe times out.
-        let (_ep, cert) =
-            build_direct_listener_at((Ipv4Addr::LOCALHOST, 0).into()).expect("cert");
-        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let dead_addr = dead.local_addr().unwrap();
-        drop(dead);
-        let reachable = probe_udp_reachable(dead_addr, cert, Duration::from_millis(400)).await;
-        assert!(!reachable, "blocked UDP is not reachable");
-        assert_eq!(select_transport(reachable), Transport::TcpFallback);
     }
 
     #[tokio::test]
@@ -1804,7 +1766,7 @@ mod tests {
 
         // Client with a keepalive shorter than the server's idle timeout.
         let ep =
-            client_endpoint_with(cert, Some(Duration::from_millis(300)), Duration::from_secs(30))
+            client_endpoint_with(cert, Some(Duration::from_millis(300)), Duration::from_secs(30), addr)
                 .unwrap();
         let conn = ep.connect(addr, "localhost").unwrap().await.unwrap();
 
@@ -1880,74 +1842,6 @@ mod tests {
         server_task.await.expect("edge task join");
     }
 
-    // --- P1.4d-ii: credential handshake over QUIC ---
-
-    use crate::identity::AgentIdentity;
-    use ct_common::{AgentId, TenantId};
-    use ct_control_plane::credential::CredentialIssuer;
-    use ct_control_plane::enrollment::Enrollment;
-    use ct_control_plane::issuance::mint_for_enrolled;
-
-    fn enrolled_credential(
-        expires_at: u64,
-    ) -> (ct_common::credential::SignedCredential, [u8; 32]) {
-        let issuer = CredentialIssuer::generate();
-        let mut enrollment = Enrollment::new();
-        let tenant = TenantId("tenant-1".into());
-        let token = enrollment.issue_join_token(tenant);
-        let identity = AgentIdentity::generate();
-        let agent_id = AgentId("agent-1".into());
-        enrollment
-            .redeem(&token, agent_id.clone(), identity.public_key_bytes())
-            .unwrap();
-        let signed = mint_for_enrolled(&issuer, &enrollment, &agent_id, expires_at).unwrap();
-        (signed, issuer.public_key_bytes())
-    }
-
-    #[tokio::test]
-    async fn agent_authenticates_to_edge_with_valid_credential() {
-        let (signed, issuer_pk) = enrolled_credential(1_000);
-        let (server, cert) =
-            ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
-        let addr = server.local_addr().expect("addr");
-
-        let server_task = tokio::spawn(async move {
-            let conn = ct_edge::auth::accept_and_authenticate(&server, &issuer_pk, 500)
-                .await
-                .map_err(|e| e.to_string())?;
-            conn.closed().await;
-            Ok::<(), String>(())
-        });
-
-        let conn = dial_quic(addr, cert).await.expect("dial");
-        present_credential(&conn, &signed)
-            .await
-            .expect("edge accepts valid credential");
-        conn.close(0u32.into(), b"done");
-        server_task.await.expect("join").expect("edge auth ok");
-    }
-
-    #[tokio::test]
-    async fn edge_rejects_expired_credential() {
-        let (signed, issuer_pk) = enrolled_credential(100); // expires at 100
-        let (server, cert) =
-            ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
-        let addr = server.local_addr().expect("addr");
-
-        let server_task = tokio::spawn(async move {
-            // now = 500 >= 100 → expired → Err
-            ct_edge::auth::accept_and_authenticate(&server, &issuer_pk, 500)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        });
-
-        let conn = dial_quic(addr, cert).await.expect("dial");
-        let result = present_credential(&conn, &signed).await;
-        assert!(result.is_err(), "expired credential must be rejected");
-        let _ = server_task.await;
-    }
-
     #[tokio::test]
     async fn agent_registers_tunnel_with_edge() {
         use ct_edge::state::EdgeState;
@@ -1987,6 +1881,30 @@ mod tests {
         let loaded = load_cert(&path).expect("load");
         assert_eq!(loaded, cert, "agent loads the edge cert from the shared file");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_quic_control_ack_that_never_comes_times_out_instead_of_hanging() {
+        // The edge reads the request and then goes silent while the connection stays
+        // up (quinn keeps it alive): without a bound the ack read never returns.
+        let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let edge = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let (_send, mut recv) = conn.accept_bi().await.unwrap();
+            let _ = recv.read_to_end(8192).await.unwrap();
+            conn.closed().await;
+        });
+        let conn = dial_quic(addr, cert).await.expect("dial");
+        let bound = Duration::from_millis(300);
+        let start = std::time::Instant::now();
+        let e = quic_control_exchange(&conn, b"Axxxx", 8, "tunnel registration", bound)
+            .await
+            .expect_err("a silent edge must not hang the ack read");
+        assert!(e.to_string().contains("tunnel registration ack timed out"), "{e}");
+        assert!(start.elapsed() < Duration::from_secs(5), "returned at the bound, not later");
+        conn.close(0u32.into(), b"done");
+        let _ = edge.await;
     }
 
     // #20 TC3: a mock edge that reads one bi-stream request and replies with a

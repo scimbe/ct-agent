@@ -9,6 +9,7 @@
 //! test builds its own [`AgentStatus`] and its own facts and never touches the
 //! process-wide instance.
 
+use crate::codec::now_unix;
 use std::sync::RwLock;
 
 use ct_common::sync::RwLockExt;
@@ -145,11 +146,6 @@ impl AgentStatus {
         self.inner.read_safe().reconnects
     }
 
-    /// Seconds since the last liveness observation, `None` before the first.
-    pub fn last_seen_secs_ago_at(&self, now: u64) -> Option<u64> {
-        self.inner.read_safe().last_seen.map(|t| now.saturating_sub(t))
-    }
-
     /// The `/status` document at `now` with the given process facts.
     pub fn snapshot_at(&self, now: u64, facts: &ProcessFacts) -> Value {
         let s = self.inner.read_safe().clone();
@@ -235,13 +231,6 @@ impl Default for AgentStatus {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 // ---- process-wide convenience wrappers ------------------------------------------------

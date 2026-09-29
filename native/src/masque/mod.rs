@@ -6,11 +6,10 @@
 //! otherwise indistinguishable from ordinary HTTPS traffic on the wire.
 //!
 //! See CADS-Tunnel's `docs/adr/0024-masque-connect-udp-fallback.md` for the full
-//! design and M1 (`spike-masque-h2/`)/M2 (`masque-proxy`) that proved the transport
-//! layer this module's [`dial_quic_via_masque`] builds on. **Not yet wired into the
-//! agent's reconnect loop or `ladder.rs`'s `EdgeRung`** -- that's the deliberately
-//! separate follow-up (mirrors M2's own proxy-backend-then-registration split), so
-//! this lands as a real, independently testable unit first.
+//! design and M1 (the since-removed spike)/M2 (`masque-proxy`) that proved the transport
+//! layer this module's [`dial_quic_via_masque`] builds on. The agent's reconnect loop
+//! tries it (`serve.rs`, `try_dial_via_masque`) before the TLS-TCP fallback when
+//! `CT_AGENT_MASQUE_*` is configured.
 
 mod capsule;
 // ct-agent#179: `pub(crate)` so the soak harness drives the bounded pumps directly.
@@ -129,6 +128,42 @@ pub async fn dial_quic_via_masque(
 /// real publicly-trusted one, while production always goes through the wrapper
 /// above.
 async fn dial_quic_via_masque_with_proxy_roots(
+    proxy_tcp_addr: SocketAddr,
+    sni_host: &str,
+    target: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    token: &str,
+    proxy_roots: rustls::RootCertStore,
+) -> Result<quinn::Connection, BoxError> {
+    dial_quic_via_masque_within(MASQUE_DIAL_TIMEOUT, proxy_tcp_addr, sni_host, target, edge_cert, token, proxy_roots)
+        .await
+}
+
+/// Upper bound on one whole MASQUE dial (TCP connect, TLS, h2, extended CONNECT,
+/// inner QUIC handshake). Without it a proxy that accepts TCP and then stays silent
+/// stalls the reconnect loop before it ever reaches the TLS-TCP fallback.
+const MASQUE_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Dropping the inner future on timeout is safe: the h2 driver is a `TaskGuard`
+/// and aborts with it.
+async fn dial_quic_via_masque_within(
+    bound: std::time::Duration,
+    proxy_tcp_addr: SocketAddr,
+    sni_host: &str,
+    target: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    token: &str,
+    proxy_roots: rustls::RootCertStore,
+) -> Result<quinn::Connection, BoxError> {
+    tokio::time::timeout(
+        bound,
+        dial_quic_via_masque_unbounded(proxy_tcp_addr, sni_host, target, edge_cert, token, proxy_roots),
+    )
+    .await
+    .map_err(|_| -> BoxError { format!("MASQUE dial via {proxy_tcp_addr} timed out after {bound:?}").into() })?
+}
+
+async fn dial_quic_via_masque_unbounded(
     proxy_tcp_addr: SocketAddr,
     sni_host: &str,
     target: SocketAddr,

@@ -395,3 +395,31 @@ fn process_wide_drop_totals_render_as_one_labeled_prometheus_counter() {
     assert!(text.contains("\nct_agent_masque_dropped_datagrams_total{direction=\"inbound\"} "), "{text}");
     assert!(text.ends_with('\n'), "exposition block is newline-terminated so the next series starts on its own line");
 }
+
+#[tokio::test]
+async fn a_proxy_that_accepts_tcp_and_stays_silent_times_out() {
+    // Accepts the TCP connection, never speaks TLS: without a bound the dial (and the
+    // reconnect loop behind it) would wait forever instead of moving on to the fallback.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    let silent = tokio::spawn(async move {
+        let (_sock, _) = listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let (_edge, edge_cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
+    let start = std::time::Instant::now();
+    let e = super::dial_quic_via_masque_within(
+        std::time::Duration::from_millis(300),
+        proxy_addr,
+        "masque.test",
+        "127.0.0.1:9".parse().unwrap(),
+        edge_cert,
+        TEST_TOKEN,
+        rustls::RootCertStore::empty(),
+    )
+    .await
+    .expect_err("a silent proxy must not hang the dial");
+    assert!(e.to_string().contains("timed out"), "{e}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    silent.abort();
+}

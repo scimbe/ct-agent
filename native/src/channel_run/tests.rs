@@ -3680,8 +3680,42 @@ fn run_service_handler_does_not_deadlock_on_input_larger_than_the_pipe_buffer() 
     // panics, which is exactly the failure mode being guarded against.
     use ct_common::channel::ServiceType::CodeGeneration;
     let big = "x".repeat(200_000);
-    let out = run_service_handler("cat", CodeGeneration, &big).unwrap();
-    assert_eq!(out, big, "the full oversized input round-trips without hanging");
+    let out = run_service_handler("wc -c", CodeGeneration, &big).unwrap();
+    assert_eq!(out.trim(), "200000", "the full oversized input reaches the handler without hanging");
+    // `cat` writes to stdout before it has drained stdin -- the deadlock shape. The result is
+    // past the channel message ceiling, so it must come back as an error, still without hanging.
+    let e = run_service_handler("cat", CodeGeneration, &big).unwrap_err();
+    assert!(e.contains("exceeds"), "{e}");
+}
+
+#[test]
+fn run_service_handler_does_not_leak_agent_secrets_into_the_handler_env() {
+    use ct_common::channel::ServiceType::CodeGeneration;
+    std::env::set_var("CT_CHANNEL_HOLDER_KEY", "holder-secret-for-test");
+    let out = run_service_handler(
+        "printf '%s|%s' \"${CT_CHANNEL_HOLDER_KEY:-unset}\" \"$CT_SERVICE_TYPE\"",
+        CodeGeneration,
+        "",
+    )
+    .unwrap();
+    std::env::remove_var("CT_CHANNEL_HOLDER_KEY");
+    assert!(out.starts_with("unset|"), "the holder key reached the handler: {out}");
+}
+
+#[test]
+fn peer_facing_stderr_tail_redacts_a_value_whose_keyword_falls_before_the_cut() {
+    // The cut lands right after `api_key=`: redacting only the kept tail would no longer see
+    // the keyword and would ship the bare value to the peer.
+    let secret = "sk-live-VERYSECRETVALUE";
+    let mut stderr = "x".repeat(10_000);
+    stderr.push_str(" api_key=");
+    stderr.push_str(secret);
+    stderr.push(' ');
+    stderr.push_str(&"y".repeat(HANDLER_STDERR_PEER_TAIL_MAX - secret.len() - 1));
+    let cut_at = stderr.len() - HANDLER_STDERR_PEER_TAIL_MAX;
+    assert!(stderr[..cut_at].ends_with(" api_key=") && stderr[cut_at..].starts_with(secret));
+    let out = peer_facing_stderr_tail(stderr.as_bytes());
+    assert!(!out.contains(secret), "{out}");
 }
 
 #[test]
@@ -6666,4 +6700,84 @@ async fn channel_local_stream_variant_surfaces_a_spawn_failure_on_every_poll_not
     let mut buf = [0u8; 4];
     let err2 = local.read(&mut buf).await.unwrap_err();
     assert_eq!(err2.kind(), io::ErrorKind::NotFound, "the failure surfaces on read too, not just write");
+}
+
+/// Live (non-zombie) processes whose process group is `pgid`, from /proc.
+#[cfg(target_os = "linux")]
+fn live_processes_in_group(pgid: i32) -> usize {
+    let Ok(dir) = std::fs::read_dir("/proc") else { return 0 };
+    dir.filter_map(|e| e.ok())
+        .filter_map(|e| std::fs::read_to_string(e.path().join("stat")).ok())
+        .filter(|stat| {
+            // "pid (comm) state ppid pgrp ..." -- comm may contain spaces, so split after ')'.
+            let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else { return false };
+            let mut f = rest.split_whitespace();
+            let state = f.next();
+            let _ppid = f.next();
+            let pgrp = f.next().and_then(|p| p.parse::<i32>().ok());
+            pgrp == Some(pgid) && state != Some("Z")
+        })
+        .count()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dropping_a_stream_handler_kills_its_grandchildren_too() {
+    // A pipeline or backgrounded child outlives a kill of the `sh -c` pid alone; the handler
+    // runs in its own process group so the drop reaches the whole subtree.
+    let proc = spawn_stream_handler("sleep 30 | cat", "code_generation").unwrap();
+    let pgid = proc.child.id().unwrap() as i32;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(live_processes_in_group(pgid) >= 2, "the handler's pipeline is running before the drop");
+    drop(proc);
+    let mut left = usize::MAX;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        left = live_processes_in_group(pgid);
+        if left == 0 {
+            break;
+        }
+    }
+    assert_eq!(left, 0, "processes of the dropped handler's group are still running");
+}
+
+#[test]
+fn jsonrpc_error_for_echoes_the_request_id() {
+    let e = super::service_calls::jsonrpc_error_for(br#"{"jsonrpc":"2.0","id":7,"method":"x"}"#, "too big");
+    let v: serde_json::Value = serde_json::from_slice(&e).unwrap();
+    assert_eq!(v["id"], 7);
+    assert_eq!(v["error"]["code"], -32603);
+    assert_eq!(v["error"]["message"], "too big");
+    let e = super::service_calls::jsonrpc_error_for(b"not json", "x");
+    let v: serde_json::Value = serde_json::from_slice(&e).unwrap();
+    assert!(v["id"].is_null());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_serve_member_retries_a_dial_failure_instead_of_exiting() {
+    // An outer Err is a dial/setup failure (an edge restart). A persistent serve member must
+    // come back for another attempt; a one-shot join still ends on it.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = std::sync::Arc::new(AtomicU32::new(0));
+    let c = calls.clone();
+    let serve = tokio::spawn(async move {
+        run_dcutr_join_loop::<(), _, _>("test", true, || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Err::<Result<(), BoxError>, BoxError>("edge unreachable".into())
+            }
+        })
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+    assert!(calls.load(Ordering::SeqCst) >= 2, "the serve loop dialed again after the failure");
+    assert!(!serve.is_finished(), "and did not end the serve process");
+    serve.abort();
+
+    let one_shot = run_dcutr_join_loop::<(), _, _>("test", false, || async {
+        Err::<Result<(), BoxError>, BoxError>("edge unreachable".into())
+    })
+    .await;
+    assert!(one_shot.is_err(), "a one-shot join still ends on a dial failure");
 }

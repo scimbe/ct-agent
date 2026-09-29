@@ -48,6 +48,13 @@ Add `--docker`/`-Docker` to run as a container instead of directly on the host (
 direct-host path is meant for an isolated VM/container/dedicated host — the script
 warns about this before proceeding). See `scripts/setup.sh --help` for all flags.
 
+**CLI only** (`ct-agent ssh`, `ssh-config`, `login`, `channel …`): these take everything
+via flags and need no `.env`, tunnel config or running agent. Install just the binary:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh | bash -s -- --client-only
+```
+
 This is the one supported way to install `ct-agent` — it downloads the right
 [prebuilt release binary](https://github.com/scimbe/ct-agent/releases) for your
 OS/arch itself, so there's no separate manual-download path to keep in sync. If

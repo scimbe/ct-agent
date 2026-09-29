@@ -295,11 +295,11 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_OIDC_CLI_CLIENT_ID` | `ct-agent login` only: overrides the realm's public device-grant CLI client id (default `ct-agent-cli`) |
 | `CT_AGENT_LOGIN_TOKEN_FILE` | overrides where `ct-agent login` stores (and `channel register`/`allowlist` read) the token; default `<CT_AGENT_STATE_DIR>/oidc-token.json`, else `$HOME/.ct-agent/oidc-token.json` |
 
-**`CT_CHANNEL_PHASE_MARKER=off` (or `0`) is a measurement tool, not a tuning knob.** It
+**`CT_CHANNEL_PHASE_MARKER=off` (or `0`/`false`/`no`) is a measurement tool, not a tuning knob.** It
 suppresses the v0.4.14 phase preamble while keeping everything else identical — the only way
 to vary the marker as a *single* variable, since every marked release also carries the #494
-ack-reader fix. Markers are on by default, and only the literal `off`/`0` disables them, so a
-typo cannot silently drop the marker. **Do not set it in production:** an unmarked member
+ack-reader fix. Markers are on by default, and only an explicit off spelling (`off`/`0`/`false`/`no`)
+disables them, so a typo cannot silently drop the marker (it is reported at start). **Do not set it in production:** an unmarked member
 cannot pair phase-deterministically and hits an N×10 s retry staircase on a large share of
 pairings (field-measured 2026-08-14, p=0.013).
 

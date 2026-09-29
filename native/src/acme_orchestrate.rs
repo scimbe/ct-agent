@@ -250,7 +250,7 @@ impl AcmeCertConfig {
     /// `CT_ACME_DNS01_PROPAGATION_TIMEOUT_SECS` (default 180),
     /// `CT_ACME_DNS01_ATTEMPTS` (default 3 -- whole-order retries on the
     /// propagation race; every attempt costs a real CA order),
-    /// `CT_ACME_DNS01_INITIAL_DELAY_SECS` (default 75 -- see
+    /// `CT_ACME_DNS01_INITIAL_DELAY_SECS` (default 5 -- see
     /// `dns01_propagation::DEFAULT_INITIAL_DELAY`; lowering it risks
     /// re-poisoning the resolver cache). The ACME directory URL and any EAB
     /// credentials are no longer configured here at all (#233): the
@@ -279,7 +279,10 @@ impl AcmeCertConfig {
             .unwrap_or_else(|| cert_out_dir.join("acme-account-key.der"));
         let dns01_resolver_urls = get("CT_ACME_DNS01_RESOLVER_URLS")
             .filter(|s| !s.is_empty())
-            .map(|s| s.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect())
+            .map(|s| s.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect::<Vec<_>>())
+            // "," or " , " parses to no resolver at all, and an empty list made the
+            // propagation check pass without a single lookup.
+            .filter(|urls| !urls.is_empty())
             .unwrap_or_else(|| dns01_propagation::DEFAULT_RESOLVER_URLS.iter().map(|s| s.to_string()).collect());
         let dns01_initial_delay = get("CT_ACME_DNS01_INITIAL_DELAY_SECS")
             .filter(|s| !s.is_empty())
@@ -302,9 +305,7 @@ impl AcmeCertConfig {
             dns01_attempts: get("CT_ACME_DNS01_ATTEMPTS")
                 .filter(|v| !v.is_empty())
                 .and_then(|v| v.parse::<u32>().ok()),
-            dns01_use_authoritative: get("CT_ACME_DNS01_AUTHORITATIVE")
-                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
-                .unwrap_or(true),
+            dns01_use_authoritative: crate::envflag::flag_named("CT_ACME_DNS01_AUTHORITATIVE", get("CT_ACME_DNS01_AUTHORITATIVE").as_deref(), true),
             acme_directory_extra_hosts: crate::acme_client::parse_allowed_directory_hosts(
                 get(crate::acme_client::ALLOW_DIRECTORY_HOST_ENV).as_deref(),
             ),
@@ -319,20 +320,45 @@ impl AcmeCertConfig {
     }
 }
 
-/// Whether the cert at `path` is missing or old enough to renew.
+/// Whether the cert at `path` is missing or due for renewal: by its own validity
+/// window when the chain parses (see [`renewal_due_by_validity`]), else by file age.
 fn needs_renewal(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Ok(pem) = std::fs::read(path) else {
         return true; // no cert yet
     };
-    let Ok(modified) = meta.modified() else {
+    if let Some((not_before, not_after)) = leaf_validity(&pem) {
+        return renewal_due_by_validity(not_before, not_after, SystemTime::now());
+    }
+    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
         return true; // can't tell how old it is -- renew to be safe
     };
     renewal_due(modified, SystemTime::now())
 }
 
-/// Pure core of [`needs_renewal`] (ct-agent#179): a cert written at `issued_at`
-/// is due at `now` once it is [`RENEW_AFTER_DAYS`] old. A `now` before `issued_at`
-/// (the clock stepped back) counts as due, as before -- renew to be safe.
+/// The first certificate's (the leaf's) `notBefore`/`notAfter` in a PEM chain.
+fn leaf_validity(pem: &[u8]) -> Option<(SystemTime, SystemTime)> {
+    let (_, block) = x509_parser::pem::parse_x509_pem(pem).ok()?;
+    let cert = block.parse_x509().ok()?;
+    let to_system = |t: x509_parser::time::ASN1Time| {
+        u64::try_from(t.timestamp()).ok().map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s))
+    };
+    Some((to_system(cert.validity().not_before)?, to_system(cert.validity().not_after)?))
+}
+
+/// Renew once two thirds of the certificate's own lifetime have passed -- day 60 of a
+/// 90-day certificate, as before, but also day 30 of a 45-day one. A fixed age from the
+/// file's mtime breaks as CA lifetimes shrink (Let's Encrypt's move to 45 days), and after
+/// a restore with a fresh mtime.
+pub(crate) fn renewal_due_by_validity(not_before: SystemTime, not_after: SystemTime, now: SystemTime) -> bool {
+    let Ok(lifetime) = not_after.duration_since(not_before) else {
+        return true; // nonsensical window -- renew to be safe
+    };
+    now >= not_before + lifetime * 2 / 3
+}
+
+/// Pure core of the file-age fallback in [`needs_renewal`] (ct-agent#179): a cert written
+/// at `issued_at` is due at `now` once it is [`RENEW_AFTER_DAYS`] old. A `now` before
+/// `issued_at` (the clock stepped back) counts as due, as before -- renew to be safe.
 pub(crate) fn renewal_due(issued_at: SystemTime, now: SystemTime) -> bool {
     let age = now.duration_since(issued_at).unwrap_or(Duration::MAX);
     age >= Duration::from_secs(RENEW_AFTER_DAYS * 24 * 60 * 60)
@@ -451,12 +477,13 @@ pub async fn obtain_or_renew(config: &AcmeCertConfig) -> Result<bool, BoxError> 
     let key_tmp = PathBuf::from(format!("{}.new", key_path.display()));
     let cert_tmp = PathBuf::from(format!("{}.new", cert_path.display()));
     write_private(&key_tmp, issued.key_pem.as_bytes())?;
-    if let Err(e) = std::fs::write(&cert_tmp, issued.cert_chain_pem.as_bytes()) {
+    if let Err(e) = crate::secret_file::write_durable(&cert_tmp, issued.cert_chain_pem.as_bytes()) {
         let _ = std::fs::remove_file(&key_tmp);
         return Err(e.into());
     }
     std::fs::rename(&key_tmp, &key_path)?;
     std::fs::rename(&cert_tmp, &cert_path)?;
+    crate::secret_file::sync_parent_dir(&cert_path)?;
     eprintln!(
         "ct-agent: obtained a certificate for {} ({} -> {})",
         config.hostname,
@@ -580,6 +607,51 @@ mod tests {
             vec!["https://dns.google/resolve".to_string(), "https://dns.quad9.net/dns-query".to_string()]
         );
         assert_eq!(cfg.dns01_propagation_timeout, Duration::from_secs(30));
+    }
+
+    fn cert_pem_valid(from: (i32, u8, u8), to: (i32, u8, u8)) -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::new(vec!["app.example.com".to_string()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(from.0, from.1, from.2);
+        params.not_after = rcgen::date_time_ymd(to.0, to.1, to.2);
+        let key = rcgen::KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().pem().into_bytes()
+    }
+
+    fn day(y2030_jan_day: u64) -> SystemTime {
+        // 2030-01-01T00:00:00Z
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_893_456_000 + (y2030_jan_day - 1) * 86_400)
+    }
+
+    #[test]
+    fn renewal_follows_the_certificates_own_lifetime() {
+        // A 45-day certificate: renewal at day 30, long before the 60-day file-age rule.
+        let pem = cert_pem_valid((2030, 1, 1), (2030, 2, 15));
+        let (nb, na) = leaf_validity(&pem).expect("parses");
+        assert_eq!(nb, day(1));
+        assert!(!renewal_due_by_validity(nb, na, day(25)));
+        assert!(renewal_due_by_validity(nb, na, day(31)));
+        // A 90-day certificate keeps the old day-60 behaviour.
+        let pem = cert_pem_valid((2030, 1, 1), (2030, 4, 1));
+        let (nb, na) = leaf_validity(&pem).unwrap();
+        assert!(!renewal_due_by_validity(nb, na, day(59)));
+        assert!(renewal_due_by_validity(nb, na, day(61)));
+        assert!(leaf_validity(b"not a pem").is_none(), "falls back to file age");
+    }
+
+    #[test]
+    fn an_empty_resolver_list_falls_back_to_the_defaults() {
+        let env = |k: &str| match k {
+            "CT_AGENT_CP_URL" => Some("https://cp.example".to_string()),
+            "CT_AGENT_TOKEN" => Some("deadbeef".to_string()),
+            "CT_AGENT_HOSTNAME" => Some("app.example.com".to_string()),
+            "CT_ACME_DNS01_RESOLVER_URLS" => Some(" , ".to_string()),
+            _ => None,
+        };
+        let cfg = AcmeCertConfig::from_env_with(env).unwrap();
+        assert_eq!(
+            cfg.dns01_resolver_urls,
+            dns01_propagation::DEFAULT_RESOLVER_URLS.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
     }
 
     /// #31: `write_private` must also FIX a file that already exists world-readable.

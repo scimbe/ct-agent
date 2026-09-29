@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 
 use ct_agent::reconnect::Backoff;
 use ct_common::sync::MutexExt;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 /// Why a supervised child exited -- the whole point of this binary: turn "it died" into
@@ -117,6 +117,41 @@ const STDERR_RING_LINES: usize = 50;
 const HEALTHY_UPTIME_THRESHOLD: Duration = Duration::from_secs(60);
 const BASE_DELAY: Duration = Duration::from_secs(1);
 const MAX_DELAY: Duration = Duration::from_secs(60);
+/// A stderr "line" longer than this is forwarded and kept in pieces; nothing buffers
+/// an unterminated line without bound.
+const STDERR_MAX_LINE: usize = 16 * 1024;
+/// How long the child gets to exit on its own after a forwarded SIGTERM/SIGINT.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// How one supervised run ended.
+enum RunEnd {
+    Exited(CrashReason),
+    /// The supervisor itself was asked to stop; the child was stopped with it.
+    Stopped,
+}
+
+/// Resolves when this process receives SIGTERM or SIGINT (Ctrl-C on Windows).
+async fn shutdown_requested() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -160,11 +195,15 @@ async fn main() {
     loop {
         let started = Instant::now();
         eprintln!("ct-agent-supervisor: starting {child_bin} {}", child_args.join(" "));
-        let outcome = run_once(&child_bin, &child_args).await;
+        let outcome = run_once(&child_bin, &child_args, tokio::io::stderr(), shutdown_requested()).await;
         let uptime = started.elapsed();
 
         let reason = match outcome {
-            Ok(reason) => reason,
+            Ok(RunEnd::Exited(reason)) => reason,
+            Ok(RunEnd::Stopped) => {
+                eprintln!("ct-agent-supervisor: stopped by signal, {child_bin} stopped with it");
+                return;
+            }
             Err(e) => {
                 // The child binary itself couldn't be spawned (not found, not executable) --
                 // not a crash of a running process, but still worth recording + backing off
@@ -202,7 +241,13 @@ async fn main() {
         // happens with u32::MAX -- unwrap_or is defensive, not expected to fire.
         let delay = backoff.next_delay().unwrap_or(MAX_DELAY);
         eprintln!("ct-agent-supervisor: restarting in {delay:?}");
-        tokio::time::sleep(delay).await;
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = shutdown_requested() => {
+                eprintln!("ct-agent-supervisor: stopped by signal while waiting to restart");
+                return;
+            }
+        }
     }
 }
 
@@ -210,32 +255,53 @@ async fn main() {
 /// bounded ring buffer of the trailing lines (to detect a panic line), pass its stdout through
 /// unchanged (existing log pipelines that read a supervised `ct-agent`'s stdout keep working
 /// unmodified), and classify why it exited once it does.
-async fn run_once(bin: &str, args: &[String]) -> std::io::Result<CrashReason> {
+async fn run_once<W>(
+    bin: &str,
+    args: &[String],
+    stderr_out: W,
+    stop: impl std::future::Future<Output = ()>,
+) -> std::io::Result<RunEnd>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let mut child = Command::new(bin)
         .args(args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
+        // If the supervisor ever unwinds out of here, the child must not live on as an
+        // orphan that a restarted supervisor would then run a second copy next to.
+        .kill_on_drop(true)
         .spawn()?;
 
     // `.stderr(Stdio::piped())` above guarantees the handle; an absent one is
     // reported as a spawn error rather than panicking the supervisor (ct-agent#176).
     let stderr = child.stderr.take().ok_or_else(|| std::io::Error::other("child stderr was not piped"))?;
-    let mut ring: VecDeque<String> = VecDeque::with_capacity(STDERR_RING_LINES);
-    let mut lines = BufReader::new(stderr).lines();
-    let mut stderr_out = tokio::io::stderr();
-    // Tee the child's stderr: forward every line unchanged (so a caller tailing this
-    // supervisor's own stderr sees exactly what the child would have printed directly) while
-    // also retaining the trailing STDERR_RING_LINES for post-mortem classification.
-    while let Ok(Some(line)) = lines.next_line().await {
-        let _ = stderr_out.write_all(line.as_bytes()).await;
-        let _ = stderr_out.write_all(b"\n").await;
-        if ring.len() >= STDERR_RING_LINES {
-            ring.pop_front();
-        }
-        ring.push_back(line);
-    }
+    let pump = tokio::spawn(pump_stderr(stderr, stderr_out));
 
-    let status = child.wait().await?;
+    tokio::pin!(stop);
+    let status = tokio::select! {
+        status = child.wait() => status?,
+        _ = &mut stop => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                // Forward the stop as a graceful SIGTERM; the agent gets SHUTDOWN_GRACE.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+            }
+            if tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await.is_err() {
+                let _ = child.kill().await;
+            }
+            pump.abort();
+            return Ok(RunEnd::Stopped);
+        }
+    };
+    // The pump ends at EOF, i.e. once every writer of the pipe is gone; a grandchild that
+    // inherited it must not keep the supervisor from restarting.
+    let ring = match tokio::time::timeout(Duration::from_secs(2), pump).await {
+        Ok(Ok(ring)) => ring,
+        _ => VecDeque::new(),
+    };
     #[cfg(unix)]
     let signal = {
         use std::os::unix::process::ExitStatusExt;
@@ -243,7 +309,43 @@ async fn run_once(bin: &str, args: &[String]) -> std::io::Result<CrashReason> {
     };
     #[cfg(not(unix))]
     let signal: Option<i32> = None;
-    Ok(classify_exit(signal, status.code(), &ring))
+    Ok(RunEnd::Exited(classify_exit(signal, status.code(), &ring)))
+}
+
+/// Tee the child's stderr: forward every byte unchanged to `out` (so a caller tailing the
+/// supervisor's stderr sees exactly what the child printed) while keeping the trailing
+/// [`STDERR_RING_LINES`] lines for post-mortem classification. Reads raw bytes, so non-UTF-8
+/// output cannot end the drain -- a stopped drain lets the pipe fill and blocks the child on
+/// its next write to stderr, forever.
+async fn pump_stderr<R, W>(stderr: R, mut out: W) -> VecDeque<String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut ring: VecDeque<String> = VecDeque::with_capacity(STDERR_RING_LINES);
+    let mut reader = BufReader::new(stderr);
+    let mut line = Vec::with_capacity(256);
+    loop {
+        line.clear();
+        match (&mut reader).take(STDERR_MAX_LINE as u64).read_until(b'\n', &mut line).await {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                // Keep the pipe drained even if line framing fails.
+                let _ = tokio::io::copy(&mut reader, &mut out).await;
+                break;
+            }
+        }
+        let _ = out.write_all(&line).await;
+        if ring.len() >= STDERR_RING_LINES {
+            ring.pop_front();
+        }
+        let text = line.strip_suffix(b"\n").unwrap_or(&line);
+        ring.push_back(String::from_utf8_lossy(text).into_owned());
+    }
+    let _ = out.flush().await;
+    ring
 }
 
 /// Pure classification core (no process I/O), so the exit-status logic is unit-testable
@@ -293,14 +395,7 @@ fn is_valid_status_token(s: &str) -> bool {
 /// caller-supplied value of any length, not a timing-sensitive comparison itself since token
 /// length isn't secret.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    ct_agent::codec::ct_eq(a, b)
 }
 
 /// Checks the `Authorization: Bearer <token>` header against the configured status token
@@ -367,6 +462,40 @@ async fn serve_status(listen: &str, history: Arc<Mutex<CrashHistory>>, expected_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn non_utf8_stderr_does_not_stop_the_drain_or_wedge_the_child() {
+        // An invalid byte, then far more than a pipe buffer: a drain that stops at the first
+        // invalid line leaves the child blocked on its stderr write forever.
+        let args = vec![
+            "-c".to_string(),
+            "printf '\\377\\n' >&2; head -c 300000 /dev/zero | tr '\\0' e >&2; echo >&2; echo 'panicked at x' >&2; exit 3"
+                .to_string(),
+        ];
+        let end = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_once("sh", &args, tokio::io::sink(), std::future::pending()),
+        )
+        .await
+        .expect("the child finished: its stderr was drained to the end")
+        .unwrap();
+        match end {
+            RunEnd::Exited(CrashReason::Panic(p)) => assert!(p.contains("panicked at x"), "{p}"),
+            RunEnd::Exited(other) => panic!("expected the trailing panic line to classify, got {other}"),
+            RunEnd::Stopped => panic!("not stopped"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_is_forwarded_to_the_child_and_ends_the_run() {
+        let args = vec!["-c".to_string(), "trap 'exit 7' TERM; sleep 30 & wait".to_string()];
+        let stop = tokio::time::sleep(Duration::from_millis(200));
+        let start = Instant::now();
+        let end = run_once("sh", &args, tokio::io::sink(), stop).await.unwrap();
+        assert!(matches!(end, RunEnd::Stopped));
+        assert!(start.elapsed() < SHUTDOWN_GRACE, "the child exited on the forwarded SIGTERM");
+    }
 
     fn ring(lines: &[&str]) -> VecDeque<String> {
         lines.iter().map(|s| s.to_string()).collect()

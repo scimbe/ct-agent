@@ -130,11 +130,10 @@ where
             return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
         }
     };
-    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::other(e.to_string());
-    let (relay_send, relay_recv) = match role {
-        ChannelRole::Initiate => relay_conn.open_bi().await.map_err(|e| map_err(Box::new(e)))?,
-        ChannelRole::Accept => relay_conn.accept_bi().await.map_err(|e| map_err(Box::new(e)))?,
-    };
+    // Bounded (#139): after `Admitted` the partner is paired, so the stream opens at once;
+    // a live-but-silent relay would otherwise hold this session (and a serve slot) forever.
+    let (relay_send, relay_recv) =
+        open_channel_streams(relay_conn, role, ct_common::channel_quic::DIRECT_STREAM_SETUP_TIMEOUT).await?;
     let (gate_stream, relay_peer) =
         dial_relay_gate_over_443(relay_gate_addr, relay_gate_cert, own_grant, holder).await?;
     // #248: seed the DCUtR swarm with this member's OWN reflexive address, when the edge
@@ -237,11 +236,10 @@ where
         run_upgradable_session_initiator, run_upgradable_session_responder_verified, Role, UpgradeCoordinator,
     };
 
-    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::other(e.to_string());
-    let (relay_send, relay_recv) = match role {
-        ChannelRole::Initiate => relay_conn.open_bi().await.map_err(|e| map_err(Box::new(e)))?,
-        ChannelRole::Accept => relay_conn.accept_bi().await.map_err(|e| map_err(Box::new(e)))?,
-    };
+    // Bounded (#139): after `Admitted` the partner is paired, so the stream opens at once;
+    // a live-but-silent relay would otherwise hold this session (and a serve slot) forever.
+    let (relay_send, relay_recv) =
+        open_channel_streams(relay_conn, role, ct_common::channel_quic::DIRECT_STREAM_SETUP_TIMEOUT).await?;
     // The relay handshake borrows these; the direct-establishment closures need owned copies.
     let (relay_priv, relay_peer) = (*own_noise_private, *peer_noise_public);
     let (direct_priv, direct_peer) = (*own_noise_private, *peer_noise_public);
@@ -1088,9 +1086,9 @@ pub(crate) fn dcutr_loop_action<T>(
 /// #24: the shared DCUtR join loop both relay-only variants run — deduplicated
 /// from two near-verbatim ~45-line copies whose diverged `label` printed
 /// "relay-gate" in the circuit-relay branch. `join` performs ONE dial+admission
-/// attempt; its **outer** `Err` is a dial/setup failure and stays terminal
-/// (exactly the old `?`-propagation), while the **inner** `Result` is the
-/// admission outcome and is routed through [`dcutr_loop_action`]'s policy.
+/// attempt; its **outer** `Err` is a dial/setup failure, terminal for a one-shot
+/// join and retried like a transient admission error in serve mode, while the
+/// **inner** `Result` is the admission outcome, routed through [`dcutr_loop_action`].
 pub(crate) async fn run_dcutr_join_loop<T, F, Fut>(label: &str, serve_loop: bool, join: F) -> Result<T, BoxError>
 where
     F: Fn() -> Fut,
@@ -1099,7 +1097,14 @@ where
     let mut attempt: u32 = 0;
     let mut consecutive_refusals: u32 = 0;
     loop {
-        let result = join().await?;
+        // In serve mode a dial/setup failure (an edge restart, a network blip) is one more
+        // transient outcome to back off from; ending the persistent serve process on it
+        // contradicted the serve loop's purpose. One-shot callers keep the old `?`.
+        let result = match join().await {
+            Ok(result) => result,
+            Err(e) if serve_loop => Err(e),
+            Err(e) => return Err(e),
+        };
         match dcutr_loop_action(&result, serve_loop, attempt, ONE_SHOT_DCUTR_ADMISSION_RETRIES, consecutive_refusals) {
             DcutrLoopAction::RetryReset { delay, consecutive_refusals: refusals } => {
                 if let Err(e) = &result {
