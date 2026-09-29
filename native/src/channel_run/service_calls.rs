@@ -1063,7 +1063,12 @@ pub(crate) fn call_service_params_ignored_warning(params_env_is_set: bool) -> Op
 /// needed to prove the JSON-RPC wiring (argument parsing, error propagation, response shape)
 /// is correct. See [`channel_local`]'s own comment at the call site for the design rationale
 /// (replaces the removed local REST-server listener; no new network listener anywhere).
-pub(crate) fn register_grant_tool(reg: &mut ct_common::mcp::ToolRegistry, operator: SigningKey, scope: GrantScope) {
+pub(crate) fn register_grant_tool(
+    reg: &mut ct_common::mcp::ToolRegistry,
+    operator: SigningKey,
+    scope: GrantScope,
+    issuers: GrantIssuers,
+) {
     if scope.any {
         // ct-agent#174: the pre-#174 cross-channel behaviour, kept for one release behind an
         // explicit flag. Said once per process, at registration.
@@ -1077,9 +1082,11 @@ pub(crate) fn register_grant_tool(reg: &mut ct_common::mcp::ToolRegistry, operat
             );
         });
     }
-    reg.register(
+    reg.register_ctx(
         "channel/grant",
-        "Issue a channel grant FOR THIS AGENT'S OWN CHANNEL. Arguments: {channel, holder, \
+        "Issue a channel grant FOR THIS AGENT'S OWN CHANNEL. Callable only by a configured grant \
+         issuer (CT_CHANNEL_GRANT_ISSUERS, else CT_CHANNEL_BRIDGE_PEER) -- refused for every other \
+         admitted channel member. Arguments: {channel, holder, \
          direction, expires_in} (64-hex channel id, 64-hex member holder pubkey, \
          \"initiate\"|\"accept\", a relative duration like \"30d\" -- the same fields `channel \
          grant --interactive` prompts for). Returns {grant: <hex>}. One channel per serving \
@@ -1088,7 +1095,8 @@ pub(crate) fn register_grant_tool(reg: &mut ct_common::mcp::ToolRegistry, operat
          other channel id is refused, so an admitted \
          member of this channel can never mint grants for another channel the same operator key \
          signs for.",
-        move |args: &serde_json::Value| {
+        move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
+            issuers.check(ctx.peer)?;
             let field = |name: &str| -> Result<&str, String> {
                 args.get(name)
                     .and_then(|v| v.as_str())
@@ -1106,6 +1114,69 @@ pub(crate) fn register_grant_tool(reg: &mut ct_common::mcp::ToolRegistry, operat
             Ok(serde_json::json!({ "grant": grant }))
         },
     );
+}
+
+/// Env var naming the channel members allowed to call `channel/grant`: their Noise public keys,
+/// 64 hex each, separated by commas or whitespace.
+pub(crate) const GRANT_ISSUERS_ENV: &str = "CT_CHANNEL_GRANT_ISSUERS";
+
+/// Who may call `channel/grant`. The audit finding: the tool checked only the channel, so ANY
+/// admitted member -- even one holding an initiate-only grant -- could mint operator-signed
+/// grants for any holder and direction on this channel: promote itself to `accept` (and so
+/// receive other members' calls), or admit strangers. Issuing grants is an operator action, so
+/// the caller must be one of the Noise keys named in [`GRANT_ISSUERS_ENV`], or -- when that is
+/// unset -- the configured bridge peer (`CT_CHANNEL_BRIDGE_PEER`, the operator's own portal
+/// connection). With neither, every call is refused, naming what to set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct GrantIssuers {
+    pub(crate) allowed: Vec<[u8; 32]>,
+    /// Entries of [`GRANT_ISSUERS_ENV`] that were not 64 hex (reported once at registration).
+    pub(crate) invalid: Vec<String>,
+}
+
+impl GrantIssuers {
+    pub(crate) fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// Read from a variable lookup (the testable seam).
+    pub(crate) fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Self {
+        let mut issuers = Self::default();
+        match f(GRANT_ISSUERS_ENV).filter(|v| !v.trim().is_empty()) {
+            Some(list) => {
+                for entry in list.split(|c: char| c == ',' || c.is_whitespace()).filter(|e| !e.is_empty()) {
+                    match decode_hex_32_bridge_peer(entry) {
+                        Some(key) => issuers.allowed.push(key),
+                        None => issuers.invalid.push(entry.to_string()),
+                    }
+                }
+            }
+            None => issuers.allowed.extend(f("CT_CHANNEL_BRIDGE_PEER").and_then(|v| decode_hex_32_bridge_peer(v.trim()))),
+        }
+        issuers
+    }
+
+    /// Only these callers -- what a test or an explicit caller constructs.
+    #[cfg(test)]
+    pub(crate) fn only(keys: &[[u8; 32]]) -> Self {
+        Self { allowed: keys.to_vec(), invalid: Vec::new() }
+    }
+
+    /// Refuse unless `caller` (the session's attested Noise key) is an allowed issuer.
+    pub(crate) fn check(&self, caller: Option<[u8; 32]>) -> Result<(), String> {
+        if self.allowed.is_empty() {
+            return Err(format!(
+                "channel/grant: no grant issuer is configured on this agent -- set {GRANT_ISSUERS_ENV} \
+                 (the Noise public keys allowed to issue grants) or CT_CHANNEL_BRIDGE_PEER"
+            ));
+        }
+        match caller {
+            Some(peer) if self.allowed.contains(&peer) => Ok(()),
+            _ => Err(format!(
+                "channel/grant: caller is not an authorized grant issuer ({GRANT_ISSUERS_ENV})"
+            )),
+        }
+    }
 }
 
 /// ct-agent#174: env var restoring `channel/grant`'s pre-#174 cross-channel issuance for one
@@ -1882,13 +1953,24 @@ pub(crate) fn channel_local(peer: Option<[u8; 32]>) -> ChannelLocal {
                 (Some(own), false) => format!("for its own channel {}... only", hex_prefix(own)),
                 (None, false) => "-- but none of CT_CHANNEL_ID/CT_GRANT_CHANNEL/CT_CHANNEL_GRANT names a channel, so every call will be refused (ct-agent#174)".to_string(),
             };
-            register_grant_tool(&mut reg, operator, scope);
+            let issuers = GrantIssuers::from_env();
+            let issuer_line = match (issuers.allowed.len(), issuers.invalid.is_empty()) {
+                (0, _) => format!(
+                    "-- but no grant issuer is configured ({GRANT_ISSUERS_ENV} or CT_CHANNEL_BRIDGE_PEER), \
+                     so every call will be refused"
+                ),
+                (n, true) => format!("callable by {n} configured issuer(s)"),
+                (n, false) => format!(
+                    "callable by {n} configured issuer(s); ignored invalid {GRANT_ISSUERS_ENV} entries: {}",
+                    issuers.invalid.join(", ")
+                ),
+            };
+            register_grant_tool(&mut reg, operator, scope, issuers);
             static GRANT_TOOL_LINE: std::sync::Once = std::sync::Once::new();
             GRANT_TOOL_LINE.call_once(|| {
                 eprintln!(
                     "ct-agent channel: --serve configured to expose channel/grant \
-                     (CT_CHANNEL_OPERATOR_KEY set) {scope_line} -- served to admitted peers only, \
-                     no new network listener"
+                     (CT_CHANNEL_OPERATOR_KEY set) {scope_line}, {issuer_line} -- no new network listener"
                 );
             });
         }

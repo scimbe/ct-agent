@@ -1148,6 +1148,9 @@ fn issue_grant_from_fields_validates_each_field_and_self_verifies() {
     );
 }
 
+/// The Noise key the channel/grant tests call as: an allowed grant issuer.
+const TEST_GRANT_ISSUER: [u8; 32] = [0xa5; 32];
+
 #[test]
 fn channel_grant_tool_issues_a_verifiable_grant_over_json_rpc() {
     // 2026-09-01: the channel/grant tool replaces the removed local REST-server listener --
@@ -1164,7 +1167,7 @@ fn channel_grant_tool_issues_a_verifiable_grant_over_json_rpc() {
 
     let mut reg = ToolRegistry::new();
     // ct-agent#174: the tool is scoped to the serving process's own channel.
-    register_grant_tool(&mut reg, op.key.clone(), GrantScope::own([0x66u8; 32]));
+    register_grant_tool(&mut reg, op.key.clone(), GrantScope::own([0x66u8; 32]), GrantIssuers::only(&[TEST_GRANT_ISSUER]));
 
     let request = encode_request(
         1,
@@ -1179,7 +1182,7 @@ fn channel_grant_tool_issues_a_verifiable_grant_over_json_rpc() {
             }
         }),
     );
-    let response_bytes = reg.dispatch(&request);
+    let response_bytes = reg.dispatch_ctx(&ct_common::mcp::CallContext::authenticated(TEST_GRANT_ISSUER), &request);
     let response = decode_response(&response_bytes).expect("valid JSON-RPC response");
     assert!(response.error.is_none(), "unexpected error: {:?}", response.error);
     let grant_hex = response.result.expect("result present").get("grant").expect("grant field").as_str().unwrap().to_string();
@@ -1197,7 +1200,7 @@ fn channel_grant_tool_rejects_missing_or_invalid_fields_without_panicking() {
 
     let op = OperatorIdentity::generate();
     let mut reg = ToolRegistry::new();
-    register_grant_tool(&mut reg, op.key.clone(), GrantScope::own([0x11u8; 32]));
+    register_grant_tool(&mut reg, op.key.clone(), GrantScope::own([0x11u8; 32]), GrantIssuers::only(&[TEST_GRANT_ISSUER]));
 
     // Missing a required field entirely.
     let request = encode_request(
@@ -1205,7 +1208,7 @@ fn channel_grant_tool_rejects_missing_or_invalid_fields_without_panicking() {
         "tools/call",
         serde_json::json!({ "name": "channel/grant", "arguments": { "channel": hex_encode(&[0x11u8; 32]) } }),
     );
-    let response = decode_response(&reg.dispatch(&request)).expect("valid JSON-RPC response");
+    let response = decode_response(&reg.dispatch_ctx(&ct_common::mcp::CallContext::authenticated(TEST_GRANT_ISSUER), &request)).expect("valid JSON-RPC response");
     assert!(response.result.is_none(), "missing fields must not return a result");
     assert!(response.error.is_some(), "missing fields must be a JSON-RPC error, not a silent failure");
 
@@ -1223,7 +1226,7 @@ fn channel_grant_tool_rejects_missing_or_invalid_fields_without_panicking() {
             }
         }),
     );
-    let response = decode_response(&reg.dispatch(&request)).expect("valid JSON-RPC response");
+    let response = decode_response(&reg.dispatch_ctx(&ct_common::mcp::CallContext::authenticated(TEST_GRANT_ISSUER), &request)).expect("valid JSON-RPC response");
     assert!(response.result.is_none());
     assert!(response.error.is_some(), "garbled channel hex must be a JSON-RPC error");
 }
@@ -1240,7 +1243,7 @@ fn grant_call_error(reg: &ct_common::mcp::ToolRegistry, channel_hex: &str, holde
             "arguments": { "channel": channel_hex, "holder": holder_hex, "direction": "accept", "expires_in": "30d" }
         }),
     );
-    let response = decode_response(&reg.dispatch(&request)).expect("valid JSON-RPC response");
+    let response = decode_response(&reg.dispatch_ctx(&ct_common::mcp::CallContext::authenticated(TEST_GRANT_ISSUER), &request)).expect("valid JSON-RPC response");
     response.error.map(|e| format!("{e:?}"))
 }
 
@@ -1254,7 +1257,7 @@ fn channel_grant_tool_refuses_a_grant_for_another_channel_174() {
     let holder_hex = hex_encode(&ChannelIdentity::generate().holder.verifying_key().to_bytes());
     let own = [0x66u8; 32];
     let mut reg = ToolRegistry::new();
-    register_grant_tool(&mut reg, op.key.clone(), GrantScope::own(own));
+    register_grant_tool(&mut reg, op.key.clone(), GrantScope::own(own), GrantIssuers::only(&[TEST_GRANT_ISSUER]));
 
     assert_eq!(grant_call_error(&reg, &hex_encode(&own), &holder_hex), None, "own channel is served");
     assert_eq!(
@@ -1273,7 +1276,7 @@ fn channel_grant_tool_refuses_every_call_when_no_channel_is_configured_174() {
     let op = OperatorIdentity::generate();
     let holder_hex = hex_encode(&ChannelIdentity::generate().holder.verifying_key().to_bytes());
     let mut reg = ToolRegistry::new();
-    register_grant_tool(&mut reg, op.key.clone(), GrantScope { own_channel: None, any: false });
+    register_grant_tool(&mut reg, op.key.clone(), GrantScope { own_channel: None, any: false }, GrantIssuers::only(&[TEST_GRANT_ISSUER]));
     let err = grant_call_error(&reg, &hex_encode(&[0x66u8; 32]), &holder_hex).expect("must be refused");
     assert!(err.contains("needs CT_CHANNEL_ID") && err.contains("CT_CHANNEL_GRANT"), "{err}");
 }
@@ -1284,11 +1287,11 @@ fn channel_grant_tool_env_override_restores_cross_channel_issuance_174() {
     let op = OperatorIdentity::generate();
     let holder_hex = hex_encode(&ChannelIdentity::generate().holder.verifying_key().to_bytes());
     let mut reg = ToolRegistry::new();
-    register_grant_tool(&mut reg, op.key.clone(), GrantScope { own_channel: Some([0x66u8; 32]), any: true });
+    register_grant_tool(&mut reg, op.key.clone(), GrantScope { own_channel: Some([0x66u8; 32]), any: true }, GrantIssuers::only(&[TEST_GRANT_ISSUER]));
     assert_eq!(grant_call_error(&reg, &hex_encode(&[0x77u8; 32]), &holder_hex), None, "CT_CHANNEL_GRANT_ANY=1: old behaviour");
     // The override alone is enough -- even with no own channel configured.
     let mut reg = ToolRegistry::new();
-    register_grant_tool(&mut reg, op.key.clone(), GrantScope { own_channel: None, any: true });
+    register_grant_tool(&mut reg, op.key.clone(), GrantScope { own_channel: None, any: true }, GrantIssuers::only(&[TEST_GRANT_ISSUER]));
     assert_eq!(grant_call_error(&reg, &hex_encode(&[0x77u8; 32]), &holder_hex), None);
 }
 
@@ -1331,6 +1334,55 @@ fn grant_scope_from_lookup_prefers_ct_channel_id_then_ct_grant_channel_174() {
     assert!(scope.check(&id).is_ok());
     assert!(scope.check(&grant_channel).unwrap_err().contains("66666666"));
     assert!(scope.check("zz").unwrap_err().contains("64 hex"));
+}
+
+#[test]
+fn channel_grant_tool_refuses_members_that_are_not_grant_issuers() {
+    // Audit finding: any admitted member (even an initiate-only one) could mint operator-signed
+    // grants for any holder and direction on the channel -- e.g. promote itself to `accept`.
+    use ct_common::mcp::{decode_response, encode_request, CallContext, ToolRegistry};
+    let op = OperatorIdentity::generate();
+    let own = [0x66u8; 32];
+    let member = [0x11u8; 32];
+    let call = |reg: &ToolRegistry, ctx: &CallContext| {
+        let request = encode_request(
+            1,
+            "tools/call",
+            serde_json::json!({
+                "name": "channel/grant",
+                "arguments": { "channel": hex_encode(&own), "holder": hex_encode(&member), "direction": "accept", "expires_in": "30d" }
+            }),
+        );
+        decode_response(&reg.dispatch_ctx(ctx, &request)).expect("valid JSON-RPC response").error.map(|e| format!("{e:?}"))
+    };
+
+    let mut reg = ToolRegistry::new();
+    register_grant_tool(&mut reg, op.key.clone(), GrantScope::own(own), GrantIssuers::only(&[TEST_GRANT_ISSUER]));
+    assert_eq!(call(&reg, &CallContext::authenticated(TEST_GRANT_ISSUER)), None, "a configured issuer is served");
+    let err = call(&reg, &CallContext::authenticated(member)).expect("a plain member is refused");
+    assert!(err.contains("not an authorized grant issuer"), "{err}");
+    assert!(call(&reg, &CallContext::default()).is_some(), "an anonymous caller is refused");
+
+    // No issuer configured at all: every call is refused, naming what to set.
+    let mut reg = ToolRegistry::new();
+    register_grant_tool(&mut reg, op.key.clone(), GrantScope::own(own), GrantIssuers::default());
+    let err = call(&reg, &CallContext::authenticated(TEST_GRANT_ISSUER)).expect("refused");
+    assert!(err.contains("CT_CHANNEL_GRANT_ISSUERS") && err.contains("CT_CHANNEL_BRIDGE_PEER"), "{err}");
+}
+
+#[test]
+fn grant_issuers_come_from_their_own_variable_else_the_bridge_peer() {
+    let lookup = |pairs: &[(&str, &str)]| {
+        let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        GrantIssuers::from_lookup(move |k| m.get(k).cloned())
+    };
+    let (a, b, bridge) = (hex_encode(&[1u8; 32]), hex_encode(&[2u8; 32]), hex_encode(&[3u8; 32]));
+    assert_eq!(lookup(&[]).allowed, Vec::<[u8; 32]>::new());
+    assert_eq!(lookup(&[("CT_CHANNEL_BRIDGE_PEER", &bridge)]).allowed, vec![[3u8; 32]], "the bridge peer by default");
+    let list = format!("{a}, {b}\nnot-hex");
+    let issuers = lookup(&[("CT_CHANNEL_GRANT_ISSUERS", &list), ("CT_CHANNEL_BRIDGE_PEER", &bridge)]);
+    assert_eq!(issuers.allowed, vec![[1u8; 32], [2u8; 32]], "the explicit list wins over the bridge peer");
+    assert_eq!(issuers.invalid, vec!["not-hex".to_string()]);
 }
 
 #[test]
