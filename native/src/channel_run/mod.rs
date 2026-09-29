@@ -132,7 +132,7 @@ pub async fn run_channel_join_with_admission<P>(
 where
     P: AsyncRead + AsyncWrite + Unpin,
 {
-    let (peer_endpoint, peer_noise, observed_reflexive) = match admission {
+    let (peer_endpoint, peer_noise, observed_reflexive, peer_holder) = match admission {
         ChannelJoinOutcome::Admitted { peer_endpoint, peer_noise_pubkey, peer_holder, peer_attestation, observed_reflexive } => {
             let noise = peer_noise_pubkey
                 .ok_or("broker admitted the join but relayed no peer Noise key (registry has none)")?;
@@ -151,7 +151,7 @@ where
             ) {
                 return Err("peer Noise-key attestation failed — refusing to pin a possibly-substituted key (#101)".into());
             }
-            (peer_endpoint, noise, observed_reflexive)
+            (peer_endpoint, noise, observed_reflexive, peer_holder)
         }
         ChannelJoinOutcome::Refused { category } => {
             // #524: the frozen base string stays the prefix; the category (when the
@@ -167,6 +167,9 @@ where
             return Err(ParkExpired::boxed("channel park expired with no partner within the edge park window (#21) -- re-parking"))
         }
     };
+    // The attestation binds the Noise key to `peer_holder` only; the peer's operator-signed grant
+    // binds `peer_holder` to this channel (checked inside the session when enabled).
+    let local = gate_local(local, request, role, peer_holder)?;
     // #104: built once, moved into whichever single relay-fallback call site below
     // actually fires (they're mutually exclusive). `None` whenever direct_upgrade is off
     // (the default) or the edge reported no reflexive address for this admission.
@@ -338,12 +341,31 @@ where
 /// LIVE peer against whatever key this function hands it, so a consistent substitution at both
 /// points would defeat that check too. Only the independently-signed attestation (which the
 /// edge cannot forge) closes it. Pure (no I/O), so unit-testable without a live relay.
+/// `local` behind the peer-grant check when [`REQUIRE_PEER_GRANT_ENV`] is on (see `peer_grant`),
+/// a pass-through otherwise. `peer_holder` is the holder admission attested the pinned Noise key
+/// with. Fails when the check is on but cannot run (no operator key configured).
+pub(crate) fn gate_local<P>(
+    local: P,
+    request: &ChannelJoinRequest,
+    role: ChannelRole,
+    peer_holder: [u8; 32],
+) -> Result<PeerGrantGate<P>, BoxError> {
+    let check = PeerGrantPolicy::from_env()?.map(|policy| PeerGrantCheck {
+        policy,
+        own_grant: request.grant.clone(),
+        peer_holder,
+        role,
+    });
+    Ok(PeerGrantGate::new(local, check))
+}
+
+/// The peer's attested Noise key and the holder that attested it.
 pub(crate) fn verify_relayed_dcutr_peer(
     request: &ChannelJoinRequest,
     noise: [u8; 32],
     peer_holder: Option<[u8; 32]>,
     peer_attestation: Option<[u8; 64]>,
-) -> Result<[u8; 32], BoxError> {
+) -> Result<([u8; 32], [u8; 32]), BoxError> {
     let peer_holder =
         peer_holder.ok_or("relay admitted the DCUtR join but relayed no peer holder -- cannot verify (#101)")?;
     let attestation =
@@ -356,7 +378,7 @@ pub(crate) fn verify_relayed_dcutr_peer(
     ) {
         return Err("peer Noise-key attestation failed -- refusing to pin a possibly-substituted key (#101)".into());
     }
-    Ok(noise)
+    Ok((noise, peer_holder))
 }
 
 pub async fn join_via_relay_dcutr<P>(
@@ -373,7 +395,7 @@ where
 {
     // CADS-Tunnel#495 U2 (a'): relay_conn's own bi-stream carries the DCUtR base leg
     // below -- PHASE_MARKER_RELAY.
-    let peer_noise = match present_channel_join_marked(relay_conn, request, holder, PHASE_MARKER_RELAY).await? {
+    let (peer_noise, peer_holder) = match present_channel_join_marked(relay_conn, request, holder, PHASE_MARKER_RELAY).await? {
         ChannelJoinOutcome::Admitted { peer_noise_pubkey: Some(noise), peer_holder, peer_attestation, .. } => {
             verify_relayed_dcutr_peer(request, noise, peer_holder, peer_attestation)?
         }
@@ -392,6 +414,7 @@ where
             return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
         }
     };
+    let local = gate_local(local, request, role, peer_holder)?;
     // The DCUtR session runs the Noise_IK over the relay bi-stream as its base leg, punching to
     // direct in the background. Initiator opens the bi-stream; acceptor accepts the edge-opened one.
     let (relay_send, relay_recv) = open_relay_channel_streams(relay_conn, role).await?;
@@ -822,6 +845,10 @@ pub async fn run_channel_command(cfg: ChannelRunConfig) -> Result<(), BoxError> 
 
 mod session;
 pub use session::*;
+
+// Security audit: the peer's grant, checked end to end after the Noise handshake (opt-in).
+mod peer_grant;
+pub use peer_grant::*;
 
 mod errors;
 pub(crate) use errors::*;
