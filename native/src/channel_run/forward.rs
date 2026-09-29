@@ -141,6 +141,16 @@ pub fn accept_forward_request_with(
     }
 }
 
+/// Whether [`FORWARD_ALLOW_ENV`] is configured at all (scimbe/ct-agent#255 slice 2,
+/// AUF-20260929-029): `channel_local`'s switch for whether THIS session should run as the
+/// accept side of a channel TCP forward ([`super::forward_stream::forward_accept_local`])
+/// instead of whatever it would otherwise build. Mirrors [`parse_forward_allowlist`]'s own
+/// "unset or empty means off" rule exactly, so the two can never disagree about whether the
+/// feature is on.
+pub(crate) fn forward_allow_configured() -> bool {
+    !parse_forward_allowlist(std::env::var(FORWARD_ALLOW_ENV).ok().as_deref()).is_empty()
+}
+
 /// The target as it goes into an event: trimmed to [`MAX_TARGET_LEN`]. Control characters
 /// are escaped by the event layer itself (stderr) and by serde (the ring), so the only thing
 /// left to bound here is the length.

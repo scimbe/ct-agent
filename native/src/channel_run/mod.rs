@@ -852,6 +852,13 @@ pub use join_config::*;
 mod forward;
 pub use forward::*;
 
+// scimbe/ct-agent#255 slice 2 (AUF-20260929-029): the wire framing and the stream engine that
+// actually run a channel TCP forward -- the initiate side's local listener and the byte-
+// transparent per-connection pump on both sides, built on `forward`'s policy gate above.
+mod forward_stream;
+mod forward_wire;
+pub(crate) use forward_stream::*;
+
 // ct-agent#169: secret-shape redaction for text that leaves this process towards a remote peer.
 mod redact;
 pub(crate) use redact::redact_secrets;

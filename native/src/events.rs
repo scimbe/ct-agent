@@ -98,8 +98,18 @@ pub const SSH_OWNER_AUTH_REFUSED: &str = "ssh_owner_auth_refused";
 /// peer-triggerable event; the counter on `/metrics` stays exact.
 pub const FORWARD_REFUSED: &str = "forward_refused";
 
+/// `{target}`: this member dialed `target` and started pumping a peer's forwarded TCP
+/// connection to it (scimbe/ct-agent#255 slice 2, AUF-20260929-029) -- one per forwarded
+/// stream, paired with [`FORWARD_CLOSE`].
+pub const FORWARD_OPEN: &str = "forward_open";
+
+/// `{target, bytes_in, bytes_out}`: a forwarded TCP stream opened by [`FORWARD_OPEN`] ended.
+/// `bytes_in` is bytes received from the channel peer and written to `target`; `bytes_out` is
+/// bytes read from `target` and sent to the peer.
+pub const FORWARD_CLOSE: &str = "forward_close";
+
 /// Every event kind, in the order `/metrics` renders `ct_agent_events_total{kind}`.
-pub const KINDS: [&str; 17] = [
+pub const KINDS: [&str; 19] = [
     REGISTERED,
     REGISTRATION_FAILED,
     DISCONNECTED,
@@ -117,6 +127,8 @@ pub const KINDS: [&str; 17] = [
     ORIGIN_TLS_TERMINATED,
     SSH_OWNER_AUTH_REFUSED,
     FORWARD_REFUSED,
+    FORWARD_OPEN,
+    FORWARD_CLOSE,
 ];
 
 // ---- the event ----------------------------------------------------------------
