@@ -20,11 +20,32 @@ on:
 env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
-# Read-only by default; only the jobs that create the release or attach assets get write
-# access, each on its own. The build legs also never keep a token in the checkout
-# (persist-credentials: false), and GH_TOKEN exists only in the upload step's env: code that
-# runs inside `cargo build` (a dependency's build.rs or proc-macro) must not be able to
-# rewrite other legs' assets or checksums, which the manifest job would then sign.
+# Build and publish are separate jobs with separate privileges:
+#
+#   version-matches-tag  read-only; resolves the tag to ONE commit every leg builds
+#   build (matrix)       read-only token, no secrets; hands its binaries to the run as
+#                        an artifact and never touches the release
+#   sign                 environment `release` (required reviewer, v* tags only); the
+#                        only job that can read CT_RELEASE_SIGNING_KEY; no write token
+#   publish              the only job with `contents: write`; runs no project code,
+#                        checks every byte against the signed manifest, then attaches
+#                        everything to a draft release and publishes it in one step
+#
+# Before this split each build leg held `contents: write` and uploaded straight to the
+# release, the manifest job then signed whatever .sha256 files it found THERE, and the
+# release was public (empty, then half-filled) while the legs were still running. Now
+# code that runs inside `cargo build` (a dependency's build.rs or proc-macro) holds no
+# token that can write the release; the signer hashes the artifact bytes itself instead
+# of trusting a checksum file; nothing is visible until every leg, the signature and
+# the reviewer approval are in; and a failing leg blocks the release instead of
+# shipping it without that asset.
+#
+# Repository settings this workflow relies on (not expressible in this file):
+#   * Ruleset "release tags": refs/tags/v* -- restrict creation, update and deletion
+#     (bypass: repository admins), so a tag cannot be pushed or moved by anyone else.
+#   * Environment `release`: required reviewer(s); deployment tags restricted to v*;
+#     holds the secret CT_RELEASE_SIGNING_KEY (delete the repository-level copy).
+#     workflow_dispatch backfills must then be started "from" the tag itself.
 permissions:
   contents: read
 
@@ -36,11 +57,25 @@ jobs:
     # they had. Fail the release instead of publishing another mislabelled binary.
     # ct-agent-wasm is versioned independently and ships no release asset -- not covered.
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.tag.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
+      - name: tag is a v* tag; pin its commit
+        id: tag
+        run: |
+          # A dispatch input is free text: refuse branch names and anything that is not
+          # a version tag, so `ref:` below can only ever resolve to a release tag.
+          case "$RELEASE_TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::'$RELEASE_TAG' is not a v* release tag"; exit 1 ;;
+          esac
+          sha="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          echo "tag $RELEASE_TAG -> $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - name: crate version == tag
         run: |
           crate="$(sed -n 's/^version = "\(.*\)"/\1/p' native/Cargo.toml | head -1)"
@@ -51,26 +86,11 @@ jobs:
             exit 1
           fi
 
-  create-release:
-    needs: version-matches-tag
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write   # create the release
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Create the release (idempotent)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "$RELEASE_TAG" --generate-notes --verify-tag || true
-
   build:
-    needs: create-release
+    needs: version-matches-tag
     name: ${{ matrix.asset }}
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write   # the upload step attaches this leg's assets
+    # Inherits the read-only default: no job-level write, no GH_TOKEN anywhere.
     strategy:
       fail-fast: false
       matrix:
@@ -97,7 +117,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          # The commit the tag pointed at when the run started -- not the tag name, so
+          # the legs cannot build different trees if the tag moves mid-run.
+          ref: ${{ needs.version-matches-tag.outputs.sha }}
           persist-credentials: false
 
       - name: Add target
@@ -122,68 +144,61 @@ jobs:
         # cross-compilation quirk breaking an otherwise-unrelated release build.
         run: cargo build --release --locked --target ${{ matrix.target }} -p ct-agent
 
-      - name: Stage + upload asset
+
+      - name: Stage assets
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          # Security-hardening pass, B.1: cloudflared ships signed binaries;
-          # this repo shipped neither a signature nor even a checksum, so
-          # there was nothing an operator could verify a download against
-          # beyond "it's the file GitHub served me". A detached SHA-256
-          # checksum is the cheap first step (full Sigstore/cosign or
-          # platform Authenticode/notarization signing is a separately
-          # tracked, bigger lift). `sha256sum` on Linux/Windows (Git Bash
-          # ships it); `shasum -a 256` on macOS, which has no `sha256sum`.
-          checksum() {
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "$1" > "$1.sha256"
-            else
-              shasum -a 256 "$1" > "$1.sha256"
-            fi
-          }
-
-          bin="target/${{ matrix.target }}/release/ct-agent"
-          [ -f "$bin.exe" ] && bin="$bin.exe"
-          cp "$bin" "${{ matrix.asset }}"
-          checksum "${{ matrix.asset }}"
-          gh release upload "$RELEASE_TAG" "${{ matrix.asset }}" "${{ matrix.asset }}.sha256" --clobber
-
-          # `-p ct-agent` builds BOTH binaries of this package. Until now only the first
-          # was uploaded, so `ct-agent-supervisor` (#331) was compiled for all eight
-          # targets on every release and then thrown away -- which is why no image could
-          # install it and no deployment could use it. It is a drop-in wrapper
+          # `-p ct-agent` builds BOTH binaries of this package. Until #331 only the first
+          # was shipped, so `ct-agent-supervisor` was compiled for all eight targets on
+          # every release and then thrown away. It is a drop-in wrapper
           # (`ct-agent-supervisor <subcommand>`, same env), so shipping the binary is what
           # makes "supervise it" an operator decision instead of a rebuild.
+          # Checksums are NOT made here: the sign job hashes these exact bytes itself.
+          mkdir -p dist
+          bin="target/${{ matrix.target }}/release/ct-agent"
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          cp "$bin" "dist/${{ matrix.asset }}"
           sup="target/${{ matrix.target }}/release/ct-agent-supervisor"
           [ -f "$sup.exe" ] && sup="$sup.exe"
-          sup_asset="$(printf '%s' "${{ matrix.asset }}" | sed 's/^ct-agent/ct-agent-supervisor/')"
-          cp "$sup" "$sup_asset"
-          checksum "$sup_asset"
-          gh release upload "$RELEASE_TAG" "$sup_asset" "$sup_asset.sha256" --clobber
+          cp "$sup" "dist/$(printf '%s' "${{ matrix.asset }}" | sed 's/^ct-agent/ct-agent-supervisor/')"
+          ls -l dist
 
-  manifest:
-    # #184: one signed statement of what this release IS. The per-asset .sha256 files
-    # above prove a download arrived intact; they say nothing about who published it,
-    # because whoever can write the release can write the checksum next to it. This job
-    # collects every published .sha256 into ONE release-manifest.json and -- once the
+      - name: Hand the binaries to the sign/publish jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    # #184: one signed statement of what this release IS. A per-asset .sha256 proves a
+    # download arrived intact; it says nothing about who published it, because whoever
+    # can write the release can write the checksum next to it. This job hashes every
+    # binary the build legs produced into ONE release-manifest.json and -- once the
     # operator has created the signing key -- signs it with an ed25519 key that lives
-    # only in the CT_RELEASE_SIGNING_KEY repository secret. ct-agent's self-update pins
-    # the matching PUBLIC key (native/src/self_update.rs, RELEASE_SIGNING_PUBKEYS /
-    # CT_AGENT_RELEASE_PUBKEY); with a key pinned it refuses any release whose manifest
-    # is missing, unsigned, signed by another key, or disagrees with the asset.
+    # only in the CT_RELEASE_SIGNING_KEY secret of the `release` environment. ct-agent's
+    # self-update pins the matching PUBLIC key (native/src/self_update.rs,
+    # RELEASE_SIGNING_PUBKEYS / CT_AGENT_RELEASE_PUBKEY); with a key pinned it refuses
+    # any release whose manifest is missing, unsigned, signed by another key, or
+    # disagrees with the asset.
+    #
+    # The environment is the gate: its required reviewer approves each release before
+    # this job (and so publish) runs, and its tag policy keeps the key out of runs from
+    # branches. The job holds no write token at all; publish uploads what it signed.
     #
     # One-time key setup (scimbe, not yet done as of 2026-09-06):
     #   openssl genpkey -algorithm ed25519 -out ct-release-signing.pem
     #   # public key, 64 hex chars -- paste into RELEASE_SIGNING_PUBKEYS in self_update.rs:
     #   openssl pkey -in ct-release-signing.pem -pubout -outform DER | tail -c 32 | xxd -p -c 64
     #   # then store the PEM (the whole file, including the BEGIN/END lines) as the
-    #   # repository secret CT_RELEASE_SIGNING_KEY (Settings -> Secrets -> Actions).
+    #   # secret CT_RELEASE_SIGNING_KEY of the `release` environment
+    #   # (Settings -> Environments -> release -> Environment secrets).
     # Rotation: add the new public key as the second RELEASE_SIGNING_PUBKEYS slot, ship a
     # release signed by the OLD key (so every agent learns the new key), then swap the
     # secret and drop the old slot in the following release.
     #
-    # Until the secret exists, the manifest is still built and uploaded UNSIGNED: agents
+    # Until the secret exists, the manifest is still built and published UNSIGNED: agents
     # (which pin no key yet) log it as "unverified: no release key pinned" and keep
     # installing on the per-asset .sha256 alone, exactly as before #184. The signing step
     # is gated on the secret being non-empty; a `secrets.*` expression is not allowed in
@@ -198,61 +213,66 @@ jobs:
     #     -in release-manifest.json -sigfile sig.bin
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write   # attach the manifest and its signature
+    environment: release
+    permissions: {}
     env:
       CT_RELEASE_SIGNING_KEY: ${{ secrets.CT_RELEASE_SIGNING_KEY }}
     steps:
-      - name: Download every published checksum
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p sums
-          gh release download "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" -p '*.sha256' -D sums
-          ls -l sums
-          # An empty set means the build matrix uploaded nothing -- refuse to publish a
-          # manifest that vouches for no assets.
-          [ -n "$(ls -A sums)" ] || { echo "::error::no .sha256 files on release $RELEASE_TAG"; exit 1; }
+      - name: Collect the build legs' binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ct-agent-*
+          path: dist
+          merge-multiple: true
 
-      - name: Build release-manifest.json
+      - name: Checksums + release-manifest.json
         run: |
-          # Deterministic: sorted keys, no whitespace. The asset name is the checksum file
-          # name minus its .sha256 suffix; the digest is the first token of its one line
-          # (both `sha256sum` and macOS `shasum -a 256` write `<hex>  <name>`).
+          # Deterministic: sorted keys, no whitespace. Digests are computed HERE from the
+          # artifact bytes; the per-asset .sha256 files are written from the same digests
+          # in the `<hex>  <name>` format setup.sh / verify-release.sh already parse.
           python3 - <<'PY'
-          import json, os, re, sys, time
+          import hashlib, json, os, sys, time
+          names = sorted(os.listdir("dist"))
+          if not names:
+              sys.exit("no build artifacts -- refusing to sign a manifest that vouches for nothing")
+          os.makedirs("meta", exist_ok=True)
           assets = {}
-          for fn in sorted(os.listdir("sums")):
-              if not fn.endswith(".sha256"):
-                  continue
-              name = fn[: -len(".sha256")]
-              with open(os.path.join("sums", fn), encoding="utf-8") as f:
-                  digest = f.read().split()[0].lower()
-              if not re.fullmatch(r"[0-9a-f]{64}", digest):
-                  sys.exit(f"{fn}: not a SHA-256 hex digest: {digest!r}")
-              assets[name] = digest
+          for name in names:
+              if not name.startswith("ct-agent-"):
+                  sys.exit(f"unexpected artifact file {name!r}")
+              h = hashlib.sha256()
+              with open(os.path.join("dist", name), "rb") as f:
+                  for chunk in iter(lambda: f.read(1 << 20), b""):
+                      h.update(chunk)
+              assets[name] = h.hexdigest()
+              with open(os.path.join("meta", name + ".sha256"), "w", encoding="utf-8") as f:
+                  f.write(f"{assets[name]}  {name}\n")
           manifest = {
               "schema": 1,
               "tag": os.environ["RELEASE_TAG"],
               "created_at": int(time.time()),
               "assets": assets,
           }
-          with open("release-manifest.json", "wb") as f:
+          with open("meta/release-manifest.json", "wb") as f:
               f.write(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-          print(open("release-manifest.json").read())
+          print(open("meta/release-manifest.json").read())
           PY
 
       - name: Sign release-manifest.json (only when CT_RELEASE_SIGNING_KEY is set)
         if: ${{ env.CT_RELEASE_SIGNING_KEY != '' }}
+        working-directory: meta
         run: |
           umask 077
-          printf '%s\n' "$CT_RELEASE_SIGNING_KEY" > key.pem
+          key="$RUNNER_TEMP/key.pem"
+          printf '%s\n' "$CT_RELEASE_SIGNING_KEY" > "$key"
+          trap 'rm -f "$key"' EXIT
           # Prefer python `cryptography` (preinstalled on the GitHub runner images); fall
           # back to openssl, which produces the identical raw 64-byte signature for ed25519.
           if python3 -c 'import cryptography.hazmat.primitives.serialization' 2>/dev/null; then
-            python3 - <<'PY'
+            KEY="$key" python3 - <<'PY'
+          import os
           from cryptography.hazmat.primitives import serialization
-          with open("key.pem", "rb") as f:
+          with open(os.environ["KEY"], "rb") as f:
               key = serialization.load_pem_private_key(f.read(), password=None)
           with open("release-manifest.json", "rb") as f:
               sig = key.sign(f.read())
@@ -261,28 +281,85 @@ jobs:
               f.write(sig)
           PY
           else
-            openssl pkeyutl -sign -inkey key.pem -rawin -in release-manifest.json -out sig.bin
+            openssl pkeyutl -sign -inkey "$key" -rawin -in release-manifest.json -out sig.bin
           fi
           base64 -w0 sig.bin > release-manifest.sig
           echo >> release-manifest.sig
-          # Self-check against the public half before publishing anything.
-          openssl pkey -in key.pem -pubout -out pub.pem
-          openssl pkeyutl -verify -pubin -inkey pub.pem -rawin -in release-manifest.json -sigfile sig.bin
-          echo "signed with public key $(openssl pkey -in key.pem -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
-          rm -f key.pem
+          # Self-check against the public half before anything is handed on.
+          openssl pkey -in "$key" -pubout -out "$RUNNER_TEMP/pub.pem"
+          openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/pub.pem" -rawin -in release-manifest.json -sigfile sig.bin
+          echo "signed with public key $(openssl pkey -in "$key" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+          rm -f sig.bin
 
-      - name: Upload the manifest (and its signature, when signed)
+      - name: Hand the checksums, manifest and signature to publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-meta
+          path: meta/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    # The only job that can write the release, and it runs no project code (no checkout,
+    # no build): it re-checks that the binaries it is about to upload are byte-for-byte
+    # the ones the manifest lists, attaches everything to a DRAFT release, and only then
+    # makes it public -- so no installer ever sees a release that is missing assets,
+    # checksums or the manifest.
+    needs: sign
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create/fill/publish the release
+    steps:
+      - name: Collect binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ct-agent-*
+          path: dist
+          merge-multiple: true
+
+      - name: Collect checksums, manifest and signature
+        uses: actions/download-artifact@v4
+        with:
+          name: release-meta
+          path: dist
+
+      - name: Binaries match the (signed) manifest
+        working-directory: dist
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, sys
+          m = json.load(open("release-manifest.json", encoding="utf-8"))
+          if m.get("tag") != os.environ["RELEASE_TAG"]:
+              sys.exit(f"manifest is for {m.get('tag')!r}, not {os.environ['RELEASE_TAG']!r}")
+          meta = {"release-manifest.json", "release-manifest.sig"}
+          bins = {n for n in os.listdir(".") if n not in meta and not n.endswith(".sha256")}
+          if bins != set(m["assets"]):
+              sys.exit(f"binaries {sorted(bins)} != manifest {sorted(m['assets'])}")
+          for n in sorted(bins):
+              with open(n, "rb") as f:
+                  d = hashlib.sha256(f.read()).hexdigest()
+              if d != m["assets"][n]:
+                  sys.exit(f"{n}: {d} != manifest {m['assets'][n]}")
+          print(f"{len(bins)} binaries match the manifest")
+          PY
+          sha256sum -c ./*.sha256
+          [ -f release-manifest.sig ] || echo "::warning::CT_RELEASE_SIGNING_KEY is not set -- release-manifest.json published UNSIGNED (#184)"
+
+      - name: Publish the release
+        working-directory: dist
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          files="release-manifest.json"
-          if [ -f release-manifest.sig ]; then
-            files="$files release-manifest.sig"
-          else
-            echo "::warning::CT_RELEASE_SIGNING_KEY is not set -- release-manifest.json uploaded UNSIGNED (#184)"
+          # No checkout here, so gh is told the repo explicitly (v0.7.28 release run).
+          R=(-R "$GITHUB_REPOSITORY")
+          # First run for a tag: a draft. Re-run / workflow_dispatch backfill of an
+          # existing release: replace its assets in place (--clobber).
+          if ! gh release view "$RELEASE_TAG" "${R[@]}" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" "${R[@]}" --draft --verify-tag --generate-notes
           fi
-          # shellcheck disable=SC2086
-          # The manifest job has no checkout, so gh must be told the repo explicitly
-          # (the download step above already does) -- without -R it fails with
-          # "not a git repository" (v0.7.28 release run).
-          gh release upload "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" $files --clobber
+          gh release upload "$RELEASE_TAG" "${R[@]}" ./* --clobber
+          # Only a draft is flipped public; an already published (possibly older)
+          # release is left as it is, so a backfill never re-marks it "latest".
+          if [ "$(gh release view "$RELEASE_TAG" "${R[@]}" --json isDraft -q .isDraft)" = "true" ]; then
+            gh release edit "$RELEASE_TAG" "${R[@]}" --draft=false
+          fi
