@@ -2016,7 +2016,7 @@ pub async fn run_agent(
         if let Ok((listener, cert)) = crate::transport::build_tunnel_direct_listener() {
             if let Ok(bound) = listener.local_addr() {
                 let advertised = SocketAddr::new(ip, bound.port());
-                if let Ok(adv) = dial_quic(config.edge, edge_cert.clone()).await {
+                if let Ok(adv) = dial_quic(config.resolve_edge_or(config.edge).await, edge_cert.clone()).await {
                     let _ = crate::transport::advertise_direct_listener(&adv, &token, advertised, &cert)
                         .await;
                     adv.close(0u32.into(), b"advertised");
@@ -2100,15 +2100,21 @@ pub async fn run_agent(
     // CADS-Tunnel#799: consecutive short-lived QUIC sessions, feeding the fallback
     // pool's reprobe hysteresis (see `reprobe_policy_after`).
     let mut quic_flaps: u32 = 0;
+    let mut edge = config.edge;
     loop {
         if let Some((listener, task)) = direct.as_mut() {
             listener.ensure_running(task);
+        }
+        let resolved = config.resolve_edge_or(edge).await;
+        if resolved != edge {
+            eprintln!("ct-agent: edge {} now resolves to {resolved} (was {edge})", config.edge_host.as_deref().unwrap_or("?"));
+            edge = resolved;
         }
         // `pre_registered`: the TLS-TCP fallback pool already registered this
         // connection before handing it over (make-before-break, CADS-Tunnel#799),
         // so the registration below is skipped for it.
         let (conn, pre_registered) = match dial_quic_or_blocked_error(
-            config.edge,
+            edge,
             edge_cert.clone(),
             Duration::from_secs(5),
         )
@@ -2238,14 +2244,14 @@ pub async fn run_agent(
         };
         eprintln!(
             "ct-agent: registered with edge {} (serving){}",
-            config.edge,
+            edge,
             config.hostname_bind_note()
         );
         crate::status::set_registered_now();
         crate::events::emit(
             crate::events::REGISTERED,
             serde_json::json!({
-                "edge": config.edge.to_string(),
+                "edge": edge.to_string(),
                 "transport": crate::status::STATUS.transport(),
                 // CADS-Tunnel#795: whether this registration also bound the public hostname.
                 "hostname_bound": config.binds_hostname(),
@@ -2944,9 +2950,10 @@ pub(crate) async fn run_tcp_fallback_pool_on(
             _ = reprobe_due => {
                 let Some(policy) = reprobe else { continue };
                 next_probe = Some(tokio::time::Instant::now() + policy.interval);
+                let edge = config.resolve_edge_or(config.edge).await;
                 let conn = match tokio::time::timeout(
                     Duration::from_secs(5),
-                    dial_quic(config.edge, ctx.edge_cert.clone()),
+                    dial_quic(edge, ctx.edge_cert.clone()),
                 )
                 .await
                 {
@@ -2964,7 +2971,7 @@ pub(crate) async fn run_tcp_fallback_pool_on(
                     eprintln!(
                         "ct-agent: UDP/QUIC to {} answered a probe ({probe_ok_streak}/{}); staying on the \
                          TLS-TCP fallback until it holds (CADS-Tunnel#799)",
-                        config.edge, policy.confirmations
+                        edge, policy.confirmations
                     );
                     continue;
                 }
@@ -2979,7 +2986,7 @@ pub(crate) async fn run_tcp_fallback_pool_on(
                             "ct-agent: UDP/QUIC to {} recovered and the QUIC registration is up — leaving \
                              the TLS-TCP fallback: {parked} parked registration(s) closed, {} relayed \
                              tunnel(s) left to finish (#16, CADS-Tunnel#799)",
-                            config.edge,
+                            edge,
                             serving.len()
                         );
                         // A worker whose STOP arrived while we were probing is relaying a
@@ -3003,7 +3010,7 @@ pub(crate) async fn run_tcp_fallback_pool_on(
                         eprintln!(
                             "ct-agent: UDP/QUIC to {} answered a probe but registering over it failed ({e}); \
                              staying on the TLS-TCP fallback (CADS-Tunnel#799)",
-                            config.edge
+                            edge
                         );
                         conn.close(0u32.into(), b"quic registration failed - staying on the tcp fallback");
                         probe_ok_streak = 0;
@@ -3099,11 +3106,15 @@ async fn run_agent_tcp_fallback_worker(
     // #46 FB-c: the TCP-fallback rungs to try in order — the configured edge port,
     // then the unified :443 front door when CT_AGENT_FALLBACK_443 is set. The first
     // rung that connects+registers serves the client; if all fail, back off.
-    let rungs = crate::ladder::tcp_rungs(config.edge, config.fallback_443);
+    let mut edge = config.edge;
     // CADS-Tunnel#799: consecutive parked registrations the edge ended within
     // `SHORT_REGISTRATION`.
     let mut short_lived: u32 = 0;
     loop {
+        // Re-resolved per attempt, like the QUIC loop: a long fallback stint must follow
+        // the edge to a new address too.
+        edge = config.resolve_edge_or(edge).await;
+        let rungs = crate::ladder::tcp_rungs(edge, config.fallback_443);
         // `Some(d)`: a rung got registered and its parked slot ended without a
         // Client after `d`. `None` with `served`: a plain tunnel completed.
         let mut parked_ended: Option<Duration> = None;
@@ -7265,6 +7276,7 @@ mod tests {
 
         // Agent: run the full loop (dial → register → accept-and-serve-noise).
         let config = AgentConfig {
+            edge_host: None,
             edge: edge_addr,
             origin: origin_addr,
             origin_proto: OriginProto::Tcp,
