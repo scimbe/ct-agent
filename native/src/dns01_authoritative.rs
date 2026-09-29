@@ -116,6 +116,30 @@ impl AuthoritativeChecker {
     }
 }
 
+/// The servers still holding issuance up: `(missing, unreachable)`, each as `host (ip)`.
+///
+/// Absent anywhere is real evidence of lag and always counts. An unreachable address
+/// counts only when its NS name answered on no other address: every NS name resolves to
+/// its A *and* AAAA records, so on a host without an IPv6 route each dual-stack server
+/// has one address that can never answer -- counting those made the check unpassable
+/// there while never tripping the all-unreachable fallback either.
+fn pending_servers(probes: &[(&str, IpAddr, Probe)]) -> (Vec<String>, Vec<String>) {
+    let answered = |host: &str| {
+        probes.iter().any(|(h, _, p)| *h == host && matches!(p, Probe::Present | Probe::Absent))
+    };
+    let mut missing = Vec::new();
+    let mut unreachable = Vec::new();
+    for (host, ip, probe) in probes {
+        match probe {
+            Probe::Present => {}
+            Probe::Absent => missing.push(format!("{host} ({ip})")),
+            Probe::Unreachable if answered(host) => {}
+            Probe::Unreachable => unreachable.push(format!("{host} ({ip})")),
+        }
+    }
+    (missing, unreachable)
+}
+
 /// What one direct query to an authoritative server actually told us.
 ///
 /// The distinction is the whole point: "the server answered and does not have
@@ -215,15 +239,11 @@ impl AuthoritativeChecker {
         let servers = self.authoritative_addrs(&zone).await?;
         let deadline = Instant::now() + self.timeout;
         loop {
-            let mut missing: Vec<String> = Vec::new();
-            let mut unreachable: Vec<String> = Vec::new();
+            let mut probes = Vec::with_capacity(servers.len());
             for (host, ip) in &servers {
-                match self.probe(*ip, record_name, expected_value, &zone).await {
-                    Probe::Present => {}
-                    Probe::Absent => missing.push(format!("{host} ({ip})")),
-                    Probe::Unreachable => unreachable.push(format!("{host} ({ip})")),
-                }
+                probes.push((host.as_str(), *ip, self.probe(*ip, record_name, expected_value, &zone).await));
             }
+            let (missing, unreachable) = pending_servers(&probes);
             // Not one authoritative server is reachable from here. That is a
             // fact about this host's network, not about propagation -- most
             // often outbound UDP/53 being blocked. Refusing to issue on that
@@ -265,6 +285,29 @@ impl AuthoritativeChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unroutable_address_of_a_server_that_answered_elsewhere_does_not_hold_issuance_up() {
+        let v4: IpAddr = "192.0.2.10".parse().unwrap();
+        let v6: IpAddr = "2001:db8::10".parse().unwrap();
+        let v4b: IpAddr = "192.0.2.11".parse().unwrap();
+        let v6b: IpAddr = "2001:db8::11".parse().unwrap();
+        // IPv4-only host, two dual-stack NS names, both serve the value over v4.
+        let (missing, unreachable) = pending_servers(&[
+            ("ns1", v4, Probe::Present),
+            ("ns1", v6, Probe::Unreachable),
+            ("ns2", v4b, Probe::Present),
+            ("ns2", v6b, Probe::Unreachable),
+        ]);
+        assert!(missing.is_empty() && unreachable.is_empty(), "{missing:?} {unreachable:?}");
+        // A server that answered "absent" anywhere still holds it up.
+        let (missing, _) = pending_servers(&[("ns1", v4, Probe::Absent), ("ns1", v6, Probe::Unreachable)]);
+        assert_eq!(missing, vec!["ns1 (192.0.2.10)".to_string()]);
+        // A server that answered on no address at all still counts as unreachable.
+        let (_, unreachable) =
+            pending_servers(&[("ns1", v4, Probe::Present), ("ns2", v4b, Probe::Unreachable)]);
+        assert_eq!(unreachable, vec!["ns2 (192.0.2.11)".to_string()]);
+    }
 
     #[test]
     fn zone_walk_candidates_go_from_most_to_least_specific() {

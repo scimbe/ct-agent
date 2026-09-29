@@ -34,14 +34,13 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 // paths as before; `pub` now where some were `pub(crate)`/private, which only widens.
 // ---------------------------------------------------------------------------------------
 pub use ct_common::channel_wire::{
-    decode_hex_32, decode_hex_64, decode_refusal_category, error_names_park_expiry, is_refusal_token_shape,
-    parse_channel_ack, quic_park_expired_marker, ChannelJoinOutcome, DroppedLegBeforeAck, CHANNEL_ACK_MAX_BYTES,
-    PHASE_MARKER_RELAY, PHASE_MARKER_RENDEZVOUS, PHASE_PREAMBLE_MAGIC, POSSESSION_CHALLENGE_LEN,
-    REFUSAL_CATEGORY_MAX_LEN,
+    decode_hex_32, decode_refusal_category, error_names_park_expiry, ChannelJoinOutcome, PHASE_MARKER_RELAY,
+    PHASE_MARKER_RENDEZVOUS, REFUSAL_CATEGORY_MAX_LEN,
 };
+#[cfg(test)]
+pub(crate) use ct_common::channel_wire::PHASE_PREAMBLE_MAGIC;
 pub use ct_common::channel_wire::io::{
-    present_channel_join_on_stream, present_channel_relay_join_on_stream, read_refusal_tail_token,
-    ADMISSION_EXCHANGE_TIMEOUT, KA_PARK_INACTIVITY_BOUND, REFUSAL_TAIL_BOUND,
+    present_channel_join_on_stream, present_channel_relay_join_on_stream, ADMISSION_EXCHANGE_TIMEOUT,
 };
 pub use ct_common::channel_quic::{present_channel_join, present_channel_join_quic};
 
@@ -55,19 +54,19 @@ pub use ct_common::channel_quic::{present_channel_join, present_channel_join_qui
 /// length prefix (it would mean a >=65280-byte join, refused as len-oob by every edge
 /// since the field existed).
 /// #495 measurement isolation (requested by the tester after the 2a series proved
-/// unrunnable with published binaries): `CT_CHANNEL_PHASE_MARKER=off` (or `0`)
+/// unrunnable with published binaries): `CT_CHANNEL_PHASE_MARKER=off` (or `0`/`false`/`no`)
 /// suppresses the phase preamble on EVERY transport while keeping everything else
 /// identical — the only way to vary the marker as a SINGLE variable, since every marked
 /// release also carries the #494 ack-reader fix. Default: markers on.
 pub(crate) fn phase_marker_enabled() -> bool {
-    phase_marker_enabled_from(std::env::var("CT_CHANNEL_PHASE_MARKER").ok().as_deref())
+    phase_marker_enabled_from(crate::envflag::env_value("CT_CHANNEL_PHASE_MARKER", true).as_deref())
 }
 
-/// Pure core of [`phase_marker_enabled`]: only the explicit strings `off`/`0`
-/// disable the marker — unset, empty, or anything else keeps the default (on),
-/// so a typo can never silently drop the marker generation.
+/// Pure core of [`phase_marker_enabled`]: only an explicit off spelling (`off`/`0`/`false`/`no`,
+/// see [`crate::envflag`]) disables the marker — unset, empty, or anything else keeps the
+/// default (on), so a typo can never silently drop the marker generation.
 pub(crate) fn phase_marker_enabled_from(v: Option<&str>) -> bool {
-    !matches!(v.map(str::trim), Some("off") | Some("0"))
+    crate::envflag::flag(v, true)
 }
 
 /// #495 2a: the ONE gate for sending a `[0xFF, phase]` preamble on a `:443` TLS
@@ -132,14 +131,15 @@ mod tests {
     }
 
     #[test]
-    fn phase_marker_switch_disables_only_on_explicit_off_or_zero() {
+    fn phase_marker_switch_disables_only_on_an_explicit_off_spelling() {
         // #495 measurement isolation: only the explicit opt-outs disable the marker —
         // unset/empty/typos keep the default ON, so the marker generation can never be
         // dropped by accident.
         assert!(phase_marker_enabled_from(None), "unset -> on");
         assert!(phase_marker_enabled_from(Some("")), "empty -> on");
         assert!(phase_marker_enabled_from(Some("on")), "explicit on -> on");
-        assert!(phase_marker_enabled_from(Some("false")), "unknown word -> on (no silent opt-out)");
+        assert!(phase_marker_enabled_from(Some("offf")), "a typo -> on (no silent opt-out)");
+        assert!(!phase_marker_enabled_from(Some("false")), "false -> disabled, as for every other flag");
         assert!(!phase_marker_enabled_from(Some("off")), "off -> disabled");
         assert!(!phase_marker_enabled_from(Some("0")), "0 -> disabled");
         assert!(!phase_marker_enabled_from(Some(" off ")), "trimmed -> disabled");

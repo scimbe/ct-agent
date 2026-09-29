@@ -51,6 +51,7 @@
 //!      the actionable message. The first time the credential is found expired and
 //!      not refreshable, one structured line goes to stderr (once per process).
 
+use crate::codec::now_unix;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -156,10 +157,6 @@ fn device_auth_url(issuer: &str) -> String {
 /// `{issuer}/protocol/openid-connect/token` — same derivation as `device_auth_url`.
 fn token_url(issuer: &str) -> String {
     format!("{}/protocol/openid-connect/token", issuer.trim_end_matches('/'))
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// `POST {device_auth_url}`: `client_id` + `scope=openid`, per RFC 8628 §3.1. Public
@@ -322,6 +319,18 @@ impl StoredToken {
             issuer: issuer.to_string(),
             client_id: client_id.to_string(),
         }
+    }
+
+    /// The store after a refresh answered with `tok`. RFC 6749 §6 lets an IdP keep the
+    /// refresh token and omit it from the response; dropping ours then would turn the
+    /// next access-token expiry into a manual re-login.
+    fn after_refresh(&self, tok: &TokenResponse, now: u64) -> Self {
+        let mut next = Self::from_token_response(tok, &self.issuer, &self.client_id, now);
+        if next.refresh_token.as_deref().is_none_or(str::is_empty) {
+            next.refresh_token = self.refresh_token.clone();
+            next.refresh_expires_at = self.refresh_expires_at;
+        }
+        next
     }
 
     /// Expired, or within [`ACCESS_TOKEN_EXPIRY_SKEW_SECS`] of it, at `now`. An
@@ -601,6 +610,11 @@ pub(crate) async fn resolve_oidc_token_classified() -> Result<String, ResolveErr
     }
 
     let path = token_store_path(env).map_err(ResolveError::Definitive)?;
+    // One refresh at a time: concurrent callers (the bridge tools) would otherwise all
+    // present the same rotating refresh token, and every one after the first gets
+    // invalid_grant. The next caller in line re-reads the store and finds it fresh.
+    static REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _refreshing = REFRESH.lock().await;
     let stored = read_stored_token(&path).map_err(|e| {
         ResolveError::Definitive(format!(
             "CT_OIDC_TOKEN is not set and no stored login was found at {} ({e}). Run `ct-agent login`, \
@@ -644,7 +658,7 @@ pub(crate) async fn resolve_oidc_token_classified() -> Result<String, ResolveErr
         }
     };
 
-    let new_stored = StoredToken::from_token_response(&refreshed, &stored.issuer, &stored.client_id, now);
+    let new_stored = stored.after_refresh(&refreshed, now);
     persist_stored_token(&path, &new_stored).map_err(|e| {
         ResolveError::Definitive(format!("refreshed the login but failed to save it at {}: {e}", path.display()))
     })?;
@@ -696,6 +710,33 @@ pub async fn resolve_oidc_token_with_retry(attempts: u32, base: Duration) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refresh_that_omits_the_refresh_token_keeps_the_stored_one() {
+        let stored = StoredToken {
+            access_token: "old".into(),
+            refresh_token: Some("keep-me".into()),
+            access_expires_at: Some(10),
+            refresh_expires_at: Some(10_000),
+            issuer: "https://idp.example/realms/x".into(),
+            client_id: "ct-agent".into(),
+        };
+        let not_rotated: TokenResponse =
+            serde_json::from_str(r#"{"access_token":"new","expires_in":300}"#).unwrap();
+        let next = stored.after_refresh(&not_rotated, 100);
+        assert_eq!(next.access_token, "new");
+        assert_eq!(next.access_expires_at, Some(400));
+        assert_eq!(next.refresh_token.as_deref(), Some("keep-me"));
+        assert_eq!(next.refresh_expires_at, Some(10_000));
+
+        let rotated: TokenResponse = serde_json::from_str(
+            r#"{"access_token":"new","expires_in":300,"refresh_token":"rotated","refresh_expires_in":50}"#,
+        )
+        .unwrap();
+        let next = stored.after_refresh(&rotated, 100);
+        assert_eq!(next.refresh_token.as_deref(), Some("rotated"));
+        assert_eq!(next.refresh_expires_at, Some(150));
+    }
     use axum::extract::State as AxState;
     use axum::routing::post;
     use axum::Router;

@@ -331,6 +331,10 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Prefixed<T> {
     }
 }
 
+/// How long a client has to complete the TLS handshake the terminator runs. Its own constant
+/// (the same 10 s as the SSH owner-auth preamble today) so tuning one never moves the other.
+const ORIGIN_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Terminate the client's TLS on `client` (whose sniffed first bytes are replayed by the
 /// [`Prefixed`] wrapper), then relay the plaintext to the Origin. The handshake failure is
 /// logged here, once, with the rustls reason: it is the one failure an operator will hit
@@ -344,9 +348,12 @@ async fn terminate_tls_then_forward<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut tls = match terminator.acceptor().accept(client).await {
-        Ok(tls) => tls,
-        Err(e) => {
+    // Bounded like the SSH owner preamble: a client that stalls mid-handshake would
+    // otherwise hold a serving slot (a parked fallback registration, a QUIC stream).
+    let handshake = tokio::time::timeout(ORIGIN_TLS_HANDSHAKE_TIMEOUT, terminator.acceptor().accept(client));
+    let mut tls = match handshake.await {
+        Ok(Ok(tls)) => tls,
+        Ok(Err(e)) => {
             // Throttled like the events below, but never blind: the next written line says how
             // many were dropped, so an operator's own failure (the reason above) stays findable.
             if let Some(suppressed) = crate::events::allow("origin_tls_handshake_failed") {
@@ -354,6 +361,13 @@ where
                 eprintln!("ct-agent: origin TLS terminate: handshake failed: {e}{dropped}");
             }
             return Err(format!("origin TLS terminate: handshake failed: {e}").into());
+        }
+        Err(_) => {
+            return Err(format!(
+                "origin TLS terminate: no handshake within {}s",
+                ORIGIN_TLS_HANDSHAKE_TIMEOUT.as_secs()
+            )
+            .into())
         }
     };
     let sni = tls.get_ref().1.server_name().map(str::to_string);
@@ -391,8 +405,8 @@ where
 /// timeout before a Client ever arrives, so the very first real request lands
 /// on an already-dead connection and never completes, even though the
 /// Client↔Edge TLS layer works perfectly every time. Since this relay only
-/// ever carries request/response protocols (HTTP, or the Noise handshake in
-/// [`serve_noise_bridge`]), the Client always speaks first, so waiting for
+/// ever carries request/response protocols (HTTP, or a Noise handshake), the
+/// Client always speaks first, so waiting for
 /// its first chunk before dialing costs nothing.
 ///
 /// scimbe/ct-agent#204: with a `terminator` (`CT_AGENT_ORIGIN_TLS=terminate`) and a
@@ -866,55 +880,6 @@ where
             writer.await
         }
     }
-}
-
-/// Serve one relayed stream as the Origin's Noise responder (M8.3): terminate
-/// the `Noise_IK` handshake with the Origin private key, then bridge one
-/// request/response to the local `origin` — decrypt the Client's frame, forward
-/// the plaintext to the Origin (TCP), read its reply, and return it encrypted.
-///
-/// Generic over the byte transport so it drives a QUIC stream in the live path
-/// (M8.4) and an in-memory duplex in tests. The Edge only ever relays the
-/// encrypted frames.
-pub async fn serve_noise_bridge<S, R>(
-    send: &mut S,
-    recv: &mut R,
-    origin: SocketAddr,
-    origin_private: &[u8; 32],
-) -> Result<(), BoxError>
-where
-    S: AsyncWrite + Unpin,
-    R: AsyncRead + Unpin,
-{
-    let mut hs = origin_handshake(origin_private)?;
-    let mut buf = vec![0u8; 65535];
-    let mut tmp = vec![0u8; 65535];
-
-    // <- handshake message 1, -> handshake message 2
-    let m1 = read_frame(recv).await?;
-    hs.read_message(&m1, &mut tmp)?;
-    let n = hs.write_message(&[], &mut buf)?;
-    send.write_all(&frame(&buf[..n])).await?;
-    send.flush().await?;
-
-    let mut transport = hs.into_transport_mode()?;
-
-    // Decrypt the Client's request and forward the plaintext to the Origin.
-    let req_ct = read_frame(recv).await?;
-    let n = transport.read_message(&req_ct, &mut tmp)?;
-    let request = tmp[..n].to_vec();
-
-    let mut tcp = connect_origin(origin).await?;
-    tcp.write_all(&request).await?;
-    tcp.shutdown().await?;
-    let mut response = Vec::new();
-    tcp.read_to_end(&mut response).await?;
-
-    // Encrypt the Origin's response back to the Client.
-    let n = transport.write_message(&response, &mut buf)?;
-    send.write_all(&frame(&buf[..n])).await?;
-    send.flush().await?;
-    Ok(())
 }
 
 /// Encrypt `plaintext` as one Noise frame and write it to `send` -- the one
@@ -1458,7 +1423,7 @@ impl DirectTokenPolicy {
 /// that gates the tunnel, so its comparison must not leak how many leading
 /// bytes a guess got right (`RoutingToken`'s derived `PartialEq` short-circuits).
 fn routing_token_eq_ct(a: &RoutingToken, b: &RoutingToken) -> bool {
-    a.0.iter().zip(b.0.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    crate::codec::ct_eq(&a.0, &b.0)
 }
 
 /// Apply `policy` to the payload the initiator put into Noise message 1 and
@@ -1528,7 +1493,62 @@ where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    serve_noise_stream_with_policy(send, recv, origin, origin_keys, metrics, gate, None).await
+    serve_noise_stream_with_policy(send, recv, origin, origin_keys, metrics, gate, None, None).await
+}
+
+/// A stream half that fails with `TimedOut` once `deadline` has passed, until [`PreAuth::lift`]
+/// -- how the direct path bounds everything before a peer is authenticated without threading a
+/// timeout through every read and write of the handshake and the local-auth gate. `None` never
+/// times out (the relayed paths, whose pre-auth phase the Edge already bounds).
+struct PreAuth<T> {
+    inner: T,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<T> PreAuth<T> {
+    fn new(inner: T, deadline: Option<tokio::time::Instant>) -> Self {
+        Self { inner, deadline: deadline.map(|d| Box::pin(tokio::time::sleep_until(d))) }
+    }
+
+    /// The peer is authenticated: no deadline from here on.
+    fn lift(&mut self) {
+        self.deadline = None;
+    }
+
+    fn expired(&mut self, cx: &mut Context<'_>) -> bool {
+        self.deadline.as_mut().is_some_and(|d| std::future::Future::poll(d.as_mut(), cx).is_ready())
+    }
+}
+
+fn preauth_timed_out() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "direct connection not authenticated in time")
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for PreAuth<T> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if self.expired(cx) {
+            return Poll::Ready(Err(preauth_timed_out()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for PreAuth<T> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        if self.expired(cx) {
+            return Poll::Ready(Err(preauth_timed_out()));
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.expired(cx) {
+            return Poll::Ready(Err(preauth_timed_out()));
+        }
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// [`serve_noise_stream`] with the direct-connect routing-token check
@@ -1538,20 +1558,27 @@ where
 /// before message 2 is written; a refusal returns [`DirectConnectRefused`]
 /// without ever dialing the Origin. `None` is the relayed path, where the Edge
 /// has already checked the token: the payload is ignored, exactly as before.
+// The relayed wrapper above passes `None` for the two direct-only arguments.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_noise_stream_with_policy<S, R>(
-    mut send: S,
-    mut recv: R,
+    send: S,
+    recv: R,
     origin: SocketAddr,
     origin_keys: &[[u8; 32]],
     metrics: Arc<TunnelMetrics>,
     gate: &local_auth::LocalAuthGate,
     direct_policy: Option<&DirectTokenPolicy>,
+    preauth_deadline: Option<tokio::time::Instant>,
 ) -> Result<(), BoxError>
 where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
     let mut buf = vec![0u8; 65535];
+    // The direct path bounds everything before the peer is authenticated -- handshake and
+    // local-auth gate -- by one deadline (see `DirectLimits::setup_timeout`); lifted below.
+    let mut send = PreAuth::new(send, preauth_deadline);
+    let mut recv = PreAuth::new(recv, preauth_deadline);
 
     // <- handshake message 1, -> handshake message 2. Time it and count the
     // outcome for observability (M14.1b). During a key rotation (#12) the Agent
@@ -1613,6 +1640,8 @@ where
         // A share link's 302 (#185) already answered this connection.
         GateOutcome::Closed => return Ok(()),
     };
+    send.lift();
+    recv.lift();
 
     // Bridge the Noise session <-> the Origin TCP socket, both ways, streaming.
     // Meter the Origin socket: bytes read from it flow back to the Client
@@ -1651,7 +1680,7 @@ where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    serve_noise_udp_with_policy(send, recv, origin, origin_keys, None).await
+    serve_noise_udp_with_policy(send, recv, origin, origin_keys, None, None).await
 }
 
 /// [`serve_noise_udp`] with the direct-connect routing-token check (ct-agent#45
@@ -1659,17 +1688,21 @@ where
 /// on the direct path judges the handshake payload before message 2, `None`
 /// (relayed) ignores it.
 pub async fn serve_noise_udp_with_policy<S, R>(
-    mut send: S,
-    mut recv: R,
+    send: S,
+    recv: R,
     origin: SocketAddr,
     origin_keys: &[[u8; 32]],
     direct_policy: Option<&DirectTokenPolicy>,
+    preauth_deadline: Option<tokio::time::Instant>,
 ) -> Result<(), BoxError>
 where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
     let mut hbuf = vec![0u8; 65535];
+    // See serve_noise_stream_with_policy: the handshake is bounded on the direct path.
+    let mut send = PreAuth::new(send, preauth_deadline);
+    let mut recv = PreAuth::new(recv, preauth_deadline);
     let m1 = read_frame(&mut recv).await?;
     let (mut hs, hs_payload) = origin_handshake_any_with_payload(origin_keys, &m1)
         .ok_or("no origin identity matched the client handshake")?;
@@ -1679,6 +1712,8 @@ where
     send.write_all(&frame(&hbuf[..n])).await?;
     send.flush().await?;
     let transport = hs.into_transport_mode()?;
+    send.lift();
+    recv.lift();
 
     let udp = UdpSocket::bind(crate::transport::unspecified_for(origin)).await?;
     udp.connect(origin).await?;
@@ -1753,6 +1788,44 @@ pub async fn serve_direct(
     gate: Arc<local_auth::LocalAuthGate>,
     token_policy: Arc<DirectTokenPolicy>,
 ) -> Result<(), BoxError> {
+    serve_direct_within(listener, origin, origin_keys, proto, metrics, gate, token_policy, DirectLimits::DEFAULT)
+        .await
+}
+
+/// Bounds on the direct listener, which anyone who knows the address can reach before
+/// any authentication has happened.
+#[derive(Clone, Copy)]
+pub(crate) struct DirectLimits {
+    /// Connections served at once; further ones are refused at the QUIC layer.
+    pub(crate) max_connections: usize,
+    /// From an accepted connection to its first bi-stream: a peer that connects and
+    /// never opens one would otherwise hold its slot for the connection's whole life.
+    pub(crate) setup_timeout: Duration,
+    /// After the stream was served, how long the client gets to close the connection
+    /// itself (a clean close keeps unacknowledged tail bytes) before the agent does.
+    pub(crate) linger: Duration,
+}
+
+impl DirectLimits {
+    pub(crate) const DEFAULT: Self = Self {
+        max_connections: 256,
+        setup_timeout: Duration::from_secs(10),
+        linger: Duration::from_secs(30),
+    };
+}
+
+// `serve_direct`'s signature plus the limits; the test seam for them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_direct_within(
+    listener: Endpoint,
+    origin: SocketAddr,
+    origin_keys: Arc<Vec<[u8; 32]>>,
+    proto: OriginProto,
+    metrics: Arc<TunnelMetrics>,
+    gate: Arc<local_auth::LocalAuthGate>,
+    token_policy: Arc<DirectTokenPolicy>,
+    limits: DirectLimits,
+) -> Result<(), BoxError> {
     let mut conns = tokio::task::JoinSet::new();
     loop {
         let incoming = tokio::select! {
@@ -1764,45 +1837,88 @@ pub async fn serve_direct(
             // simply disabled for the round (`accept` is what the loop waits on).
             Some(_) = conns.join_next() => continue,
         };
+        while conns.try_join_next().is_some() {}
+        if conns.len() >= limits.max_connections {
+            incoming.refuse();
+            note_direct_refused_at_capacity(limits.max_connections);
+            continue;
+        }
         let metrics = Arc::clone(&metrics);
         let keys = Arc::clone(&origin_keys);
         let gate = Arc::clone(&gate);
         let policy = Arc::clone(&token_policy);
         conns.spawn(tracked(async move {
-            if let Ok(conn) = incoming.await {
-                if let Ok((send, recv)) = conn.accept_bi().await {
-                    let served = match proto {
-                        OriginProto::Tcp => {
-                            serve_noise_stream_with_policy(
-                                send,
-                                recv,
-                                origin,
-                                &keys,
-                                metrics,
-                                &gate,
-                                Some(&policy),
-                            )
-                            .await
-                        }
-                        OriginProto::Udp => {
-                            serve_noise_udp_with_policy(send, recv, origin, &keys, Some(&policy))
-                                .await
-                        }
-                    };
-                    if let Err(e) = &served {
-                        if e.downcast_ref::<DirectConnectRefused>().is_some() {
-                            conn.close(
-                                DIRECT_REFUSED_CLOSE_CODE.into(),
-                                b"direct-connect refused (#45)",
-                            );
-                        }
+            // One deadline for everything before the peer is authenticated: the QUIC/TLS
+            // handshake, its first bi-stream, the Noise handshake and the local-auth gate. A
+            // peer that stalls anywhere in there gives its slot back when it passes.
+            let deadline = tokio::time::Instant::now() + limits.setup_timeout;
+            let setup = tokio::time::timeout_at(deadline, async {
+                let conn = incoming.await.ok()?;
+                match conn.accept_bi().await {
+                    Ok(streams) => Some((conn, streams)),
+                    Err(_) => None,
+                }
+            })
+            .await;
+            let Ok(Some((conn, (send, recv)))) = setup else {
+                return; // dropping an unfinished handshake or connection closes it
+            };
+            let served = match proto {
+                OriginProto::Tcp => {
+                    serve_noise_stream_with_policy(send, recv, origin, &keys, metrics, &gate, Some(&policy), Some(deadline))
+                        .await
+                }
+                OriginProto::Udp => {
+                    serve_noise_udp_with_policy(send, recv, origin, &keys, Some(&policy), Some(deadline)).await
+                }
+            };
+            match &served {
+                // A failed or refused session gets no linger: close at once, so a stream of
+                // garbage handshakes cannot keep the slots full for `linger` each.
+                Err(e) if e.downcast_ref::<DirectConnectRefused>().is_some() => {
+                    conn.close(DIRECT_REFUSED_CLOSE_CODE.into(), b"direct-connect refused (#45)");
+                }
+                Err(_) => conn.close(0u32.into(), b"failed"),
+                // A served one lets the client close first (a clean close keeps unacknowledged
+                // tail bytes), for at most `linger`.
+                Ok(()) => {
+                    if tokio::time::timeout(limits.linger, conn.closed()).await.is_err() {
+                        conn.close(0u32.into(), b"served");
                     }
                 }
-                conn.closed().await;
             }
         }));
     }
     Ok(())
+}
+
+/// Direct connections refused because [`DirectLimits::max_connections`] were in use.
+static DIRECT_REFUSED_AT_CAPACITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count a refusal at the cap and say so at most once a minute: a limit whose triggering
+/// nobody can see is undiagnosable ("clients do not get through").
+fn note_direct_refused_at_capacity(max: usize) {
+    use std::sync::atomic::Ordering;
+    static LAST_LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let total = DIRECT_REFUSED_AT_CAPACITY.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let last = LAST_LOGGED.load(Ordering::Relaxed);
+    if now >= last + 60 && LAST_LOGGED.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        eprintln!(
+            "ct-agent: direct listener at its connection cap ({max}); refusing new direct connections \
+             ({total} refused so far, ct_agent_direct_refused_at_capacity_total)"
+        );
+    }
+}
+
+/// The `/metrics` series for [`note_direct_refused_at_capacity`].
+pub(crate) fn render_direct_refused_prometheus() -> String {
+    format!(
+        "# HELP ct_agent_direct_refused_at_capacity_total Direct connections refused because the listener was at its connection cap.\n\
+         # TYPE ct_agent_direct_refused_at_capacity_total counter\n\
+         ct_agent_direct_refused_at_capacity_total {}\n",
+        DIRECT_REFUSED_AT_CAPACITY.load(std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 /// Everything the direct-connect accept loop needs, kept by [`run_agent`] so the
@@ -1897,7 +2013,7 @@ pub async fn run_agent(
     // by THIS scope -- see `DirectListener` for the intended lifetime.
     let mut direct: Option<(DirectListener, TaskGuard<()>)> = None;
     if let Some(ip) = config.direct_advertise_ip {
-        if let Ok((listener, cert)) = crate::transport::build_direct_listener() {
+        if let Ok((listener, cert)) = crate::transport::build_tunnel_direct_listener() {
             if let Ok(bound) = listener.local_addr() {
                 let advertised = SocketAddr::new(ip, bound.port());
                 if let Ok(adv) = dial_quic(config.edge, edge_cert.clone()).await {
@@ -1956,15 +2072,22 @@ pub async fn run_agent(
     // #16 escape hatch: CT_AGENT_REGISTER_TCP_ONLY pins the agent to the TLS-TCP
     // fallback permanently — no QUIC dial, no probing, no upgrade. For operators
     // whose UDP path is known-flaky and who prefer the stable transport outright.
+    let fallback_ctx = FallbackCtx {
+        config: config.clone(),
+        edge_cert: edge_cert.clone(),
+        token: token.clone(),
+        origin_keys: Arc::clone(&origin_keys),
+        gate: Arc::clone(&gate),
+        revocation: Arc::clone(&revocation),
+        terminator: terminator.clone(),
+        metrics: Arc::clone(&metrics),
+    };
     if config.register_tcp_only {
         eprintln!(
             "ct-agent: CT_AGENT_REGISTER_TCP_ONLY set — registering over TLS-TCP exclusively (no QUIC)"
         );
         switch_transport("tcp-fallback");
-        return run_agent_tcp_fallback_with_revocation(
-            config, edge_cert, token, origin_keys, gate, revocation, terminator,
-        )
-        .await;
+        return run_agent_tcp_fallback_with_ctx(&fallback_ctx).await;
     }
     let (reconnect_base, reconnect_max) = reconnect_backoff_bounds();
     // ct-agent#179: the retry policy is a value (`reconnect::ReconnectPolicy`), so the
@@ -2019,13 +2142,7 @@ pub async fn run_agent(
                         );
                         switch_transport("tcp-fallback");
                         match run_agent_tcp_fallback_until_quic_recovers(
-                            config,
-                            edge_cert.clone(),
-                            token.clone(),
-                            Arc::clone(&origin_keys),
-                            Arc::clone(&gate),
-                            Arc::clone(&revocation),
-                            terminator.clone(),
+                            &fallback_ctx,
                             reprobe_policy_after(quic_flaps),
                         )
                         .await
@@ -2457,7 +2574,7 @@ async fn serve_quic_connection(
 /// probe racing the assertion).
 ///
 /// #45 slice 3: production now enters through
-/// [`run_agent_tcp_fallback_with_revocation`] (it needs the shared revocation view);
+/// [`run_agent_tcp_fallback_with_ctx`] (it needs the shared revocation view);
 /// this argument-compatible wrapper stays for the e2e tests only.
 #[cfg(test)]
 async fn run_agent_tcp_fallback(
@@ -2467,16 +2584,7 @@ async fn run_agent_tcp_fallback(
     origin_keys: Arc<Vec<[u8; 32]>>,
     gate: Arc<local_auth::LocalAuthGate>,
 ) -> Result<(), BoxError> {
-    run_agent_tcp_fallback_with_revocation(
-        config,
-        edge_cert,
-        token,
-        origin_keys,
-        gate,
-        Arc::new(RevocationView::default()),
-        None,
-    )
-    .await
+    run_agent_tcp_fallback_with_ctx(&FallbackCtx::for_test(config, edge_cert, token, origin_keys, gate)).await
 }
 
 /// [`run_agent_tcp_fallback`] sharing `revocation` with [`run_agent`]'s
@@ -2490,32 +2598,13 @@ async fn run_agent_tcp_fallback(
 /// budget and spawn a fresh pool; only that outer budget running out returns
 /// `Err`. With the default unbounded budget none of this ever ends. Before #180,
 /// ONE worker's exhaustion returned `Err` from here -- and exited the process.
-async fn run_agent_tcp_fallback_with_revocation(
-    config: &AgentConfig,
-    edge_cert: CertificateDer<'static>,
-    token: RoutingToken,
-    origin_keys: Arc<Vec<[u8; 32]>>,
-    gate: Arc<local_auth::LocalAuthGate>,
-    revocation: Arc<RevocationView>,
-    terminator: Option<Arc<OriginTerminator>>,
-) -> Result<(), BoxError> {
+async fn run_agent_tcp_fallback_with_ctx(ctx: &FallbackCtx) -> Result<(), BoxError> {
     let (reconnect_base, reconnect_max) = reconnect_backoff_bounds();
     let mut outer = Backoff::new(reconnect_base, reconnect_max, reconnect_max_attempts());
     loop {
         // No reprobe: this is the permanent (CT_AGENT_REGISTER_TCP_ONLY / e2e) mode,
         // so the pool only ever ends with every worker gone.
-        let _exit = run_tcp_fallback_pool(
-            config,
-            edge_cert.clone(),
-            token.clone(),
-            Arc::clone(&origin_keys),
-            Arc::clone(&gate),
-            Arc::clone(&revocation),
-            terminator.clone(),
-            FallbackBudget::from_env(),
-            None,
-        )
-        .await;
+        let _exit = run_tcp_fallback_pool(ctx, FallbackBudget::from_env(), None).await;
         crate::events::emit(crate::events::FALLBACK_EXHAUSTED, serde_json::json!({}));
         crate::status::set_registered(None);
         match outer.next_delay_jittered(rand::random::<f64>()) {
@@ -2634,6 +2723,44 @@ impl FallbackBudget {
     }
 }
 
+/// Everything a TLS-TCP fallback worker serves with, shared by the pool (cheap to
+/// clone: handles and `Arc`s). `metrics` is `run_agent`'s own, so tunnels served
+/// over the fallback show up on the `/metrics` scrape like QUIC ones.
+#[derive(Clone)]
+pub(crate) struct FallbackCtx {
+    pub(crate) config: AgentConfig,
+    pub(crate) edge_cert: CertificateDer<'static>,
+    pub(crate) token: RoutingToken,
+    pub(crate) origin_keys: Arc<Vec<[u8; 32]>>,
+    pub(crate) gate: Arc<local_auth::LocalAuthGate>,
+    pub(crate) revocation: Arc<RevocationView>,
+    pub(crate) terminator: Option<Arc<OriginTerminator>>,
+    pub(crate) metrics: Arc<TunnelMetrics>,
+}
+
+#[cfg(test)]
+impl FallbackCtx {
+    /// A pool context with no revocation history, no terminator and its own metrics.
+    pub(crate) fn for_test(
+        config: &AgentConfig,
+        edge_cert: CertificateDer<'static>,
+        token: RoutingToken,
+        origin_keys: Arc<Vec<[u8; 32]>>,
+        gate: Arc<local_auth::LocalAuthGate>,
+    ) -> Self {
+        Self {
+            config: config.clone(),
+            edge_cert,
+            token,
+            origin_keys,
+            gate,
+            revocation: Arc::new(RevocationView::default()),
+            terminator: None,
+            metrics: Arc::new(TunnelMetrics::new()),
+        }
+    }
+}
+
 /// [`run_agent_tcp_fallback`], but temporary (#16): serve over the TLS-TCP
 /// fallback pool while probing UDP/QUIC per `reprobe`, and return
 /// [`FallbackExit::QuicRecovered`] as soon as the probe policy is satisfied AND
@@ -2647,30 +2774,8 @@ impl FallbackBudget {
 /// ct-agent#180: a worker that gives up ends that worker only; the pool returns
 /// [`FallbackExit::AllWorkersGaveUp`] once none is left, and `run_agent` treats
 /// that as one step of ITS reconnect budget rather than a process exit.
-// the pool's signature plus the #799 reprobe policy; refactor tracked separately
-#[allow(clippy::too_many_arguments)]
-async fn run_agent_tcp_fallback_until_quic_recovers(
-    config: &AgentConfig,
-    edge_cert: CertificateDer<'static>,
-    token: RoutingToken,
-    origin_keys: Arc<Vec<[u8; 32]>>,
-    gate: Arc<local_auth::LocalAuthGate>,
-    revocation: Arc<RevocationView>,
-    terminator: Option<Arc<OriginTerminator>>,
-    reprobe: ReprobePolicy,
-) -> FallbackExit {
-    run_tcp_fallback_pool(
-        config,
-        edge_cert,
-        token,
-        origin_keys,
-        gate,
-        revocation,
-        terminator,
-        FallbackBudget::from_env(),
-        Some(reprobe),
-    )
-    .await
+async fn run_agent_tcp_fallback_until_quic_recovers(ctx: &FallbackCtx, reprobe: ReprobePolicy) -> FallbackExit {
+    run_tcp_fallback_pool(ctx, FallbackBudget::from_env(), Some(reprobe)).await
 }
 
 /// The TLS-TCP fallback pool itself (#229, ct-agent#180, CADS-Tunnel#799):
@@ -2689,32 +2794,8 @@ async fn run_agent_tcp_fallback_until_quic_recovers(
 /// and is otherwise NOT an event: the mode stays up on the remaining workers
 /// (before #180 it was fatal to the whole mode). A given-up worker is not
 /// replaced, so a finite budget still ends the pool.
-// pre-existing pool signature plus the two #180 parameters; refactor tracked separately
-#[allow(clippy::too_many_arguments)]
-async fn run_tcp_fallback_pool(
-    config: &AgentConfig,
-    edge_cert: CertificateDer<'static>,
-    token: RoutingToken,
-    origin_keys: Arc<Vec<[u8; 32]>>,
-    gate: Arc<local_auth::LocalAuthGate>,
-    revocation: Arc<RevocationView>,
-    terminator: Option<Arc<OriginTerminator>>,
-    budget: FallbackBudget,
-    reprobe: Option<ReprobePolicy>,
-) -> FallbackExit {
-    run_tcp_fallback_pool_on(
-        &TASKS_LIVE,
-        config,
-        edge_cert,
-        token,
-        origin_keys,
-        gate,
-        revocation,
-        terminator,
-        budget,
-        reprobe,
-    )
-    .await
+async fn run_tcp_fallback_pool(ctx: &FallbackCtx, budget: FallbackBudget, reprobe: Option<ReprobePolicy>) -> FallbackExit {
+    run_tcp_fallback_pool_on(&TASKS_LIVE, ctx, budget, reprobe).await
 }
 
 /// CADS-Tunnel#799: a worker's way of telling its pool "the edge consumed my
@@ -2740,20 +2821,13 @@ impl ConsumedSignal {
 /// process-wide [`TASKS_LIVE`] (ct-agent#179): the soak harness asserts that weeks
 /// of worker churn leak no task, on a gauge of its own so no other test's tasks
 /// can skew the sample. Production only ever calls it through the wrapper above.
-// the wrapper's signature plus the gauge; refactor tracked separately
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tcp_fallback_pool_on(
     gauge: &'static LiveGauge,
-    config: &AgentConfig,
-    edge_cert: CertificateDer<'static>,
-    token: RoutingToken,
-    origin_keys: Arc<Vec<[u8; 32]>>,
-    gate: Arc<local_auth::LocalAuthGate>,
-    revocation: Arc<RevocationView>,
-    terminator: Option<Arc<OriginTerminator>>,
+    ctx: &FallbackCtx,
     budget: FallbackBudget,
     reprobe: Option<ReprobePolicy>,
 ) -> FallbackExit {
+    let config = &ctx.config;
     use std::collections::{HashMap, HashSet};
 
     let n = config.tcp_fallback_pool_size.max(1);
@@ -2769,27 +2843,11 @@ pub(crate) async fn run_tcp_fallback_pool_on(
     // ct-agent#180: a worker that burned its budget is not replaced.
     let mut given_up = 0usize;
     let spawn_one = |workers: &mut tokio::task::JoinSet<(usize, Result<(), BoxError>)>, id: usize| {
-        let config = config.clone();
-        let edge_cert = edge_cert.clone();
-        let token = token.clone();
-        let origin_keys = Arc::clone(&origin_keys);
-        let gate = Arc::clone(&gate);
-        let tracker = RevocationTracker::new(Arc::clone(&revocation));
-        let terminator = terminator.clone();
+        let ctx = ctx.clone();
+        let tracker = RevocationTracker::new(Arc::clone(&ctx.revocation));
         let consumed = ConsumedSignal { id, tx: Some(consumed_tx.clone()) };
         workers.spawn(gauge.track(async move {
-            let r = run_agent_tcp_fallback_worker(
-                &config,
-                edge_cert,
-                token,
-                origin_keys,
-                gate,
-                tracker,
-                terminator,
-                budget,
-                consumed,
-            )
-            .await;
+            let r = run_agent_tcp_fallback_worker(&ctx, tracker, budget, consumed).await;
             (id, r)
         }))
     };
@@ -2888,7 +2946,7 @@ pub(crate) async fn run_tcp_fallback_pool_on(
                 next_probe = Some(tokio::time::Instant::now() + policy.interval);
                 let conn = match tokio::time::timeout(
                     Duration::from_secs(5),
-                    dial_quic(config.edge, edge_cert.clone()),
+                    dial_quic(config.edge, ctx.edge_cert.clone()),
                 )
                 .await
                 {
@@ -2914,7 +2972,7 @@ pub(crate) async fn run_tcp_fallback_pool_on(
                 // connection while every TCP slot is still parked. Only once the
                 // edge has accepted that registration do the parked slots go.
                 crate::events::next_conn_id();
-                match register_tunnel(&conn, &token).await {
+                match register_tunnel(&conn, &ctx.token).await {
                     Ok(()) => {
                         let parked = handles.len() - serving.len();
                         eprintln!(
@@ -3027,20 +3085,13 @@ impl TcpAttemptEnd {
 /// registration the edge ends without a Client is re-registered immediately
 /// (see [`TcpAttemptEnd`]); a plain ('A'/'B') registration re-registers after
 /// its tunnel as before.
-// pre-existing signature plus the #204 terminator and the #799 signal; refactor tracked separately
-#[allow(clippy::too_many_arguments)]
 async fn run_agent_tcp_fallback_worker(
-    config: &AgentConfig,
-    edge_cert: CertificateDer<'static>,
-    token: RoutingToken,
-    origin_keys: Arc<Vec<[u8; 32]>>,
-    gate: Arc<local_auth::LocalAuthGate>,
+    ctx: &FallbackCtx,
     mut revocation: RevocationTracker,
-    terminator: Option<Arc<OriginTerminator>>,
     budget: FallbackBudget,
     consumed: ConsumedSignal,
 ) -> Result<(), BoxError> {
-    let metrics = Arc::new(TunnelMetrics::new());
+    let config = &ctx.config;
     // Reconnect loop (issue #5 / P1.2b): re-register and serve again after each
     // single tunnel ends or the connection drops, with backoff on failure. The
     // budget is the pool's (`FallbackBudget::from_env` in production).
@@ -3061,19 +3112,7 @@ async fn run_agent_tcp_fallback_worker(
         for addr in &rungs {
             // ct-agent#178: every rung is one registration attempt (see the QUIC loop).
             crate::events::next_conn_id();
-            match tcp_connect_register_serve(
-                config,
-                *addr,
-                &edge_cert,
-                &token,
-                &origin_keys,
-                &metrics,
-                &gate,
-                &mut revocation,
-                terminator.clone(),
-                &consumed,
-            )
-            .await
+            match tcp_connect_register_serve(ctx, *addr, &mut revocation, &consumed).await
             {
                 // The relayed Client is done; the pool parked a replacement the
                 // moment this registration was consumed. This worker is finished.
@@ -3175,20 +3214,14 @@ async fn run_agent_tcp_fallback_worker(
 /// CADS-Tunnel#799: failures before and after the edge accepted the
 /// registration are told apart in the error (see [`TcpAttemptEnd`]), and the
 /// STOP byte that ends the ping phase fires `consumed` so the pool re-parks.
-// pre-existing signature; refactor tracked separately
-#[allow(clippy::too_many_arguments)]
 async fn tcp_connect_register_serve(
-    config: &AgentConfig,
+    ctx: &FallbackCtx,
     target: SocketAddr,
-    edge_cert: &CertificateDer<'static>,
-    token: &RoutingToken,
-    origin_keys: &[[u8; 32]],
-    metrics: &Arc<TunnelMetrics>,
-    gate: &local_auth::LocalAuthGate,
     revocation: &mut RevocationTracker,
-    terminator: Option<Arc<OriginTerminator>>,
     consumed: &ConsumedSignal,
 ) -> Result<TcpServed, TcpAttemptEnd> {
+    let FallbackCtx { config, edge_cert, token, origin_keys, gate, terminator, metrics, .. } = ctx;
+    let terminator = terminator.clone();
     let mut stream = tcp_tls_connect(target, edge_cert.clone()).await?;
     // Browser Plane over the TCP fallback (#41 FB3): register+bind the public
     // hostname in one 'B' frame, then raw-forward the relayed browser stream to
@@ -3734,6 +3767,138 @@ mod tests {
         edge.abort();
     }
 
+    /// The pool serves with `run_agent`'s metrics, so the scrape sees fallback tunnels.
+    #[tokio::test]
+    async fn tunnels_served_over_the_fallback_reach_the_agents_metrics() {
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::pow::Challenge;
+        use ct_common::{Capability, OriginIdentity};
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use ct_edge::serve::serve_tcp_connection;
+        use ct_edge::state::EdgeState;
+        use quinn::Connection;
+        use std::net::Ipv4Addr;
+
+        // Real dual edge (TCP + QUIC); we exercise only the TCP fallback side.
+        let ca = Ca::new("e2e-ca").unwrap();
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let token = RoutingToken([0x33; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        // Edge: accept each TCP connection and serve it ('A' parks, 'C' delivers).
+        //
+        // ct-agent#15: this is the REAL pinned ct-edge, which predates role 'K'
+        // and rejects an unknown role byte by erroring out and dropping the
+        // connection with no ack. That makes this test a genuine end-to-end proof
+        // of the legacy-Edge fallback: the Agent's 'K' attempt gets dropped
+        // ack-less, it redials and registers with plain 'A', and the tunnel works
+        // exactly as before. Accept in an unbounded loop rather than a fixed count
+        // so the extra probe dial isn't a brittle magic number.
+        let state_e = state.clone();
+        let edge = tokio::spawn(async move {
+            loop {
+                let (tcp, peer) = tcp_listener.accept().await.unwrap();
+                let (acc, st, ch) = (acceptor.clone(), state_e.clone(), challenge.clone());
+                tokio::spawn(async move {
+                    if let Ok(tls) = acc.accept(tcp).await {
+                        // The trailing None is ct-edge's per-connection cap (no cap in this
+                        // test); peer.ip() (#603) is the real accept()-time address.
+                        let _ = serve_tcp_connection(tls, &st, &ch, None, peer.ip()).await;
+                    }
+                });
+            }
+        });
+
+        // Origin: a streaming TCP echo (copy) — echoes bytes as they arrive, so
+        // the round-trip does not depend on a half-close propagating through the
+        // relay chain (matches the known-good TCP-fallback harness).
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = origin_listener.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+            let _ = w.shutdown().await;
+        });
+
+        // The agent holds the origin private key; the Capability pins its public.
+        let origin_kp = generate_static_keypair();
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: tcp_addr.to_string(),
+        };
+
+        // Agent: run the TCP fallback (connect + register + serve one tunnel).
+        // Pool size 1: the real edge parks one registration per token, and a
+        // larger pool would just have the Agent's own workers supersede each
+        // other's park slot before the Client arrives.
+        let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), &origin_addr.to_string()).unwrap();
+        cfg.tcp_fallback_pool_size = 1;
+        let ca_root_a = ca_root.clone();
+        let a_token = token.clone();
+        let metrics = Arc::new(TunnelMetrics::new());
+        let ctx_metrics = Arc::clone(&metrics);
+        let agent = tokio::spawn(async move {
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let mut ctx = FallbackCtx::for_test(
+                &cfg,
+                ca_root_a,
+                a_token,
+                std::sync::Arc::new(vec![origin_kp.private]),
+                std::sync::Arc::new(gate),
+            );
+            ctx.metrics = ctx_metrics;
+            let _ = run_agent_tcp_fallback_with_ctx(&ctx).await;
+        });
+
+        // Wait until the agent has registered (parked) at the edge.
+        for _ in 0..200 {
+            if state.has_tcp_agent(&token) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(state.has_tcp_agent(&token), "agent parked over TLS-TCP");
+
+        // Client: tunnel over TLS-TCP through the edge to the origin, expect echo.
+        let client_kp = generate_static_keypair();
+        let client_stream = ct_client::transport::tcp_tls_connect(tcp_addr, ca_root)
+            .await
+            .unwrap();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(15),
+            ct_client::transport::client_tunnel_noise_tcp(
+                client_stream,
+                &token,
+                &cap,
+                &client_kp.private,
+                b"hello-tcp-fallback",
+            ),
+        )
+        .await
+        .expect("round-trip timed out (relay/serve deadlock)")
+        .unwrap();
+        assert_eq!(
+            resp, b"hello-tcp-fallback",
+            "cross-host TCP-fallback Noise round-trip succeeds"
+        );
+
+        assert!(metrics.tunnels_opened.get() >= 1, "the fallback tunnel was counted in the shared metrics");
+        assert!(metrics.bytes_to_origin.get() > 0, "and its bytes");
+        agent.abort();
+        edge.abort();
+    }
+
     /// A `CT_AGENT_ORIGIN_PROTO=udp` agent on the TLS-TCP fallback must bridge
     /// datagrams to its UDP origin, as the QUIC path does.
     #[tokio::test]
@@ -3909,55 +4074,6 @@ mod tests {
 
         let echoed = edge.await.unwrap();
         assert_eq!(echoed, b"ping", "edge gets the origin's echo through the agent");
-        let _ = origin.await;
-    }
-
-    #[tokio::test]
-    async fn noise_bridge_decrypts_to_origin_and_reencrypts() {
-        use ct_common::noise::{client_handshake_for, frame, generate_static_keypair};
-        use ct_common::{Capability, OriginIdentity, RoutingToken};
-
-        // A real TCP echo Origin — it only ever sees plaintext.
-        let (origin_addr, origin) = echo_origin().await;
-
-        let origin_kp = generate_static_keypair();
-        let client_kp = generate_static_keypair();
-        let cap = Capability {
-            token: RoutingToken([0u8; 32]),
-            origin: OriginIdentity(origin_kp.public),
-            edge_addr: "edge:443".into(),
-        };
-
-        let (client_io, server_io) = tokio::io::duplex(8192);
-        let (mut c_read, mut c_write) = tokio::io::split(client_io);
-
-        // Agent-side responder bridge (the code under test).
-        let origin_priv = origin_kp.private;
-        let bridge = tokio::spawn(async move {
-            let (mut s_read, mut s_write) = tokio::io::split(server_io);
-            serve_noise_bridge(&mut s_write, &mut s_read, origin_addr, &origin_priv).await
-        });
-
-        // Inline Client initiator (mirrors ct-client::noise::client_noise_exchange).
-        let mut hs = client_handshake_for(&client_kp.private, &cap).expect("initiator");
-        let mut buf = vec![0u8; 65535];
-        let mut tmp = vec![0u8; 65535];
-        let n = hs.write_message(&[], &mut buf).unwrap();
-        c_write.write_all(&frame(&buf[..n])).await.unwrap();
-        let m2 = read_frame(&mut c_read).await.unwrap();
-        hs.read_message(&m2, &mut tmp).unwrap();
-        let mut transport = hs.into_transport_mode().unwrap();
-        let n = transport.write_message(b"secret-request", &mut buf).unwrap();
-        c_write.write_all(&frame(&buf[..n])).await.unwrap();
-        let resp_ct = read_frame(&mut c_read).await.unwrap();
-        let n = transport.read_message(&resp_ct, &mut tmp).unwrap();
-
-        assert_eq!(
-            &tmp[..n],
-            b"secret-request",
-            "agent decrypted to origin, origin echoed, agent re-encrypted"
-        );
-        bridge.await.unwrap().expect("bridge ok");
         let _ = origin.await;
     }
 
@@ -4521,6 +4637,97 @@ mod tests {
         let _ = origin.await;
     }
 
+    /// A direct listener with `limits`, serving nothing useful (origin :9); returns its
+    /// address and the client endpoint that trusts it.
+    async fn direct_listener_with(limits: DirectLimits) -> (SocketAddr, quinn::Endpoint, tokio::task::JoinHandle<()>) {
+        use crate::transport::build_direct_listener_at;
+        use std::net::Ipv4Addr;
+        let (listener, cert) = build_direct_listener_at((Ipv4Addr::LOCALHOST, 0).into()).expect("listener");
+        let laddr = listener.local_addr().expect("laddr");
+        let srv = tokio::spawn(async move {
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ = serve_direct_within(
+                listener,
+                "127.0.0.1:9".parse().unwrap(),
+                std::sync::Arc::new(vec![[0u8; 32]]),
+                OriginProto::Tcp,
+                std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new()),
+                std::sync::Arc::new(gate),
+                std::sync::Arc::new(DirectTokenPolicy::new(RoutingToken([0u8; 32]), false)),
+                limits,
+            )
+            .await;
+        });
+        let client = ct_edge::transport::build_client_endpoint(cert).expect("client");
+        (laddr, client, srv)
+    }
+
+    #[tokio::test]
+    async fn the_direct_listener_refuses_connections_beyond_its_cap() {
+        let limits = DirectLimits { max_connections: 1, setup_timeout: Duration::from_secs(20), linger: Duration::from_secs(30) };
+        let (laddr, client, srv) = direct_listener_with(limits).await;
+        // Holds the one slot: connected, never opens a stream.
+        let first = client.connect(laddr, "localhost").unwrap().await.expect("first connection accepted");
+        let second = tokio::time::timeout(Duration::from_secs(5), client.connect(laddr, "localhost").unwrap())
+            .await
+            .expect("the refusal is immediate, not a hang");
+        assert!(second.is_err(), "a connection beyond the cap is refused");
+        assert!(
+            !render_direct_refused_prometheus().contains("ct_agent_direct_refused_at_capacity_total 0\n"),
+            "and the refusal is counted on /metrics"
+        );
+        first.close(0u32.into(), b"done");
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn a_direct_peer_that_stalls_inside_the_handshake_is_closed() {
+        // Review on #240: the setup bound ended at accept_bi, so a peer that opened a stream
+        // and then went silent held its slot in read_frame forever (QUIC keepalive keeps the
+        // connection itself alive). The bound now covers the Noise handshake and gate too.
+        let limits = DirectLimits { max_connections: 8, setup_timeout: Duration::from_millis(300), linger: Duration::from_secs(30) };
+        let (laddr, client, srv) = direct_listener_with(limits).await;
+        let conn = client.connect(laddr, "localhost").unwrap().await.expect("connected");
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[0u8]).await.unwrap(); // half a frame length: accept_bi fires, read_frame waits
+        tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("the agent closed the stalled connection instead of holding it");
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_direct_session_frees_its_slot_at_once() {
+        // Review on #240: every exit used to linger up to 30 s, so a garbage handshake held a
+        // slot for the whole linger. A failed session is now closed at once, and the cap
+        // recovers: the next connection is accepted.
+        let limits = DirectLimits { max_connections: 1, setup_timeout: Duration::from_secs(20), linger: Duration::from_secs(30) };
+        let (laddr, client, srv) = direct_listener_with(limits).await;
+        let first = client.connect(laddr, "localhost").unwrap().await.expect("first connection accepted");
+        let (mut send, _recv) = first.open_bi().await.unwrap();
+        send.write_all(&[0, 4, 1, 2, 3, 4]).await.unwrap(); // a frame no origin key accepts
+        tokio::time::timeout(Duration::from_secs(5), first.closed())
+            .await
+            .expect("the failed session was closed at once, not lingered");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second = tokio::time::timeout(Duration::from_secs(5), client.connect(laddr, "localhost").unwrap())
+            .await
+            .expect("no hang");
+        assert!(second.is_ok(), "the slot came back: the next connection is accepted");
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn a_direct_connection_that_never_opens_a_stream_is_closed() {
+        let limits = DirectLimits { max_connections: 8, setup_timeout: Duration::from_millis(300), linger: Duration::from_secs(30) };
+        let (laddr, client, srv) = direct_listener_with(limits).await;
+        let conn = client.connect(laddr, "localhost").unwrap().await.expect("connected");
+        tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("the agent closed the idle connection instead of holding it");
+        srv.abort();
+    }
+
     // ---- ct-agent#45 slice 1: the RoutingToken in the direct-connect handshake ----
 
     #[test]
@@ -4833,6 +5040,7 @@ mod tests {
                 m,
                 &gate,
                 policy.as_ref(),
+                None,
             )
             .await
         });
@@ -5039,7 +5247,7 @@ mod tests {
         let (a_read, a_write) = tokio::io::split(agent_cipher);
         let origin_priv = origin_kp.private;
         let agent = tokio::spawn(async move {
-            serve_noise_udp_with_policy(a_write, a_read, origin_addr, &[origin_priv], Some(&policy))
+            serve_noise_udp_with_policy(a_write, a_read, origin_addr, &[origin_priv], Some(&policy), None)
                 .await
         });
 
@@ -6534,13 +6742,7 @@ mod tests {
         let pool = tokio::spawn(async move {
             let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
             run_tcp_fallback_pool(
-                &cfg,
-                ca_root,
-                RoutingToken([0x18u8; 32]),
-                Arc::new(vec![[0u8; 32]]),
-                Arc::new(gate),
-                Arc::new(RevocationView::default()),
-                None,
+                &FallbackCtx::for_test(&cfg, ca_root, RoutingToken([0x18u8; 32]), Arc::new(vec![[0u8; 32]]), Arc::new(gate)),
                 budget,
                 None,
             )
@@ -6620,13 +6822,7 @@ mod tests {
         let exit = tokio::time::timeout(
             Duration::from_secs(10),
             run_tcp_fallback_pool(
-                &cfg,
-                ca_root,
-                RoutingToken([0x19u8; 32]),
-                Arc::new(vec![[0u8; 32]]),
-                Arc::new(gate),
-                Arc::new(RevocationView::default()),
-                None,
+                &FallbackCtx::for_test(&cfg, ca_root, RoutingToken([0x19u8; 32]), Arc::new(vec![[0u8; 32]]), Arc::new(gate)),
                 budget,
                 None,
             ),
@@ -6692,13 +6888,7 @@ mod tests {
         let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
         let agent = tokio::spawn(async move {
             let _ = run_tcp_fallback_pool(
-                &cfg,
-                ca_root,
-                RoutingToken([0x79u8; 32]),
-                Arc::new(vec![[0u8; 32]]),
-                Arc::new(gate),
-                Arc::new(RevocationView::default()),
-                None,
+                &FallbackCtx::for_test(&cfg, ca_root, RoutingToken([0x79u8; 32]), Arc::new(vec![[0u8; 32]]), Arc::new(gate)),
                 budget,
                 None,
             )
@@ -6778,13 +6968,7 @@ mod tests {
         let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
         let agent = tokio::spawn(async move {
             let _ = run_tcp_fallback_pool(
-                &cfg,
-                ca_root,
-                RoutingToken([0x7au8; 32]),
-                Arc::new(vec![[0u8; 32]]),
-                Arc::new(gate),
-                Arc::new(RevocationView::default()),
-                None,
+                &FallbackCtx::for_test(&cfg, ca_root, RoutingToken([0x7au8; 32]), Arc::new(vec![[0u8; 32]]), Arc::new(gate)),
                 FallbackBudget { base: Duration::from_secs(10), max: Duration::from_secs(20), attempts: 5 },
                 None,
             )
@@ -6853,13 +7037,7 @@ mod tests {
         let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
         let agent = tokio::spawn(async move {
             let _ = run_tcp_fallback_pool(
-                &cfg,
-                ca_root,
-                RoutingToken([0x7bu8; 32]),
-                Arc::new(vec![[0u8; 32]]),
-                Arc::new(gate),
-                Arc::new(RevocationView::default()),
-                None,
+                &FallbackCtx::for_test(&cfg, ca_root, RoutingToken([0x7bu8; 32]), Arc::new(vec![[0u8; 32]]), Arc::new(gate)),
                 FallbackBudget { base: Duration::from_secs(10), max: Duration::from_secs(20), attempts: 5 },
                 None,
             )

@@ -151,6 +151,7 @@ fn resolve_primary_identity(
         }
         std::fs::rename(&key_tmp, kp)?;
         std::fs::rename(&cap_tmp, cap_path)?;
+        crate::secret_file::sync_parent_dir(std::path::Path::new(cap_path))?;
         return Ok((cap, origin_key.private_bytes()));
     }
     // Default: a fresh, unique single-agent identity.
@@ -243,6 +244,7 @@ pub fn rotate_origin_key(
     }
     std::fs::rename(&key_tmp, key_path)?;
     std::fs::rename(&cap_tmp, cap_path)?;
+    crate::secret_file::sync_parent_dir(std::path::Path::new(cap_path))?;
     Ok(new_cap)
 }
 

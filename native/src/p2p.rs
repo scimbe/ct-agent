@@ -56,14 +56,18 @@
 
 use std::time::Duration;
 
+#[cfg(test)]
 use ct_common::channel::{
     verify_holder_possession, verify_stateless, ChannelId, GrantError, SignedChannelGrant,
     UnixSeconds,
 };
+#[cfg(test)]
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+#[cfg(test)]
 use libp2p::core::transport::MemoryTransport;
 use libp2p::core::upgrade::Version;
 use libp2p::futures::StreamExt;
+#[cfg(test)]
 use libp2p::kad::{self, store::MemoryStore, Quorum, Record, RecordKey};
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
@@ -84,6 +88,7 @@ const CT_CHANNEL_PROTOCOL: StreamProtocol = StreamProtocol::new("/ct/channel/1.0
 /// duplex; our `Noise_IK` session runs on top of it.
 pub type P2pDuplex = Compat<libp2p::Stream>;
 
+#[cfg(test)]
 /// Build a minimal libp2p swarm for the in-memory seam: `MemoryTransport`, upgraded
 /// with libp2p-noise (connection security) + yamux (stream multiplexing), driving a
 /// single [`stream::Behaviour`] so we can open/accept raw substreams. Every peer gets a
@@ -105,6 +110,7 @@ fn build_memory_swarm() -> Result<Swarm<stream::Behaviour>, BoxError> {
     Ok(swarm)
 }
 
+#[cfg(test)]
 /// Connect two in-process libp2p peers over `MemoryTransport` and open a single raw
 /// stream between them, returning each side as an `AsyncRead + AsyncWrite + Unpin`
 /// duplex (the `(dialer, listener)` pair). The two swarms are then driven forever on
@@ -185,6 +191,7 @@ pub async fn connected_memory_stream_pair() -> Result<(P2pDuplex, P2pDuplex), Bo
     Ok((dialer_stream.compat(), listener_stream.compat()))
 }
 
+#[cfg(test)]
 /// Build a libp2p swarm for the real-TCP seam: a Tokio TCP transport upgraded with
 /// libp2p-noise (connection security) + yamux (muxer), driving a single
 /// [`stream::Behaviour`]. Structurally identical to [`build_memory_swarm`] except the
@@ -203,6 +210,7 @@ fn build_tcp_swarm() -> Result<Swarm<stream::Behaviour>, BoxError> {
     Ok(swarm)
 }
 
+#[cfg(test)]
 /// Connect two libp2p peers over a **real loopback TCP transport** and open a single raw
 /// stream between them, returning each side as an `AsyncRead + AsyncWrite + Unpin` duplex
 /// (the `(dialer, listener)` pair). This is the real-network counterpart of
@@ -298,6 +306,7 @@ pub async fn connected_tcp_stream_pair() -> Result<(P2pDuplex, P2pDuplex), BoxEr
     Ok((dialer_stream.compat(), listener_stream.compat()))
 }
 
+#[cfg(test)]
 /// The behaviour a **relay client** peer runs: the libp2p Circuit-Relay v2 client
 /// (installed by `SwarmBuilder::with_relay_client`, which also splices its relayed
 /// transport in alongside TCP) composed with the raw-substream [`stream::Behaviour`] we
@@ -713,6 +722,7 @@ pub async fn nat_lab_dial(peer_via_relay: Multiaddr) -> Result<(), BoxError> {
     }
 }
 
+#[cfg(test)]
 /// Build a **relay client**'s swarm: TCP + noise + yamux, plus the Circuit-Relay v2 client
 /// transport (`with_relay_client`) so this peer can make a reservation on / dial through a
 /// relay, driving the composite [`RelayClientBehaviour`]. As on every transport, the fresh
@@ -1081,6 +1091,7 @@ fn add_direct_punch_listeners(swarm: &mut Swarm<DcutrRelayClientBehaviour>) -> R
     Ok(())
 }
 
+#[cfg(test)]
 /// Connect two libp2p peers **through a third Circuit-Relay v2 relay node** and open a
 /// single raw stream between them, returning each side as an `AsyncRead + AsyncWrite +
 /// Unpin` duplex (the `(dialer, listener)` pair). Three in-process nodes run over TCP
@@ -1208,6 +1219,7 @@ pub async fn connected_relayed_stream_pair() -> Result<(P2pDuplex, P2pDuplex), B
     Ok((dialer_stream.compat(), listener_stream.compat()))
 }
 
+#[cfg(test)]
 /// Connect two **DCUtR-enabled** libp2p peers through a Circuit-Relay v2 relay node and open
 /// a single raw stream between them, returning each side as an `AsyncRead + AsyncWrite +
 /// Unpin` duplex (the `(dialer, listener)` pair). Structurally identical to
@@ -1695,12 +1707,14 @@ where
     }
 }
 
+#[cfg(test)]
 /// The domain-separation tag for a DHT coordinate record's signing preimage. A distinct,
 /// versioned prefix keeps this signature from ever being confused with a grant, an
 /// invitation, or the member-Noise attestation (`ct-a2a-noise-attest-v1`) — exactly as the
 /// rest of `ct_common::channel` domain-separates every signed message.
 const COORDINATE_RECORD_DOMAIN: &[u8] = b"ct-a2a-dht-coordinate-v1";
 
+#[cfg(test)]
 /// A **holder-signed** Kademlia DHT record mapping a [`ChannelId`] to a channel member's
 /// reachability `coordinates` (#121 D-kademlia, **invariant #4**).
 ///
@@ -1730,6 +1744,7 @@ pub struct SignedCoordinateRecord {
     pub signature: [u8; 64],
 }
 
+#[cfg(test)]
 impl SignedCoordinateRecord {
     /// The canonical, domain-separated preimage the holder signs: `domain || channel_id ||
     /// holder || coordinates`. Binding `channel` and `holder` into the preimage (not just the
@@ -1815,6 +1830,7 @@ impl SignedCoordinateRecord {
     }
 }
 
+#[cfg(test)]
 /// Build a minimal libp2p **Kademlia** swarm over loopback TCP (noise + yamux), driving a
 /// single `kad::Behaviour` backed by an in-memory record store. Structurally identical to
 /// [`build_tcp_swarm`] except the behaviour is the DHT. The node is put into
@@ -1838,6 +1854,7 @@ fn build_kad_swarm() -> Result<Swarm<kad::Behaviour<MemoryStore>>, BoxError> {
     Ok(swarm)
 }
 
+#[cfg(test)]
 /// Publish a coordinate record on an in-process Kademlia DHT from node A and **resolve it by
 /// [`ChannelId`] from a second node B** — the discovery counterpart of the connectivity seams
 /// above (#121 D-kademlia). Two in-process nodes run over TCP loopback: node A
@@ -1917,6 +1934,7 @@ pub async fn kademlia_publish_and_resolve(
     }
 }
 
+#[cfg(test)]
 /// Why a peer may **not** use a superpeer's Circuit-Relay for a given channel
 /// ([`authorize_relay_circuit`], invariant #3). Distinct variants so a relay can log
 /// *which* containment rule refused a circuit without leaking grant contents.
@@ -1942,6 +1960,7 @@ pub enum RelayCircuitError {
     RequesterPossessionFailed,
 }
 
+#[cfg(test)]
 impl std::fmt::Display for RelayCircuitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1962,8 +1981,10 @@ impl std::fmt::Display for RelayCircuitError {
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for RelayCircuitError {}
 
+#[cfg(test)]
 /// **Invariant #3 admission gate for a superpeer's Circuit-Relay.** A superpeer (any
 /// member the operator lets relay) must forward a circuit **only** for a channel it is
 /// itself a grant-member of, and only to a peer that proves co-membership on that same
@@ -2013,6 +2034,7 @@ pub fn authorize_relay_circuit(
     Ok(())
 }
 
+#[cfg(test)]
 /// [`authorize_relay_circuit`] **plus a connect-time proof of possession** — the full
 /// admission a *live* superpeer relay applies, and the last unit-gatable layer before the
 /// `C-circuit-relay-transport` relay is safe to run publicly. On top of the two grant +
@@ -2050,6 +2072,7 @@ pub fn authorize_relay_circuit_with_possession(
     Ok(())
 }
 
+#[cfg(test)]
 /// Mints and single-use-verifies the fresh challenges [`authorize_relay_circuit_with_possession`]
 /// is checked against — the **freshness half** of the relay possession gate.
 ///
@@ -2079,6 +2102,7 @@ pub struct RelayChallenger {
     outstanding: std::collections::HashMap<[u8; 32], u64>,
 }
 
+#[cfg(test)]
 impl RelayChallenger {
     pub fn new() -> Self {
         Self::default()

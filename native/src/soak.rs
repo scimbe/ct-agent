@@ -126,7 +126,7 @@ async fn reconnect_loop_survives_a_multi_hour_edge_outage_and_recovers() {
 #[tokio::test(start_paused = true)]
 async fn fallback_pool_survives_weeks_of_worker_churn_without_leaking_tasks() {
     use crate::config::AgentConfig;
-    use crate::serve::{run_tcp_fallback_pool_on, FallbackBudget, FallbackExit, RevocationView};
+    use crate::serve::{run_tcp_fallback_pool_on, FallbackBudget, FallbackCtx, FallbackExit};
     use crate::task_guard::LiveGauge;
     use ct_common::RoutingToken;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -174,13 +174,13 @@ async fn fallback_pool_survives_weeks_of_worker_churn_without_leaking_tasks() {
         loop {
             let exit = run_tcp_fallback_pool_on(
                 &GAUGE,
-                &config,
-                edge_cert.clone(),
-                RoutingToken([0x79u8; 32]),
-                Arc::new(vec![[0u8; 32]]),
-                Arc::clone(&gate),
-                Arc::new(RevocationView::default()),
-                None,
+                &FallbackCtx::for_test(
+                    &config,
+                    edge_cert.clone(),
+                    RoutingToken([0x79u8; 32]),
+                    Arc::new(vec![[0u8; 32]]),
+                    Arc::clone(&gate),
+                ),
                 budget,
                 None,
             )

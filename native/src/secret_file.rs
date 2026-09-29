@@ -39,25 +39,80 @@ use std::path::Path;
 /// true forever.
 #[cfg(unix)]
 pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    // A symlink at `path` is refused outright (the O_NOFOLLOW contract). A link planted
+    // after this check is harmless: `rename` replaces the link itself, never its target.
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::from_raw_os_error(libc::ELOOP));
+    }
+    replace_atomically(path, bytes, 0o600)
 }
 
-/// Non-Unix fallback: there is no mode to set, so this is a plain write. Kept as a
+/// Non-Unix fallback: there is no mode to set, so this is a plain atomic replace. Kept as a
 /// separate `cfg` rather than a runtime branch so the Unix path carries no dead code.
 #[cfg(not(unix))]
 pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, bytes)
+    replace_atomically(path, bytes, 0o600)
+}
+
+/// [`write_private`]'s crash safety for a file that is not a secret (a certificate chain a
+/// web server under another user must read, an id file): created at `0644` minus the umask.
+pub fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    replace_atomically(path, bytes, 0o644)
+}
+
+/// Write a temp sibling (created exclusively, `mode`, `O_NOFOLLOW`), `fsync` it, rename it
+/// over `path`, then `fsync` the directory. Writing `path` in place with `truncate` left an
+/// empty or half-written file behind on a crash -- for a rotated OIDC refresh token or the
+/// local-auth credential that is a manual re-login on an unattended host.
+fn replace_atomically(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = temp_sibling(path);
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let written = (|| {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(mode).custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        sync_parent_dir(path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// `.<name>.tmp` next to `path`.
+fn temp_sibling(path: &Path) -> std::path::PathBuf {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    path.with_file_name(format!(".{name}.tmp"))
+}
+
+/// `fsync` the directory holding `path`, so a completed `rename` into it survives a power
+/// loss. A no-op where directories cannot be opened for syncing.
+pub fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -142,5 +197,47 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "created at 0600, not narrowed to it afterwards");
+    }
+
+    #[test]
+    fn write_private_replaces_atomically_and_leaves_no_temp_file() {
+        let dir = scratch("atomic");
+        let path = dir.join("token.json");
+        write_private(&path, b"first").unwrap();
+        // A stale temp from an interrupted earlier write, even a symlink, is not followed.
+        let tmp = dir.join(".token.json.tmp");
+        #[cfg(unix)]
+        {
+            let decoy = dir.join("decoy");
+            std::fs::write(&decoy, b"untouched").unwrap();
+            std::os::unix::fs::symlink(&decoy, &tmp).unwrap();
+            write_private(&path, b"second").unwrap();
+            assert_eq!(std::fs::read(&decoy).unwrap(), b"untouched");
+        }
+        #[cfg(not(unix))]
+        write_private(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert!(std::fs::symlink_metadata(&tmp).is_err(), "no temp file left behind");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_durable_is_readable_by_others_but_still_atomic() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("durable");
+        let path = dir.join("fullchain.pem");
+        write_durable(&path, b"cert").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644 & !process_umask(), "0644 minus the umask, not forced to 0600");
+        assert_eq!(std::fs::read(&path).unwrap(), b"cert");
+    }
+
+    /// The umask from /proc, read without changing it (it is process-wide, and the
+    /// other tests run concurrently).
+    #[cfg(target_os = "linux")]
+    fn process_umask() -> u32 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status.lines().find(|l| l.starts_with("Umask:")).unwrap();
+        u32::from_str_radix(line.trim_start_matches("Umask:").trim(), 8).unwrap()
     }
 }

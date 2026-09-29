@@ -19,6 +19,7 @@
 //! Every route reads through an [`ObserveState`] so a test can serve a private
 //! status/counter/ring instance instead of the process-wide ones.
 
+use crate::codec::now_unix;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -122,16 +123,10 @@ fn render_text_with(metrics: &TunnelMetrics, status: &AgentStatus, events: &Even
     let mut text = metrics.render_prometheus();
     text.push_str(&status.render_prometheus());
     text.push_str(&events.render_prometheus());
+    text.push_str(&crate::serve::render_direct_refused_prometheus());
     text.push_str(&crate::masque::render_dropped_datagrams_prometheus());
     text.push_str(&crate::task_guard::render_prometheus());
     text
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 async fn status_json(State(state): State<ObserveState>) -> impl IntoResponse {

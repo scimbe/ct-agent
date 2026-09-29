@@ -47,6 +47,7 @@
 //! minted or revoked by the CLI while the agent serves takes effect
 //! immediately. This is Mesh-Plane HTTP-mode only, like the rest of the gate.
 
+use crate::codec::hex_encode;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -168,26 +169,12 @@ fn hash_credential(salt: &[u8; 16], password: &[u8]) -> [u8; 32] {
 /// the `subtle` crate for one function. Both inputs are fixed-size 32-byte
 /// hashes so there is no length-leak to guard against separately.
 fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let mut diff = 0u8;
-    for i in 0..32 {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    crate::codec::ct_eq(a, b)
 }
 
 fn hex_decode_fixed<const N: usize>(s: &str) -> Result<[u8; N], String> {
-    if s.len() != N * 2 {
-        return Err(format!("expected {} hex chars, got {}", N * 2, s.len()));
-    }
-    let mut out = [0u8; N];
-    for i in 0..N {
-        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
-    }
-    Ok(out)
+    // Byte-slicing `&s[i*2..]` panicked on a non-ASCII character (#606's bug class).
+    crate::codec::hex_decode(s).ok_or_else(|| format!("expected {} hex chars, got {:?}", N * 2, s.len()))
 }
 
 /// A per-process, global (not per-source -- the Agent has no reliable

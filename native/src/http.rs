@@ -37,6 +37,27 @@ pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 static SHARED: OnceLock<reqwest::Client> = OnceLock::new();
 
+/// Redirects stay on the host they started at, never downgrade to plain http, and
+/// stop after 10 hops. reqwest's default policy strips only the standard credential
+/// headers on a cross-host hop: our `x-ct-agent-token` would follow, and a 307/308
+/// re-posts the body -- an OIDC `refresh_token` or `device_code` -- to wherever the
+/// redirect points. A blocked redirect is returned to the caller as the 3xx response.
+fn same_origin_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let Some(origin) = attempt.previous().first() else {
+            return attempt.stop();
+        };
+        let next = attempt.url();
+        let same_host = next.host_str() == origin.host_str();
+        let no_downgrade = !(origin.scheme() == "https" && next.scheme() != "https");
+        if attempt.previous().len() > 10 || !same_host || !no_downgrade {
+            attempt.stop()
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 /// The process-wide client. Cheap to call: `reqwest::Client` is an `Arc` handle,
 /// so every caller shares the same pool. Built once with [`DEFAULT_TIMEOUT`],
 /// [`CONNECT_TIMEOUT`], [`POOL_IDLE_TIMEOUT`] and a `ct-agent/<version>` user
@@ -52,6 +73,7 @@ pub fn shared() -> reqwest::Client {
                 .timeout(DEFAULT_TIMEOUT)
                 .user_agent(format!("ct-agent/{}", env!("CARGO_PKG_VERSION")))
                 .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+                .redirect(same_origin_redirects())
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
         })
@@ -61,6 +83,58 @@ pub fn shared() -> reqwest::Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-shot HTTP server on loopback answering `response`; returns its address and
+    /// how many requests it saw.
+    async fn one_shot(response: String) -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let _ = s.write_all(response.as_bytes()).await;
+            }
+        });
+        (addr, hits)
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_another_host_is_not_followed() {
+        // "localhost" vs "127.0.0.1": a different host name, as far as the policy is concerned.
+        let (target, target_hits) = one_shot("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n".into()).await;
+        let (origin, _) = one_shot(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://localhost:{}/token\r\ncontent-length: 0\r\n\r\n",
+            target.port()
+        ))
+        .await;
+        let resp = shared()
+            .post(format!("http://{origin}/token"))
+            .header("x-ct-agent-token", "secret")
+            .body("refresh_token=secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 307, "the redirect is handed back, not followed");
+        assert_eq!(target_hits.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing reached the other host");
+    }
+
+    #[tokio::test]
+    async fn a_same_host_redirect_is_still_followed() {
+        let (target, target_hits) = one_shot("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n".into()).await;
+        let (origin, _) = one_shot(format!(
+            "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{}/x\r\ncontent-length: 0\r\n\r\n",
+            target.port()
+        ))
+        .await;
+        let resp = shared().get(format!("http://{origin}/")).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(target_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn shared_returns_a_client_on_every_call() {

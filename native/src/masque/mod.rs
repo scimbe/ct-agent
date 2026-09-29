@@ -6,11 +6,10 @@
 //! otherwise indistinguishable from ordinary HTTPS traffic on the wire.
 //!
 //! See CADS-Tunnel's `docs/adr/0024-masque-connect-udp-fallback.md` for the full
-//! design and M1 (`spike-masque-h2/`)/M2 (`masque-proxy`) that proved the transport
-//! layer this module's [`dial_quic_via_masque`] builds on. **Not yet wired into the
-//! agent's reconnect loop or `ladder.rs`'s `EdgeRung`** -- that's the deliberately
-//! separate follow-up (mirrors M2's own proxy-backend-then-registration split), so
-//! this lands as a real, independently testable unit first.
+//! design and M1 (the since-removed spike)/M2 (`masque-proxy`) that proved the transport
+//! layer this module's [`dial_quic_via_masque`] builds on. The agent's reconnect loop
+//! tries it (`serve.rs`, `try_dial_via_masque`) before the TLS-TCP fallback when
+//! `CT_AGENT_MASQUE_*` is configured.
 
 mod capsule;
 // ct-agent#179: `pub(crate)` so the soak harness drives the bounded pumps directly.

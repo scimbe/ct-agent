@@ -184,12 +184,7 @@ pub enum OwnerAuth {
 
 /// Whether `CT_AGENT_SSH_OWNER_AUTH` opts out. Only an explicit off/0/false does.
 pub fn owner_auth_disabled(get: &impl Fn(&str) -> Option<String>) -> bool {
-    get(OWNER_AUTH_ENV)
-        .map(|v| {
-            let v = v.trim();
-            v.eq_ignore_ascii_case("off") || v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no")
-        })
-        .unwrap_or(false)
+    !crate::envflag::flag_named(OWNER_AUTH_ENV, get(OWNER_AUTH_ENV).as_deref(), true)
 }
 
 /// The agent-side policy from the environment and the state dir: `Off` only on the explicit
