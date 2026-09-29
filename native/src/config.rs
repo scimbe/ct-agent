@@ -248,20 +248,77 @@ fn resolve_addr(var: &str, s: &str) -> Result<SocketAddr, String> {
 /// Bound on one edge re-resolution; a slow resolver must not stall a reconnect.
 const EDGE_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The address last resolved for each edge host in this process (see
+/// [`AgentConfig::resolve_edge_or`]).
+static LEARNED_EDGES: std::sync::Mutex<Vec<(String, SocketAddr)>> = std::sync::Mutex::new(Vec::new());
+
+fn learned_edge(host: &str) -> Option<SocketAddr> {
+    use ct_common::sync::MutexExt;
+    LEARNED_EDGES.lock_safe().iter().find(|(h, _)| h == host).map(|(_, a)| *a)
+}
+
+fn remember_edge(host: &str, addr: SocketAddr) {
+    use ct_common::sync::MutexExt;
+    let mut learned = LEARNED_EDGES.lock_safe();
+    match learned.iter_mut().find(|(h, _)| h == host) {
+        Some(entry) => entry.1 = addr,
+        None => learned.push((host.to_string(), addr)),
+    }
+}
+
+/// The DNS answers for `host` ("name:port"). Tests replace the resolver per host with
+/// [`test_dns::set`], so a reconnect loop can be driven through an edge move.
+async fn lookup_edge(host: &str) -> std::io::Result<Vec<SocketAddr>> {
+    #[cfg(test)]
+    if let Some(answers) = test_dns::get(host) {
+        return Ok(answers);
+    }
+    Ok(tokio::net::lookup_host(host).await?.collect())
+}
+
+#[cfg(test)]
+pub(crate) mod test_dns {
+    use ct_common::sync::MutexExt;
+    use std::net::SocketAddr;
+
+    static ANSWERS: std::sync::Mutex<Vec<(String, Vec<SocketAddr>)>> = std::sync::Mutex::new(Vec::new());
+
+    /// Answer lookups of `host` with `addrs` from now on (tests use a host name of their own).
+    pub(crate) fn set(host: &str, addrs: Vec<SocketAddr>) {
+        let mut answers = ANSWERS.lock_safe();
+        answers.retain(|(h, _)| h != host);
+        answers.push((host.to_string(), addrs));
+    }
+
+    pub(super) fn get(host: &str) -> Option<Vec<SocketAddr>> {
+        ANSWERS.lock_safe().iter().find(|(h, _)| h == host).map(|(_, a)| a.clone())
+    }
+}
+
 impl AgentConfig {
     /// The edge address to dial now. A hostname `CT_AGENT_EDGE` is looked up again, so an
     /// agent running for months follows the edge to a new IP (a recreated Compose service,
     /// a re-addressed host) instead of reconnecting to the startup address forever. An IP
     /// literal, a failed lookup or one that times out returns `last` -- the caller's last
     /// good address -- so a resolver outage never takes a working edge away.
+    ///
+    /// The process remembers the address it last resolved for the host, so every caller -- the
+    /// QUIC reconnect loop and each TLS-TCP fallback worker -- falls back to the newest address
+    /// any of them learned, not to its own (possibly startup) `last`. And when that address is
+    /// still among the answers it is kept: with several records behind the name (edge replicas)
+    /// taking the first one each time would move the agent between edges on every reconnect.
     pub async fn resolve_edge_or(&self, last: SocketAddr) -> SocketAddr {
         let Some(host) = &self.edge_host else {
             return self.edge;
         };
-        match tokio::time::timeout(EDGE_RESOLVE_TIMEOUT, tokio::net::lookup_host(host.as_str())).await {
-            Ok(Ok(mut addrs)) => addrs.next().unwrap_or(last),
-            _ => last,
-        }
+        let known = learned_edge(host).unwrap_or(last);
+        let answers = match tokio::time::timeout(EDGE_RESOLVE_TIMEOUT, lookup_edge(host)).await {
+            Ok(Ok(addrs)) if !addrs.is_empty() => addrs,
+            _ => return known,
+        };
+        let chosen = if answers.contains(&known) { known } else { answers[0] };
+        remember_edge(host, chosen);
+        chosen
     }
 
     /// CADS-Tunnel#795: a hostname the operator set that this agent will never bind.
@@ -496,6 +553,27 @@ mod tests {
         let mut gone = named.clone();
         gone.edge_host = Some("edge.does-not-exist.invalid:4433".into());
         assert_eq!(gone.resolve_edge_or(other).await, other);
+    }
+
+    #[tokio::test]
+    async fn a_resolved_edge_stays_put_among_replicas_and_is_shared_as_the_fallback() {
+        let a: SocketAddr = "192.0.2.10:4433".parse().unwrap();
+        let b: SocketAddr = "192.0.2.11:4433".parse().unwrap();
+        let startup: SocketAddr = "192.0.2.99:4433".parse().unwrap();
+        let mut cfg = AgentConfig::parse("10.0.0.2:4433", "127.0.0.1:8080").unwrap();
+        cfg.edge_host = Some("replicas.sticky.test:4433".into());
+
+        test_dns::set("replicas.sticky.test:4433", vec![b, a]);
+        assert_eq!(cfg.resolve_edge_or(startup).await, b, "first answer when nothing is known yet");
+        test_dns::set("replicas.sticky.test:4433", vec![a, b]);
+        assert_eq!(cfg.resolve_edge_or(b).await, b, "the known edge is kept while it is still an answer");
+        test_dns::set("replicas.sticky.test:4433", vec![a]);
+        assert_eq!(cfg.resolve_edge_or(b).await, a, "and left once it is gone");
+
+        // A failed lookup falls back to what the process learned, not to a caller's stale
+        // `last` (a fallback worker passes the startup address).
+        test_dns::set("replicas.sticky.test:4433", vec![]);
+        assert_eq!(cfg.resolve_edge_or(startup).await, a);
     }
     use super::*;
 

@@ -5693,6 +5693,67 @@ mod tests {
         edge.abort();
     }
 
+    /// #245 review: pins re-resolution at the place it has to happen -- inside the reconnect
+    /// loop. The edge's name answers A; A registers the agent, then goes away for good; the name
+    /// now answers B. The agent must end up registered at B. Resolving once before the loop
+    /// (the pre-#245 shape) keeps dialing the dead A forever.
+    #[tokio::test]
+    async fn run_agent_follows_its_edge_name_to_a_new_address() {
+        use ct_edge::serve::register_agent;
+        use ct_edge::state::EdgeState;
+        use quinn::Connection;
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        // Two edges with one certificate, as one edge that moved.
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let endpoint = || {
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+            let cfg = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key).unwrap();
+            quinn::Endpoint::server(cfg, "127.0.0.1:0".parse().unwrap()).unwrap()
+        };
+        let (edge_a, edge_b) = (endpoint(), endpoint());
+        let (addr_a, addr_b) = (edge_a.local_addr().unwrap(), edge_b.local_addr().unwrap());
+        let host = "moved.edge.test:4433";
+        crate::config::test_dns::set(host, vec![addr_a]);
+
+        let (st_a, st_b) = (Arc::new(EdgeState::<Connection>::new()), Arc::new(EdgeState::<Connection>::new()));
+        let registered_at_b = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_b = Arc::clone(&registered_at_b);
+        let at_a = tokio::spawn(async move {
+            let conn = edge_a.accept().await.unwrap().await.unwrap();
+            register_agent(&conn, &st_a).await.unwrap();
+            // The edge moves: the name now points at B, and A is gone for good.
+            crate::config::test_dns::set(host, vec![addr_b]);
+            conn.close(0u32.into(), b"moved");
+            edge_a.close(0u32.into(), b"moved");
+        });
+        let at_b = tokio::spawn(async move {
+            let conn = edge_b.accept().await.unwrap().await.unwrap();
+            register_agent(&conn, &st_b).await.unwrap();
+            flag_b.store(true, std::sync::atomic::Ordering::SeqCst);
+            conn.closed().await;
+        });
+
+        let mut cfg = AgentConfig::parse(&addr_a.to_string(), "127.0.0.1:9").unwrap();
+        cfg.edge_host = Some(host.to_string());
+        let agent = tokio::spawn(async move {
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ = run_agent(&cfg, cert, RoutingToken([7u8; 32]), Arc::new(vec![[0u8; 32]]), Arc::new(gate), None).await;
+        });
+
+        at_a.await.unwrap();
+        let moved = tokio::time::timeout(Duration::from_secs(30), async {
+            while !registered_at_b.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        agent.abort();
+        at_b.abort();
+        assert!(moved.is_ok(), "the agent re-resolved its edge name and registered at the new address");
+    }
+
     /// ct-agent#15 acceptance for the ping-capable role, end to end through the
     /// real `tcp_connect_register_serve`: a 'K'-aware Edge admits the Agent,
     /// keeps the parked connection busy with real payload PING/PONG round trips,
