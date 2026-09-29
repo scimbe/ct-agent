@@ -1044,12 +1044,10 @@ fn trim_trailing_line_ending(bytes: &[u8]) -> &[u8] {
 // registration path (`RevocationTracker`), with no new wire contract and no new
 // credential.
 
-/// Version tag of the direct-connect handshake payload: "a RoutingToken
-/// follows" (ct-agent#45 slice 1). See [`DirectHandshakePayload`] for the encoding.
-pub const DIRECT_HS_PAYLOAD_TOKEN_V1: u8 = 0x01;
-
-/// Exact length of a v1 payload: the tag byte plus the raw 32-byte token.
-pub const DIRECT_HS_PAYLOAD_TOKEN_V1_LEN: usize = 1 + 32;
+/// The payload's version tag and v1 length are shared with the client side
+/// (`ct_common::noise::direct_handshake_payload`, CADS-Tunnel#770), so both halves
+/// of the contract come from one definition.
+pub use ct_common::noise::{DIRECT_HS_PAYLOAD_TOKEN_V1, DIRECT_HS_PAYLOAD_TOKEN_V1_LEN};
 
 /// What the initiator's Noise_IK **message-1 payload** said on the
 /// direct-connect path (ct-agent#45 slice 1).
@@ -1095,16 +1093,6 @@ pub fn parse_direct_handshake_payload(payload: &[u8]) -> DirectHandshakePayload 
         }
         _ => DirectHandshakePayload::Legacy,
     }
-}
-
-/// Encode `token` as the v1 direct-connect handshake payload -- the client half
-/// of the contract on [`DirectHandshakePayload`]. CADS-Tunnel's client sends
-/// exactly this (slice 2); the tests here use it to play a #45-aware client.
-pub fn encode_direct_handshake_payload(token: &RoutingToken) -> Vec<u8> {
-    let mut out = Vec::with_capacity(DIRECT_HS_PAYLOAD_TOKEN_V1_LEN);
-    out.push(DIRECT_HS_PAYLOAD_TOKEN_V1);
-    out.extend_from_slice(&token.0);
-    out
 }
 
 /// Named log line for a token mismatch (grep target, see ct-agent#45).
@@ -4747,7 +4735,7 @@ mod tests {
         // token as the same raw 32 bytes the relay path's register frame carries,
         // plus the classification table (empty/unknown = legacy, bad v1 = malformed).
         let token = RoutingToken([0xab; 32]);
-        let enc = encode_direct_handshake_payload(&token);
+        let enc = ct_common::noise::direct_handshake_payload(&token).to_vec();
         assert_eq!(enc.len(), DIRECT_HS_PAYLOAD_TOKEN_V1_LEN, "1 tag byte + 32 token bytes");
         assert_eq!(enc[0], DIRECT_HS_PAYLOAD_TOKEN_V1);
         assert_eq!(&enc[1..], &token.0[..], "raw token bytes, no extra serialization");
@@ -5140,7 +5128,7 @@ mod tests {
         // (b) a #45-aware client sends `0x01 ‖ token`, and it is this tunnel's token.
         let own = RoutingToken([0x45; 32]);
         let policy = DirectTokenPolicy::new(own.clone(), false);
-        let rig = direct_token_rig(Some(policy), encode_direct_handshake_payload(&own)).await;
+        let rig = direct_token_rig(Some(policy), ct_common::noise::direct_handshake_payload(&own).to_vec()).await;
         let (dialed, metrics) = direct_token_rig_expect_served(rig, b"tokened-direct").await;
         assert!(dialed, "origin dialed for the matching token");
         assert_eq!(metrics.tunnels_opened.get(), 1);
@@ -5158,7 +5146,7 @@ mod tests {
         let view = Arc::new(RevocationView::default());
         RevocationTracker::new(Arc::clone(&view)).note(RegistrationOutcome::RefusedDefinitive);
         let policy = DirectTokenPolicy::with_revocation(own.clone(), false, view);
-        let rig = direct_token_rig(Some(policy), encode_direct_handshake_payload(&own)).await;
+        let rig = direct_token_rig(Some(policy), ct_common::noise::direct_handshake_payload(&own).to_vec()).await;
         direct_token_rig_expect_refused(rig, DIRECT_REFUSED_REVOKED).await;
     }
 
@@ -5180,7 +5168,7 @@ mod tests {
         // pre-#45 code, which served every client that knew the origin key.
         let policy = DirectTokenPolicy::new(RoutingToken([0x45; 32]), false);
         let foreign = RoutingToken([0x99; 32]);
-        let rig = direct_token_rig(Some(policy), encode_direct_handshake_payload(&foreign)).await;
+        let rig = direct_token_rig(Some(policy), ct_common::noise::direct_handshake_payload(&foreign).to_vec()).await;
         direct_token_rig_expect_refused(rig, DIRECT_REFUSED_MISMATCH).await;
     }
 
@@ -5209,7 +5197,7 @@ mod tests {
         // the Edge already checked the token there, so even a payload naming a
         // foreign token is simply not looked at.
         let foreign = RoutingToken([0x99; 32]);
-        let rig = direct_token_rig(None, encode_direct_handshake_payload(&foreign)).await;
+        let rig = direct_token_rig(None, ct_common::noise::direct_handshake_payload(&foreign).to_vec()).await;
         let (dialed, metrics) = direct_token_rig_expect_served(rig, b"relayed").await;
         assert!(dialed);
         assert_eq!(metrics.tunnels_opened.get(), 1);
@@ -5275,7 +5263,7 @@ mod tests {
         // (b) on the datagram path: matching token -> one datagram echoes through.
         let own = RoutingToken([0x45; 32]);
         let policy = DirectTokenPolicy::new(own.clone(), false);
-        let rig = direct_token_udp_rig(policy, encode_direct_handshake_payload(&own)).await;
+        let rig = direct_token_udp_rig(policy, ct_common::noise::direct_handshake_payload(&own).to_vec()).await;
         let DirectTokenUdpRig { origin_reached, agent, mut hs, mut c_read, mut c_write } = rig;
         let mut buf = vec![0u8; 65535];
         let mut tmp = vec![0u8; 65535];
@@ -5299,7 +5287,7 @@ mod tests {
         // never sees a datagram, the named line is the error.
         let policy = DirectTokenPolicy::new(RoutingToken([0x45; 32]), false);
         let foreign = RoutingToken([0x99; 32]);
-        let rig = direct_token_udp_rig(policy, encode_direct_handshake_payload(&foreign)).await;
+        let rig = direct_token_udp_rig(policy, ct_common::noise::direct_handshake_payload(&foreign).to_vec()).await;
         let DirectTokenUdpRig { origin_reached, agent, hs: _hs, mut c_read, c_write: _w } = rig;
         let err = tokio::time::timeout(Duration::from_secs(5), agent)
             .await
@@ -5370,7 +5358,7 @@ mod tests {
         let mut hs = client_handshake_for(&client_kp.private, &cap).unwrap();
         let mut buf = vec![0u8; 65535];
         let foreign = RoutingToken([0x99; 32]);
-        let n = hs.write_message(&encode_direct_handshake_payload(&foreign), &mut buf).unwrap();
+        let n = hs.write_message(&ct_common::noise::direct_handshake_payload(&foreign), &mut buf).unwrap();
         send.write_all(&frame(&buf[..n])).await.unwrap();
 
         assert!(read_frame(&mut recv).await.is_err(), "no message 2 for a refused client");
