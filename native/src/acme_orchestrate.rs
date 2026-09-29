@@ -305,9 +305,7 @@ impl AcmeCertConfig {
             dns01_attempts: get("CT_ACME_DNS01_ATTEMPTS")
                 .filter(|v| !v.is_empty())
                 .and_then(|v| v.parse::<u32>().ok()),
-            dns01_use_authoritative: get("CT_ACME_DNS01_AUTHORITATIVE")
-                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
-                .unwrap_or(true),
+            dns01_use_authoritative: crate::envflag::flag_named("CT_ACME_DNS01_AUTHORITATIVE", get("CT_ACME_DNS01_AUTHORITATIVE").as_deref(), true),
             acme_directory_extra_hosts: crate::acme_client::parse_allowed_directory_hosts(
                 get(crate::acme_client::ALLOW_DIRECTORY_HOST_ENV).as_deref(),
             ),

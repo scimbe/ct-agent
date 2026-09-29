@@ -442,16 +442,9 @@ fn parse_masque_fallback(
     }
 }
 
-/// Read a boolean env flag: set and not `""`/`0`/`false` (case-insensitive,
-/// trimmed) means on. The one shared reading of "truthy" across every boolean
-/// `CT_AGENT_*` flag, so `=0` reliably means off everywhere instead of per-flag.
+/// A boolean `CT_AGENT_*` flag, off by default (see [`crate::envflag`]).
 fn truthy(get: &impl Fn(&str) -> Option<String>, key: &str) -> bool {
-    get(key)
-        .map(|v| {
-            let v = v.trim();
-            !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
-        })
-        .unwrap_or(false)
+    crate::envflag::flag_named(key, get(key).as_deref(), false)
 }
 
 /// See [`AgentConfig::tcp_fallback_pool_size`].
@@ -509,6 +502,9 @@ mod tests {
         assert!(!base(Some("")), "empty -> off");
         assert!(base(Some("1")), "1 -> on");
         assert!(base(Some("true")), "true -> on");
+        assert!(!base(Some("off")), "off -> off (it used to switch the fallback ON)");
+        assert!(!base(Some("no")), "no -> off");
+        assert!(base(Some("yes")), "yes -> on");
     }
 
     #[test]
@@ -579,6 +575,10 @@ mod tests {
         assert!(!base(Some("")), "empty -> off");
         assert!(base(Some("1")), "1 -> on");
         assert!(base(Some("true")), "true -> on");
+        // Pinned on purpose: an unrecognised spelling falls back to the default (off) and is
+        // warned about at start -- it must not quietly become "on" either ("garbage = on is
+        // safer" would make every typo in every other flag switch a feature on).
+        assert!(!base(Some("enforce")), "unrecognised -> default (off), with a startup warning");
     }
 
     #[test]

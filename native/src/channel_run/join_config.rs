@@ -488,10 +488,7 @@ impl ChannelJoinCliConfig {
         // ct-agent#47: default ON, same truthy-opt-out idiom as
         // service_calls::call_persistent_enabled_from (only an explicit off value disables --
         // a typo can never silently reintroduce the exit(1)-on-death contract).
-        let call_reconnect = !matches!(
-            f("CT_CHANNEL_CALL_RECONNECT").as_deref().map(str::trim),
-            Some(s) if s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("no")
-        );
+        let call_reconnect = crate::envflag::flag_named("CT_CHANNEL_CALL_RECONNECT", f("CT_CHANNEL_CALL_RECONNECT").as_deref(), true);
         Ok(Self {
             role,
             broker_addr,
