@@ -123,6 +123,7 @@ fn render_text_with(metrics: &TunnelMetrics, status: &AgentStatus, events: &Even
     let mut text = metrics.render_prometheus();
     text.push_str(&status.render_prometheus());
     text.push_str(&events.render_prometheus());
+    text.push_str(&crate::serve::render_direct_refused_prometheus());
     text.push_str(&crate::masque::render_dropped_datagrams_prometheus());
     text.push_str(&crate::task_guard::render_prometheus());
     text
