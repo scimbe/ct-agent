@@ -556,7 +556,7 @@ fn verify_relayed_dcutr_peer_accepts_a_genuinely_attested_key_41() {
     let (request, holder_pub, attestation) = dcutr_attestation_fixture(channel, &signer, noise);
 
     let result = verify_relayed_dcutr_peer(&request, noise, Some(holder_pub), Some(attestation));
-    assert_eq!(result.unwrap(), noise, "a genuinely attested key is accepted and returned unchanged");
+    assert_eq!(result.unwrap(), (noise, holder_pub), "a genuinely attested key is accepted and returned unchanged");
 }
 
 #[test]

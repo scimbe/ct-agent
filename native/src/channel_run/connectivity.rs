@@ -102,7 +102,7 @@ where
     // CADS-Tunnel#495 U2 (a'): relay_conn's actual (post-admission) bi-stream carries the
     // relay-gate leg's data below -- PHASE_MARKER_RELAY, mirroring the :443 relay ladder's
     // own phase_marker_for(&stream, PHASE_MARKER_RELAY) call.
-    let (peer_noise, own_observed_reflexive) =
+    let (peer_noise, own_observed_reflexive, peer_holder) =
         match present_channel_join_marked(relay_conn, request, holder, PHASE_MARKER_RELAY).await? {
         ChannelJoinOutcome::Admitted {
             peer_noise_pubkey: Some(noise),
@@ -112,8 +112,8 @@ where
             ..
         } => {
             // ct-agent#41 (#35 "Path A"): see verify_relayed_dcutr_peer's own doc comment.
-            let noise = verify_relayed_dcutr_peer(request, noise, peer_holder, peer_attestation)?;
-            (noise, observed_reflexive)
+            let (noise, peer_holder) = verify_relayed_dcutr_peer(request, noise, peer_holder, peer_attestation)?;
+            (noise, observed_reflexive, peer_holder)
         }
         ChannelJoinOutcome::Admitted { .. } => {
             return Err("DCUtR relay-gate join needs the peer's relayed Noise key (register the member's key, #101)".into())
@@ -130,6 +130,7 @@ where
             return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
         }
     };
+    let local = gate_local(local, request, role, peer_holder)?;
     let (relay_send, relay_recv) = open_relay_channel_streams(relay_conn, role).await?;
     let (gate_stream, relay_peer) =
         dial_relay_gate_over_443(relay_gate_addr, relay_gate_cert, own_grant, holder).await?;
