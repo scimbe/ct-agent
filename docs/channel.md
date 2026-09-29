@@ -1,3 +1,4 @@
+<!-- trace: AUF-20260929-020 -->
 # `ct-agent channel` — reference
 
 The Agent-Fabric channel subsystem: end-to-end encrypted (Noise_IK) sessions between two
@@ -302,6 +303,44 @@ ack-reader fix. Markers are on by default, and only an explicit off spelling (`o
 disables them, so a typo cannot silently drop the marker (it is reported at start). **Do not set it in production:** an unmarked member
 cannot pair phase-deterministically and hits an N×10 s retry staircase on a large share of
 pairings (field-measured 2026-08-14, p=0.013).
+
+## TCP forward over a paired channel ([#255](https://github.com/scimbe/ct-agent/issues/255)) — opt-in, default **off**
+
+A paired channel already carries one end-to-end Noise session between two members. The forward
+option gives that session a second use: the **initiating** side offers a local TCP listener on
+loopback, and every connection to it becomes one byte-transparent stream inside the *existing*
+Noise session, which the **accepting** side dials out to a TCP target it can reach. A database or
+an sshd therefore stays bound to the accepting host's loopback and is never exposed publicly — the
+reason the option exists at all ("Bau es über die channels, ich moechte nichts oeffentlich
+exposed", CTO, 2026-09-29). mTLS, where the forwarded protocol uses it, runs end to end between
+the two applications; neither the edge nor `ct-agent` terminates it.
+
+**Shipped state: off, and off means off.** `CT_CHANNEL_FORWARD_ALLOW` unset or empty is *not*
+"allow everything" — it is the default, and it refuses every forward request the peer makes.
+There is no wildcard spelling. Turning the option on is two deliberate steps (the allowlist, and
+for anything that is not loopback a second grant), and both are on the **accepting** side, which is
+the side whose network is being reached into. The option is delivered in three slices; **until the
+grant-revocation slice lands, do not enable it in production** — revocation of a channel grant
+must end running forwarded streams ([#45](https://github.com/scimbe/ct-agent/issues/45)), and that
+is a security property, not a convenience.
+
+### Accept side — the gate
+
+| Variable | Meaning |
+|---|---|
+| `CT_CHANNEL_FORWARD_ALLOW` | **The switch.** Comma-separated list of exact `host:port` targets this member will dial for a peer. Unset or empty (**the default**) refuses everything. Whitespace around an entry is ignored; an entry that is not a `host:port` address is dropped. Matching is exact on a canonical spelling — the host lowercased and an IP literal in its own printed form, so `[0:0:0:0:0:0:0:1]:5432` and `[::1]:5432` are one entry — never a prefix or substring test, and never across ports |
+| `CT_CHANNEL_FORWARD_ALLOW_NON_LOOPBACK` | The **second grant** (`1`/`true`/`yes`/`on`). Without it, a listed target is still refused unless it is a loopback address (`127.0.0.0/8`, `::1`, or the name `localhost`). An allowlist typo that would turn a channel into an open proxy into the accepting host's network therefore needs two independent operator mistakes, not one |
+
+Every refusal emits one `forward_refused` event with the requested `target` and the `reason` —
+the option being off, the target not being listed, the missing second grant, or a target that is
+not a `host:port` address at all. An operator can tell a missing grant from a typo without turning
+the option on to find out. The event is rate-limited on stderr and in the event ring like every
+other peer-triggerable event, while `ct_agent_events_total{kind="forward_refused"}` on `/metrics`
+stays exact under a flood.
+
+Any name other than `localhost` counts as non-loopback even if it happens to resolve to `127.0.0.1`:
+the gate refuses to resolve a name in order to judge it, because the name may resolve differently a
+moment later, between the check and the dial.
 
 ## Environment variables (agent-card & marketplace-offer CLI, #144/#152)
 

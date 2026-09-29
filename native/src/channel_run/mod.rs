@@ -847,6 +847,11 @@ pub use connectivity::*;
 mod join_config;
 pub use join_config::*;
 
+// scimbe/ct-agent#255: the accept side's gate in front of the channel TCP forward.
+// Default off; nothing here touches the transport until the stream slice lands.
+mod forward;
+pub use forward::*;
+
 // ct-agent#169: secret-shape redaction for text that leaves this process towards a remote peer.
 mod redact;
 pub(crate) use redact::redact_secrets;

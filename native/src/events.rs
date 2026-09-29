@@ -91,8 +91,15 @@ pub const ORIGIN_TLS_TERMINATED: &str = "origin_tls_terminated";
 /// before any byte reached sshd. `sni` as above, `error` the reason (wrong/missing key, timeout).
 pub const SSH_OWNER_AUTH_REFUSED: &str = "ssh_owner_auth_refused";
 
+/// `{target, reason}`: a peer asked this member to forward a TCP connection to `target` and
+/// the accept-side gate said no (scimbe/ct-agent#255): the option is off (`CT_CHANNEL_FORWARD_ALLOW`
+/// unset or empty -- the shipped default), the target is not on the allowlist, or it is not a
+/// loopback address and the separate second grant is missing. Rate-limited like every other
+/// peer-triggerable event; the counter on `/metrics` stays exact.
+pub const FORWARD_REFUSED: &str = "forward_refused";
+
 /// Every event kind, in the order `/metrics` renders `ct_agent_events_total{kind}`.
-pub const KINDS: [&str; 16] = [
+pub const KINDS: [&str; 17] = [
     REGISTERED,
     REGISTRATION_FAILED,
     DISCONNECTED,
@@ -109,6 +116,7 @@ pub const KINDS: [&str; 16] = [
     DOCTOR_SANDBOX,
     ORIGIN_TLS_TERMINATED,
     SSH_OWNER_AUTH_REFUSED,
+    FORWARD_REFUSED,
 ];
 
 // ---- the event ----------------------------------------------------------------
