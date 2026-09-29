@@ -130,10 +130,7 @@ where
             return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
         }
     };
-    // Bounded (#139): after `Admitted` the partner is paired, so the stream opens at once;
-    // a live-but-silent relay would otherwise hold this session (and a serve slot) forever.
-    let (relay_send, relay_recv) =
-        open_channel_streams(relay_conn, role, ct_common::channel_quic::DIRECT_STREAM_SETUP_TIMEOUT).await?;
+    let (relay_send, relay_recv) = open_relay_channel_streams(relay_conn, role).await?;
     let (gate_stream, relay_peer) =
         dial_relay_gate_over_443(relay_gate_addr, relay_gate_cert, own_grant, holder).await?;
     // #248: seed the DCUtR swarm with this member's OWN reflexive address, when the edge
@@ -236,10 +233,7 @@ where
         run_upgradable_session_initiator, run_upgradable_session_responder_verified, Role, UpgradeCoordinator,
     };
 
-    // Bounded (#139): after `Admitted` the partner is paired, so the stream opens at once;
-    // a live-but-silent relay would otherwise hold this session (and a serve slot) forever.
-    let (relay_send, relay_recv) =
-        open_channel_streams(relay_conn, role, ct_common::channel_quic::DIRECT_STREAM_SETUP_TIMEOUT).await?;
+    let (relay_send, relay_recv) = open_relay_channel_streams(relay_conn, role).await?;
     // The relay handshake borrows these; the direct-establishment closures need owned copies.
     let (relay_priv, relay_peer) = (*own_noise_private, *peer_noise_public);
     let (direct_priv, direct_peer) = (*own_noise_private, *peer_noise_public);
@@ -1083,11 +1077,28 @@ pub(crate) fn dcutr_loop_action<T>(
     DcutrLoopAction::Stop
 }
 
+/// How many dial/setup failures in a row a persistent DCUtR serve member tolerates before it
+/// ends with the error. With [`dial_failure_action`]'s backoff that is several minutes of an
+/// unreachable edge -- far longer than an edge restart -- while a permanent misconfiguration
+/// still surfaces instead of retrying silently forever.
+pub(crate) const MAX_CONSECUTIVE_DCUTR_DIAL_FAILURES: u32 = 20;
+
+/// The delay before the next dial after `consecutive` dial/setup failures in a row
+/// (`consecutive >= 1`), or `None` once [`MAX_CONSECUTIVE_DCUTR_DIAL_FAILURES`] is reached.
+/// Exponential from [`DCUTR_RETRY_BACKOFF`], capped like a definitive refusal: a failure that
+/// happens at once must not dial at the fast inter-session cadence. Pure.
+pub(crate) fn dial_failure_action(consecutive: u32) -> Option<std::time::Duration> {
+    if consecutive >= MAX_CONSECUTIVE_DCUTR_DIAL_FAILURES {
+        return None;
+    }
+    Some(admission_retry_backoff(DCUTR_RETRY_BACKOFF, true, consecutive.saturating_sub(1)))
+}
+
 /// #24: the shared DCUtR join loop both relay-only variants run — deduplicated
 /// from two near-verbatim ~45-line copies whose diverged `label` printed
 /// "relay-gate" in the circuit-relay branch. `join` performs ONE dial+admission
 /// attempt; its **outer** `Err` is a dial/setup failure, terminal for a one-shot
-/// join and retried like a transient admission error in serve mode, while the
+/// join and retried with [`dial_failure_action`]'s bounded backoff in serve mode, while the
 /// **inner** `Result` is the admission outcome, routed through [`dcutr_loop_action`].
 pub(crate) async fn run_dcutr_join_loop<T, F, Fut>(label: &str, serve_loop: bool, join: F) -> Result<T, BoxError>
 where
@@ -1096,13 +1107,37 @@ where
 {
     let mut attempt: u32 = 0;
     let mut consecutive_refusals: u32 = 0;
+    let mut consecutive_dial_failures: u32 = 0;
     loop {
-        // In serve mode a dial/setup failure (an edge restart, a network blip) is one more
-        // transient outcome to back off from; ending the persistent serve process on it
-        // contradicted the serve loop's purpose. One-shot callers keep the old `?`.
+        // In serve mode a dial/setup failure (an edge restart, a network blip) is retried with
+        // its own exponential backoff instead of ending the persistent serve process -- but not
+        // forever: a failure that never clears (a misconfigured relay address fails at once,
+        // every time) ends the loop after MAX_CONSECUTIVE_DCUTR_DIAL_FAILURES so the operator
+        // or a supervisor sees it. One-shot callers keep the old `?`.
         let result = match join().await {
-            Ok(result) => result,
-            Err(e) if serve_loop => Err(e),
+            Ok(result) => {
+                consecutive_dial_failures = 0;
+                result
+            }
+            Err(e) if serve_loop => {
+                consecutive_dial_failures = consecutive_dial_failures.saturating_add(1);
+                match dial_failure_action(consecutive_dial_failures) {
+                    Some(delay) => {
+                        eprintln!(
+                            "ct-agent channel: {label} dial failed ({consecutive_dial_failures}/\
+                             {MAX_CONSECUTIVE_DCUTR_DIAL_FAILURES}), retrying in {delay:?}: {e}"
+                        );
+                        tokio::time::sleep(equal_jitter(delay, rand::random::<f64>())).await;
+                        continue;
+                    }
+                    None => {
+                        return Err(format!(
+                            "{label}: giving up after {consecutive_dial_failures} consecutive dial failures: {e}"
+                        )
+                        .into())
+                    }
+                }
+            }
             Err(e) => return Err(e),
         };
         match dcutr_loop_action(&result, serve_loop, attempt, ONE_SHOT_DCUTR_ADMISSION_RETRIES, consecutive_refusals) {

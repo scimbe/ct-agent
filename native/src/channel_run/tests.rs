@@ -6771,7 +6771,10 @@ async fn a_serve_member_retries_a_dial_failure_instead_of_exiting() {
         .await
     });
     tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-    assert!(calls.load(Ordering::SeqCst) >= 2, "the serve loop dialed again after the failure");
+    let dials = calls.load(Ordering::SeqCst);
+    assert!(dials >= 2, "the serve loop dialed again after the failure");
+    // Backed off, not the 200ms session cadence (which would be ~600 dials in 120s).
+    assert!(dials < MAX_CONSECUTIVE_DCUTR_DIAL_FAILURES, "dial failures back off: {dials} dials in 120s");
     assert!(!serve.is_finished(), "and did not end the serve process");
     serve.abort();
 
@@ -6780,4 +6783,71 @@ async fn a_serve_member_retries_a_dial_failure_instead_of_exiting() {
     })
     .await;
     assert!(one_shot.is_err(), "a one-shot join still ends on a dial failure");
+}
+
+#[test]
+fn dial_failures_back_off_exponentially_and_end_at_the_cap() {
+    assert_eq!(dial_failure_action(1), Some(DCUTR_RETRY_BACKOFF));
+    assert_eq!(dial_failure_action(2), Some(DCUTR_RETRY_BACKOFF * 2));
+    assert_eq!(dial_failure_action(4), Some(DCUTR_RETRY_BACKOFF * 8));
+    assert_eq!(dial_failure_action(MAX_CONSECUTIVE_DCUTR_DIAL_FAILURES - 1), Some(REFUSED_ADMISSION_BACKOFF_CAP));
+    assert_eq!(dial_failure_action(MAX_CONSECUTIVE_DCUTR_DIAL_FAILURES), None);
+    assert_eq!(dial_failure_action(u32::MAX), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_serve_member_ends_after_a_dial_failure_that_never_clears() {
+    // A permanent setup failure (a relay address the socket can never reach) fails at once on
+    // every attempt. The serve loop must surface it instead of retrying silently forever.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = std::sync::Arc::new(AtomicU32::new(0));
+    let c = calls.clone();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3600),
+        run_dcutr_join_loop::<(), _, _>("test", true, || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Err::<Result<(), BoxError>, BoxError>("address family not supported".into())
+            }
+        }),
+    )
+    .await
+    .expect("the serve loop ends within the hour");
+    let e = result.expect_err("with the dial error");
+    assert!(e.to_string().contains("consecutive dial failures"), "{e}");
+    assert!(e.to_string().contains("address family not supported"), "{e}");
+    assert_eq!(calls.load(Ordering::SeqCst), MAX_CONSECUTIVE_DCUTR_DIAL_FAILURES);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_successful_dial_resets_the_dial_failure_streak() {
+    // Intermittent dial failures between served sessions never add up to the cap: each dial
+    // that reaches admission starts the streak over.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = std::sync::Arc::new(AtomicU32::new(0));
+    let served = std::sync::Arc::new(AtomicU32::new(0));
+    let (c, s) = (calls.clone(), served.clone());
+    let serve = tokio::spawn(async move {
+        run_dcutr_join_loop::<(), _, _>("test", true, || {
+            let (c, s) = (c.clone(), s.clone());
+            async move {
+                if c.fetch_add(1, Ordering::SeqCst) % 10 == 9 {
+                    s.fetch_add(1, Ordering::SeqCst);
+                    Ok(Ok(()))
+                } else {
+                    Err::<Result<(), BoxError>, BoxError>("edge restarting".into())
+                }
+            }
+        })
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    assert!(served.load(Ordering::SeqCst) >= 3, "sessions were served between the failures");
+    assert!(
+        calls.load(Ordering::SeqCst) > MAX_CONSECUTIVE_DCUTR_DIAL_FAILURES,
+        "more failures in total than the cap, yet"
+    );
+    assert!(!serve.is_finished(), "the serve loop is still running");
+    serve.abort();
 }
