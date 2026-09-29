@@ -20,8 +20,13 @@ on:
 env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
+# Read-only by default; only the jobs that create the release or attach assets get write
+# access, each on its own. The build legs also never keep a token in the checkout
+# (persist-credentials: false), and GH_TOKEN exists only in the upload step's env: code that
+# runs inside `cargo build` (a dependency's build.rs or proc-macro) must not be able to
+# rewrite other legs' assets or checksums, which the manifest job would then sign.
 permissions:
-  contents: write   # create the release and attach assets
+  contents: read
 
 jobs:
   version-matches-tag:
@@ -35,6 +40,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
       - name: crate version == tag
         run: |
           crate="$(sed -n 's/^version = "\(.*\)"/\1/p' native/Cargo.toml | head -1)"
@@ -48,8 +54,12 @@ jobs:
   create-release:
     needs: version-matches-tag
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the release
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Create the release (idempotent)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -59,6 +69,8 @@ jobs:
     needs: create-release
     name: ${{ matrix.asset }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write   # the upload step attaches this leg's assets
     strategy:
       fail-fast: false
       matrix:
@@ -86,6 +98,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
 
       - name: Add target
         run: rustup target add ${{ matrix.target }}
@@ -185,6 +198,8 @@ jobs:
     #     -in release-manifest.json -sigfile sig.bin
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # attach the manifest and its signature
     env:
       CT_RELEASE_SIGNING_KEY: ${{ secrets.CT_RELEASE_SIGNING_KEY }}
     steps:
