@@ -414,7 +414,8 @@ where
 /// HERE and the plaintext relayed to the Origin -- for an sshd or any other raw-TCP
 /// Origin that cannot terminate TLS itself. A first chunk that is not a ClientHello
 /// (the Edge already stripped TLS in Gelb, or a plain client) is forwarded raw exactly
-/// as without a terminator; `None` never inspects the bytes beyond the read it always did.
+/// as without a terminator -- unless the terminator requires SSH owner auth (#214), in which
+/// case it is refused; `None` never inspects the bytes beyond the read it always did.
 pub async fn serve_duplex_to_origin<T>(
     mut client: T,
     origin: SocketAddr,
@@ -431,6 +432,18 @@ where
     if let Some(terminator) = terminator {
         if looks_like_tls_client_hello(&first[..n]) {
             return terminate_tls_then_forward(Prefixed::new(first[..n].to_vec(), client), origin, &terminator).await;
+        }
+        // #214 fails closed: the owner-auth preamble runs inside the terminated TLS session, so a
+        // stream that never offered a ClientHello this sniff accepts (TLS stripped upstream, or a
+        // client that dodges the sniff) cannot pass it and must not reach the Origin raw.
+        if let crate::ssh_owner::OwnerAuth::Required(_) = terminator.owner_auth() {
+            let e = "stream did not start with a TLS ClientHello, so owner authentication cannot run";
+            eprintln!("ct-agent: origin TLS terminate: {e}; stream refused (#214)");
+            crate::events::emit(
+                crate::events::SSH_OWNER_AUTH_REFUSED,
+                serde_json::json!({ "sni": serde_json::Value::Null, "error": e }),
+            );
+            return Err(format!("origin TLS terminate: {e}").into());
         }
     }
     let mut tcp = connect_origin(origin).await?;
@@ -3250,7 +3263,18 @@ async fn tcp_connect_register_serve(
             // delivered. The rungs degrade one at a time, each on a fresh connection:
             // 'F' -> 'L' -> 'B'.
             let mut framed = false;
-            if config.framed_fallback {
+            // The framed relay cannot terminate TLS (see below), so with a terminator it would hand
+            // the client's TLS -- and, past #214, an unauthenticated stream -- to the Origin raw.
+            if config.framed_fallback && terminator.is_some() {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "ct-agent: CT_AGENT_FRAMED_FALLBACK is ignored with CT_AGENT_ORIGIN_TLS=terminate; \
+                         registering the raw fallback so the terminator applies"
+                    )
+                });
+            }
+            if config.framed_fallback && terminator.is_none() {
                 match register_tunnel_stream_browser_framed_capable(&mut stream, token, host).await {
                     Ok(()) => framed = true,
                     Err(e) => {
@@ -7597,8 +7621,8 @@ mod origin_tls_tests {
 
     #[tokio::test]
     async fn terminator_leaves_a_plain_stream_alone() {
-        // Gelb: the Edge already stripped TLS, the first bytes are an SSH banner -- forwarded
-        // raw, terminator or not, and the origin's answer comes back raw.
+        // Gelb with owner auth explicitly off (`load` starts `Off`): the Edge already stripped
+        // TLS, the first bytes are an SSH banner -- forwarded raw, and the answer comes back raw.
         let dir = tempfile::tempdir().unwrap();
         let pki = test_pki::issue("ssh.test.invalid");
         let (_ca, cert, key) = test_pki::write_to(&pki, dir.path());
@@ -7613,6 +7637,81 @@ mod origin_tls_tests {
         let n = client_side.read(&mut echoed).await.unwrap();
         assert_eq!(&echoed[..n], b"SSH-2.0-plain\r\n");
         drop(client_side);
+        let _ = tokio::time::timeout(Duration::from_secs(5), relay).await.expect("relay ends");
+    }
+
+    /// An Origin that records whether anyone ever connected to it.
+    async fn spawn_connect_counter() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((_s, _)) = listener.accept().await {
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        (addr, hits)
+    }
+
+    #[tokio::test]
+    async fn owner_auth_refuses_a_stream_that_skips_tls() {
+        // #214 bypass: with owner auth required, a stream whose first bytes are not a ClientHello
+        // the sniff accepts -- plain SSH (TLS stripped upstream), or a record with a version byte
+        // the sniff rejects but an SNI router would still route -- must never reach the Origin.
+        let dir = tempfile::tempdir().unwrap();
+        let pki = test_pki::issue("ssh.test.invalid");
+        let (_ca, cert, key) = test_pki::write_to(&pki, dir.path());
+        let owner = crate::ssh_owner::OwnerKey::generate();
+        let terminator = Arc::new(
+            OriginTerminator::load(&cert, &key)
+                .unwrap()
+                .with_owner_auth(crate::ssh_owner::OwnerAuth::Required(Arc::new(owner))),
+        );
+        let (origin_addr, hits) = spawn_connect_counter().await;
+        let odd_hello = [0x16, 0x03, 0x05, 0x00, 0x08, 0x01, 0x00, 0x00, 0x04, 0x03, 0x03, 0xaa, 0xbb];
+        for first in [&b"SSH-2.0-attacker\r\n"[..], &odd_hello[..]] {
+            let (mut client_side, agent_side) = tokio::io::duplex(8192);
+            let t = Arc::clone(&terminator);
+            let relay = tokio::spawn(async move { serve_duplex_to_origin(agent_side, origin_addr, Some(t)).await });
+            client_side.write_all(first).await.unwrap();
+            client_side.flush().await.unwrap();
+            let err = tokio::time::timeout(Duration::from_secs(5), relay).await.unwrap().unwrap().unwrap_err();
+            assert!(err.to_string().contains("owner authentication cannot run"), "{err}");
+            let mut buf = [0u8; 16];
+            assert_eq!(client_side.read(&mut buf).await.unwrap(), 0, "nothing comes back, the stream is closed");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "the Origin was never dialed");
+    }
+
+    #[tokio::test]
+    async fn owner_auth_still_gates_a_terminated_stream() {
+        // The TLS path is unchanged: the preamble runs inside the session and the right key passes.
+        let dir = tempfile::tempdir().unwrap();
+        let pki = test_pki::issue("ssh.test.invalid");
+        let (_ca, cert, key) = test_pki::write_to(&pki, dir.path());
+        let owner = crate::ssh_owner::OwnerKey::generate();
+        let terminator = Arc::new(
+            OriginTerminator::load(&cert, &key)
+                .unwrap()
+                .with_owner_auth(crate::ssh_owner::OwnerAuth::Required(Arc::new(owner.clone()))),
+        );
+        let origin_addr = spawn_plain_echo().await;
+        let (client_side, agent_side) = tokio::io::duplex(8192);
+        let relay =
+            tokio::spawn(async move { serve_duplex_to_origin(agent_side, origin_addr, Some(terminator)).await });
+        let sni = rustls::pki_types::ServerName::try_from("ssh.test.invalid").unwrap();
+        let mut tls = client_trusting(&pki.ca_der).connect(sni, client_side).await.expect("TLS");
+        let pre = crate::ssh_owner::client_handshake(&mut tls, Some(&owner)).await.expect("owner auth");
+        assert_eq!(pre, crate::ssh_owner::ClientPreamble::Authenticated);
+        tls.write_all(b"SSH-2.0-owner\r\n").await.unwrap();
+        tls.flush().await.unwrap();
+        let mut echoed = [0u8; 64];
+        let n = tls.read(&mut echoed).await.unwrap();
+        assert_eq!(&echoed[..n], b"SSH-2.0-owner\r\n");
+        tls.shutdown().await.unwrap();
+        drop(tls);
         let _ = tokio::time::timeout(Duration::from_secs(5), relay).await.expect("relay ends");
     }
 
