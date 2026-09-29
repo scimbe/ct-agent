@@ -250,6 +250,76 @@ pub fn next_conn_id() -> u64 {
     CONN_ID.fetch_add(1, Ordering::SeqCst) + 1
 }
 
+// ---- rate limit for peer-triggered lines --------------------------------------------
+
+/// Lines per kind and [`LIMIT_WINDOW`] that a peer can trigger before authenticating.
+pub const LIMIT_PER_WINDOW: u32 = 30;
+/// See [`LIMIT_PER_WINDOW`].
+pub const LIMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+struct Budget {
+    window_start: std::time::Instant,
+    used: u32,
+    suppressed: u64,
+}
+
+static BUDGETS: std::sync::Mutex<Option<std::collections::HashMap<&'static str, Budget>>> =
+    std::sync::Mutex::new(None);
+
+/// Whether another `key` line may be written now. `Some(n)`: yes, and `n` lines of this
+/// key were suppressed since the last one written; `None`: over budget, stay quiet.
+/// Anyone who can reach a public hostname or the direct listener can trigger these lines
+/// once per connection; without a budget a connection flood rotates the event ring (the
+/// forensic history) within seconds and blocks runtime threads on its file I/O.
+///
+/// The budget is **global per key, not per peer**: none of the throttled events carries the
+/// remote address, so there is nothing to key a per-peer budget on. One peer can therefore
+/// use up a key's budget and hide a later, more interesting line of the same key for the rest
+/// of the window. Under load the counters on `/metrics` (always bumped, see [`emit_limited`])
+/// are the reliable record; the lines and the ring are a sample. A `suppressed` count is
+/// reported only with the next written line of the same key, so a flood that ends inside a
+/// window leaves its count unreported until that key fires again (or lost on restart).
+pub fn allow(key: &'static str) -> Option<u64> {
+    allow_at(key, std::time::Instant::now())
+}
+
+fn allow_at(key: &'static str, now: std::time::Instant) -> Option<u64> {
+    let mut guard = BUDGETS.lock_safe();
+    let b = guard.get_or_insert_with(Default::default).entry(key).or_insert(Budget {
+        window_start: now,
+        used: 0,
+        suppressed: 0,
+    });
+    if now.duration_since(b.window_start) >= LIMIT_WINDOW {
+        b.window_start = now;
+        b.used = 0;
+    }
+    if b.used >= LIMIT_PER_WINDOW {
+        b.suppressed += 1;
+        return None;
+    }
+    b.used += 1;
+    Some(std::mem::take(&mut b.suppressed))
+}
+
+/// [`emit`] for an event a peer can trigger before authenticating: always counted (the
+/// metrics stay exact), written to stderr and the ring only within [`allow`]'s budget;
+/// the next written one carries `suppressed` when some were dropped. Returns whether it
+/// was written, so a caller's own accompanying line can follow suit.
+pub fn emit_limited(kind: &'static str, mut fields: Value) -> bool {
+    let Some(suppressed) = allow(kind) else {
+        EVENT_COUNTS.bump(kind);
+        return false;
+    };
+    if suppressed > 0 {
+        if let Value::Object(map) = &mut fields {
+            map.insert("suppressed".to_string(), Value::from(suppressed));
+        }
+    }
+    emit(kind, fields);
+    true
+}
+
 /// The current connection id, `None` before the first attempt.
 pub fn current_conn_id() -> Option<u64> {
     match CONN_ID.load(Ordering::SeqCst) {
@@ -523,6 +593,20 @@ mod tests {
         let line = format_line(&ev, false);
         assert!(!line.contains('\n') && !line.contains('\u{1b}'), "{line}");
         assert!(line.contains("bye\\nct-agent event: registered edge=evil\\u{1b}[2J"), "{line}");
+    }
+
+    #[test]
+    fn the_peer_triggered_budget_caps_a_window_and_reports_what_it_dropped() {
+        let t0 = std::time::Instant::now();
+        let key = "test_budget_key";
+        for _ in 0..LIMIT_PER_WINDOW {
+            assert_eq!(allow_at(key, t0), Some(0));
+        }
+        for _ in 0..5 {
+            assert_eq!(allow_at(key, t0), None, "over budget within the window");
+        }
+        assert_eq!(allow_at(key, t0 + LIMIT_WINDOW), Some(5), "next window reports the 5 dropped");
+        assert_eq!(allow_at("test_budget_other_key", t0), Some(0), "budgets are per key");
     }
 
     #[test]
