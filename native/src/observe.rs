@@ -18,15 +18,24 @@
 //!
 //! Every route reads through an [`ObserveState`] so a test can serve a private
 //! status/counter/ring instance instead of the process-wide ones.
+//!
+//! The listener is bounded: at most [`MAX_CONNECTIONS`] at once (more are closed
+//! on accept), [`HEADER_READ_TIMEOUT`] to send a request head and
+//! [`CONNECTION_LIFETIME`] per connection, so idle or slow clients cannot pin
+//! file descriptors the data path shares. On a loopback bind every request must
+//! carry a local `Host` (an IP literal or `localhost`): a web page that rebinds
+//! its own name to 127.0.0.1 (DNS rebinding) is refused instead of reading
+//! `/events` and `/status` same-origin.
 
 use crate::codec::now_unix;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{RawQuery, State};
-use axum::http::header::CONTENT_TYPE;
+use axum::extract::{RawQuery, Request, State};
+use axum::http::header::{CONTENT_TYPE, HOST};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 
@@ -40,6 +49,13 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Default and upper bound for `GET /events?n=`.
 pub const EVENTS_DEFAULT_N: usize = 100;
 pub const EVENTS_MAX_N: usize = 1000;
+
+/// Concurrent connections the listener serves; further accepts are closed at once.
+pub const MAX_CONNECTIONS: usize = 32;
+/// Time a client has to send a complete request head.
+pub const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Upper bound on one connection's life (a scraper simply reconnects).
+pub const CONNECTION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What the routes read. [`ObserveState::live`] wires the process-wide
 /// instances; tests build one from their own.
@@ -153,7 +169,9 @@ fn events_n(query: Option<&str>) -> usize {
 }
 
 async fn events_ndjson(State(state): State<ObserveState>, RawQuery(query): RawQuery) -> impl IntoResponse {
-    let lines = state.recent_events(events_n(query.as_deref()));
+    // The ring read is blocking file I/O (up to two ~1 MiB files): off the async workers.
+    let n = events_n(query.as_deref());
+    let lines = tokio::task::spawn_blocking(move || state.recent_events(n)).await.unwrap_or_default();
     let mut body = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
     for l in lines {
         body.push_str(&l);
@@ -175,8 +193,82 @@ pub async fn serve_metrics_on(
     listener: tokio::net::TcpListener,
     metrics: Arc<TunnelMetrics>,
 ) -> Result<(), BoxError> {
-    axum::serve(listener, metrics_router(metrics)).await?;
-    Ok(())
+    let loopback = listener.local_addr()?.ip().is_loopback();
+    serve_bounded(listener, guarded(metrics_router(metrics), loopback), ListenerLimits::DEFAULT).await
+}
+
+/// The listener's bounds (the module doc); a parameter so tests can use short ones.
+#[derive(Debug, Clone, Copy)]
+struct ListenerLimits {
+    max_connections: usize,
+    header_read_timeout: std::time::Duration,
+    connection_lifetime: std::time::Duration,
+}
+
+impl ListenerLimits {
+    const DEFAULT: Self = Self {
+        max_connections: MAX_CONNECTIONS,
+        header_read_timeout: HEADER_READ_TIMEOUT,
+        connection_lifetime: CONNECTION_LIFETIME,
+    };
+}
+
+/// `router`, with the DNS-rebinding guard when the listener is on loopback. A non-loopback bind
+/// is reachable by address anyway, and scrapers there use service names in `Host`.
+fn guarded(router: Router, loopback: bool) -> Router {
+    if loopback {
+        router.layer(axum::middleware::from_fn(require_local_host))
+    } else {
+        router
+    }
+}
+
+/// Refuse a request whose `Host` is not local (see the module doc).
+async fn require_local_host(req: Request, next: Next) -> Response {
+    let host = req.headers().get(HOST).and_then(|h| h.to_str().ok());
+    if host.is_some_and(is_local_host) {
+        next.run(req).await
+    } else {
+        (StatusCode::MISDIRECTED_REQUEST, "the observability listener only answers local Host names\n").into_response()
+    }
+}
+
+/// Whether a `Host` header value names this machine without DNS: an IP literal (`127.0.0.1:9100`,
+/// `[::1]:9100`), `localhost` or a `*.localhost` name (RFC 6761), with or without a port. Pure.
+fn is_local_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(rest) => return rest.split_once(']').is_some_and(|(ip, _)| ip.parse::<std::net::Ipv6Addr>().is_ok()),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    name.parse::<std::net::Ipv4Addr>().is_ok() || name == "localhost" || name.ends_with(".localhost")
+}
+
+/// Accept loop with the bounds from the module doc. Accept errors (EMFILE under fd pressure) are
+/// retried after a short pause instead of ending the listener.
+async fn serve_bounded(listener: tokio::net::TcpListener, app: Router, limits: ListenerLimits) -> Result<(), BoxError> {
+    let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            continue; // over the cap: `stream` drops here, closing it
+        };
+        let service = hyper_util::service::TowerToHyperService::new(app.clone());
+        tokio::spawn(async move {
+            let _permit = permit;
+            let conn = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(limits.header_read_timeout)
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service);
+            let _ = tokio::time::timeout(limits.connection_lifetime, conn).await;
+        });
+    }
 }
 
 #[cfg(test)]
@@ -309,7 +401,7 @@ mod tests {
         let mut resp = String::new();
         for _ in 0..50 {
             if let Ok(mut sock) = tokio::net::TcpStream::connect(addr).await {
-                sock.write_all(b"GET /metrics HTTP/1.0\r\nHost: x\r\n\r\n")
+                sock.write_all(b"GET /metrics HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
                     .await
                     .unwrap();
                 let _ = sock.read_to_string(&mut resp).await;
@@ -324,6 +416,84 @@ mod tests {
             resp.contains("ct_tunnels_opened_total 5"),
             "serve_metrics served the scrape: {resp:.60}"
         );
+    }
+
+    #[test]
+    fn only_names_that_need_no_dns_are_local_hosts() {
+        for ok in ["127.0.0.1", "127.0.0.1:9100", "10.0.0.5:9100", "[::1]:9100", "[::1]", "localhost", "LOCALHOST:9100", "a.localhost:1", "localhost."] {
+            assert!(is_local_host(ok), "{ok}");
+        }
+        for bad in ["rebind.attacker.example", "rebind.attacker.example:9100", "localhost.attacker.example", "[evil]:1", "", "x"] {
+            assert!(!is_local_host(bad), "{bad}");
+        }
+    }
+
+    /// Raw HTTP/1.1 GET with `host` against `addr`; the full response text.
+    async fn raw_get(addr: SocketAddr, path: &str, host: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        let _ = sock.read_to_string(&mut resp).await;
+        resp
+    }
+
+    #[tokio::test]
+    async fn a_loopback_listener_refuses_a_rebound_host_name() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_metrics_on(listener, Arc::new(TunnelMetrics::new())));
+        let evil = raw_get(addr, "/events", "rebind.attacker.example:9100").await;
+        assert!(evil.starts_with("HTTP/1.1 421"), "{evil:.60}");
+        let local = raw_get(addr, "/healthz", &addr.to_string()).await;
+        assert!(!local.starts_with("HTTP/1.1 421"), "{local:.60}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_non_loopback_listener_keeps_answering_service_names() {
+        // A compose scraper reaches `ct-agent:9100`; the guard only applies on loopback.
+        let app = guarded(metrics_router(Arc::new(TunnelMetrics::new())), false);
+        let resp = app
+            .oneshot(Request::get("/metrics").header("host", "ct-agent:9100").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_listener_bounds_connections_and_silent_clients() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = metrics_router(Arc::new(TunnelMetrics::new()));
+        let limits = ListenerLimits {
+            max_connections: 2,
+            header_read_timeout: std::time::Duration::from_millis(300),
+            connection_lifetime: std::time::Duration::from_secs(30),
+        };
+        let server = tokio::spawn(serve_bounded(listener, app, limits));
+        // Two silent clients take both slots ...
+        let mut silent = Vec::new();
+        for _ in 0..2 {
+            silent.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // ... so a third is closed at once (well before the 300ms header timeout).
+        let mut third = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(std::time::Duration::from_millis(200), third.read(&mut buf)).await;
+        assert!(matches!(n, Ok(Ok(0)) | Ok(Err(_))), "over the cap: closed, got {n:?}");
+        // The silent ones are dropped once the header-read timeout passes, freeing the slots.
+        for s in &mut silent {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), s.read(&mut buf)).await;
+            assert!(matches!(n, Ok(Ok(_)) | Ok(Err(_))), "a silent client was closed, got {n:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let resp = raw_get(addr, "/healthz", "127.0.0.1").await;
+        assert!(resp.starts_with("HTTP/1.1"), "a slot is free again: {resp:.40}");
+        server.abort();
     }
 
     // ---- ct-agent#178: /status, /healthz, /events over a PRIVATE state ----------------

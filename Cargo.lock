@@ -541,6 +541,8 @@ dependencies = [
  "hickory-resolver 0.26.1",
  "http",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "installer-engine",
  "libc",
  "libp2p",
