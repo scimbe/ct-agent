@@ -1477,6 +1477,18 @@ fn origin_handshake_any_with_payload(
     None
 }
 
+/// Wait for the first bytes the Edge relays into a parked plain registration (see the 'A' arm
+/// of the TCP fallback). EOF before any byte is the park dying, reported as an error.
+async fn await_first_relayed_bytes<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>, BoxError> {
+    let mut first = vec![0u8; 4096];
+    let n = stream.read(&mut first).await?;
+    if n == 0 {
+        return Err("parked registration closed before a client arrived".into());
+    }
+    first.truncate(n);
+    Ok(first)
+}
+
 /// Serve one relayed stream as the Origin's Noise responder with a **full-duplex
 /// streaming** bridge (M9.2): terminate the `Noise_IK` handshake, then
 /// [`noise_pump`] between the decrypted Client stream and the local Origin TCP
@@ -3400,13 +3412,23 @@ async fn tcp_connect_register_serve(
     // with the stream byte-exactly at the first relayed byte, so the Noise
     // handshake below sees an untouched stream.
     let mut was_consumed = false;
-    if ping_capable {
+    let stream = if ping_capable {
         if let Err(e) = await_ping_phase_end(&mut stream).await {
             return Err(TcpAttemptEnd::registered(registered_at, false, e));
         }
         consumed.fire();
         was_consumed = true;
-    }
+        Prefixed::new(Vec::new(), stream)
+    } else {
+        // 'A' parks with no ping phase: the park ends when the Edge relays the Client's first
+        // bytes. Wait for them HERE, so a parked registration that dies idle (a middlebox drop,
+        // an Edge restart) ends the attempt without counting as a failed tunnel -- the Noise
+        // handshake, and with it the tunnel metrics, starts only once a Client is there.
+        match await_first_relayed_bytes(&mut stream).await {
+            Ok(first) => Prefixed::new(first, stream),
+            Err(e) => return Err(TcpAttemptEnd::registered(registered_at, false, e)),
+        }
+    };
     let (recv, send) = split(stream);
     let served = match config.origin_proto {
         OriginProto::Tcp => serve_noise_stream(send, recv, config.origin, origin_keys, Arc::clone(metrics), gate).await,
@@ -3920,6 +3942,202 @@ mod tests {
         assert!(metrics.bytes_to_origin.get() > 0, "and its bytes");
         agent.abort();
         edge.abort();
+    }
+
+    /// #242 review: on the non-ping 'A' rung the registration parks INSIDE the relay read. A
+    /// parked registration that dies with no client ever arriving (superseded by the pool's own
+    /// next worker here; a middlebox idle drop in the field) is not a failed tunnel and must not
+    /// count as one -- otherwise an idle fallback agent reports a steady failure rate.
+    #[tokio::test]
+    async fn a_parked_fallback_registration_that_dies_idle_is_not_a_failed_tunnel() {
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::pow::Challenge;
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use ct_edge::serve::serve_tcp_connection;
+        use ct_edge::state::EdgeState;
+        use quinn::Connection;
+        use std::net::Ipv4Addr;
+
+        let ca = Ca::new("e2e-ca").unwrap();
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let token = RoutingToken([0x34; 32]);
+        let token_probe = token.clone();
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+        // The edge's per-connection tasks are kept so the test can drop every parked
+        // registration at once -- what a middlebox's idle timeout does in the field.
+        let conns: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> = Arc::default();
+        let (state_e, conns_e) = (state.clone(), Arc::clone(&conns));
+        let edge = tokio::spawn(async move {
+            loop {
+                let (tcp, peer) = tcp_listener.accept().await.unwrap();
+                let (acc, st, ch) = (acceptor.clone(), state_e.clone(), challenge.clone());
+                let task = tokio::spawn(async move {
+                    let Ok(mut tls) = acc.accept(tcp).await else { return };
+                    // An edge without role 'K' (the rung this is about): drop a 'K' registration
+                    // unacknowledged, as a pre-'K' edge does, so the agent falls back to 'A'.
+                    let mut role = [0u8; 1];
+                    if tls.read_exact(&mut role).await.is_err() || role[0] == b'K' {
+                        return;
+                    }
+                    let _ = serve_tcp_connection(Prefixed::new(role.to_vec(), tls), &st, &ch, None, peer.ip()).await;
+                });
+                conns_e.lock().unwrap().push(task.abort_handle());
+            }
+        });
+
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), &origin.local_addr().unwrap().to_string()).unwrap();
+        cfg.tcp_fallback_pool_size = 1;
+        let metrics = Arc::new(TunnelMetrics::new());
+        let ctx_metrics = Arc::clone(&metrics);
+        let agent = tokio::spawn(async move {
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let mut ctx = FallbackCtx::for_test(
+                &cfg,
+                ca_root,
+                token,
+                Arc::new(vec![generate_static_keypair().private]),
+                Arc::new(gate),
+            );
+            ctx.metrics = ctx_metrics;
+            let _ = run_agent_tcp_fallback_with_ctx(&ctx).await;
+        });
+        let mut drops = 0;
+        for _ in 0..3 {
+            for _ in 0..200 {
+                if state.has_tcp_agent(&token_probe) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(state.has_tcp_agent(&token_probe), "the agent parked a registration");
+            for c in conns.lock().unwrap().drain(..) {
+                c.abort();
+            }
+            drops += 1;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        agent.abort();
+        edge.abort();
+        assert_eq!(metrics.tunnels_opened.get(), 0, "no client ever came");
+        assert_eq!(metrics.tunnels_failed.get(), 0, "and no tunnel failed: {drops} parks died idle");
+    }
+
+    /// #242 review: the struct literal in `run_agent` is the only thing that makes the fallback
+    /// pool count on the metrics the scrape serves. Prove it end to end: `run_agent` on the TLS-TCP
+    /// fallback, one tunnel through the real edge, then `/metrics` over the agent's own listener.
+    #[tokio::test]
+    async fn run_agents_metrics_listener_sees_tunnels_served_over_the_fallback() {
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::pow::Challenge;
+        use ct_common::{Capability, OriginIdentity};
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use ct_edge::serve::serve_tcp_connection;
+        use ct_edge::state::EdgeState;
+        use quinn::Connection;
+        use std::net::Ipv4Addr;
+
+        let ca = Ca::new("e2e-ca").unwrap();
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let token = RoutingToken([0x35; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+        let state_e = state.clone();
+        let edge = tokio::spawn(async move {
+            loop {
+                let (tcp, peer) = tcp_listener.accept().await.unwrap();
+                let (acc, st, ch) = (acceptor.clone(), state_e.clone(), challenge.clone());
+                tokio::spawn(async move {
+                    if let Ok(tls) = acc.accept(tcp).await {
+                        let _ = serve_tcp_connection(tls, &st, &ch, None, peer.ip()).await;
+                    }
+                });
+            }
+        });
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = origin_listener.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+            let _ = w.shutdown().await;
+        });
+
+        let origin_kp = generate_static_keypair();
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: tcp_addr.to_string(),
+        };
+        let metrics_addr = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap()
+        };
+        let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), &origin_addr.to_string()).unwrap();
+        cfg.register_tcp_only = true;
+        cfg.tcp_fallback_pool_size = 1;
+        cfg.metrics_listen = Some(metrics_addr);
+        let (a_root, a_token) = (ca_root.clone(), token.clone());
+        let agent = tokio::spawn(async move {
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ = run_agent(&cfg, a_root, a_token, Arc::new(vec![origin_kp.private]), Arc::new(gate), None).await;
+        });
+        for _ in 0..500 {
+            if state.has_tcp_agent(&token) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(state.has_tcp_agent(&token), "agent parked over TLS-TCP");
+
+        let client_stream = ct_client::transport::tcp_tls_connect(tcp_addr, ca_root).await.unwrap();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(15),
+            ct_client::transport::client_tunnel_noise_tcp(
+                client_stream,
+                &token,
+                &cap,
+                &generate_static_keypair().private,
+                b"scrape-me",
+            ),
+        )
+        .await
+        .expect("round-trip timed out")
+        .unwrap();
+        assert_eq!(resp, b"scrape-me");
+
+        let mut body = String::new();
+        for _ in 0..50 {
+            if let Ok(mut sock) = tokio::net::TcpStream::connect(metrics_addr).await {
+                sock.write_all(b"GET /metrics HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").await.unwrap();
+                body.clear();
+                let _ = sock.read_to_string(&mut body).await;
+                if body.contains("ct_tunnels_opened_total 1") {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        agent.abort();
+        edge.abort();
+        assert!(body.contains("ct_tunnels_opened_total 1"), "the scrape sees the fallback tunnel: {body:.400}");
     }
 
     /// A `CT_AGENT_ORIGIN_PROTO=udp` agent on the TLS-TCP fallback must bridge
