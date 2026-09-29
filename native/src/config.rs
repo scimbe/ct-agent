@@ -106,8 +106,11 @@ impl OriginTls {
 /// Runtime configuration for the Agent daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
-    /// Edge address to dial (outbound).
+    /// Edge address to dial (outbound), as resolved at startup.
     pub edge: SocketAddr,
+    /// `CT_AGENT_EDGE` as configured, when it names a host rather than an IP literal:
+    /// re-resolved on every reconnect (see [`Self::resolve_edge_or`]).
+    pub edge_host: Option<String>,
     /// Local Origin service to expose through the tunnel.
     pub origin: SocketAddr,
     /// Whether the Origin speaks TCP or UDP.
@@ -240,7 +243,25 @@ fn resolve_addr(var: &str, s: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("{var} '{s}' resolved to no address"))
 }
 
+/// Bound on one edge re-resolution; a slow resolver must not stall a reconnect.
+const EDGE_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl AgentConfig {
+    /// The edge address to dial now. A hostname `CT_AGENT_EDGE` is looked up again, so an
+    /// agent running for months follows the edge to a new IP (a recreated Compose service,
+    /// a re-addressed host) instead of reconnecting to the startup address forever. An IP
+    /// literal, a failed lookup or one that times out returns `last` -- the caller's last
+    /// good address -- so a resolver outage never takes a working edge away.
+    pub async fn resolve_edge_or(&self, last: SocketAddr) -> SocketAddr {
+        let Some(host) = &self.edge_host else {
+            return self.edge;
+        };
+        match tokio::time::timeout(EDGE_RESOLVE_TIMEOUT, tokio::net::lookup_host(host.as_str())).await {
+            Ok(Ok(mut addrs)) => addrs.next().unwrap_or(last),
+            _ => last,
+        }
+    }
+
     /// CADS-Tunnel#795: a hostname the operator set that this agent will never bind.
     /// ct-agent binds `CT_AGENT_HOSTNAME` only in browser mode (`CT_AGENT_MODE=browser`)
     /// -- on QUIC via the `'H'` bind, on the TLS-TCP fallback via the `'B'/'L'/'F'`
@@ -281,10 +302,12 @@ impl AgentConfig {
     }
 
     pub fn parse(edge: &str, origin: &str) -> Result<AgentConfig, String> {
+        let edge_host = edge.parse::<SocketAddr>().is_err().then(|| edge.trim().to_string());
         let edge = resolve_addr("CT_AGENT_EDGE", edge)?;
         let origin = resolve_addr("CT_AGENT_ORIGIN", origin)?;
         Ok(AgentConfig {
             edge,
+            edge_host,
             origin,
             origin_proto: OriginProto::default(),
             direct_advertise_ip: None,
@@ -455,6 +478,23 @@ const DEFAULT_TCP_FALLBACK_MAX_SERVING: usize = 32;
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_hostname_edge_is_re_resolved_and_an_ip_literal_is_not() {
+        let literal = AgentConfig::parse("10.0.0.2:4433", "127.0.0.1:8080").unwrap();
+        assert_eq!(literal.edge_host, None);
+        let other: SocketAddr = "192.0.2.1:1".parse().unwrap();
+        assert_eq!(literal.resolve_edge_or(other).await, literal.edge, "a literal never changes");
+
+        let named = AgentConfig::parse("localhost:4433", "127.0.0.1:8080").unwrap();
+        assert_eq!(named.edge_host.as_deref(), Some("localhost:4433"));
+        let now = named.resolve_edge_or(other).await;
+        assert!(now.ip().is_loopback() && now.port() == 4433, "looked up again: {now}");
+
+        // A lookup that fails keeps the caller's last good address.
+        let mut gone = named.clone();
+        gone.edge_host = Some("edge.does-not-exist.invalid:4433".into());
+        assert_eq!(gone.resolve_edge_or(other).await, other);
+    }
     use super::*;
 
     #[test]
