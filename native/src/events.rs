@@ -184,11 +184,25 @@ pub fn format_line(ev: &Event, json: bool) -> String {
         line.push_str(k);
         line.push('=');
         match v {
-            Value::String(s) => line.push_str(s),
+            Value::String(s) => push_escaped(&mut line, s),
             other => line.push_str(&other.to_string()),
         }
     }
     line
+}
+
+/// Append `s` with every control character escaped (`\n`, `\u{1b}`, ...): a field value can come
+/// from the network (a QUIC close reason is the peer's bytes), and a raw newline or escape
+/// sequence would forge log lines or drive the operator's terminal. The JSON forms are already
+/// escaped by serde.
+fn push_escaped(line: &mut String, s: &str) {
+    for c in s.chars() {
+        if c.is_control() {
+            line.extend(c.escape_default());
+        } else {
+            line.push(c);
+        }
+    }
 }
 
 /// Emit one event: count it, print it to stderr in the configured format, and
@@ -434,7 +448,7 @@ impl Ring {
 
     fn append_locked(&self, line: &str) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
+            crate::secret_file::create_private_dir_all(dir)?;
         }
         let incoming = line.len() as u64 + 1;
         let current = match std::fs::metadata(&self.path) {
@@ -571,6 +585,16 @@ pub fn ring_write_errors() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_compact_line_escapes_control_characters_from_the_peer() {
+        // A QUIC close reason is the peer's bytes: a newline must not forge a second event line,
+        // an ESC must not reach the terminal.
+        let ev = Event::new(DISCONNECTED, serde_json::json!({"reason": "bye\nct-agent event: registered edge=evil\u{1b}[2J"}));
+        let line = format_line(&ev, false);
+        assert!(!line.contains('\n') && !line.contains('\u{1b}'), "{line}");
+        assert!(line.contains("bye\\nct-agent event: registered edge=evil\\u{1b}[2J"), "{line}");
+    }
+
     #[test]
     fn the_peer_triggered_budget_caps_a_window_and_reports_what_it_dropped() {
         let t0 = std::time::Instant::now();

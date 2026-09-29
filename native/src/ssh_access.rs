@@ -220,16 +220,17 @@ pub fn default_owner_key_file(home: &Path, hostname: &str) -> PathBuf {
     home.join(".ssh").join(format!("ct-agent-{hostname}.owner"))
 }
 
-/// A path as it goes on the ProxyCommand line: double-quoted when it contains whitespace
-/// (ssh_config splits the command on whitespace and honours double quotes), verbatim otherwise
-/// so the common case reads exactly like the user typed it.
+/// A path as it goes on the ProxyCommand line. ssh expands `%` tokens in it and then runs it
+/// with `$SHELL -c`, so a path with anything but plain path characters is single-quoted for the
+/// shell (a `'` inside becomes `'\''`) and every `%` is doubled -- a `;`, `$(..)` or backtick in
+/// a file name must never run. The common case stays verbatim, exactly as the user typed it.
 fn shell_word(path: &Path) -> String {
     let s = path.display().to_string();
-    if s.chars().any(char::is_whitespace) {
-        format!("\"{s}\"")
-    } else {
-        s
+    let plain = |c: char| c.is_ascii_alphanumeric() || "/._-+,:@=~".contains(c);
+    if !s.is_empty() && s.chars().all(plain) {
+        return s;
     }
+    format!("'{}'", s.replace('\'', "'\\''").replace('%', "%%"))
 }
 
 /// The `~/.ssh/config` stanza for `args`, exactly:
@@ -459,6 +460,16 @@ pub(crate) mod test_pki {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_proxy_command_path_can_never_run_code_or_expand_tokens() {
+        assert_eq!(shell_word(Path::new("/home/u/.ssh/ca.pem")), "/home/u/.ssh/ca.pem");
+        assert_eq!(shell_word(Path::new("~/ca.pem")), "~/ca.pem");
+        assert_eq!(shell_word(Path::new("/x/a;touch pwned")), "'/x/a;touch pwned'");
+        assert_eq!(shell_word(Path::new("/x/$(id)`id`")), "'/x/$(id)`id`'");
+        assert_eq!(shell_word(Path::new("/x/it's")), "'/x/it'\\''s'");
+        assert_eq!(shell_word(Path::new("/x/100%h")), "'/x/100%%h'");
+    }
+
     use super::*;
     use rustls::pki_types::PrivateKeyDer;
     use tokio::io::AsyncReadExt;
@@ -594,7 +605,7 @@ mod tests {
             owner_key_file: None,
             owner_key: None,
         };
-        assert!(render_ssh_config(&a).contains("--ca \"/my certs/ca.pem\"\n"));
+        assert!(render_ssh_config(&a).contains("--ca '/my certs/ca.pem'\n"));
     }
 
     #[test]

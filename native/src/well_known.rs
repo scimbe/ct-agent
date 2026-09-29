@@ -76,7 +76,9 @@ pub fn write_agent_card_for_origin(
     let wk_dir = out_dir.join(".well-known");
     std::fs::create_dir_all(&wk_dir)?;
     let path = wk_dir.join("agent-card.json");
-    std::fs::write(&path, agent_card_well_known_body(card).map_err(std::io::Error::other)?)?;
+    // Atomic temp-and-rename: a symlink planted at the target (the directory is often a web root
+    // another user can write) is replaced, never followed.
+    crate::secret_file::write_durable(&path, agent_card_well_known_body(card).map_err(std::io::Error::other)?.as_bytes())?;
     Ok(path)
 }
 
@@ -106,6 +108,20 @@ pub fn read_and_verify_agent_card(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn writing_the_card_replaces_a_planted_symlink_instead_of_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let wk = dir.path().join("web").join(".well-known");
+        std::fs::create_dir_all(&wk).unwrap();
+        std::os::unix::fs::symlink(&victim, wk.join("agent-card.json")).unwrap();
+        let path = write_agent_card_for_origin(&signed_card(), &dir.path().join("web")).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious", "the link target is untouched");
+        assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+    }
+
     use super::*;
     use ct_common::channel::{CellId, ChannelId, Skill};
     use ed25519_dalek::{Signer, SigningKey};
