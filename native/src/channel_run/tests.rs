@@ -7255,10 +7255,20 @@ async fn channel_forward_idle_timeout_closes_a_silent_stream() {
         "the idle-timed-out stream's local side closes (EOF), no bytes ever moved"
     );
 
-    tokio::time::sleep(Duration::from_millis(50)).await; // let the accept side's own teardown land
-                                                          // `>` rather than `== +1`: EVENT_COUNTS is one process-wide static shared with every other
-                                                          // concurrently-running test in this binary (same tolerance as the mTLS test above and
-                                                          // forward.rs's own event test).
+    // Wait for the accept side's own teardown instead of sleeping a fixed 50ms at it: that side
+    // only starts its OWN idle countdown when this side's Close arrives, so its forward_close is
+    // up to a full idle window behind the EOF above -- a fixed sleep passed only while some other
+    // concurrently-running test happened to bump the same counter inside it (AUF-20260930-005:
+    // the three gated-forward tests at the end of this file made that coincidence stop holding).
+    // `>` rather than `== +1` for that same reason: EVENT_COUNTS is one process-wide static
+    // shared with every other test in this binary (the tolerance the mTLS test above and
+    // forward.rs's own event test already use).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while events::EVENT_COUNTS.get(events::FORWARD_CLOSE) <= open_before
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     assert!(
         events::EVENT_COUNTS.get(events::FORWARD_CLOSE) > open_before,
         "the idle timeout must produce a forward_close"
@@ -7266,4 +7276,287 @@ async fn channel_forward_idle_timeout_closes_a_silent_stream() {
 
     a_task.abort();
     b_task.abort();
+}
+
+// --- AUF-20260930-005 (INC-20260930-101): a grant that ends, ends the forward ------------------
+//
+// trace: AUF-20260930-005 (INC-20260930-101)
+//
+// Until now `PeerGrantGate` decided once, at session setup, whether the peer's grant allowed the
+// session at all. INC-20260930-101: a grant that expires or is revoked while the session runs has
+// to end it -- and with it every CT_CHANNEL_FORWARD stream it carries, on BOTH members, within
+// `GRANT_TEARDOWN_BUDGET`, after which the initiate side's listener refuses new connections. The
+// three tests below drive real TCP through a real Noise session for each half of that sentence:
+// the expiry, the revocation, and (the regression guard) a grant that is simply still valid.
+
+/// A plain TCP echo target that serves `connections` connections and whose task returns once all
+/// of them are closed -- awaiting the handle is how a test proves the ACCEPT side tore its own
+/// dialed socket down too, not just the initiate side's listener ("auf beiden Seiten").
+async fn spawn_echo_target(connections: usize) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let mut echoes = Vec::new();
+        for _ in 0..connections {
+            let Ok((mut tcp, _)) = listener.accept().await else {
+                break;
+            };
+            echoes.push(tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                loop {
+                    match tcp.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if tcp.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+        for echo in echoes {
+            let _ = echo.await;
+        }
+    });
+    (addr, handle)
+}
+
+/// What [`spawn_gated_forward_pair`] hands back: the initiate side's bound listener address, the
+/// two session tasks, and each member's one revoke handle.
+struct GatedForwardPair {
+    bound: SocketAddr,
+    initiate: tokio::task::JoinHandle<io::Result<()>>,
+    accept: tokio::task::JoinHandle<io::Result<()>>,
+    revoke_initiate: GrantRevokeHandle,
+    revoke_accept: GrantRevokeHandle,
+}
+
+/// One Initiate + Accept forward pair, exactly as [`spawn_forward_pair`] builds it, but with both
+/// members' `local` behind the peer-grant gate (what `CT_CHANNEL_REQUIRE_PEER_GRANT` switches on,
+/// driven directly here rather than through the process environment) and both grants expiring at
+/// `expires_at`. That is the shape this incident is about: a forward whose authorization can run
+/// out while it is carrying bytes.
+fn spawn_gated_forward_pair(target: String, expires_at: u64) -> GatedForwardPair {
+    use ed25519_dalek::Signer as _;
+
+    let operator = ed25519_dalek::SigningKey::from_bytes(&[0x41u8; 32]);
+    let channel = [0x99u8; 32];
+    let a_holder = ed25519_dalek::SigningKey::from_bytes(&[0x02u8; 32])
+        .verifying_key()
+        .to_bytes();
+    let b_holder = ed25519_dalek::SigningKey::from_bytes(&[0x03u8; 32])
+        .verifying_key()
+        .to_bytes();
+    let sign = |holder: [u8; 32], direction: ct_common::channel::Direction| {
+        let g = ct_common::channel::ChannelGrant {
+            channel: ct_common::channel::ChannelId(channel),
+            holder,
+            direction,
+            rights: ct_common::channel::Rights::ReadWrite,
+            delegable: false,
+            expires_at,
+        };
+        ct_common::channel::SignedChannelGrant {
+            signature: operator.sign(&g.signing_bytes()).to_bytes(),
+            grant: g,
+        }
+    };
+    let policy = PeerGrantPolicy {
+        operator: operator.verifying_key().to_bytes(),
+    };
+    let a_check = PeerGrantCheck {
+        policy: policy.clone(),
+        own_grant: sign(a_holder, ct_common::channel::Direction::Initiate),
+        peer_holder: b_holder,
+        role: ChannelRole::Initiate,
+    };
+    let b_check = PeerGrantCheck {
+        policy,
+        own_grant: sign(b_holder, ct_common::channel::Direction::Accept),
+        peer_holder: a_holder,
+        role: ChannelRole::Accept,
+    };
+
+    let a = generate_static_keypair();
+    let b = generate_static_keypair();
+    let (a_priv, a_pub) = (a.private, a.public);
+    let (b_priv, b_pub) = (b.private, b.public);
+    let (a_transport, b_transport) = tokio::io::duplex(1 << 16);
+
+    let spec = ForwardSpec {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        target: target.clone(),
+    };
+    // The idle timeout is the shipped default here: nothing but the grant may close these
+    // streams, or the tests below would prove the wrong teardown.
+    let idle = Duration::from_secs(forward_stream::DEFAULT_IDLE_SECS);
+    let (a_local, bound) = forward_initiate_local(&spec, forward_stream::DEFAULT_MAX_STREAMS, idle)
+        .expect("the loopback listener binds");
+    let b_local = forward_accept_local(
+        Some(target),
+        None,
+        forward_stream::DEFAULT_MAX_STREAMS,
+        idle,
+    );
+    let mut a_gate = PeerGrantGate::new(a_local, Some(a_check));
+    let mut b_gate = PeerGrantGate::new(b_local, Some(b_check));
+    let revoke_initiate = a_gate
+        .revoke_handle()
+        .expect("a fresh gate owns its handle");
+    let revoke_accept = b_gate
+        .revoke_handle()
+        .expect("a fresh gate owns its handle");
+
+    let initiate = tokio::spawn(async move {
+        let (ar, aw) = tokio::io::split(a_transport);
+        run_channel_session_on_stream(aw, ar, ChannelRole::Initiate, &a_priv, &b_pub, a_gate).await
+    });
+    let accept = tokio::spawn(async move {
+        let (br, bw) = tokio::io::split(b_transport);
+        run_channel_session_on_stream(bw, br, ChannelRole::Accept, &b_priv, &a_pub, b_gate).await
+    });
+    GatedForwardPair {
+        bound,
+        initiate,
+        accept,
+        revoke_initiate,
+        revoke_accept,
+    }
+}
+
+/// Open one forwarded stream through `bound` and prove it carries bytes: the connection the two
+/// "the grant ended" tests then watch die, and the one the regression test watches survive.
+async fn open_forwarded_stream(bound: SocketAddr, byte: u8) -> tokio::net::TcpStream {
+    let mut tcp = tokio::net::TcpStream::connect(bound)
+        .await
+        .expect("the local forward listener accepts a TCP connection");
+    tcp.write_all(&[byte])
+        .await
+        .expect("the stream takes bytes");
+    let mut echoed = [0u8; 1];
+    tcp.read_exact(&mut echoed)
+        .await
+        .expect("the forward carries bytes end to end while the grant is valid");
+    assert_eq!(echoed[0], byte);
+    tcp
+}
+
+/// Whether an already-open forwarded stream is gone within [`GRANT_TEARDOWN_BUDGET`]: a clean EOF
+/// or a reset -- both are the teardown, which one arrives depends on whether the peer's FIN or
+/// the local engine's abort wins the race. `false` means it was still open when the budget ran
+/// out, which is exactly the failure INC-20260930-101 reported.
+async fn forwarded_stream_is_closed(tcp: &mut tokio::net::TcpStream) -> bool {
+    let mut buf = [0u8; 1];
+    matches!(
+        tokio::time::timeout(GRANT_TEARDOWN_BUDGET, tcp.read(&mut buf)).await,
+        Ok(Ok(0)) | Ok(Err(_))
+    )
+}
+
+/// Whether a FRESH connection to the initiate side's listener is refused. Either the connect
+/// itself fails (the engine task is already dropped with the session, so the listener is gone) or
+/// the accepted socket is closed at once without ever carrying a byte (the engine is still alive
+/// and refusing, see `run_forward_initiate_engine`). Both are "abgewiesen"; which one an operator
+/// sees is a race this assertion deliberately does not pin down.
+async fn forward_connection_is_refused(bound: SocketAddr) -> bool {
+    let Ok(mut tcp) = tokio::net::TcpStream::connect(bound).await else {
+        return true;
+    };
+    if tcp.write_all(b"probe").await.is_err() {
+        return true;
+    }
+    forwarded_stream_is_closed(&mut tcp).await
+}
+
+#[tokio::test]
+async fn channel_forward_streams_end_when_the_grant_expires_and_the_listener_then_refuses() {
+    // AUF-20260930-005 criterion 1: the grant expires while a forwarded stream is open. Within
+    // GRANT_TEARDOWN_BUDGET that stream is closed on BOTH sides -- the initiate side's client
+    // socket and the accept side's dialed target socket -- and a new connect is refused.
+    let grant_secs = 2;
+    let (target_addr, target) = spawn_echo_target(1).await;
+    let pair = spawn_gated_forward_pair(
+        target_addr.to_string(),
+        crate::codec::now_unix() + grant_secs,
+    );
+    let mut tcp = open_forwarded_stream(pair.bound, b'x').await;
+
+    // Wait the grant out; the budget starts here.
+    tokio::time::sleep(Duration::from_secs(grant_secs)).await;
+    assert!(
+        forwarded_stream_is_closed(&mut tcp).await,
+        "the open forward stream must be gone within {GRANT_TEARDOWN_BUDGET:?} of the grant expiring"
+    );
+    assert!(
+        tokio::time::timeout(GRANT_TEARDOWN_BUDGET, target).await.is_ok(),
+        "the accept side must close the socket it dialed to the target too, not just the initiate side"
+    );
+    assert!(
+        forward_connection_is_refused(pair.bound).await,
+        "no new connection may be served on the initiate side's listener once the grant is over"
+    );
+
+    pair.initiate.abort();
+    pair.accept.abort();
+}
+
+#[tokio::test]
+async fn channel_forward_streams_end_when_the_grant_is_revoked() {
+    // AUF-20260930-005: the same end, reached by a revocation instead of the clock. Both members
+    // are told, which is what the broker's channel-revoke path does when it reaches them; either
+    // one alone would do, since the other's engine sees its end of the session duplex go EOF.
+    let (target_addr, target) = spawn_echo_target(1).await;
+    let pair = spawn_gated_forward_pair(target_addr.to_string(), crate::codec::now_unix() + 3600);
+    let mut tcp = open_forwarded_stream(pair.bound, b'x').await;
+
+    pair.revoke_initiate
+        .revoke("the operator revoked the peer's grant");
+    pair.revoke_accept
+        .revoke("the operator revoked the peer's grant");
+    assert!(
+        forwarded_stream_is_closed(&mut tcp).await,
+        "a revoked grant must close the open forward stream within {GRANT_TEARDOWN_BUDGET:?}"
+    );
+    assert!(
+        tokio::time::timeout(GRANT_TEARDOWN_BUDGET, target)
+            .await
+            .is_ok(),
+        "the accept side's dialed target socket goes with it"
+    );
+    assert!(
+        forward_connection_is_refused(pair.bound).await,
+        "and no new connection is served afterwards"
+    );
+
+    pair.initiate.abort();
+    pair.accept.abort();
+}
+
+#[tokio::test]
+async fn channel_forward_streams_stay_open_while_the_grant_is_valid() {
+    // AUF-20260930-005 criterion 2, the regression guard: the same gated pair with a grant that
+    // is NOT about to expire keeps its stream open well past the teardown budget, and its
+    // listener keeps opening new ones. Without this the incident's fix could "pass" by closing
+    // every forward.
+    let (target_addr, _target) = spawn_echo_target(2).await;
+    let pair = spawn_gated_forward_pair(target_addr.to_string(), crate::codec::now_unix() + 3600);
+    let mut tcp = open_forwarded_stream(pair.bound, b'x').await;
+
+    tokio::time::sleep(GRANT_TEARDOWN_BUDGET + Duration::from_secs(1)).await;
+    tcp.write_all(b"y")
+        .await
+        .expect("a valid grant leaves the stream open");
+    let mut echoed = [0u8; 1];
+    tcp.read_exact(&mut echoed)
+        .await
+        .expect("and it still carries bytes both ways");
+    assert_eq!(&echoed, b"y");
+
+    // The listener is still serving, too: a second connection opens its own forwarded stream.
+    let second = open_forwarded_stream(pair.bound, b'z').await;
+    drop(second);
+
+    pair.initiate.abort();
+    pair.accept.abort();
 }
