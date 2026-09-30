@@ -320,13 +320,11 @@ async fn run_forward_initiate_engine(
                 }
             }
             frame = out_rx.recv() => {
-                match frame {
-                    Some(f) => {
-                        if f.write(&mut mux_write).await.is_err() {
-                            break;
-                        }
+                // None: out_tx clones always outlive this branch; unreachable in practice
+                if let Some(f) = frame {
+                    if f.write(&mut mux_write).await.is_err() {
+                        break;
                     }
-                    None => {} // out_tx clones always outlive this branch; unreachable in practice
                 }
             }
             Some(done) = streams.join_next(), if !streams.is_empty() => {
@@ -393,13 +391,11 @@ async fn run_forward_accept_engine(
                 }
             }
             frame = out_rx.recv() => {
-                match frame {
-                    Some(f) => {
-                        if f.write(&mut mux_write).await.is_err() {
-                            break;
-                        }
+                // None: out_tx clones always outlive this branch; unreachable in practice
+                if let Some(f) = frame {
+                    if f.write(&mut mux_write).await.is_err() {
+                        break;
                     }
-                    None => {}
                 }
             }
             Some(done) = streams.join_next(), if !streams.is_empty() => {
