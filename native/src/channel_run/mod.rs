@@ -857,6 +857,7 @@ pub use forward::*;
 // transparent per-connection pump on both sides, built on `forward`'s policy gate above.
 mod forward_stream;
 mod forward_wire;
+#[allow(unused_imports)] // re-export for the forward tests; the lib itself uses the module path (ct-agent#255)
 pub(crate) use forward_stream::*;
 
 // ct-agent#169: secret-shape redaction for text that leaves this process towards a remote peer.
