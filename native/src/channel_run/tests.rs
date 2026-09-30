@@ -2,6 +2,7 @@
 //! former single-file `channel_run.rs` (consolidation program: module split, slice 1).
 
 use super::*;
+use crate::events;
 use ct_common::noise::generate_static_keypair;
 use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
 use std::collections::HashMap;
@@ -6902,4 +6903,367 @@ async fn a_successful_dial_resets_the_dial_failure_streak() {
     );
     assert!(!serve.is_finished(), "the serve loop is still running");
     serve.abort();
+}
+
+// ---------------------------------------------------------------------------------------------
+// scimbe/ct-agent#255 slice 2 (AUF-20260929-029): the channel TCP forward end to end -- two
+// members in ONE process (Initiate + Accept), the way #255 acceptance 2's "local" clause asks
+// for (the real labor-com -> labor-de leg is a later slice, DEC-0045 B1). Both members' Noise
+// session runs over a plain in-process duplex, exactly the [`run_channel_session_on_stream`]
+// pattern `run_channel_session_on_stream_forms_the_noise_tunnel_over_a_plain_duplex` above
+// already established -- the forward engines are just each side's `local`.
+// ---------------------------------------------------------------------------------------------
+
+/// Build an mTLS server (`rcgen` self-signed certs, the client cert used directly as its own
+/// trust root -- same minimal-PKI shortcut `serve_stream_to_origin_carries_a_full_tls_session`
+/// already uses for the server side) bound to loopback: the "echte mTLS-Testserver" #255
+/// acceptance 1 asks the forward's target to be. Returns the bound address, the client's own
+/// cert+key to present, and a handle to the one accepted connection's captured peer certificate
+/// (`None` until the handshake completes).
+async fn spawn_mtls_echo_target() -> (
+    SocketAddr,
+    (
+        CertificateDer<'static>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    std::sync::Arc<tokio::sync::Mutex<Option<CertificateDer<'static>>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    crate::transport::install_crypto_provider();
+
+    let server_certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let server_cert = server_certified.cert.der().clone();
+    let server_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        server_certified.key_pair.serialize_der(),
+    ));
+
+    let client_certified =
+        rcgen::generate_simple_self_signed(vec!["forward-client".to_string()]).unwrap();
+    let client_cert = client_certified.cert.der().clone();
+    let client_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        client_certified.key_pair.serialize_der(),
+    ));
+
+    let mut client_roots = rustls::RootCertStore::empty();
+    client_roots.add(client_cert.clone()).unwrap();
+    let client_verifier =
+        rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(client_roots))
+            .build()
+            .expect("client cert verifier builds from one self-signed root");
+    let scfg = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(vec![server_cert], server_key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(scfg));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen: std::sync::Arc<tokio::sync::Mutex<Option<CertificateDer<'static>>>> =
+        Default::default();
+    let seen_clone = seen.clone();
+    let handle = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("one TCP connection arrives");
+        let mut tls = acceptor
+            .accept(tcp)
+            .await
+            .expect("the mTLS handshake completes");
+        let peer_cert = tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .cloned();
+        *seen_clone.lock().await = peer_cert;
+        let mut buf = [0u8; 5];
+        tls.read_exact(&mut buf)
+            .await
+            .expect("reads the client's plaintext");
+        assert_eq!(
+            &buf, b"hello",
+            "the forward carried the client's bytes unchanged"
+        );
+        tls.write_all(b"world")
+            .await
+            .expect("writes the server's reply");
+        tls.shutdown().await.expect("clean TLS close");
+    });
+
+    (addr, (client_cert, client_key), seen, handle)
+}
+
+/// Wire up ONE Initiate + Accept pair over a plain in-process duplex "transport" (the Noise
+/// session's own wire), each side's `local` built by the forward engines under test. Returns
+/// the initiate's bound listener address (which is what a "real" `CT_CHANNEL_FORWARD` caller
+/// would connect a TCP client to) and the two sessions' join handles.
+fn spawn_forward_pair(
+    target: String,
+    max_streams: usize,
+    idle: Duration,
+) -> (
+    SocketAddr,
+    tokio::task::JoinHandle<io::Result<()>>,
+    tokio::task::JoinHandle<io::Result<()>>,
+) {
+    let a = generate_static_keypair();
+    let b = generate_static_keypair();
+    let (a_priv, a_pub) = (a.private, a.public);
+    let (b_priv, b_pub) = (b.private, b.public);
+    let (a_transport, b_transport) = tokio::io::duplex(1 << 16);
+
+    let spec = ForwardSpec {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        target: target.clone(),
+    };
+    let (a_local, bound) =
+        forward_initiate_local(&spec, max_streams, idle).expect("the loopback listener binds");
+    let b_local = forward_accept_local(Some(target), None, max_streams, idle);
+
+    let a_task = tokio::spawn(async move {
+        let (ar, aw) = tokio::io::split(a_transport);
+        run_channel_session_on_stream(aw, ar, ChannelRole::Initiate, &a_priv, &b_pub, a_local).await
+    });
+    let b_task = tokio::spawn(async move {
+        let (br, bw) = tokio::io::split(b_transport);
+        run_channel_session_on_stream(bw, br, ChannelRole::Accept, &b_priv, &a_pub, b_local).await
+    });
+    (bound, a_task, b_task)
+}
+
+#[tokio::test]
+async fn channel_forward_carries_a_full_mtls_connection_byte_transparent_to_the_accept_sides_target(
+) {
+    // #255 acceptance 1 (AUF-20260929-029): a TCP connection on the INITIATE side's local
+    // listener reaches an mTLS test server behind the ACCEPT member; the server sees the
+    // client's certificate unchanged -- proof the forward is byte-transparent end to end,
+    // including a real TLS handshake (mTLS runs end-to-end, this member never touches it).
+    let (target_addr, (client_cert, client_key), seen_cert, target_task) =
+        spawn_mtls_echo_target().await;
+
+    let open_before = events::EVENT_COUNTS.get(events::FORWARD_OPEN);
+    let close_before = events::EVENT_COUNTS.get(events::FORWARD_CLOSE);
+
+    let (bound, a_task, b_task) = spawn_forward_pair(
+        target_addr.to_string(),
+        forward_stream::DEFAULT_MAX_STREAMS,
+        Duration::from_secs(30),
+    );
+
+    // #255 acceptance 2: the listener binds ONLY on loopback -- proven directly, not just by
+    // parse-time policy (`parse_forward_spec_requires_loopback_and_both_parts`).
+    assert!(
+        bound.ip().is_loopback(),
+        "the forward listener must bind loopback only, bound to {bound}"
+    );
+
+    let tcp = tokio::net::TcpStream::connect(bound)
+        .await
+        .expect("the local listener accepts a TCP connection");
+    // The server's own cert isn't handed back by spawn_mtls_echo_target, so this client trusts
+    // it via a custom no-op verifier instead of pinning it -- this test's point is that the
+    // CLIENT's certificate reaches the server unchanged through the forward, a concern the
+    // server-cert side of the handshake doesn't touch (already covered elsewhere, e.g.
+    // `serve_stream_to_origin_carries_a_full_tls_session`, by pinning a real root).
+    let ccfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyServerCert))
+        .with_client_auth_cert(vec![client_cert.clone()], client_key)
+        .expect("client cert configures");
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(ccfg));
+    let sni = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut tls = connector
+        .connect(sni, tcp)
+        .await
+        .expect("the mTLS handshake completes through the forward");
+    tls.write_all(b"hello").await.unwrap();
+    tls.flush().await.unwrap();
+    let mut reply = [0u8; 5];
+    tls.read_exact(&mut reply)
+        .await
+        .expect("reads the target's reply through the forward");
+    assert_eq!(&reply, b"world");
+    drop(tls);
+
+    target_task.await.expect("the target server task completes");
+    let got_cert = seen_cert
+        .lock()
+        .await
+        .clone()
+        .expect("the target captured a peer certificate");
+    assert_eq!(
+        got_cert, client_cert,
+        "the target sees the client's certificate byte-for-byte unchanged"
+    );
+
+    // #255 acceptance 2: forward_open/forward_close both fired for this stream. `>` rather than
+    // `== +1`: EVENT_COUNTS is one process-wide static, and other tests in this same binary bump
+    // the same kind concurrently (the established tolerance forward.rs's own event test already
+    // uses, for the identical reason).
+    tokio::time::sleep(Duration::from_millis(100)).await; // let the accept-side pump finish its own teardown
+    assert!(events::EVENT_COUNTS.get(events::FORWARD_OPEN) > open_before);
+    assert!(events::EVENT_COUNTS.get(events::FORWARD_CLOSE) > close_before);
+
+    a_task.abort();
+    b_task.abort();
+}
+
+/// A `rustls` server-cert verifier that accepts anything -- this test's client only cares that
+/// the mTLS handshake completes and its OWN certificate reaches the server unchanged; pinning
+/// the target's server cert is a different, already-well-tested rustls concern
+/// (`serve_stream_to_origin_carries_a_full_tls_session`).
+#[derive(Debug)]
+struct AcceptAnyServerCert;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[tokio::test]
+async fn channel_forward_max_streams_refuses_a_connection_over_the_cap() {
+    // #255 acceptance 3 (AUF-20260929-029): CT_CHANNEL_FORWARD_MAX_STREAMS actually bites. A
+    // plain TCP echo target (no TLS needed for this one) held open by its first client so the
+    // stream count stays at the cap while a second connection is attempted.
+    let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+    let target = tokio::spawn(async move {
+        loop {
+            let Ok((mut tcp, _)) = target_listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1];
+                while tcp.read(&mut buf).await.unwrap_or(0) > 0 {
+                    let _ = tcp.write_all(&buf).await;
+                }
+            });
+        }
+    });
+
+    let (bound, a_task, b_task) =
+        spawn_forward_pair(target_addr.to_string(), 1, Duration::from_secs(30));
+
+    // First connection: takes the one available stream, and stays open (never sends EOF).
+    let first = tokio::net::TcpStream::connect(bound)
+        .await
+        .expect("first connection is accepted");
+    // Give the mux a moment to actually open the stream against the target before the second
+    // connection races it -- both sides run real async tasks, not something to assert on
+    // instantly.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Second connection: over the cap -- the initiate engine refuses it immediately (closes the
+    // accepted socket right away rather than silently queuing it), so a read here reaches EOF
+    // instead of ever seeing a reply.
+    let mut second = tokio::net::TcpStream::connect(bound)
+        .await
+        .expect("TCP connect itself still succeeds");
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(5), second.read(&mut buf))
+        .await
+        .expect("the refusal is immediate, not a hang")
+        .expect("a closed socket reads as a clean EOF, not an error");
+    assert_eq!(
+        n, 0,
+        "the second connection is refused (EOF) once CT_CHANNEL_FORWARD_MAX_STREAMS=1 is reached"
+    );
+
+    // The first connection is unaffected by the second's refusal.
+    let mut first = first;
+    first.write_all(b"x").await.unwrap();
+    let mut echoed = [0u8; 1];
+    first
+        .read_exact(&mut echoed)
+        .await
+        .expect("the first (within-cap) stream keeps working");
+    assert_eq!(&echoed, b"x");
+
+    drop(first);
+    target.abort();
+    a_task.abort();
+    b_task.abort();
+}
+
+#[tokio::test]
+async fn channel_forward_idle_timeout_closes_a_silent_stream() {
+    // #255 acceptance 3 (AUF-20260929-029): CT_CHANNEL_FORWARD_IDLE_SECS (here driven directly
+    // via the Duration parameter every real env value ultimately becomes) closes a forwarded
+    // stream that moves no bytes in EITHER direction for that long.
+    let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+    let _target = tokio::spawn(async move {
+        // Accept and hold the connection open -- it must never EOF on its own, so any close the
+        // test observes is the idle timeout, not the target hanging up.
+        let (tcp, _) = target_listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+        drop(tcp);
+    });
+
+    let idle = Duration::from_millis(150);
+    let (bound, a_task, b_task) = spawn_forward_pair(
+        target_addr.to_string(),
+        forward_stream::DEFAULT_MAX_STREAMS,
+        idle,
+    );
+
+    let open_before = events::EVENT_COUNTS.get(events::FORWARD_CLOSE);
+    let mut tcp = tokio::net::TcpStream::connect(bound)
+        .await
+        .expect("connects to the local listener");
+    // Send nothing at all; just wait past the idle window.
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut buf))
+        .await
+        .expect("the idle timeout fires within 5s, not a hang")
+        .expect("a closed socket reads as a clean EOF, not an error");
+    assert_eq!(
+        n, 0,
+        "the idle-timed-out stream's local side closes (EOF), no bytes ever moved"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await; // let the accept side's own teardown land
+                                                          // `>` rather than `== +1`: EVENT_COUNTS is one process-wide static shared with every other
+                                                          // concurrently-running test in this binary (same tolerance as the mTLS test above and
+                                                          // forward.rs's own event test).
+    assert!(
+        events::EVENT_COUNTS.get(events::FORWARD_CLOSE) > open_before,
+        "the idle timeout must produce a forward_close"
+    );
+
+    a_task.abort();
+    b_task.abort();
 }

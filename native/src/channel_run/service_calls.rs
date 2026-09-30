@@ -32,7 +32,7 @@ impl From<tokio::io::DuplexStream> for LocalDuplex {
 }
 
 impl LocalDuplex {
-    fn with_pump(stream: tokio::io::DuplexStream, pump: TaskGuard<()>) -> Self {
+    pub(crate) fn with_pump(stream: tokio::io::DuplexStream, pump: TaskGuard<()>) -> Self {
         Self { stream, _pump: Some(pump) }
     }
 }
@@ -71,6 +71,11 @@ pub(crate) enum ChannelLocal {
     /// different mode -- a stream handler the operator explicitly configured either runs, or
     /// the session fails loud, never a quiet downgrade to an unconfigured default.
     Stream(Result<StreamHandlerProcess, std::sync::Arc<io::Error>>),
+    /// scimbe/ct-agent#255 slice 2 (AUF-20260929-029): the channel TCP forward, either side.
+    /// `Err` only ever comes from the initiate side (a bad `CT_CHANNEL_FORWARD` value, or its
+    /// loopback listener failing to bind) -- captured at construction, same "fail loud on
+    /// every poll, never a silent downgrade" contract as `Stream` above.
+    Forward(Result<LocalDuplex, std::sync::Arc<io::Error>>),
 }
 
 /// ct-agent#220: the spawned `CT_AGENT_STREAM_HANDLER_CMD` child, kept alive alongside its
@@ -194,6 +199,10 @@ impl AsyncRead for ChannelLocal {
             ChannelLocal::Serve(d) => Pin::new(d).poll_read(cx, buf),
             ChannelLocal::Stream(Ok(s)) => Pin::new(s).poll_read(cx, buf),
             ChannelLocal::Stream(Err(e)) => Poll::Ready(Err(io::Error::new(e.kind(), e.to_string()))),
+            ChannelLocal::Forward(Ok(d)) => Pin::new(d).poll_read(cx, buf),
+            ChannelLocal::Forward(Err(e)) => {
+                Poll::Ready(Err(io::Error::new(e.kind(), e.to_string())))
+            }
         }
     }
 }
@@ -209,6 +218,10 @@ impl AsyncWrite for ChannelLocal {
             ChannelLocal::Serve(d) => Pin::new(d).poll_write(cx, buf),
             ChannelLocal::Stream(Ok(s)) => Pin::new(s).poll_write(cx, buf),
             ChannelLocal::Stream(Err(e)) => Poll::Ready(Err(io::Error::new(e.kind(), e.to_string()))),
+            ChannelLocal::Forward(Ok(d)) => Pin::new(d).poll_write(cx, buf),
+            ChannelLocal::Forward(Err(e)) => {
+                Poll::Ready(Err(io::Error::new(e.kind(), e.to_string())))
+            }
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -217,6 +230,10 @@ impl AsyncWrite for ChannelLocal {
             ChannelLocal::Serve(d) => Pin::new(d).poll_flush(cx),
             ChannelLocal::Stream(Ok(s)) => Pin::new(s).poll_flush(cx),
             ChannelLocal::Stream(Err(e)) => Poll::Ready(Err(io::Error::new(e.kind(), e.to_string()))),
+            ChannelLocal::Forward(Ok(d)) => Pin::new(d).poll_flush(cx),
+            ChannelLocal::Forward(Err(e)) => {
+                Poll::Ready(Err(io::Error::new(e.kind(), e.to_string())))
+            }
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -225,6 +242,10 @@ impl AsyncWrite for ChannelLocal {
             ChannelLocal::Serve(d) => Pin::new(d).poll_shutdown(cx),
             ChannelLocal::Stream(Ok(s)) => Pin::new(s).poll_shutdown(cx),
             ChannelLocal::Stream(Err(e)) => Poll::Ready(Err(io::Error::new(e.kind(), e.to_string()))),
+            ChannelLocal::Forward(Ok(d)) => Pin::new(d).poll_shutdown(cx),
+            ChannelLocal::Forward(Err(e)) => {
+                Poll::Ready(Err(io::Error::new(e.kind(), e.to_string())))
+            }
         }
     }
 }
@@ -1751,6 +1772,66 @@ pub(crate) fn enrich_manifest_list(registry_url: &str, body: serde_json::Value) 
 /// (pre-admission paths) or not applicable (`Pipe`/one-shot `--call` mode never dispatches
 /// through a registry at all) — identical to today's always-anonymous `dispatch()` behaviour.
 pub(crate) fn channel_local(peer: Option<[u8; 32]>) -> ChannelLocal {
+    // scimbe/ct-agent#255 slice 2 (AUF-20260929-029), initiate side: CT_CHANNEL_FORWARD turns
+    // this session into a TCP port-forward client -- an EXCLUSIVE mode, same posture as
+    // CT_AGENT_STREAM_HANDLER_CMD below (no ping/serve/call semantics share this session).
+    // Checked first because, like that branch, a construction failure (a bad spec, or the
+    // loopback listener failing to bind) must fail THIS session loudly, never silently fall
+    // through to a Pipe/Serve session the operator never asked for.
+    if let Ok(raw) = std::env::var(super::forward_stream::FORWARD_ENV) {
+        let max_streams = super::forward_stream::max_streams_from_env(
+            std::env::var(super::forward_stream::FORWARD_MAX_STREAMS_ENV)
+                .ok()
+                .as_deref(),
+        );
+        let idle = super::forward_stream::idle_timeout_from_env(
+            std::env::var(super::forward_stream::FORWARD_IDLE_SECS_ENV)
+                .ok()
+                .as_deref(),
+        );
+        let built = super::forward_stream::parse_forward_spec(&raw)
+            .map_err(io::Error::other)
+            .and_then(|spec| super::forward_stream::forward_initiate_local(&spec, max_streams, idle).map(|(d, bound)| (d, bound, spec.target)))
+            .map(|(local, bound, target)| {
+                eprintln!(
+                    "ct-agent channel: CT_CHANNEL_FORWARD {bound} -> {target} (max_streams={max_streams}, \
+                     idle={idle:?}, scimbe/ct-agent#255)"
+                );
+                local
+            });
+        return ChannelLocal::Forward(built.map_err(std::sync::Arc::new));
+    }
+    // Accept side of the same feature: a non-empty CT_CHANNEL_FORWARD_ALLOW makes this member
+    // ready to dial forward targets for its paired peer -- also exclusive, mirroring the
+    // initiate branch above so the two sides of one forward pairing are symmetric. The
+    // allowlist/non-loopback strings are captured HERE (not re-read from the live environment
+    // per request) so the policy this session enforces is pinned to what was configured when
+    // the session started.
+    if super::forward::forward_allow_configured() {
+        let max_streams = super::forward_stream::max_streams_from_env(
+            std::env::var(super::forward_stream::FORWARD_MAX_STREAMS_ENV)
+                .ok()
+                .as_deref(),
+        );
+        let idle = super::forward_stream::idle_timeout_from_env(
+            std::env::var(super::forward_stream::FORWARD_IDLE_SECS_ENV)
+                .ok()
+                .as_deref(),
+        );
+        eprintln!(
+            "ct-agent channel: {} configured -- accepting TCP forward requests for this session \
+             (max_streams={max_streams}, idle={idle:?}, scimbe/ct-agent#255)",
+            super::forward::FORWARD_ALLOW_ENV
+        );
+        let allow_raw = std::env::var(super::forward::FORWARD_ALLOW_ENV).ok();
+        let non_loopback_raw = std::env::var(super::forward::FORWARD_ALLOW_NON_LOOPBACK_ENV).ok();
+        return ChannelLocal::Forward(Ok(super::forward_stream::forward_accept_local(
+            allow_raw,
+            non_loopback_raw,
+            max_streams,
+            idle,
+        )));
+    }
     // #173 distributed crew: one-shot `service/<slug>` client. Reads the prompt on stdin, calls the
     // peer's service, prints the BARE output — the crew-bridge `CREW_*_CMD` contract. Checked before
     // the raw CT_CHANNEL_CALL below because it's the service-specific (and jq-free) path.
