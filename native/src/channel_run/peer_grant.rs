@@ -26,6 +26,21 @@
 //! a member that sends the prelude to one that does not expect it corrupts that member's first
 //! application bytes. It is therefore opt-in (`CT_CHANNEL_REQUIRE_PEER_GRANT`) and has to be
 //! switched on for every member of a channel together.
+//!
+//! ## The grant's end is enforced for as long as the session runs
+//!
+//! The check above is a *point-in-time* admission decision: it ran once, right after the Noise
+//! handshake. A session admitted at 10:00 with a grant that expires at 10:05 kept running at
+//! 11:00 -- and kept forwarding TCP streams (#255) -- for as long as both members stayed
+//! connected. INC-20260930-101: a revoked or expired grant has to end the session it authorized.
+//! [`GrantLifetime`] is that clock. It is armed with this member's OWN grant expiry when the gate
+//! is built, re-armed with the EARLIER of the two expiries as soon as the peer's grant verifies,
+//! and it also carries a [`GrantRevokeHandle`] for a revocation that reaches this member while
+//! the session runs. When it fires, the session's plaintext side EOFs and the local side is
+//! closed underneath it, which ends every forwarded stream on both members within
+//! [`GRANT_TEARDOWN_BUDGET`] and leaves the initiate side's listener refusing new connections.
+//
+// trace: AUF-20260930-005 (INC-20260930-101)
 
 use std::io;
 use std::pin::Pin;
@@ -34,6 +49,7 @@ use std::time::Duration;
 
 use ct_common::channel::{Direction, SignedChannelGrant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::oneshot;
 
 use super::ChannelRole;
 
@@ -49,6 +65,11 @@ const MAGIC: &[u8; 5] = b"CTPG1";
 pub(crate) const PRELUDE_LEN: usize = MAGIC.len() + SignedChannelGrant::WIRE_LEN;
 /// How long a peer has, after the Noise handshake, to present its grant.
 pub(crate) const PEER_GRANT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The budget INC-20260930-101 gives a session whose grant ended: within it every forwarded
+/// stream of that session is closed on BOTH members and no new one is opened. Nothing here ever
+/// waits this out -- [`GrantLifetime`] ends the session on the next poll of its plaintext side --
+/// it is the bound the tests assert against, named once so they and this doc cannot drift apart.
+pub const GRANT_TEARDOWN_BUDGET: Duration = Duration::from_secs(5);
 
 /// The configuration of the check: on, with the operator key to verify against.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +86,11 @@ impl PeerGrantPolicy {
 
     /// [`from_env`](Self::from_env) over a variable lookup (the testable seam).
     pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, String> {
-        if !crate::envflag::flag_named(REQUIRE_PEER_GRANT_ENV, f(REQUIRE_PEER_GRANT_ENV).as_deref(), false) {
+        if !crate::envflag::flag_named(
+            REQUIRE_PEER_GRANT_ENV,
+            f(REQUIRE_PEER_GRANT_ENV).as_deref(),
+            false,
+        ) {
             return Ok(None);
         }
         let raw = f(OPERATOR_PUBKEY_ENV).unwrap_or_default();
@@ -104,18 +129,25 @@ impl PeerGrantCheck {
         let body = prelude
             .strip_prefix(MAGIC.as_slice())
             .ok_or("the peer did not present a channel grant (is CT_CHANNEL_REQUIRE_PEER_GRANT on for it?)")?;
-        let grant = SignedChannelGrant::decode(body).map_err(|e| format!("the peer's grant is malformed: {e}"))?;
-        ct_common::channel::verify_stateless(&self.policy.operator, &grant, now)
-            .map_err(|e| format!("the peer's grant does not verify against the operator key: {e}"))?;
+        let grant = SignedChannelGrant::decode(body)
+            .map_err(|e| format!("the peer's grant is malformed: {e}"))?;
+        ct_common::channel::verify_stateless(&self.policy.operator, &grant, now).map_err(|e| {
+            format!("the peer's grant does not verify against the operator key: {e}")
+        })?;
         if grant.grant.channel != self.own_grant.grant.channel {
             return Err("the peer's grant is for a different channel".to_string());
         }
         if grant.grant.holder != self.peer_holder {
-            return Err("the peer's grant is for another holder than the one admission attested".to_string());
+            return Err(
+                "the peer's grant is for another holder than the one admission attested"
+                    .to_string(),
+            );
         }
         let complementary = matches!(
             (self.role, grant.grant.direction),
-            (_, Direction::Both) | (ChannelRole::Initiate, Direction::Accept) | (ChannelRole::Accept, Direction::Initiate)
+            (_, Direction::Both)
+                | (ChannelRole::Initiate, Direction::Accept)
+                | (ChannelRole::Accept, Direction::Initiate)
         );
         if !complementary {
             return Err(format!(
@@ -127,6 +159,96 @@ impl PeerGrantCheck {
     }
 }
 
+/// Ends one session from the outside when its member learns the peer's grant was revoked
+/// (AUF-20260930-005). Broker-side delivery of a revocation is `bridge/channel-revoke`, which is
+/// not built yet; this is the enforcement seam it drives when it is, and the seam the tests
+/// revoke through. Dropping the handle without revoking leaves the session alone -- the expiry
+/// clock is then the only thing that ends it.
+pub struct GrantRevokeHandle(oneshot::Sender<String>);
+
+impl GrantRevokeHandle {
+    /// End the session this handle came from: every stream it forwards is closed and no new one
+    /// is opened. `reason` is what the operator reads in the `channel_session` event.
+    pub fn revoke(self, reason: impl Into<String>) {
+        let _ = self.0.send(reason.into());
+    }
+}
+
+/// When the members' grants stop authorizing this session -- the expiry clock and the revocation
+/// side-channel, polled from the session's own plaintext side (see the module doc).
+///
+/// Both are polled, never awaited in a task of their own: the session pump holds a read on its
+/// `local` at all times, so registering `cx` on the timer here is enough for the *next* poll,
+/// milliseconds after the grant ends, to be the one that tears the session down.
+struct GrantLifetime {
+    /// Fires when the earlier of the two members' grants expires. `None` when this session has
+    /// no grant to watch (the check is off) or once it has already ended.
+    expiry: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// The revocation channel; `None` once nobody can revoke any more (the handle was dropped
+    /// without being used, or the session has ended).
+    revoke: Option<oneshot::Receiver<String>>,
+    /// Set exactly once, the operator-facing reason the session ended.
+    ended: Option<String>,
+}
+
+impl GrantLifetime {
+    /// A timer for a grant that expires at `expires_at` (unix seconds, the clock the grants
+    /// themselves are written in). `now_unix()` truncates to the second, so the timer can fire
+    /// up to a second EARLY and never late -- the safe direction for an authorization that has
+    /// run out.
+    fn timer(expires_at: u64) -> Pin<Box<tokio::time::Sleep>> {
+        let left = expires_at.saturating_sub(crate::codec::now_unix());
+        Box::pin(tokio::time::sleep(Duration::from_secs(left)))
+    }
+
+    /// Whether this session is over, registering `cx` on whichever of the two ends can still
+    /// happen. Cheap and idempotent: once ended it answers from `ended` alone.
+    fn poll_ended(&mut self, cx: &mut Context<'_>) -> bool {
+        if self.ended.is_some() {
+            return true;
+        }
+        let expired = match self.expiry.as_mut() {
+            Some(timer) => std::future::Future::poll(timer.as_mut(), cx).is_ready(),
+            None => false,
+        };
+        if expired {
+            return self.end("the channel grant expired".to_string());
+        }
+        let revoked = match self.revoke.as_mut() {
+            Some(rx) => std::future::Future::poll(Pin::new(rx), cx),
+            None => Poll::Pending,
+        };
+        match revoked {
+            Poll::Ready(Ok(why)) => self.end(format!("the channel grant was revoked: {why}")),
+            // Nobody holds the handle (never taken, or dropped unused): only expiry can end it.
+            Poll::Ready(Err(_)) => {
+                self.revoke = None;
+                false
+            }
+            Poll::Pending => false,
+        }
+    }
+
+    /// Record the end once -- logged and emitted, because "my forward died" must be answerable
+    /// from this member's own output without a broker round trip -- and report it as ended.
+    fn end(&mut self, why: String) -> bool {
+        eprintln!("ct-agent channel: {why} -- ending the session and every stream it forwards");
+        crate::events::emit(
+            crate::events::CHANNEL_SESSION,
+            serde_json::json!({ "state": "grant_ended", "reason": why }),
+        );
+        self.expiry = None;
+        self.revoke = None;
+        self.ended = Some(why);
+        true
+    }
+
+    /// The reason the session ended, for the error writers get.
+    fn reason(&self) -> &str {
+        self.ended.as_deref().unwrap_or("the channel grant ended")
+    }
+}
+
 /// The session's `local` side with the grant exchange in front of it (see the module doc). With
 /// no check it is a transparent pass-through.
 ///
@@ -135,9 +257,14 @@ impl PeerGrantCheck {
 /// (what the session writes here) it consumes exactly the peer's prelude, verifies it, and only
 /// then passes bytes on to the real `local`. A missing, late (past [`PEER_GRANT_TIMEOUT`]) or
 /// invalid grant fails both directions with `PermissionDenied`, ending the session.
+///
+/// It is also where the session's grant *lifetime* is enforced (AUF-20260930-005): see
+/// [`GrantLifetime`] and the module doc.
 pub struct PeerGrantGate<P> {
     inner: P,
     gate: Option<Gate>,
+    life: GrantLifetime,
+    revoker: Option<GrantRevokeHandle>,
 }
 
 struct Gate {
@@ -153,6 +280,12 @@ struct Gate {
 
 impl<P> PeerGrantGate<P> {
     pub fn new(inner: P, check: Option<PeerGrantCheck>) -> Self {
+        // This member's own grant already bounds the session before the peer's is known; the
+        // peer's expiry is folded in (as the earlier of the two) the moment it verifies.
+        let expiry = check
+            .as_ref()
+            .map(|c| GrantLifetime::timer(c.own_grant.grant.expires_at));
+        let (revoker, revoke) = oneshot::channel();
         let gate = check.map(|check| Gate {
             out: check.prelude(),
             out_pos: 0,
@@ -163,12 +296,30 @@ impl<P> PeerGrantGate<P> {
             deadline: Box::pin(tokio::time::sleep(PEER_GRANT_TIMEOUT)),
             check,
         });
-        Self { inner, gate }
+        Self {
+            inner,
+            gate,
+            life: GrantLifetime {
+                expiry,
+                revoke: Some(revoke),
+                ended: None,
+            },
+            revoker: Some(GrantRevokeHandle(revoker)),
+        }
+    }
+
+    /// The handle that ends this session on a revocation -- `None` on every call after the
+    /// first, since a session has exactly one owner of its teardown.
+    pub fn revoke_handle(&mut self) -> Option<GrantRevokeHandle> {
+        self.revoker.take()
     }
 }
 
 fn denied(why: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::PermissionDenied, format!("channel peer grant: {why}"))
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("channel peer grant: {why}"),
+    )
 }
 
 impl Gate {
@@ -190,9 +341,25 @@ impl Gate {
     }
 }
 
-impl<P: AsyncRead + Unpin> AsyncRead for PeerGrantGate<P> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+// `AsyncWrite` as well as `AsyncRead` (AUF-20260930-005): when the grant ends, the read side
+// closes the local side itself rather than only reporting EOF upwards -- see `poll_read`.
+impl<P: AsyncRead + AsyncWrite + Unpin> AsyncRead for PeerGrantGate<P> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = &mut *self;
+        if this.life.poll_ended(cx) {
+            // EOF towards the session pump, so it FINs the peer and the whole session ends; and
+            // the local side shut down underneath it, so the forward engine (#255) -- which owns
+            // every forwarded stream in a JoinSet and the initiate side's listener -- sees its
+            // own end of this duplex go EOF at once. That second half is what makes the 5 s
+            // budget independent of the peer: a peer that never closes cannot keep this member's
+            // streams alive, and the listener is gone before the next connection can be opened.
+            let _ = Pin::new(&mut this.inner).poll_shutdown(cx);
+            return Poll::Ready(Ok(()));
+        }
         if let Some(g) = this.gate.as_mut() {
             if g.out_pos < g.out.len() {
                 let n = buf.remaining().min(g.out.len() - g.out_pos);
@@ -209,7 +376,9 @@ impl<P: AsyncRead + Unpin> AsyncRead for PeerGrantGate<P> {
             if !g.verified {
                 if std::future::Future::poll(g.deadline.as_mut(), cx).is_ready() {
                     let secs = PEER_GRANT_TIMEOUT.as_secs();
-                    return Poll::Ready(Err(g.fail(format!("the peer did not present its grant within {secs}s"))));
+                    return Poll::Ready(Err(
+                        g.fail(format!("the peer did not present its grant within {secs}s"))
+                    ));
                 }
                 g.reader = Some(cx.waker().clone());
                 return Poll::Pending;
@@ -221,8 +390,16 @@ impl<P: AsyncRead + Unpin> AsyncRead for PeerGrantGate<P> {
 }
 
 impl<P: AsyncWrite + Unpin> AsyncWrite for PeerGrantGate<P> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
+        if this.life.poll_ended(cx) {
+            // Nothing the peer sends reaches this member's local side after its grant ended.
+            return Poll::Ready(Err(denied(this.life.reason())));
+        }
         if let Some(g) = this.gate.as_mut() {
             if let Some(why) = &g.failed {
                 return Poll::Ready(Err(denied(why)));
@@ -232,8 +409,17 @@ impl<P: AsyncWrite + Unpin> AsyncWrite for PeerGrantGate<P> {
                 g.peer.extend_from_slice(&data[..take]);
                 if g.peer.len() == PRELUDE_LEN {
                     match g.check.verify(&g.peer, crate::codec::now_unix()) {
-                        Ok(_) => {
+                        Ok(peer) => {
                             g.verified = true;
+                            // From here the session is bounded by the EARLIER of the two grants:
+                            // a peer whose grant runs out first must not keep forwarding on ours.
+                            let ends_at = g
+                                .check
+                                .own_grant
+                                .grant
+                                .expires_at
+                                .min(peer.grant.expires_at);
+                            this.life.expiry = Some(GrantLifetime::timer(ends_at));
                             if let Some(w) = g.reader.take() {
                                 w.wake();
                             }
@@ -259,7 +445,8 @@ impl<P: AsyncWrite + Unpin> AsyncWrite for PeerGrantGate<P> {
         if let Some(g) = this.gate.as_mut() {
             if !g.verified && g.failed.is_none() {
                 // The peer closed without presenting a grant: nothing of ours is released.
-                let _ = g.fail("the peer closed the session before presenting its grant".to_string());
+                let _ =
+                    g.fail("the peer closed the session before presenting its grant".to_string());
                 return Poll::Ready(Ok(()));
             }
         }
@@ -277,9 +464,25 @@ mod tests {
     const NOW: u64 = 1_000_000;
     const CHANNEL: [u8; 32] = [0x5c; 32];
 
-    fn grant(operator: &SigningKey, channel: [u8; 32], holder: [u8; 32], direction: Direction, expires_at: u64) -> SignedChannelGrant {
-        let g = ChannelGrant { channel: ChannelId(channel), holder, direction, rights: Rights::ReadWrite, delegable: false, expires_at };
-        SignedChannelGrant { signature: operator.sign(&g.signing_bytes()).to_bytes(), grant: g }
+    fn grant(
+        operator: &SigningKey,
+        channel: [u8; 32],
+        holder: [u8; 32],
+        direction: Direction,
+        expires_at: u64,
+    ) -> SignedChannelGrant {
+        let g = ChannelGrant {
+            channel: ChannelId(channel),
+            holder,
+            direction,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at,
+        };
+        SignedChannelGrant {
+            signature: operator.sign(&g.signing_bytes()).to_bytes(),
+            grant: g,
+        }
     }
 
     fn prelude_of(g: &SignedChannelGrant) -> Vec<u8> {
@@ -296,8 +499,12 @@ mod tests {
         fn new() -> Self {
             Self {
                 operator: SigningKey::from_bytes(&[0x01; 32]),
-                initiator: SigningKey::from_bytes(&[0x02; 32]).verifying_key().to_bytes(),
-                acceptor: SigningKey::from_bytes(&[0x03; 32]).verifying_key().to_bytes(),
+                initiator: SigningKey::from_bytes(&[0x02; 32])
+                    .verifying_key()
+                    .to_bytes(),
+                acceptor: SigningKey::from_bytes(&[0x03; 32])
+                    .verifying_key()
+                    .to_bytes(),
             }
         }
 
@@ -307,9 +514,17 @@ mod tests {
                 ChannelRole::Accept => (self.acceptor, self.initiator, Direction::Accept),
             };
             PeerGrantCheck {
-                policy: PeerGrantPolicy { operator: self.operator.verifying_key().to_bytes() },
+                policy: PeerGrantPolicy {
+                    operator: self.operator.verifying_key().to_bytes(),
+                },
                 // Valid at the real clock too: the gate checks with `now_unix()`.
-                own_grant: grant(&self.operator, CHANNEL, own, dir, crate::codec::now_unix() + 3600),
+                own_grant: grant(
+                    &self.operator,
+                    CHANNEL,
+                    own,
+                    dir,
+                    crate::codec::now_unix() + 3600,
+                ),
                 peer_holder: peer,
                 role,
             }
@@ -319,10 +534,24 @@ mod tests {
     #[test]
     fn a_genuine_peer_grant_is_accepted() {
         let f = Fixture::new();
-        let acceptor_grant = grant(&f.operator, CHANNEL, f.acceptor, Direction::Accept, NOW + 60);
-        assert!(f.check(ChannelRole::Initiate).verify(&prelude_of(&acceptor_grant), NOW).is_ok());
+        let acceptor_grant = grant(
+            &f.operator,
+            CHANNEL,
+            f.acceptor,
+            Direction::Accept,
+            NOW + 60,
+        );
+        assert!(f
+            .check(ChannelRole::Initiate)
+            .verify(&prelude_of(&acceptor_grant), NOW)
+            .is_ok());
         let both = grant(&f.operator, CHANNEL, f.acceptor, Direction::Both, NOW + 60);
-        assert!(f.check(ChannelRole::Initiate).verify(&prelude_of(&both), NOW).is_ok(), "Both satisfies either role");
+        assert!(
+            f.check(ChannelRole::Initiate)
+                .verify(&prelude_of(&both), NOW)
+                .is_ok(),
+            "Both satisfies either role"
+        );
     }
 
     #[test]
@@ -336,7 +565,10 @@ mod tests {
         check.peer_holder = broker_holder;
         let self_signed = grant(&broker, CHANNEL, broker_holder, Direction::Accept, NOW + 60);
         let err = check.verify(&prelude_of(&self_signed), NOW).unwrap_err();
-        assert!(err.contains("does not verify against the operator key"), "{err}");
+        assert!(
+            err.contains("does not verify against the operator key"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -344,10 +576,40 @@ mod tests {
         let f = Fixture::new();
         let check = f.check(ChannelRole::Initiate);
         let cases = [
-            (grant(&f.operator, [0x77; 32], f.acceptor, Direction::Accept, NOW + 60), "different channel"),
-            (grant(&f.operator, CHANNEL, f.initiator, Direction::Accept, NOW + 60), "another holder"),
-            (grant(&f.operator, CHANNEL, f.acceptor, Direction::Initiate, NOW + 60), "opposite direction"),
-            (grant(&f.operator, CHANNEL, f.acceptor, Direction::Accept, NOW), "does not verify"),
+            (
+                grant(
+                    &f.operator,
+                    [0x77; 32],
+                    f.acceptor,
+                    Direction::Accept,
+                    NOW + 60,
+                ),
+                "different channel",
+            ),
+            (
+                grant(
+                    &f.operator,
+                    CHANNEL,
+                    f.initiator,
+                    Direction::Accept,
+                    NOW + 60,
+                ),
+                "another holder",
+            ),
+            (
+                grant(
+                    &f.operator,
+                    CHANNEL,
+                    f.acceptor,
+                    Direction::Initiate,
+                    NOW + 60,
+                ),
+                "opposite direction",
+            ),
+            (
+                grant(&f.operator, CHANNEL, f.acceptor, Direction::Accept, NOW),
+                "does not verify",
+            ),
         ];
         for (g, why) in cases {
             let err = check.verify(&prelude_of(&g), NOW).unwrap_err();
@@ -360,15 +622,31 @@ mod tests {
     #[test]
     fn the_policy_is_off_by_default_and_fails_closed_without_an_operator_key() {
         let lookup = |pairs: &'static [(&'static str, &'static str)]| {
-            move |k: &str| pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string())
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == k)
+                    .map(|(_, v)| v.to_string())
+            }
         };
         assert_eq!(PeerGrantPolicy::from_lookup(lookup(&[])), Ok(None));
-        assert!(PeerGrantPolicy::from_lookup(lookup(&[(REQUIRE_PEER_GRANT_ENV, "1")])).unwrap_err().contains(OPERATOR_PUBKEY_ENV));
+        assert!(
+            PeerGrantPolicy::from_lookup(lookup(&[(REQUIRE_PEER_GRANT_ENV, "1")]))
+                .unwrap_err()
+                .contains(OPERATOR_PUBKEY_ENV)
+        );
         let key = "11".repeat(32);
         let key: &'static str = Box::leak(key.into_boxed_str());
-        let pairs: &'static [(&'static str, &'static str)] =
-            Box::leak(Box::new([(REQUIRE_PEER_GRANT_ENV, "on"), (OPERATOR_PUBKEY_ENV, key)]));
-        assert_eq!(PeerGrantPolicy::from_lookup(lookup(pairs)), Ok(Some(PeerGrantPolicy { operator: [0x11; 32] })));
+        let pairs: &'static [(&'static str, &'static str)] = Box::leak(Box::new([
+            (REQUIRE_PEER_GRANT_ENV, "on"),
+            (OPERATOR_PUBKEY_ENV, key),
+        ]));
+        assert_eq!(
+            PeerGrantPolicy::from_lookup(lookup(pairs)),
+            Ok(Some(PeerGrantPolicy {
+                operator: [0x11; 32]
+            }))
+        );
     }
 
     /// Two gated sessions joined by an in-memory "tunnel" (standing in for the Noise pump): returns
@@ -376,7 +654,11 @@ mod tests {
     fn session_pair(
         a: Option<PeerGrantCheck>,
         b: Option<PeerGrantCheck>,
-    ) -> (tokio::io::DuplexStream, tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (app_a, local_a) = tokio::io::duplex(4096);
         let (app_b, local_b) = tokio::io::duplex(4096);
         let mut gate_a = PeerGrantGate::new(local_a, a);
@@ -390,7 +672,10 @@ mod tests {
     #[tokio::test]
     async fn verified_members_exchange_application_data() {
         let f = Fixture::new();
-        let (mut a, mut b, tunnel) = session_pair(Some(f.check(ChannelRole::Initiate)), Some(f.check(ChannelRole::Accept)));
+        let (mut a, mut b, tunnel) = session_pair(
+            Some(f.check(ChannelRole::Initiate)),
+            Some(f.check(ChannelRole::Accept)),
+        );
         a.write_all(b"prompt").await.unwrap();
         let mut got = [0u8; 6];
         b.read_exact(&mut got).await.unwrap();
@@ -407,13 +692,22 @@ mod tests {
         // prompt -- written before the exchange completes -- never leaves it.
         let f = Fixture::new();
         let mut forged = f.check(ChannelRole::Accept);
-        forged.own_grant =
-            grant(&SigningKey::from_bytes(&[0x66; 32]), CHANNEL, f.acceptor, Direction::Accept, crate::codec::now_unix() + 3600);
-        let (mut a, mut b, tunnel) = session_pair(Some(f.check(ChannelRole::Initiate)), Some(forged));
+        forged.own_grant = grant(
+            &SigningKey::from_bytes(&[0x66; 32]),
+            CHANNEL,
+            f.acceptor,
+            Direction::Accept,
+            crate::codec::now_unix() + 3600,
+        );
+        let (mut a, mut b, tunnel) =
+            session_pair(Some(f.check(ChannelRole::Initiate)), Some(forged));
         a.write_all(b"secret prompt").await.unwrap();
         let mut got = Vec::new();
         let read = tokio::time::timeout(Duration::from_secs(2), b.read_to_end(&mut got)).await;
-        assert!(!String::from_utf8_lossy(&got).contains("secret"), "the prompt leaked: {got:?}");
+        assert!(
+            !String::from_utf8_lossy(&got).contains("secret"),
+            "the prompt leaked: {got:?}"
+        );
         assert!(read.is_ok(), "the session ended instead of hanging");
         tunnel.abort();
     }
@@ -441,14 +735,20 @@ mod tests {
         let (mut b_app, b_local) = tokio::io::duplex(16 * 1024);
         let mut b_check = f.check(ChannelRole::Accept);
         if forge_acceptor {
-            b_check.own_grant =
-                grant(&SigningKey::from_bytes(&[0x66; 32]), CHANNEL, f.acceptor, Direction::Accept, crate::codec::now_unix() + 3600);
+            b_check.own_grant = grant(
+                &SigningKey::from_bytes(&[0x66; 32]),
+                CHANNEL,
+                f.acceptor,
+                Direction::Accept,
+                crate::codec::now_unix() + 3600,
+            );
         }
         let a_gate = PeerGrantGate::new(a_local, Some(f.check(ChannelRole::Initiate)));
         let b_gate = PeerGrantGate::new(b_local, Some(b_check));
         let a_task = tokio::spawn(async move {
             let (r, w) = tokio::io::split(a_transport);
-            run_channel_session_on_stream(w, r, ChannelRole::Initiate, &a_priv, &b_pub, a_gate).await
+            run_channel_session_on_stream(w, r, ChannelRole::Initiate, &a_priv, &b_pub, a_gate)
+                .await
         });
         let b_task = tokio::spawn(async move {
             let (r, w) = tokio::io::split(b_transport);
@@ -456,13 +756,17 @@ mod tests {
         });
         a_app.write_all(b"secret prompt").await.unwrap();
         let mut got = vec![0u8; 13];
-        let received = tokio::time::timeout(Duration::from_secs(5), b_app.read_exact(&mut got)).await;
+        let received =
+            tokio::time::timeout(Duration::from_secs(5), b_app.read_exact(&mut got)).await;
         let a_failed = match received {
             Ok(Ok(_)) => false,
             _ => {
                 got.clear();
                 // The session runner still drains the stream (bounded, 30 s) before it returns.
-                matches!(tokio::time::timeout(Duration::from_secs(60), a_task).await, Ok(Ok(Err(_))))
+                matches!(
+                    tokio::time::timeout(Duration::from_secs(60), a_task).await,
+                    Ok(Ok(Err(_)))
+                )
             }
         };
         b_task.abort();
@@ -482,6 +786,91 @@ mod tests {
         assert!(a_failed, "the initiator's session ended with an error");
     }
 
+    /// AUF-20260930-005 (INC-20260930-101): the grant's expiry ends the session it authorized,
+    /// and closes the local side with it -- the mechanism the forward engines' teardown rests on
+    /// (`channel_run::tests` proves the end-to-end effect on real forwarded TCP streams).
+    #[tokio::test(start_paused = true)]
+    async fn an_expiring_grant_ends_the_session_and_closes_the_local_side() {
+        let f = Fixture::new();
+        let mut check = f.check(ChannelRole::Initiate);
+        check.own_grant = grant(
+            &f.operator,
+            CHANNEL,
+            f.initiator,
+            Direction::Initiate,
+            crate::codec::now_unix() + 1,
+        );
+        let (mut app, local) = tokio::io::duplex(4096);
+        let mut gate = PeerGrantGate::new(local, Some(check));
+        let mut prelude = vec![0u8; PRELUDE_LEN];
+        gate.read_exact(&mut prelude).await.unwrap();
+
+        // Past the expiry the session's plaintext side reads EOF -- within the budget, and
+        // without the peer having done anything at all.
+        let mut more = [0u8; 1];
+        let n = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, gate.read(&mut more))
+            .await
+            .expect("the session ends within the teardown budget, not at some later timeout")
+            .expect("an expired grant ends the session as an EOF, so the peer gets a clean FIN");
+        assert_eq!(n, 0);
+        // ... and the local side itself is closed, which is what the forward engine sees.
+        let mut rest = Vec::new();
+        app.read_to_end(&mut rest)
+            .await
+            .expect("the local side is shut down, not left dangling");
+        assert!(rest.is_empty());
+        // Nothing the peer sends can reach the local side any more.
+        assert!(gate.write_all(b"late").await.is_err());
+    }
+
+    /// AUF-20260930-005: the same end, reached by a revocation instead of the clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_revoked_grant_ends_the_session() {
+        let f = Fixture::new();
+        let (mut app, local) = tokio::io::duplex(4096);
+        let mut gate = PeerGrantGate::new(local, Some(f.check(ChannelRole::Initiate)));
+        let revoke = gate
+            .revoke_handle()
+            .expect("the first caller owns the teardown");
+        assert!(
+            gate.revoke_handle().is_none(),
+            "a session has exactly one revoke handle"
+        );
+        let mut prelude = vec![0u8; PRELUDE_LEN];
+        gate.read_exact(&mut prelude).await.unwrap();
+
+        revoke.revoke("the operator revoked the peer's grant");
+        let mut more = [0u8; 1];
+        let n = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, gate.read(&mut more))
+            .await
+            .expect("a revocation ends the session within the teardown budget")
+            .expect("as an EOF, same as an expiry");
+        assert_eq!(n, 0);
+        let mut rest = Vec::new();
+        app.read_to_end(&mut rest).await.unwrap();
+    }
+
+    /// The handle dropped unused must not look like a revocation -- a closed oneshot is "nobody
+    /// can revoke", not "revoked".
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_revoke_handle_unused_leaves_the_session_alone() {
+        let f = Fixture::new();
+        let (app, local) = tokio::io::duplex(4096);
+        let mut gate = PeerGrantGate::new(local, Some(f.check(ChannelRole::Accept)));
+        drop(gate.revoke_handle());
+        let mut prelude = vec![0u8; PRELUDE_LEN];
+        gate.read_exact(&mut prelude).await.unwrap();
+        // Still only the peer-grant timeout can end this session, minutes before the grant's own
+        // expiry (an hour out, see `Fixture::check`) would.
+        let mut more = [0u8; 1];
+        let err = tokio::time::timeout(PEER_GRANT_TIMEOUT * 2, gate.read(&mut more))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        drop(app);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_peer_that_never_presents_its_grant_is_dropped_after_the_timeout() {
         // An ungated peer (an old member) that sends nothing: the gated side gives up.
@@ -492,7 +881,10 @@ mod tests {
         let mut prelude = vec![0u8; PRELUDE_LEN];
         gate.read_exact(&mut prelude).await.unwrap();
         let mut more = [0u8; 1];
-        let err = tokio::time::timeout(PEER_GRANT_TIMEOUT * 2, gate.read(&mut more)).await.unwrap().unwrap_err();
+        let err = tokio::time::timeout(PEER_GRANT_TIMEOUT * 2, gate.read(&mut more))
+            .await
+            .unwrap()
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 }
