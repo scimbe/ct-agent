@@ -665,6 +665,14 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                 .await;
             }
         }
+        // ct-agent#267 (AUF-20261004-022): a forward must survive a peer restart or a relay
+        // drop, so with CT_CHANNEL_FORWARD set (the same env-only selection `channel_local` makes)
+        // the one session becomes a reconnecting session loop over one listener.
+        // trace: AUF-20261004-022 (ct-agent#267)
+        if let Ok(raw) = std::env::var(forward_stream::FORWARD_ENV) {
+            return run_forward_initiate_sessions(&raw, &cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert)
+                .await;
+        }
         return run_one_admission_session(&cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert).await;
     }
     // #200: persistent serve is now CONCURRENT. The #179 loop admitted a peer, served it to
