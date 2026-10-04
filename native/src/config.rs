@@ -2,6 +2,8 @@
 //!
 //! Parsed from environment variables so the Agent runs as a configurable
 //! container node in the Docker testbed.
+//!
+//! trace: REQ-0006, AUF-20260929-006
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -113,8 +115,10 @@ pub struct AgentConfig {
     /// `CT_AGENT_EDGE` as configured, when it names a host rather than an IP literal:
     /// re-resolved on every reconnect (see [`Self::resolve_edge_or`]).
     pub edge_host: Option<String>,
-    /// Local Origin service to expose through the tunnel.
-    pub origin: SocketAddr,
+    /// Local Origin service to expose through the tunnel. Keeps the configured name,
+    /// not only the address it resolved to at startup, so a recreated Origin container
+    /// is followed to its new IP (AUF-20260929-006) -- see [`DialTarget`].
+    pub origin: DialTarget,
     /// Whether the Origin speaks TCP or UDP.
     pub origin_proto: OriginProto,
     /// If set, the Agent runs a direct-path listener and advertises it at this
@@ -212,8 +216,9 @@ pub struct AgentConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasqueFallbackConfig {
     /// Where to dial TCP+TLS+h2 -- the Edge's own public front door
-    /// (`CT_AGENT_MASQUE_PROXY`, e.g. `edge_host:443`).
-    pub proxy_addr: SocketAddr,
+    /// (`CT_AGENT_MASQUE_PROXY`, e.g. `edge_host:443`). A [`DialTarget`], so a front
+    /// door that moved is followed after a failed dial (AUF-20260929-006).
+    pub proxy_addr: DialTarget,
     /// TLS SNI / `:authority` routing this connection to the Edge's registered
     /// MASQUE proxy target (`CT_AGENT_MASQUE_SNI_HOST`; must match `CT_EDGE_
     /// MASQUE_HOST` on that Edge deployment, CADS-Tunnel ADR-0024 M2).
@@ -221,8 +226,9 @@ pub struct MasqueFallbackConfig {
     /// The RFC 9298 CONNECT-UDP target to request (`CT_AGENT_MASQUE_TARGET`;
     /// must match, byte-for-byte once encoded, the deployed `masque-proxy`'s own
     /// `CT_MASQUE_PROXY_TARGET_ADDR` -- an operator-maintained convention across
-    /// the two processes, not something this Agent can verify on its own).
-    pub target: SocketAddr,
+    /// the two processes, not something this Agent can verify on its own). A
+    /// [`DialTarget`] for the same reason as `proxy_addr` (AUF-20260929-006).
+    pub target: DialTarget,
     /// The shared secret this Agent presents as `x-ct-masque-token`
     /// (`CT_AGENT_MASQUE_TOKEN`; must match the deployed `masque-proxy`'s own
     /// `CT_MASQUE_PROXY_TOKEN`, 64-hex). Target-restriction alone only answers
@@ -245,21 +251,28 @@ fn resolve_addr(var: &str, s: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("{var} '{s}' resolved to no address"))
 }
 
-/// Bound on one edge re-resolution; a slow resolver must not stall a reconnect.
-const EDGE_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Bound on one re-resolution; a slow resolver must not stall a reconnect, and must not
+/// hold up the one re-dial a failed Origin connection gets either (AUF-20260929-006).
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The address last resolved for each edge host in this process (see
-/// [`AgentConfig::resolve_edge_or`]).
-static LEARNED_EDGES: std::sync::Mutex<Vec<(String, SocketAddr)>> = std::sync::Mutex::new(Vec::new());
+/// The address last resolved for each host in this process -- edge hosts (see
+/// [`AgentConfig::resolve_edge_or`]) and dial targets (see [`DialTarget`]) alike,
+/// keyed by the configured `host:port` so the two can never collide.
+static LEARNED_ADDRS: std::sync::Mutex<Vec<(String, SocketAddr)>> =
+    std::sync::Mutex::new(Vec::new());
 
-fn learned_edge(host: &str) -> Option<SocketAddr> {
+fn learned_addr(host: &str) -> Option<SocketAddr> {
     use ct_common::sync::MutexExt;
-    LEARNED_EDGES.lock_safe().iter().find(|(h, _)| h == host).map(|(_, a)| *a)
+    LEARNED_ADDRS
+        .lock_safe()
+        .iter()
+        .find(|(h, _)| h == host)
+        .map(|(_, a)| *a)
 }
 
-fn remember_edge(host: &str, addr: SocketAddr) {
+fn remember_addr(host: &str, addr: SocketAddr) {
     use ct_common::sync::MutexExt;
-    let mut learned = LEARNED_EDGES.lock_safe();
+    let mut learned = LEARNED_ADDRS.lock_safe();
     match learned.iter_mut().find(|(h, _)| h == host) {
         Some(entry) => entry.1 = addr,
         None => learned.push((host.to_string(), addr)),
@@ -267,8 +280,9 @@ fn remember_edge(host: &str, addr: SocketAddr) {
 }
 
 /// The DNS answers for `host` ("name:port"). Tests replace the resolver per host with
-/// [`test_dns::set`], so a reconnect loop can be driven through an edge move.
-async fn lookup_edge(host: &str) -> std::io::Result<Vec<SocketAddr>> {
+/// [`test_dns::set`], so a reconnect loop -- or a dial that fails because its target
+/// moved -- can be driven through the move without any real DNS.
+async fn lookup_addrs(host: &str) -> std::io::Result<Vec<SocketAddr>> {
     #[cfg(test)]
     if let Some(answers) = test_dns::get(host) {
         return Ok(answers);
@@ -295,6 +309,117 @@ pub(crate) mod test_dns {
     }
 }
 
+/// A dial destination that remembers the NAME it was configured with, so it can follow a
+/// move (AUF-20260929-006).
+///
+/// WHY: `CT_AGENT_ORIGIN` and `CT_AGENT_MASQUE_TARGET` used to be resolved exactly once, at
+/// startup, into a `SocketAddr` every later dial reused. Recreate the Origin container (a
+/// redeploy, an image bump) and it comes back on a new IP: the agent stays registered, keeps
+/// reporting itself healthy, and answers every single request with an Origin error until
+/// someone restarts it. Measured on core 2026-09-29, all five agents name their Origin
+/// (`help-origin:443`, `ops-origin:443`, ...), so all five carry that failure -- the same class
+/// as the 2026-09-28 edge incident, one hop further in. ct-agent#245 fixed the edge hop
+/// ([`AgentConfig::resolve_edge_or`]) and left this one explicitly open.
+///
+/// COST, decided deliberately: dialing the Origin is on the hot path of EVERY relayed
+/// connection, so this does NOT resolve per connection. [`Self::current`] reads a small
+/// process-wide table (one lock, no DNS, no syscall); only a dial that actually FAILED pays
+/// for [`Self::resolve_again`]. A move therefore costs one failed connection, not a resolver
+/// round trip per request -- and a target configured as an IP literal never resolves at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialTarget {
+    /// What the name resolved to at startup -- the whole address for a literal, and the
+    /// fallback for a name until a re-resolution learns a better one.
+    startup: SocketAddr,
+    /// The configured `host:port`, or `None` when it was an IP literal (never resolved).
+    host: Option<String>,
+}
+
+impl DialTarget {
+    /// A fixed address: no name, so nothing is ever looked up (AC 4).
+    pub fn literal(addr: SocketAddr) -> DialTarget {
+        DialTarget {
+            startup: addr,
+            host: None,
+        }
+    }
+
+    /// Parse `host:port` or `IP:port`, resolving a name once (exactly what the startup
+    /// resolution always did) while keeping the name for later re-resolutions.
+    pub fn parse(var: &str, s: &str) -> Result<DialTarget, String> {
+        let s = s.trim();
+        match s.parse::<SocketAddr>() {
+            Ok(addr) => Ok(DialTarget::literal(addr)),
+            Err(_) => Ok(DialTarget {
+                startup: resolve_once(var, s)?,
+                host: Some(s.to_string()),
+            }),
+        }
+    }
+
+    /// The address to dial NOW: the newest one this process has learned for the name, else
+    /// the startup one. Never touches DNS -- see the type's COST note.
+    pub fn current(&self) -> SocketAddr {
+        match &self.host {
+            Some(host) => learned_addr(host).unwrap_or(self.startup),
+            None => self.startup,
+        }
+    }
+
+    /// Look the name up again after a dial to [`Self::current`] failed, and return the new
+    /// address when it really moved. `None` means "nothing better to try": an IP literal, a
+    /// resolver that failed or timed out, or answers that still contain the address just
+    /// dialed (so the failure was not a move and a re-dial would hit the same host twice).
+    ///
+    /// The new address is remembered process-wide, so the other connections being served
+    /// concurrently -- and every later one -- start from it instead of each paying their own
+    /// failed dial. Among several records the first is taken, but only after the known one
+    /// has been ruled out, so replicas are not reshuffled on every failure.
+    pub async fn resolve_again(&self) -> Option<SocketAddr> {
+        let host = self.host.as_ref()?;
+        let known = self.current();
+        let answers = match tokio::time::timeout(RESOLVE_TIMEOUT, lookup_addrs(host)).await {
+            Ok(Ok(addrs)) if !addrs.is_empty() => addrs,
+            _ => return None,
+        };
+        if answers.contains(&known) {
+            return None;
+        }
+        remember_addr(host, answers[0]);
+        Some(answers[0])
+    }
+}
+
+impl From<SocketAddr> for DialTarget {
+    fn from(addr: SocketAddr) -> DialTarget {
+        DialTarget::literal(addr)
+    }
+}
+
+impl std::fmt::Display for DialTarget {
+    /// Names the configured host AND the address in use, because an operator reading
+    /// "origin error" needs both to tell a move apart from a dead Origin.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.host {
+            Some(host) => write!(f, "{host} ({})", self.current()),
+            None => write!(f, "{}", self.startup),
+        }
+    }
+}
+
+/// One startup resolution of `host:port`. Tests inject answers through [`test_dns`] so a
+/// named target can be built (and then moved) without any real DNS.
+fn resolve_once(var: &str, s: &str) -> Result<SocketAddr, String> {
+    #[cfg(test)]
+    if let Some(answers) = test_dns::get(s) {
+        return answers
+            .first()
+            .copied()
+            .ok_or_else(|| format!("{var} '{s}' resolved to no address"));
+    }
+    resolve_addr(var, s)
+}
+
 impl AgentConfig {
     /// The edge address to dial now. A hostname `CT_AGENT_EDGE` is looked up again, so an
     /// agent running for months follows the edge to a new IP (a recreated Compose service,
@@ -311,13 +436,17 @@ impl AgentConfig {
         let Some(host) = &self.edge_host else {
             return self.edge;
         };
-        let known = learned_edge(host).unwrap_or(last);
-        let answers = match tokio::time::timeout(EDGE_RESOLVE_TIMEOUT, lookup_edge(host)).await {
+        let known = learned_addr(host).unwrap_or(last);
+        let answers = match tokio::time::timeout(RESOLVE_TIMEOUT, lookup_addrs(host)).await {
             Ok(Ok(addrs)) if !addrs.is_empty() => addrs,
             _ => return known,
         };
-        let chosen = if answers.contains(&known) { known } else { answers[0] };
-        remember_edge(host, chosen);
+        let chosen = if answers.contains(&known) {
+            known
+        } else {
+            answers[0]
+        };
+        remember_addr(host, chosen);
         chosen
     }
 
@@ -361,9 +490,12 @@ impl AgentConfig {
     }
 
     pub fn parse(edge: &str, origin: &str) -> Result<AgentConfig, String> {
-        let edge_host = edge.parse::<SocketAddr>().is_err().then(|| edge.trim().to_string());
+        let edge_host = edge
+            .parse::<SocketAddr>()
+            .is_err()
+            .then(|| edge.trim().to_string());
         let edge = resolve_addr("CT_AGENT_EDGE", edge)?;
-        let origin = resolve_addr("CT_AGENT_ORIGIN", origin)?;
+        let origin = DialTarget::parse("CT_AGENT_ORIGIN", origin)?;
         Ok(AgentConfig {
             edge,
             edge_host,
@@ -515,9 +647,9 @@ fn parse_masque_fallback(
                 ));
             };
             Ok(Some(MasqueFallbackConfig {
-                proxy_addr: resolve_addr("CT_AGENT_MASQUE_PROXY", &proxy)?,
+                proxy_addr: DialTarget::parse("CT_AGENT_MASQUE_PROXY", &proxy)?,
                 sni_host: sni_host.trim().to_string(),
-                target: resolve_addr("CT_AGENT_MASQUE_TARGET", &target)?,
+                target: DialTarget::parse("CT_AGENT_MASQUE_TARGET", &target)?,
                 token: token.trim().to_string(),
             }))
         }
@@ -575,13 +707,79 @@ mod tests {
         test_dns::set("replicas.sticky.test:4433", vec![]);
         assert_eq!(cfg.resolve_edge_or(startup).await, a);
     }
+
+    /// AUF-20260929-006, the case measured on core: an Origin container is recreated and
+    /// comes back on a different IP while the agent keeps running. Before this, the name
+    /// was resolved ONCE at startup and every later dial reused that address -- the agent
+    /// stayed registered, reported itself healthy, and answered every request with an
+    /// Origin error. With the resolver injected: first A, then B.
+    #[tokio::test]
+    async fn a_named_dial_target_follows_a_move_and_a_literal_is_never_resolved() {
+        let a: SocketAddr = "192.0.2.20:443".parse().unwrap();
+        let b: SocketAddr = "192.0.2.21:443".parse().unwrap();
+        let host = "moved-origin.test:443";
+        test_dns::set(host, vec![a]);
+        let origin = DialTarget::parse("CT_AGENT_ORIGIN", host).expect("resolves at startup");
+        assert_eq!(
+            origin.current(),
+            a,
+            "the startup resolution, exactly as before"
+        );
+
+        // The container is recreated under the same name. Nothing is looked up until a
+        // dial actually fails -- `current()` is what the hot path calls, and it is silent.
+        test_dns::set(host, vec![b]);
+        assert_eq!(
+            origin.current(),
+            a,
+            "no DNS on the hot path, so the move is not seen yet"
+        );
+        assert_eq!(
+            origin.resolve_again().await,
+            Some(b),
+            "a failed dial follows the move"
+        );
+        assert_eq!(
+            origin.current(),
+            b,
+            "and reaching it costs no further lookup"
+        );
+
+        // Another target for the same name -- what a concurrently served connection holds --
+        // starts from the learned address instead of paying its own failed dial.
+        let other = DialTarget::parse("CT_AGENT_ORIGIN", host).unwrap();
+        assert_eq!(other.current(), b, "learned process-wide, not per instance");
+
+        // Nothing moved since: no second address to try, so the caller keeps its own error
+        // (a down Origin must not cost a re-dial of the very same host).
+        assert_eq!(
+            origin.resolve_again().await,
+            None,
+            "already at the freshest answer"
+        );
+
+        // An IP literal is parsed, never resolved: an answer injected under its own
+        // spelling is proof, because a lookup would have returned `b`.
+        test_dns::set("10.0.0.7:8080", vec![b]);
+        let literal = DialTarget::parse("CT_AGENT_ORIGIN", "10.0.0.7:8080").unwrap();
+        assert_eq!(
+            literal.current(),
+            "10.0.0.7:8080".parse().unwrap(),
+            "no DNS for a literal"
+        );
+        assert_eq!(
+            literal.resolve_again().await,
+            None,
+            "and none on a failed dial either"
+        );
+    }
     use super::*;
 
     #[test]
     fn parses_valid_config() {
         let c = AgentConfig::parse("10.0.0.2:4433", "127.0.0.1:8080").unwrap();
         assert_eq!(c.edge, "10.0.0.2:4433".parse().unwrap());
-        assert_eq!(c.origin, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(c.origin.current(), "127.0.0.1:8080".parse().unwrap());
         assert_eq!(c.origin_proto, OriginProto::Tcp, "defaults to TCP");
         assert_eq!(c.direct_advertise_ip, None, "P2P disabled by default");
     }
@@ -738,7 +936,7 @@ mod tests {
     fn from_env_defaults_when_all_unset() {
         let c = AgentConfig::from_env_with(|_| None).unwrap();
         assert_eq!(c.edge, "127.0.0.1:4433".parse().unwrap());
-        assert_eq!(c.origin, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(c.origin.current(), "127.0.0.1:8080".parse().unwrap());
         assert_eq!(c.origin_proto, OriginProto::Tcp);
         assert_eq!(c.direct_advertise_ip, None);
         assert_eq!(c.metrics_listen, None);
@@ -755,7 +953,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(c.edge, "10.0.0.2:4433".parse().unwrap());
-        assert_eq!(c.origin, "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(c.origin.current(), "127.0.0.1:9000".parse().unwrap());
         assert_eq!(c.origin_proto, OriginProto::Udp);
         assert_eq!(c.direct_advertise_ip, Some("10.5.0.4".parse().unwrap()));
         assert_eq!(c.metrics_listen, Some("0.0.0.0:9101".parse().unwrap()));
@@ -851,9 +1049,9 @@ mod tests {
         ]))
         .unwrap();
         let masque = c.masque_fallback.expect("all four set -> Some");
-        assert_eq!(masque.proxy_addr, "10.0.0.9:443".parse().unwrap());
+        assert_eq!(masque.proxy_addr.current(), "10.0.0.9:443".parse().unwrap());
         assert_eq!(masque.sni_host, "masque.example.org");
-        assert_eq!(masque.target, "10.0.0.9:4433".parse().unwrap());
+        assert_eq!(masque.target.current(), "10.0.0.9:4433".parse().unwrap());
         assert_eq!(masque.token, "a1b2c3");
     }
 
