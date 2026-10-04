@@ -26,6 +26,19 @@
 //! reading) surviving the tunnel would need a fourth frame kind; every actual accept criterion
 //! for this slice is satisfied by whole-stream teardown, so that stays a documented follow-up
 //! rather than added here.
+//!
+//! ## The session's end is the streams' end (AUF-20260930-005, INC-20260930-101)
+//!
+//! Both engines treat "my end of the session duplex went EOF" as "every stream I own is over":
+//! the `JoinSet` is aborted on the spot, which closes each forwarded TCP connection. The
+//! initiate side additionally keeps its listener in the refusing state described at
+//! [`run_forward_initiate_engine`] for as long as it is still alive, so a client that connects
+//! in the gap between the session ending and this task being dropped gets an immediate, logged
+//! close rather than a stream nobody can serve. The session end itself is decided one layer up,
+//! by the grant lifetime the peer-grant gate keeps (`super::peer_grant`): an expiring or
+//! revoked grant closes this duplex, which is why nothing here has to know about grants.
+//
+// trace: AUF-20260930-005 (INC-20260930-101)
 
 use std::collections::HashMap;
 use std::io;
@@ -260,6 +273,14 @@ async fn pump_forward_stream(
 /// to the right stream, and serializes every stream's outbound frames back onto it. One
 /// `tokio::select!` loop, so a session end (the peer's transport closing, read/write error)
 /// drops the whole `JoinSet` — and with it every still-forwarding TCP connection — in one place.
+///
+/// AUF-20260930-005 (INC-20260930-101): that session end is also what an expired or revoked grant
+/// produces, so it must not be a silent `break`. The loop keeps running with `session_ended` set:
+/// every stream is aborted at once, no new stream is opened, and each connection the listener
+/// still accepts is closed immediately with one log line naming why -- until this task itself is
+/// dropped with the session's `LocalDuplex` and the listener goes with it. Either way a client
+/// connecting after the grant ended is refused; it only changes whether it reads the refusal as
+/// an immediate EOF or as a connection error.
 async fn run_forward_initiate_engine(
     engine_side: tokio::io::DuplexStream,
     listener: TcpListener,
@@ -272,12 +293,22 @@ async fn run_forward_initiate_engine(
     let mut inbound_txs: HashMap<u32, mpsc::Sender<StreamIn>> = HashMap::new();
     let mut streams: JoinSet<u32> = JoinSet::new();
     let mut next_id: u32 = 1;
+    let mut session_ended = false;
 
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((tcp, _peer_addr)) => {
+                    Ok((tcp, peer_addr)) => {
+                        if session_ended {
+                            // AUF-20260930-005: the grant is gone, so there is no session to
+                            // carry this connection -- refuse it at once, and say so.
+                            drop(tcp);
+                            eprintln!(
+                                "ct-agent channel: forward listener refused {peer_addr}: the channel session ended (grant expired or revoked)"
+                            );
+                            continue;
+                        }
                         if inbound_txs.len() >= max_streams {
                             // #255 acceptance 3: over the cap, refuse the local connection
                             // immediately (a deterministic close) rather than silently queuing
@@ -301,7 +332,7 @@ async fn run_forward_initiate_engine(
                     Err(e) => eprintln!("ct-agent channel: forward listener accept error: {e}"),
                 }
             }
-            frame = Frame::read(&mut mux_read) => {
+            frame = Frame::read(&mut mux_read), if !session_ended => {
                 match frame {
                     Ok(Frame::Data { id, payload }) => {
                         if let Some(tx) = inbound_txs.get(&id) {
@@ -316,10 +347,19 @@ async fn run_forward_initiate_engine(
                     // The initiate side never receives Open -- only ever sends it. A peer that
                     // sends one anyway gets ignored, not a torn-down session over one bad frame.
                     Ok(Frame::Open { .. }) => {}
-                    Err(_) => break, // the channel session ended
+                    // The channel session ended -- an expired or revoked grant among the reasons
+                    // (AUF-20260930-005). Every forwarded connection dies with it, right here.
+                    Err(_) => {
+                        session_ended = true;
+                        streams.abort_all();
+                        inbound_txs.clear();
+                        eprintln!(
+                            "ct-agent channel: the channel session ended -- closed every forwarded stream, refusing new connections"
+                        );
+                    }
                 }
             }
-            frame = out_rx.recv() => {
+            frame = out_rx.recv(), if !session_ended => {
                 // None: out_tx clones always outlive this branch; unreachable in practice
                 if let Some(f) = frame {
                     if f.write(&mut mux_write).await.is_err() {
@@ -387,7 +427,16 @@ async fn run_forward_accept_engine(
                             let _ = tx.send(StreamIn::Closed).await;
                         }
                     }
-                    Err(_) => break,
+                    // AUF-20260930-005: the session ended (an expired or revoked grant among the
+                    // reasons) -- every target socket this side dialed is closed with the
+                    // JoinSet, which is the accept half of "auf beiden Seiten binnen 5 s".
+                    Err(_) => {
+                        streams.abort_all();
+                        eprintln!(
+                            "ct-agent channel: the channel session ended -- closed every forwarded stream to its target"
+                        );
+                        break;
+                    }
                 }
             }
             frame = out_rx.recv() => {
