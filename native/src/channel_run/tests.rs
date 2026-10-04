@@ -7560,3 +7560,242 @@ async fn channel_forward_streams_stay_open_while_the_grant_is_valid() {
     pair.initiate.abort();
     pair.accept.abort();
 }
+// --- AUF-20261004-022 (ct-agent#267): a session end that is not a grant end reconnects -------
+//
+// trace: AUF-20261004-022 (ct-agent#267)
+//
+// 0.7.36 kept the initiate engine alive after ANY session end, refusing connections and never
+// closing its side of the duplex, so the process hung with a dead forward after a peer restart.
+// These drive `run_forward_initiate_reconnect_loop` with a real Noise session per admission (the
+// broker admission is the only thing stubbed): a peer that goes away is reconnected to, a grant
+// that expires or is revoked leaves the listener refusing without another admission.
+
+/// The two members' peer-grant checks for one channel, both grants expiring at `expires_at`.
+fn forward_grant_checks(expires_at: u64) -> (PeerGrantCheck, PeerGrantCheck) {
+    use ed25519_dalek::Signer as _;
+    let operator = ed25519_dalek::SigningKey::from_bytes(&[0x41u8; 32]);
+    let channel = [0x98u8; 32];
+    let a_holder = ed25519_dalek::SigningKey::from_bytes(&[0x02u8; 32])
+        .verifying_key()
+        .to_bytes();
+    let b_holder = ed25519_dalek::SigningKey::from_bytes(&[0x03u8; 32])
+        .verifying_key()
+        .to_bytes();
+    let sign = |holder: [u8; 32], direction: ct_common::channel::Direction| {
+        let g = ct_common::channel::ChannelGrant {
+            channel: ct_common::channel::ChannelId(channel),
+            holder,
+            direction,
+            rights: ct_common::channel::Rights::ReadWrite,
+            delegable: false,
+            expires_at,
+        };
+        ct_common::channel::SignedChannelGrant {
+            signature: operator.sign(&g.signing_bytes()).to_bytes(),
+            grant: g,
+        }
+    };
+    let policy = PeerGrantPolicy {
+        operator: operator.verifying_key().to_bytes(),
+    };
+    (
+        PeerGrantCheck {
+            policy: policy.clone(),
+            own_grant: sign(a_holder, ct_common::channel::Direction::Initiate),
+            peer_holder: b_holder,
+            role: ChannelRole::Initiate,
+        },
+        PeerGrantCheck {
+            policy,
+            own_grant: sign(b_holder, ct_common::channel::Direction::Accept),
+            peer_holder: a_holder,
+            role: ChannelRole::Accept,
+        },
+    )
+}
+
+/// A reconnecting forward initiator over a stub admission that, per call, starts a fresh gated
+/// accept member and runs the initiate member's real session against it.
+struct ReconnectingForward {
+    bound: SocketAddr,
+    looping: tokio::task::JoinHandle<()>,
+    admissions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Per admission: the accept member's session task (aborting it = the peer restarts).
+    accept_sides: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+    /// Per admission: the initiate member's revoke handle.
+    revokers: std::sync::Arc<std::sync::Mutex<Vec<GrantRevokeHandle>>>,
+}
+
+fn spawn_reconnecting_forward(target: String, expires_at: u64) -> ReconnectingForward {
+    let idle = Duration::from_secs(forward_stream::DEFAULT_IDLE_SECS);
+    let (listener, bound) =
+        bind_forward_listener("127.0.0.1:0".parse().unwrap()).expect("the loopback listener binds");
+    let admissions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accept_sides = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let revokers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (adm, sides, revs, tgt) = (
+        admissions.clone(),
+        accept_sides.clone(),
+        revokers.clone(),
+        target.clone(),
+    );
+    let admit = move |local: LocalDuplex| {
+        adm.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (a_check, b_check) = forward_grant_checks(expires_at);
+        let (a, b) = (generate_static_keypair(), generate_static_keypair());
+        let (a_priv, a_pub, b_priv, b_pub) = (a.private, a.public, b.private, b.public);
+        let (a_transport, b_transport) = tokio::io::duplex(1 << 16);
+        let b_local = forward_accept_local(
+            Some(tgt.clone()),
+            None,
+            forward_stream::DEFAULT_MAX_STREAMS,
+            idle,
+        );
+        let b_gate = PeerGrantGate::new(b_local, Some(b_check));
+        let accept = tokio::spawn(async move {
+            let (br, bw) = tokio::io::split(b_transport);
+            run_channel_session_on_stream(bw, br, ChannelRole::Accept, &b_priv, &a_pub, b_gate)
+                .await
+        });
+        sides.lock().unwrap().push(accept.abort_handle());
+        let revs = revs.clone();
+        async move {
+            // Built inside the admission future, like `gate_local` in the real join path, so it
+            // records into the loop's GrantEndRecord.
+            let mut a_gate = PeerGrantGate::new(local, Some(a_check));
+            revs.lock().unwrap().push(
+                a_gate
+                    .revoke_handle()
+                    .expect("a fresh gate owns its handle"),
+            );
+            let (ar, aw) = tokio::io::split(a_transport);
+            run_channel_session_on_stream(aw, ar, ChannelRole::Initiate, &a_priv, &b_pub, a_gate)
+                .await
+        }
+    };
+    let looping = tokio::spawn(run_forward_initiate_reconnect_loop(
+        listener,
+        target,
+        forward_stream::DEFAULT_MAX_STREAMS,
+        idle,
+        expires_at,
+        admit,
+    ));
+    ReconnectingForward {
+        bound,
+        looping,
+        admissions,
+        accept_sides,
+        revokers,
+    }
+}
+
+impl ReconnectingForward {
+    fn admissions(&self) -> usize {
+        self.admissions.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn wait_for_admissions(&self, n: usize, within: Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        while self.admissions() < n {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        true
+    }
+}
+
+#[tokio::test]
+async fn forward_initiator_reconnects_after_a_session_end_that_is_not_a_grant_end() {
+    // (a) The peer restarts: its session goes away while the grant is valid. The initiator closes
+    // the open stream, re-admits within the first backoff step, and a connection opened after that
+    // reaches the target through the NEW session, on the same listener address.
+    let (target_addr, _target) = spawn_echo_target(2).await;
+    let fwd = spawn_reconnecting_forward(target_addr.to_string(), crate::codec::now_unix() + 3600);
+    let mut first = open_forwarded_stream(fwd.bound, b'a').await;
+    assert_eq!(fwd.admissions(), 1);
+
+    let peer = fwd.accept_sides.lock().unwrap()[0].clone();
+    peer.abort();
+    assert!(
+        forwarded_stream_is_closed(&mut first).await,
+        "the stream of the ended session is closed"
+    );
+    assert!(
+        fwd.wait_for_admissions(2, FORWARD_RECONNECT_MIN + Duration::from_secs(3))
+            .await,
+        "the initiator admits a new session after a session end without a grant end"
+    );
+
+    let mut second = tokio::time::timeout(
+        Duration::from_secs(10),
+        open_forwarded_stream(fwd.bound, b'b'),
+    )
+    .await
+    .expect("the forward connection after the reconnect goes through");
+    second.write_all(b"c").await.unwrap();
+    let mut echoed = [0u8; 1];
+    second.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"c");
+    assert!(!fwd.looping.is_finished());
+    fwd.looping.abort();
+}
+
+#[tokio::test]
+async fn forward_initiator_does_not_reconnect_after_the_grant_expired_and_keeps_refusing() {
+    // (b) The grant runs out: the stream closes as in #264, and no new admission follows -- the
+    // listener stays bound, accepting and closing every connection at once.
+    let grant_secs = 2;
+    let (target_addr, _target) = spawn_echo_target(1).await;
+    let fwd = spawn_reconnecting_forward(
+        target_addr.to_string(),
+        crate::codec::now_unix() + grant_secs,
+    );
+    let mut tcp = open_forwarded_stream(fwd.bound, b'x').await;
+
+    tokio::time::sleep(Duration::from_secs(grant_secs)).await;
+    assert!(
+        forwarded_stream_is_closed(&mut tcp).await,
+        "the grant end closes the stream"
+    );
+    tokio::time::sleep(FORWARD_RECONNECT_MIN * 3).await;
+    assert_eq!(fwd.admissions(), 1, "an expired grant is never re-admitted");
+    for _ in 0..2 {
+        let mut probe = tokio::net::TcpStream::connect(fwd.bound).await.expect(
+            "the listener stays bound after the grant end (#264: closed and logged, not gone)",
+        );
+        let _ = probe.write_all(b"probe").await;
+        assert!(
+            forwarded_stream_is_closed(&mut probe).await,
+            "and it refuses the connection"
+        );
+    }
+    assert_eq!(fwd.admissions(), 1);
+    assert!(!fwd.looping.is_finished());
+    fwd.looping.abort();
+}
+
+#[tokio::test]
+async fn forward_initiator_does_not_reconnect_after_the_grant_was_revoked() {
+    // A revocation is a grant end too, recorded by the gate as state while the grant itself is
+    // still far from expiring -- so it is the record, not the clock, that stops the reconnect.
+    let (target_addr, _target) = spawn_echo_target(1).await;
+    let fwd = spawn_reconnecting_forward(target_addr.to_string(), crate::codec::now_unix() + 3600);
+    let mut tcp = open_forwarded_stream(fwd.bound, b'x').await;
+
+    let revoke = fwd
+        .revokers
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("the session handed out its handle");
+    revoke.revoke("the operator revoked the grant");
+    assert!(forwarded_stream_is_closed(&mut tcp).await);
+    tokio::time::sleep(FORWARD_RECONNECT_MIN * 3).await;
+    assert_eq!(fwd.admissions(), 1, "a revoked grant is never re-admitted");
+    assert!(forward_connection_is_refused(fwd.bound).await);
+    assert!(!fwd.looping.is_finished());
+    fwd.looping.abort();
+}

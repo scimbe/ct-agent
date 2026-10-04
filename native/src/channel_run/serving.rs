@@ -435,6 +435,52 @@ pub(crate) async fn run_one_admission_session(
     run_one_admission_session_with_local(cfg, request, broker_ladder, relay_ladder, front_door_cert, local).await
 }
 
+/// ct-agent#267 (AUF-20261004-022): the plane-brokered one-shot path with `CT_CHANNEL_FORWARD`
+/// set. Binds the forward listener ONCE and keeps re-admitting sessions over it with backoff
+/// ([`super::forward_stream::run_forward_initiate_reconnect_loop`]) instead of running exactly
+/// one session: a peer restart or a relay/network drop no longer ends the forward, only a grant
+/// that expired or was revoked does. A bad spec or a listener that cannot bind still fails loudly
+/// before any admission, as `channel_local`'s forward branch does.
+//
+// trace: AUF-20261004-022 (ct-agent#267)
+pub(crate) async fn run_forward_initiate_sessions(
+    raw_spec: &str,
+    cfg: &ChannelJoinCliConfig,
+    request: &ChannelJoinRequest,
+    broker_ladder: &[ChannelDialRung],
+    relay_ladder: &[ChannelDialRung],
+    front_door_cert: &Option<CertificateDer<'static>>,
+) -> Result<(), BoxError> {
+    use super::forward_stream as fs;
+    let spec = fs::parse_forward_spec(raw_spec)?;
+    let (max_streams, idle) = fs::forward_limits_from_env();
+    let (listener, bound) = fs::bind_forward_listener(spec.listen)?;
+    eprintln!(
+        "ct-agent channel: CT_CHANNEL_FORWARD {bound} -> {} (max_streams={max_streams}, \
+         idle={idle:?}, scimbe/ct-agent#255; reconnects after a session end, #267)",
+        spec.target
+    );
+    fs::run_forward_initiate_reconnect_loop(
+        listener,
+        spec.target,
+        max_streams,
+        idle,
+        request.grant.grant.expires_at,
+        |local| {
+            run_one_admission_session_with_local(
+                cfg,
+                request,
+                broker_ladder,
+                relay_ladder,
+                front_door_cert,
+                ChannelLocal::Forward(Ok(local)),
+            )
+        },
+    )
+    .await;
+    Ok(())
+}
+
 /// [`run_one_admission_session`]'s body, minus its own `channel_local()` call — `local` is supplied
 /// by the caller instead. Exists so a caller that must control the local app stream's lifecycle
 /// itself (ct-agent#47: redialing this admission cycle repeatedly while reusing ONE stdin feed

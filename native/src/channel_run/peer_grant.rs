@@ -39,11 +39,21 @@
 //! the session runs. When it fires, the session's plaintext side EOFs and the local side is
 //! closed underneath it, which ends every forwarded stream on both members within
 //! [`GRANT_TEARDOWN_BUDGET`] and leaves the initiate side's listener refusing new connections.
+//!
+//! ## Telling a grant end from any other session end (ct-agent#267)
+//!
+//! From outside, every session end looks the same: the session future returns. A forward
+//! initiator must reconnect after a peer restart or a relay/network drop, but must NOT after its
+//! grant ran out or was revoked. So the end is recorded as state, not inferred from log text:
+//! whoever runs a session inside [`with_grant_end_record`] gets the [`GrantEndRecord`] that every
+//! gate built within that scope writes its end reason into, at the same moment it logs it.
 //
 // trace: AUF-20260930-005 (INC-20260930-101)
+// trace: AUF-20261004-022 (ct-agent#267)
 
 use std::io;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -174,6 +184,42 @@ impl GrantRevokeHandle {
     }
 }
 
+/// Where a session's grant end is recorded for its caller (ct-agent#267, see the module doc):
+/// `Some(reason)` once a [`PeerGrantGate`] built inside [`with_grant_end_record`] saw its grant
+/// expire or get revoked, `None` for every other way a session can end.
+#[derive(Clone, Default)]
+pub(crate) struct GrantEndRecord(Arc<Mutex<Option<String>>>);
+
+impl GrantEndRecord {
+    fn set(&self, why: &str) {
+        if let Ok(mut slot) = self.0.lock() {
+            slot.get_or_insert_with(|| why.to_string());
+        }
+    }
+
+    /// The recorded grant end, if any. Reading does not clear it.
+    pub(crate) fn ended(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|slot| slot.clone())
+    }
+}
+
+tokio::task_local! {
+    /// The record of the session currently running in this task -- a task-local rather than one
+    /// more parameter through the dozen-argument join path, which builds its gate deep inside
+    /// (`gate_local`). Outside a [`with_grant_end_record`] scope there is none, and a gate then
+    /// records nothing (every caller that does not ask, unchanged).
+    static GRANT_END_RECORD: GrantEndRecord;
+}
+
+/// Run `session` with `record` as the place every [`PeerGrantGate`] it builds writes its grant end
+/// into (ct-agent#267). The gate must be built inside `session` -- on this task, not a spawned one.
+pub(crate) async fn with_grant_end_record<F: std::future::Future>(
+    record: GrantEndRecord,
+    session: F,
+) -> F::Output {
+    GRANT_END_RECORD.scope(record, session).await
+}
+
 /// When the members' grants stop authorizing this session -- the expiry clock and the revocation
 /// side-channel, polled from the session's own plaintext side (see the module doc).
 ///
@@ -189,6 +235,9 @@ struct GrantLifetime {
     revoke: Option<oneshot::Receiver<String>>,
     /// Set exactly once, the operator-facing reason the session ended.
     ended: Option<String>,
+    /// ct-agent#267: the caller's record of that end, when the session runs inside
+    /// [`with_grant_end_record`].
+    record: Option<GrantEndRecord>,
 }
 
 impl GrantLifetime {
@@ -239,6 +288,9 @@ impl GrantLifetime {
         );
         self.expiry = None;
         self.revoke = None;
+        if let Some(record) = &self.record {
+            record.set(&why);
+        }
         self.ended = Some(why);
         true
     }
@@ -303,6 +355,7 @@ impl<P> PeerGrantGate<P> {
                 expiry,
                 revoke: Some(revoke),
                 ended: None,
+                record: GRANT_END_RECORD.try_with(GrantEndRecord::clone).ok(),
             },
             revoker: Some(GrantRevokeHandle(revoker)),
         }

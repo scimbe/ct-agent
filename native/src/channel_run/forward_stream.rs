@@ -30,19 +30,32 @@
 //! ## The session's end is the streams' end (AUF-20260930-005, INC-20260930-101)
 //!
 //! Both engines treat "my end of the session duplex went EOF" as "every stream I own is over":
-//! the `JoinSet` is aborted on the spot, which closes each forwarded TCP connection. The
-//! initiate side additionally keeps its listener in the refusing state described at
-//! [`run_forward_initiate_engine`] for as long as it is still alive, so a client that connects
-//! in the gap between the session ending and this task being dropped gets an immediate, logged
-//! close rather than a stream nobody can serve. The session end itself is decided one layer up,
-//! by the grant lifetime the peer-grant gate keeps (`super::peer_grant`): an expiring or
-//! revoked grant closes this duplex, which is why nothing here has to know about grants.
+//! the `JoinSet` is aborted on the spot, which closes each forwarded TCP connection, and the
+//! engine returns, which EOFs its side of the duplex so the session pump finishes too. The
+//! session end itself is decided one layer up, by the grant lifetime the peer-grant gate keeps
+//! (`super::peer_grant`): an expiring or revoked grant closes this duplex, which is why the
+//! engine has to know nothing about grants.
+//!
+//! ## A session end is not the forward's end (ct-agent#267, AUF-20261004-022)
+//!
+//! In 0.7.36 the initiate engine stayed alive after its session ended, refusing every new
+//! connection, and never closed its side of the duplex -- so the session never returned and the
+//! process neither exited nor reconnected: a peer restart or a relay drop killed the forward
+//! until a manual restart. Now the listener belongs to [`run_forward_initiate_reconnect_loop`],
+//! which hands it to one fresh engine per session. When a session ends for any reason other than
+//! a grant end (recorded as state by the gate, [`super::peer_grant::GrantEndRecord`], or this
+//! member's own grant past its expiry), the loop admits a new session after a backoff of
+//! [`FORWARD_RECONNECT_MIN`] doubling up to [`FORWARD_RECONNECT_MAX`]; connections made in the
+//! meantime wait in the listen backlog and are served by the next session. After a grant end the
+//! listener stays open but refuses every connection with a log line (#264), without reconnecting.
 //
 // trace: AUF-20260930-005 (INC-20260930-101)
+// trace: AUF-20261004-022 (ct-agent#267)
 
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -159,16 +172,142 @@ pub(crate) fn forward_initiate_local(
     max_streams: usize,
     idle: Duration,
 ) -> io::Result<(LocalDuplex, SocketAddr)> {
-    let std_listener = std::net::TcpListener::bind(spec.listen)?;
+    let (listener, bound) = bind_forward_listener(spec.listen)?;
+    let local = forward_initiate_on(listener, spec.target.clone(), max_streams, idle);
+    Ok((local, bound))
+}
+
+/// Bind the initiate side's loopback listener (synchronously, see [`forward_initiate_local`]),
+/// shareable so it can outlive any one session (ct-agent#267).
+pub(crate) fn bind_forward_listener(
+    listen: SocketAddr,
+) -> io::Result<(Arc<TcpListener>, SocketAddr)> {
+    let std_listener = std::net::TcpListener::bind(listen)?;
     std_listener.set_nonblocking(true)?;
     let listener = TcpListener::from_std(std_listener)?;
     let bound = listener.local_addr()?;
+    Ok((Arc::new(listener), bound))
+}
+
+/// One session's initiate-side local app duplex over an already-bound, shared `listener`
+/// (ct-agent#267): the engine accepts on it only while its session runs.
+pub(crate) fn forward_initiate_on(
+    listener: Arc<TcpListener>,
+    target: String,
+    max_streams: usize,
+    idle: Duration,
+) -> LocalDuplex {
     let (session_side, engine_side) = tokio::io::duplex(ENGINE_DUPLEX_BUF);
-    let target = spec.target.clone();
     let pump = TaskGuard::spawn(async move {
         run_forward_initiate_engine(engine_side, listener, target, max_streams, idle).await;
     });
-    Ok((LocalDuplex::with_pump(session_side, pump), bound))
+    LocalDuplex::with_pump(session_side, pump)
+}
+
+/// [`FORWARD_MAX_STREAMS_ENV`] and [`FORWARD_IDLE_SECS_ENV`] from the process environment.
+pub(crate) fn forward_limits_from_env() -> (usize, Duration) {
+    (
+        max_streams_from_env(std::env::var(FORWARD_MAX_STREAMS_ENV).ok().as_deref()),
+        idle_timeout_from_env(std::env::var(FORWARD_IDLE_SECS_ENV).ok().as_deref()),
+    )
+}
+
+/// The first wait before re-admitting a forward session that ended without a grant end.
+pub const FORWARD_RECONNECT_MIN: Duration = Duration::from_secs(1);
+/// The cap the wait doubles up to; a session that ran at least this long counts as healthy and
+/// resets the wait to [`FORWARD_RECONNECT_MIN`].
+pub const FORWARD_RECONNECT_MAX: Duration = Duration::from_secs(30);
+
+/// The wait before the next admission (ct-agent#267): `prev` is the wait used before the session
+/// that just ended (`None` for the first), `lasted` how long that session ran.
+pub(crate) fn next_forward_reconnect_delay(prev: Option<Duration>, lasted: Duration) -> Duration {
+    match prev {
+        Some(p) if lasted < FORWARD_RECONNECT_MAX => (p * 2).min(FORWARD_RECONNECT_MAX),
+        _ => FORWARD_RECONNECT_MIN,
+    }
+}
+
+/// Why the session that just ended must not be replaced, decided from state only
+/// (ct-agent#267): the gate's recorded grant end, or this member's own grant past its expiry
+/// (`now >= expires_at`, the rule `verify_stateless` applies) -- the latter also covers a member
+/// running without the peer-grant check, whose gate records nothing. `None`: reconnect.
+pub(crate) fn forward_grant_end(
+    recorded: Option<String>,
+    own_expires_at: u64,
+    now: u64,
+) -> Option<String> {
+    recorded.or_else(|| {
+        (now >= own_expires_at)
+            .then(|| format!("this member's channel grant expired (expires_at {own_expires_at})"))
+    })
+}
+
+/// The #264 end state after a grant end: the listener stays bound and every connection is
+/// closed at once, each with one log line naming why. Never returns.
+async fn refuse_forward_connections(listener: &TcpListener, why: &str) {
+    loop {
+        match listener.accept().await {
+            Ok((tcp, peer_addr)) => {
+                drop(tcp);
+                eprintln!("ct-agent channel: forward listener refused {peer_addr}: {why}");
+            }
+            Err(e) => {
+                eprintln!("ct-agent channel: forward listener accept error: {e}");
+                // An accept error (e.g. EMFILE) can repeat immediately; do not spin on it.
+                tokio::time::sleep(FORWARD_RECONNECT_MIN).await;
+            }
+        }
+    }
+}
+
+/// The initiate side's session loop (ct-agent#267, see the module doc): one shared `listener`,
+/// one fresh engine and one `admit` call per session, reconnecting with backoff until a grant
+/// end, after which it refuses connections for good. `admit` runs one whole session (admission
+/// included) over the duplex it is given and returns when that session ends; it is the seam the
+/// tests drive without a broker. Returns only if the listener's refusing loop ever could.
+pub(crate) async fn run_forward_initiate_reconnect_loop<A, Fut, E>(
+    listener: Arc<TcpListener>,
+    target: String,
+    max_streams: usize,
+    idle: Duration,
+    own_expires_at: u64,
+    mut admit: A,
+) where
+    A: FnMut(LocalDuplex) -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let mut delay: Option<Duration> = None;
+    loop {
+        let record = super::peer_grant::GrantEndRecord::default();
+        let local = forward_initiate_on(listener.clone(), target.clone(), max_streams, idle);
+        let started = std::time::Instant::now();
+        let outcome = super::peer_grant::with_grant_end_record(record.clone(), admit(local)).await;
+        let lasted = started.elapsed();
+        if let Some(why) =
+            forward_grant_end(record.ended(), own_expires_at, crate::codec::now_unix())
+        {
+            eprintln!(
+                "ct-agent channel: forward session ended after {lasted:?}: {why} -- not reconnecting, \
+                 the forward listener refuses every new connection (#264, #267)"
+            );
+            refuse_forward_connections(&listener, &why).await;
+            return;
+        }
+        let wait = next_forward_reconnect_delay(delay, lasted);
+        delay = Some(wait);
+        match outcome {
+            Ok(()) => eprintln!(
+                "ct-agent channel: forward session ended after {lasted:?} without a grant end \
+                 (peer restart or relay/network drop) -- reconnecting in {wait:?} (#267)"
+            ),
+            Err(e) => eprintln!(
+                "ct-agent channel: forward session failed after {lasted:?}: {e} -- reconnecting \
+                 in {wait:?} (#267)"
+            ),
+        }
+        tokio::time::sleep(wait).await;
+    }
 }
 
 /// The accept side's local app duplex (#255 slice 2): no listener to bind (this side only ever
@@ -275,15 +414,14 @@ async fn pump_forward_stream(
 /// drops the whole `JoinSet` — and with it every still-forwarding TCP connection — in one place.
 ///
 /// AUF-20260930-005 (INC-20260930-101): that session end is also what an expired or revoked grant
-/// produces, so it must not be a silent `break`. The loop keeps running with `session_ended` set:
-/// every stream is aborted at once, no new stream is opened, and each connection the listener
-/// still accepts is closed immediately with one log line naming why -- until this task itself is
-/// dropped with the session's `LocalDuplex` and the listener goes with it. Either way a client
-/// connecting after the grant ended is refused; it only changes whether it reads the refusal as
-/// an immediate EOF or as a connection error.
+/// produces: every stream is aborted at once and logged. ct-agent#267: the engine then RETURNS, so
+/// its side of the duplex closes and the session pump finishes; in 0.7.36 it stayed alive
+/// refusing connections instead, which kept the session -- and the process -- hanging. What
+/// happens to the listener next is [`run_forward_initiate_reconnect_loop`]'s decision (or, for a
+/// listener this engine owns alone, it is simply dropped and connects are refused).
 async fn run_forward_initiate_engine(
     engine_side: tokio::io::DuplexStream,
-    listener: TcpListener,
+    listener: Arc<TcpListener>,
     target: String,
     max_streams: usize,
     idle: Duration,
@@ -293,22 +431,12 @@ async fn run_forward_initiate_engine(
     let mut inbound_txs: HashMap<u32, mpsc::Sender<StreamIn>> = HashMap::new();
     let mut streams: JoinSet<u32> = JoinSet::new();
     let mut next_id: u32 = 1;
-    let mut session_ended = false;
 
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((tcp, peer_addr)) => {
-                        if session_ended {
-                            // AUF-20260930-005: the grant is gone, so there is no session to
-                            // carry this connection -- refuse it at once, and say so.
-                            drop(tcp);
-                            eprintln!(
-                                "ct-agent channel: forward listener refused {peer_addr}: the channel session ended (grant expired or revoked)"
-                            );
-                            continue;
-                        }
+                    Ok((tcp, _peer_addr)) => {
                         if inbound_txs.len() >= max_streams {
                             // #255 acceptance 3: over the cap, refuse the local connection
                             // immediately (a deterministic close) rather than silently queuing
@@ -332,7 +460,7 @@ async fn run_forward_initiate_engine(
                     Err(e) => eprintln!("ct-agent channel: forward listener accept error: {e}"),
                 }
             }
-            frame = Frame::read(&mut mux_read), if !session_ended => {
+            frame = Frame::read(&mut mux_read) => {
                 match frame {
                     Ok(Frame::Data { id, payload }) => {
                         if let Some(tx) = inbound_txs.get(&id) {
@@ -348,18 +476,18 @@ async fn run_forward_initiate_engine(
                     // sends one anyway gets ignored, not a torn-down session over one bad frame.
                     Ok(Frame::Open { .. }) => {}
                     // The channel session ended -- an expired or revoked grant among the reasons
-                    // (AUF-20260930-005). Every forwarded connection dies with it, right here.
+                    // (AUF-20260930-005). Every forwarded connection dies with it, right here, and
+                    // the engine ends so the session can too (ct-agent#267).
                     Err(_) => {
-                        session_ended = true;
                         streams.abort_all();
-                        inbound_txs.clear();
                         eprintln!(
-                            "ct-agent channel: the channel session ended -- closed every forwarded stream, refusing new connections"
+                            "ct-agent channel: the channel session ended -- closed every forwarded stream"
                         );
+                        break;
                     }
                 }
             }
-            frame = out_rx.recv(), if !session_ended => {
+            frame = out_rx.recv() => {
                 // None: out_tx clones always outlive this branch; unreachable in practice
                 if let Some(f) = frame {
                     if f.write(&mut mux_write).await.is_err() {
@@ -527,6 +655,44 @@ mod tests {
         let non_loopback = parse_forward_spec("203.0.113.9:2222=127.0.0.1:5432")
             .expect_err("must refuse a non-loopback local address");
         assert!(non_loopback.contains("loopback"), "{non_loopback}");
+    }
+
+    // trace: AUF-20261004-022 (ct-agent#267)
+    #[test]
+    fn reconnect_backoff_doubles_from_one_second_to_thirty_and_resets_after_a_healthy_session() {
+        let short = Duration::from_millis(10);
+        let mut prev = None;
+        let mut seen = Vec::new();
+        for _ in 0..7 {
+            let d = next_forward_reconnect_delay(prev, short);
+            seen.push(d.as_secs());
+            prev = Some(d);
+        }
+        assert_eq!(seen, [1, 2, 4, 8, 16, 30, 30]);
+        assert_eq!(
+            next_forward_reconnect_delay(Some(FORWARD_RECONNECT_MAX), FORWARD_RECONNECT_MAX),
+            FORWARD_RECONNECT_MIN,
+            "a session that ran for the cap counts as healthy"
+        );
+    }
+
+    // trace: AUF-20261004-022 (ct-agent#267)
+    #[test]
+    fn only_a_recorded_grant_end_or_an_expired_own_grant_stops_the_reconnect() {
+        assert_eq!(
+            forward_grant_end(None, 1_000, 999),
+            None,
+            "a valid grant reconnects"
+        );
+        assert!(
+            forward_grant_end(None, 1_000, 1_000).is_some(),
+            "now == expires_at is expired"
+        );
+        assert_eq!(
+            forward_grant_end(Some("revoked".into()), 1_000, 0).as_deref(),
+            Some("revoked"),
+            "a recorded end wins even while the own grant is still valid"
+        );
     }
 
     #[test]
