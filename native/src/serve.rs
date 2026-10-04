@@ -5,6 +5,8 @@
 //! Noise-encrypted end to end (ADR-0013); the Agent forwards opaque bytes to the
 //! Origin, which terminates the Noise session (P3). The Agent never inspects
 //! them beyond forwarding.
+//!
+//! trace: REQ-0006, AUF-20260929-006
 
 use std::io;
 use std::net::SocketAddr;
@@ -19,10 +21,12 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream};
 
 use crate::reconnect::{Backoff, ReconnectPolicy, Retry};
 use rustls::pki_types::CertificateDer;
-use tokio::io::{copy_bidirectional, join, split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{
+    copy_bidirectional, join, split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf,
+};
 use tokio::net::{TcpStream, UdpSocket};
 
-use crate::config::{AgentConfig, OriginProto};
+use crate::config::{AgentConfig, DialTarget, MasqueFallbackConfig, OriginProto};
 use crate::local_auth;
 use crate::task_guard::{tracked, LiveGauge, TaskGuard, TASKS_LIVE};
 use crate::transport::{
@@ -88,16 +92,44 @@ async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Vec<u8>, BoxEr
 /// instead of failing fast with an operator-visible error.
 const ORIGIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Dial one Origin address, bounded by [`ORIGIN_CONNECT_TIMEOUT`].
+async fn dial_origin_addr(addr: SocketAddr) -> Result<TcpStream, BoxError> {
+    tokio::time::timeout(ORIGIN_CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| -> BoxError {
+            format!(
+                "connect to origin {addr} stalled after {ORIGIN_CONNECT_TIMEOUT:?} (ct-agent#58)"
+            )
+            .into()
+        })?
+        .map_err(BoxError::from)
+}
+
 /// Dial the locally-configured Origin, bounded by [`ORIGIN_CONNECT_TIMEOUT`] — the
 /// one place every relay-serving function in this file reaches the Origin, so the
 /// bound can never drift between call sites (ct-agent#58).
-async fn connect_origin(origin: SocketAddr) -> Result<TcpStream, BoxError> {
-    tokio::time::timeout(ORIGIN_CONNECT_TIMEOUT, TcpStream::connect(origin))
-        .await
-        .map_err(|_| -> BoxError {
-            format!("connect to origin {origin} stalled after {ORIGIN_CONNECT_TIMEOUT:?} (ct-agent#58)").into()
-        })?
-        .map_err(BoxError::from)
+///
+/// AUF-20260929-006: the Origin is a [`DialTarget`], not a `SocketAddr` frozen at startup.
+/// The common case is unchanged and costs nothing extra -- one dial to the address already
+/// known. Only when that dial FAILS is the name looked up again, and only if the answer
+/// really moved is the dial retried, once, against the new address. That is what turns a
+/// recreated Origin container (new IP, same name) from a permanently broken tunnel into a
+/// single failed connection; a genuinely down Origin still fails fast with its own error,
+/// because a name that did not move is never re-dialed.
+async fn connect_origin(origin: &DialTarget) -> Result<TcpStream, BoxError> {
+    let addr = origin.current();
+    let first = match dial_origin_addr(addr).await {
+        Ok(tcp) => return Ok(tcp),
+        Err(e) => e,
+    };
+    let Some(moved) = origin.resolve_again().await else {
+        return Err(first);
+    };
+    eprintln!(
+        "ct-agent: origin {origin} did not answer at {addr} ({first}); it resolves to {moved} \
+         now -- re-dialing there (AUF-20260929-006)"
+    );
+    dial_origin_addr(moved).await
 }
 
 /// Serve one relayed QUIC stream: dial the local `origin` (TCP) and relay bytes
@@ -107,7 +139,7 @@ async fn connect_origin(origin: SocketAddr) -> Result<TcpStream, BoxError> {
 pub async fn serve_stream_to_origin(
     quic_send: SendStream,
     quic_recv: RecvStream,
-    origin: SocketAddr,
+    origin: impl Into<DialTarget>,
     terminator: Option<Arc<OriginTerminator>>,
 ) -> Result<(), BoxError> {
     serve_duplex_to_origin(join(quic_recv, quic_send), origin, terminator).await
@@ -342,7 +374,7 @@ const ORIGIN_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// serve functions discard the `Err`.
 async fn terminate_tls_then_forward<T>(
     client: Prefixed<T>,
-    origin: SocketAddr,
+    origin: &DialTarget,
     terminator: &OriginTerminator,
 ) -> Result<(), BoxError>
 where
@@ -418,12 +450,13 @@ where
 /// case it is refused; `None` never inspects the bytes beyond the read it always did.
 pub async fn serve_duplex_to_origin<T>(
     mut client: T,
-    origin: SocketAddr,
+    origin: impl Into<DialTarget>,
     terminator: Option<Arc<OriginTerminator>>,
 ) -> Result<(), BoxError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    let origin = origin.into();
     let mut first = [0u8; 4096];
     let n = client.read(&mut first).await?;
     if n == 0 {
@@ -431,7 +464,8 @@ where
     }
     if let Some(terminator) = terminator {
         if looks_like_tls_client_hello(&first[..n]) {
-            return terminate_tls_then_forward(Prefixed::new(first[..n].to_vec(), client), origin, &terminator).await;
+            let client = Prefixed::new(first[..n].to_vec(), client);
+            return terminate_tls_then_forward(client, &origin, &terminator).await;
         }
         // #214 fails closed: the owner-auth preamble runs inside the terminated TLS session, so a
         // stream that never offered a ClientHello this sniff accepts (TLS stripped upstream, or a
@@ -446,7 +480,7 @@ where
             return Err(format!("origin TLS terminate: {e}").into());
         }
     }
-    let mut tcp = connect_origin(origin).await?;
+    let mut tcp = connect_origin(&origin).await?;
     tcp.write_all(&first[..n]).await?;
     copy_bidirectional(&mut client, &mut tcp).await?;
     Ok(())
@@ -600,10 +634,14 @@ where
 /// against anything — the edge reader owns it and blocks on it alone. The only
 /// `select!` on the read side is the writer's, over its (cancel-safe) queue and a
 /// timer; the Origin reader likewise races nothing.
-pub async fn serve_framed_duplex_to_origin<T>(edge: T, origin: SocketAddr) -> Result<(), BoxError>
+pub async fn serve_framed_duplex_to_origin<T>(
+    edge: T,
+    origin: impl Into<DialTarget>,
+) -> Result<(), BoxError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    let origin = origin.into();
     let (edge_r, edge_w) = split(edge);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<EdgeWrite>(FRAMED_WRITE_QUEUE);
     // The Origin is dialed by the edge→origin half (it sees the first DATA); its
@@ -642,7 +680,7 @@ where
                     let w = match origin_w.as_mut() {
                         Some(w) => w,
                         None => {
-                            let (r, w) = connect_origin(origin).await?.into_split();
+                            let (r, w) = connect_origin(&origin).await?.into_split();
                             // `origin_w` is only ever `None` before the first dial, so
                             // the oneshot is still here; a missing sender would be a
                             // logic error -- reported, not panicked on (ct-agent#176).
@@ -1497,7 +1535,7 @@ async fn await_first_relayed_bytes<S: AsyncRead + Unpin>(stream: &mut S) -> Resu
 pub async fn serve_noise_stream<S, R>(
     send: S,
     recv: R,
-    origin: SocketAddr,
+    origin: impl Into<DialTarget>,
     origin_keys: &[[u8; 32]],
     metrics: Arc<TunnelMetrics>,
     gate: &local_auth::LocalAuthGate,
@@ -1576,7 +1614,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for PreAuth<T> {
 pub async fn serve_noise_stream_with_policy<S, R>(
     send: S,
     recv: R,
-    origin: SocketAddr,
+    origin: impl Into<DialTarget>,
     origin_keys: &[[u8; 32]],
     metrics: Arc<TunnelMetrics>,
     gate: &local_auth::LocalAuthGate,
@@ -1587,6 +1625,7 @@ where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    let origin = origin.into();
     let mut buf = vec![0u8; 65535];
     // The direct path bounds everything before the peer is authenticated -- handshake and
     // local-auth gate -- by one deadline (see `DirectLimits::setup_timeout`); lifted below.
@@ -1660,7 +1699,7 @@ where
     // Meter the Origin socket: bytes read from it flow back to the Client
     // (bytes_to_client); bytes written to it came from the Client
     // (bytes_to_origin).
-    let tcp = connect_origin(origin).await?;
+    let tcp = connect_origin(&origin).await?;
     let mut tcp = Metered::new(
         tcp,
         Arc::clone(&metrics.bytes_to_client),
@@ -1686,7 +1725,7 @@ where
 pub async fn serve_noise_udp<S, R>(
     send: S,
     recv: R,
-    origin: SocketAddr,
+    origin: impl Into<DialTarget>,
     origin_keys: &[[u8; 32]],
 ) -> Result<(), BoxError>
 where
@@ -1703,7 +1742,7 @@ where
 pub async fn serve_noise_udp_with_policy<S, R>(
     send: S,
     recv: R,
-    origin: SocketAddr,
+    origin: impl Into<DialTarget>,
     origin_keys: &[[u8; 32]],
     direct_policy: Option<&DirectTokenPolicy>,
     preauth_deadline: Option<tokio::time::Instant>,
@@ -1712,6 +1751,10 @@ where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    // A UDP "connection" has no handshake that could fail, so there is nothing here to
+    // re-resolve ON: the newest address this process has learned for the name (from a TCP
+    // dial that failed, or an earlier tunnel) is taken per tunnel (AUF-20260929-006).
+    let origin = origin.into().current();
     let mut hbuf = vec![0u8; 65535];
     // See serve_noise_stream_with_policy: the handshake is bounded on the direct path.
     let mut send = PreAuth::new(send, preauth_deadline);
@@ -1794,15 +1837,25 @@ where
 /// it accepted, and finished tasks are reaped as they end rather than accumulating.
 pub async fn serve_direct(
     listener: Endpoint,
-    origin: SocketAddr,
+    origin: DialTarget,
     origin_keys: Arc<Vec<[u8; 32]>>,
     proto: OriginProto,
     metrics: Arc<TunnelMetrics>,
     gate: Arc<local_auth::LocalAuthGate>,
     token_policy: Arc<DirectTokenPolicy>,
 ) -> Result<(), BoxError> {
-    serve_direct_within(listener, origin, origin_keys, proto, metrics, gate, token_policy, DirectLimits::DEFAULT)
-        .await
+    let limits = DirectLimits::DEFAULT;
+    serve_direct_within(
+        listener,
+        origin,
+        origin_keys,
+        proto,
+        metrics,
+        gate,
+        token_policy,
+        limits,
+    )
+    .await
 }
 
 /// Bounds on the direct listener, which anyone who knows the address can reach before
@@ -1831,7 +1884,7 @@ impl DirectLimits {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_direct_within(
     listener: Endpoint,
-    origin: SocketAddr,
+    origin: DialTarget,
     origin_keys: Arc<Vec<[u8; 32]>>,
     proto: OriginProto,
     metrics: Arc<TunnelMetrics>,
@@ -1860,6 +1913,9 @@ pub(crate) async fn serve_direct_within(
         let keys = Arc::clone(&origin_keys);
         let gate = Arc::clone(&gate);
         let policy = Arc::clone(&token_policy);
+        // One clone per accepted connection: the target carries its name, and every clone
+        // shares the one process-wide address learned for it (AUF-20260929-006).
+        let origin = origin.clone();
         conns.spawn(tracked(async move {
             // One deadline for everything before the peer is authenticated: the QUIC/TLS
             // handshake, its first bi-stream, the Noise handshake and the local-auth gate. A
@@ -1878,11 +1934,28 @@ pub(crate) async fn serve_direct_within(
             };
             let served = match proto {
                 OriginProto::Tcp => {
-                    serve_noise_stream_with_policy(send, recv, origin, &keys, metrics, &gate, Some(&policy), Some(deadline))
-                        .await
+                    serve_noise_stream_with_policy(
+                        send,
+                        recv,
+                        origin,
+                        &keys,
+                        metrics,
+                        &gate,
+                        Some(&policy),
+                        Some(deadline),
+                    )
+                    .await
                 }
                 OriginProto::Udp => {
-                    serve_noise_udp_with_policy(send, recv, origin, &keys, Some(&policy), Some(deadline)).await
+                    serve_noise_udp_with_policy(
+                        send,
+                        recv,
+                        origin,
+                        &keys,
+                        Some(&policy),
+                        Some(deadline),
+                    )
+                    .await
                 }
             };
             match &served {
@@ -1949,7 +2022,7 @@ pub(crate) fn render_direct_refused_prometheus() -> String {
 /// re-spawns it on its next iteration and says so.
 struct DirectListener {
     listener: Endpoint,
-    origin: SocketAddr,
+    origin: DialTarget,
     proto: OriginProto,
     origin_keys: Arc<Vec<[u8; 32]>>,
     metrics: Arc<TunnelMetrics>,
@@ -1961,7 +2034,7 @@ impl DirectListener {
     /// Spawn the accept loop; the returned guard aborts it when dropped.
     fn spawn(&self) -> TaskGuard<()> {
         let listener = self.listener.clone();
-        let (origin, proto) = (self.origin, self.proto);
+        let (origin, proto) = (self.origin.clone(), self.proto);
         let keys = Arc::clone(&self.origin_keys);
         let metrics = Arc::clone(&self.metrics);
         let gate = Arc::clone(&self.gate);
@@ -2029,12 +2102,16 @@ pub async fn run_agent(
         if let Ok((listener, cert)) = crate::transport::build_tunnel_direct_listener() {
             if let Ok(bound) = listener.local_addr() {
                 let advertised = SocketAddr::new(ip, bound.port());
-                if let Ok(adv) = dial_quic(config.resolve_edge_or(config.edge).await, edge_cert.clone()).await {
-                    let _ = crate::transport::advertise_direct_listener(&adv, &token, advertised, &cert)
-                        .await;
+                if let Ok(adv) =
+                    dial_quic(config.resolve_edge_or(config.edge).await, edge_cert.clone()).await
+                {
+                    let _ = crate::transport::advertise_direct_listener(
+                        &adv, &token, advertised, &cert,
+                    )
+                    .await;
                     adv.close(0u32.into(), b"advertised");
                 }
-                let (origin, proto) = (config.origin, config.origin_proto);
+                let (origin, proto) = (config.origin.clone(), config.origin_proto);
                 let dmetrics = Arc::clone(&metrics);
                 let dkeys = Arc::clone(&origin_keys);
                 let dgate = Arc::clone(&gate);
@@ -2273,7 +2350,7 @@ pub async fn run_agent(
         let session_started = Instant::now();
         serve_quic_connection(
             &conn,
-            config.origin,
+            &config.origin,
             config.origin_proto,
             config.browser_forward,
             &origin_keys,
@@ -2322,24 +2399,51 @@ async fn try_dial_via_masque(
     edge_cert: CertificateDer<'static>,
 ) -> Option<quinn::Connection> {
     let masque = config.masque_fallback.as_ref()?;
-    match crate::masque::dial_quic_via_masque(
-        masque.proxy_addr,
+    let first = match dial_via_masque_once(masque, edge_cert.clone()).await {
+        Ok(conn) => return Some(conn),
+        Err(e) => e,
+    };
+    // AUF-20260929-006: the front door and the CONNECT-UDP target are configured by name
+    // just like the Origin is, and were likewise resolved once at startup. A failed dial
+    // is the moment to ask DNS again -- and only then; the retry happens solely when one
+    // of the two actually moved, so a down proxy still costs exactly one attempt.
+    let proxy_moved = masque.proxy_addr.resolve_again().await.is_some();
+    let target_moved = masque.target.resolve_again().await.is_some();
+    let second = if proxy_moved || target_moved {
+        eprintln!("ct-agent: MASQUE proxy/target moved; re-dialing once (AUF-20260929-006)");
+        match dial_via_masque_once(masque, edge_cert).await {
+            Ok(conn) => return Some(conn),
+            Err(e) => e,
+        }
+    } else {
+        first
+    };
+    eprintln!(
+        "ct-agent: MASQUE dial to {} also failed ({second})",
+        masque.proxy_addr
+    );
+    let error = format!("MASQUE dial to {} failed: {second}", masque.proxy_addr);
+    crate::status::set_last_error(error.clone());
+    crate::events::emit(
+        crate::events::REGISTRATION_FAILED,
+        serde_json::json!({ "error": error }),
+    );
+    None
+}
+
+/// One MASQUE dial attempt against the addresses the two [`DialTarget`]s currently hold.
+async fn dial_via_masque_once(
+    masque: &MasqueFallbackConfig,
+    edge_cert: CertificateDer<'static>,
+) -> Result<quinn::Connection, BoxError> {
+    crate::masque::dial_quic_via_masque(
+        masque.proxy_addr.current(),
         &masque.sni_host,
-        masque.target,
+        masque.target.current(),
         edge_cert,
         &masque.token,
     )
     .await
-    {
-        Ok(conn) => Some(conn),
-        Err(e) => {
-            eprintln!("ct-agent: MASQUE dial to {} also failed ({e})", masque.proxy_addr);
-            let error = format!("MASQUE dial to {} failed: {e}", masque.proxy_addr);
-            crate::status::set_last_error(error.clone());
-            crate::events::emit(crate::events::REGISTRATION_FAILED, serde_json::json!({ "error": error }));
-            None
-        }
-    }
 }
 
 /// Hostname-bind retry parameters (#502). The window they span (~75s) is sized
@@ -2516,7 +2620,7 @@ pub(crate) fn parse_reconnect_max_attempts(raw: Option<String>) -> u32 {
 #[allow(clippy::too_many_arguments)]
 async fn serve_quic_connection(
     conn: &Connection,
-    origin: SocketAddr,
+    origin: &DialTarget,
     proto: OriginProto,
     browser_forward: bool,
     origin_keys: &[[u8; 32]],
@@ -2555,11 +2659,13 @@ async fn serve_quic_connection(
         // Out of scope for the local-auth gate -- see `local_auth`'s module doc.
         if browser_forward {
             let terminator = terminator.clone();
+            let origin = origin.clone();
             streams.spawn(tracked(async move {
                 let _ = serve_stream_to_origin(send, recv, origin, terminator).await;
             }));
             continue;
         }
+        let origin = origin.clone();
         let keys = origin_keys.to_vec();
         let m = Arc::clone(&metrics);
         let gate = Arc::clone(gate);
@@ -3352,9 +3458,9 @@ async fn tcp_connect_register_serve(
             // this hop, so terminating TLS there needs a frame-to-stream adapter first;
             // until that exists an 'F' registration forwards verbatim, terminator or not.
             let relayed = if framed {
-                serve_framed_duplex_to_origin(stream, config.origin).await
+                serve_framed_duplex_to_origin(stream, config.origin.clone()).await
             } else {
-                serve_duplex_to_origin(stream, config.origin, terminator).await
+                serve_duplex_to_origin(stream, config.origin.clone(), terminator).await
             };
             return match relayed {
                 Ok(()) if was_consumed => Ok(TcpServed::Consumed),
@@ -3430,9 +3536,12 @@ async fn tcp_connect_register_serve(
         }
     };
     let (recv, send) = split(stream);
+    let origin = config.origin.clone();
     let served = match config.origin_proto {
-        OriginProto::Tcp => serve_noise_stream(send, recv, config.origin, origin_keys, Arc::clone(metrics), gate).await,
-        OriginProto::Udp => serve_noise_udp(send, recv, config.origin, origin_keys).await,
+        OriginProto::Tcp => {
+            serve_noise_stream(send, recv, origin, origin_keys, Arc::clone(metrics), gate).await
+        }
+        OriginProto::Udp => serve_noise_udp(send, recv, origin, origin_keys).await,
     };
     match served {
         Ok(()) if was_consumed => Ok(TcpServed::Consumed),
@@ -4852,7 +4961,7 @@ mod tests {
             let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
             let _ = serve_direct(
                 listener,
-                origin_addr,
+                origin_addr.into(),
                 std::sync::Arc::new(vec![opriv]),
                 OriginProto::Tcp,
                 dmetrics,
@@ -4897,7 +5006,7 @@ mod tests {
             let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
             let _ = serve_direct_within(
                 listener,
-                "127.0.0.1:9".parse().unwrap(),
+                DialTarget::literal("127.0.0.1:9".parse().unwrap()),
                 std::sync::Arc::new(vec![[0u8; 32]]),
                 OriginProto::Tcp,
                 std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new()),
@@ -5592,7 +5701,7 @@ mod tests {
             let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
             let _ = serve_direct(
                 listener,
-                origin_addr,
+                origin_addr.into(),
                 std::sync::Arc::new(vec![opriv]),
                 OriginProto::Tcp,
                 dmetrics,
@@ -7577,7 +7686,7 @@ mod tests {
         let config = AgentConfig {
             edge_host: None,
             edge: edge_addr,
-            origin: origin_addr,
+            origin: origin_addr.into(),
             origin_proto: OriginProto::Tcp,
             direct_advertise_ip: None,
             metrics_listen: None,
@@ -7692,6 +7801,42 @@ mod tests {
         origin.abort();
     }
 
+    /// AUF-20260929-006 at the enforcement point. The Origin moves: A is dead, B answers,
+    /// and the name resolves to B from the move onwards. The pre-fix `connect_origin` took
+    /// a `SocketAddr` resolved once at startup, so it dialed the dead A for the rest of the
+    /// process's life -- this test is red against that code and green with the re-dial.
+    #[tokio::test]
+    async fn connect_origin_re_resolves_once_after_a_failed_dial_and_reaches_the_moved_origin() {
+        // A: bound, then dropped -- a port nothing listens on, so the dial is refused fast.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = dead.local_addr().unwrap();
+        drop(dead);
+        let moved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = moved.local_addr().unwrap();
+        let accepted = tokio::spawn(async move { moved.accept().await.map(|_| ()) });
+
+        let host = format!("moved-origin-at-the-dial.test:{}", b.port());
+        crate::config::test_dns::set(&host, vec![a]);
+        let origin = DialTarget::parse("CT_AGENT_ORIGIN", &host).expect("startup resolution");
+        assert_eq!(
+            origin.current(),
+            a,
+            "configured by name, resolved to A at startup"
+        );
+
+        // The container is recreated with a new IP; the agent is NOT restarted.
+        crate::config::test_dns::set(&host, vec![b]);
+        let tcp = connect_origin(&origin)
+            .await
+            .expect("re-resolves once after the failed dial and reaches the moved Origin");
+        assert_eq!(
+            tcp.peer_addr().unwrap(),
+            b,
+            "landed on B, not stuck dialing the dead A"
+        );
+        let _ = accepted.await;
+    }
+
     #[tokio::test]
     async fn serve_duplex_to_origin_dials_the_origin_lazily_after_the_clients_first_bytes() {
         // #229 follow-up: dialing the Origin eagerly (before any Client has
@@ -7743,8 +7888,12 @@ mod tests {
         let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
 
         let started = Instant::now();
-        let result = connect_origin(addr).await;
-        assert!(result.is_ok(), "a real listener must be reachable: {:?}", result.err());
+        let result = connect_origin(&DialTarget::literal(addr)).await;
+        assert!(
+            result.is_ok(),
+            "a real listener must be reachable: {:?}",
+            result.err()
+        );
         assert!(
             started.elapsed() < ORIGIN_CONNECT_TIMEOUT,
             "a live Origin must connect long before the timeout bound"
@@ -7763,7 +7912,9 @@ mod tests {
         drop(listener); // frees the port; nothing is listening on it now
 
         let started = Instant::now();
-        let err = connect_origin(addr).await.expect_err("nothing listens on this port");
+        let err = connect_origin(&DialTarget::literal(addr))
+            .await
+            .expect_err("nothing listens on this port");
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "a real refusal must be fast, not wait out the connect timeout"
