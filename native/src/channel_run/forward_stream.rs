@@ -837,6 +837,19 @@ fn finished_stream_id(
     Some(id)
 }
 
+/// The accept side's mode line for a session: on with the peer's HELLO (or an FC_ON before the
+/// first Open), off when the first stream opens without either (older agent).
+fn accept_mode_line(peer_speaks_fc: bool) -> String {
+    if peer_speaks_fc {
+        format!(
+            "ct-agent channel: forward flow control on for this session (credit window {} KiB per stream, accept side)",
+            FC_WINDOW / 1024
+        )
+    } else {
+        "ct-agent channel: forward flow control off for this session -- the first stream opened without HELLO (older agent, accept side)".to_string()
+    }
+}
+
 /// Sleep until `deadline`; pending forever without one (its select! branch is disabled then).
 async fn sleep_until_some(deadline: Option<tokio::time::Instant>) {
     match deadline {
@@ -1078,7 +1091,13 @@ async fn run_forward_accept_engine(
     tokio::pin!(writer);
     if fc_enabled {
         let _ = ctrl_tx.send(hello_frame());
+    } else {
+        eprintln!("ct-agent channel: forward flow control off on this member ({FORWARD_FLOW_ENV})");
     }
+    // The accept side logs the session's mode too (live run of #274: in operation either node must
+    // show whether a session runs with credit): "on" when the peer's HELLO arrives, "off" when the
+    // first stream opens without it (older agent).
+    let mut mode_logged = !fc_enabled;
     let mut pending_fc = std::collections::HashSet::new();
     let mut entries: HashMap<u32, StreamEntry> = HashMap::new();
     let mut streams: JoinSet<(u32, u64, u64)> = JoinSet::new();
@@ -1104,6 +1123,10 @@ async fn run_forward_accept_engine(
                             break;
                         }
                         let credited = pending_fc.remove(&id);
+                        if !mode_logged {
+                            mode_logged = true;
+                            eprintln!("{}", accept_mode_line(credited));
+                        }
                         if running.len() >= max_streams {
                             if !ctrl_tx.send(Frame::Close { id, reason: Some(format!("{FORWARD_MAX_STREAMS_ENV} reached")) }) {
                                 streams.abort_all();
@@ -1151,7 +1174,13 @@ async fn run_forward_accept_engine(
                                     eprintln!("ct-agent channel: forward session ended -- protocol violation (control flood) -- closed every forwarded stream to its target");
                                     break;
                                 }
-                                ControlOutcome::Hello | ControlOutcome::None => {}
+                                ControlOutcome::Hello => {
+                                    if !mode_logged {
+                                        mode_logged = true;
+                                        eprintln!("{}", accept_mode_line(true));
+                                    }
+                                }
+                                ControlOutcome::None => {}
                             }
                         }
                     }
@@ -1474,6 +1503,15 @@ mod tests {
         .await
         .expect("no Close for the third stream");
         assert!(refused.contains(FORWARD_MAX_STREAMS_ENV), "unexpected reason {refused}");
+    }
+
+    // Live run of #274: the accept side names the session's mode like the initiate side does.
+    #[test]
+    fn accept_mode_line_names_on_and_off() {
+        assert!(accept_mode_line(true).contains("forward flow control on for this session"));
+        assert!(accept_mode_line(true).contains("accept side"));
+        assert!(accept_mode_line(false).contains("forward flow control off for this session"));
+        assert!(accept_mode_line(false).contains("older agent"));
     }
 
     #[test]
