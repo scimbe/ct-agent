@@ -7823,6 +7823,13 @@ async fn read_full_echo_or_clean_refusal(
 // trace: AUF-20261005-016 (DEC-0061)
 #[tokio::test]
 async fn channel_forward_many_short_parallel_streams_do_not_end_the_session() {
+    // A stuck engine (the deadlock this guards against) must fail the test, never hang it.
+    tokio::time::timeout(Duration::from_secs(120), many_short_parallel_streams_body())
+        .await
+        .expect("test hung for 120 s -- the forward engine is stuck");
+}
+
+async fn many_short_parallel_streams_body() {
     // DEC-0061 / AUF-20261005-016: #255's own stream tests (above) each drive ONE forwarded
     // connection at a time. Here, 40 short-lived connections race each other through a forward
     // whose CT_CHANNEL_FORWARD_MAX_STREAMS is the shipped default of 16, and some of the

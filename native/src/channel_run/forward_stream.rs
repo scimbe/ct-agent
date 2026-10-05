@@ -56,6 +56,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -103,10 +104,80 @@ async fn read_one_frame<R: AsyncRead + Unpin>(mut r: R) -> (R, io::Result<Frame>
 /// forwarded byte's round trip through this mux costs no more copying than the base pump would.
 const DATA_CHUNK_LEN: usize = 16 * 1024;
 
-/// Bound on the per-stream inbound queue (peer→local) and the per-engine outbound queue
-/// (every stream's frames, serialized onto the wire by one writer). Backpressure, not data
-/// loss: a full queue makes the sender's `.send().await` wait rather than drop a byte.
+/// Bound on the per-engine outbound queue (every stream's frames, serialized onto the wire by
+/// one writer). Backpressure, not data loss: a full queue makes a pump's `.send().await` wait
+/// rather than drop a byte.
 const CHANNEL_CAP: usize = 64;
+
+/// Byte budget of ONE stream's inbound queue (peer→local). The engine loop must never wait on a
+/// single stream: it is the only reader of the mux AND the only drainer of the outbound queue,
+/// so a blocking send there deadlocks against that stream's pump waiting on the full outbound
+/// queue (second review of #271, AUF-20261005-016). The queue is therefore unbounded in frames
+/// but bounded in bytes: a consumer that falls this far behind gets only its own stream closed;
+/// every other stream and the session keep running.
+const MAX_INBOUND_BUFFER_BYTES: usize = 8 << 20;
+
+/// Why [`InboundTx::push`] refused a message.
+#[derive(Debug, PartialEq, Eq)]
+enum InboundRefused {
+    /// The stream's consumer is more than [`MAX_INBOUND_BUFFER_BYTES`] behind.
+    OverBudget,
+    /// The stream's pump has ended.
+    Gone,
+}
+
+/// Engine side of one stream's inbound queue: never blocks, counts the buffered bytes.
+struct InboundTx {
+    tx: mpsc::UnboundedSender<StreamIn>,
+    pending: Arc<AtomicUsize>,
+}
+
+/// Pump side of one stream's inbound queue: `recv` releases the budget of what it hands out.
+/// Cancel-safe in `select!` like the `UnboundedReceiver::recv` it wraps.
+struct InboundRx {
+    rx: mpsc::UnboundedReceiver<StreamIn>,
+    pending: Arc<AtomicUsize>,
+}
+
+fn inbound_channel() -> (InboundTx, InboundRx) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let pending = Arc::new(AtomicUsize::new(0));
+    (
+        InboundTx {
+            tx,
+            pending: pending.clone(),
+        },
+        InboundRx { rx, pending },
+    )
+}
+
+impl InboundTx {
+    fn push(&self, msg: StreamIn) -> Result<(), InboundRefused> {
+        if let StreamIn::Data(payload) = &msg {
+            if self.pending.load(Ordering::Relaxed) + payload.len() > MAX_INBOUND_BUFFER_BYTES {
+                return Err(InboundRefused::OverBudget);
+            }
+            self.pending.fetch_add(payload.len(), Ordering::Relaxed);
+        }
+        self.tx.send(msg).map_err(|_| InboundRefused::Gone)
+    }
+
+    /// Same as [`Self::push`]; async only so tests read like the mpsc API they replaced.
+    #[cfg(test)]
+    async fn send(&self, msg: StreamIn) -> Result<(), InboundRefused> {
+        self.push(msg)
+    }
+}
+
+impl InboundRx {
+    async fn recv(&mut self) -> Option<StreamIn> {
+        let msg = self.rx.recv().await;
+        if let Some(StreamIn::Data(payload)) = &msg {
+            self.pending.fetch_sub(payload.len(), Ordering::Relaxed);
+        }
+        msg
+    }
+}
 
 /// The application duplex [`run_channel_session_on_stream`](super::run_channel_session_on_stream)
 /// pumps has its own internal buffer too; this is that buffer's size for a forward session,
@@ -368,7 +439,7 @@ async fn pump_forward_stream(
     id: u32,
     tcp: TcpStream,
     outbound: mpsc::Sender<Frame>,
-    mut inbound: mpsc::Receiver<StreamIn>,
+    mut inbound: InboundRx,
     idle: Duration,
 ) -> (u64, u64) {
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
@@ -441,7 +512,7 @@ async fn run_forward_initiate_engine(
 ) {
     let (mux_read, mut mux_write) = tokio::io::split(engine_side);
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
-    let mut inbound_txs: HashMap<u32, mpsc::Sender<StreamIn>> = HashMap::new();
+    let mut inbound_txs: HashMap<u32, InboundTx> = HashMap::new();
     let mut streams: JoinSet<u32> = JoinSet::new();
     let mut next_id: u32 = 1;
     // AUF-20261005-016: see `read_one_frame`'s own doc for why this is pinned and only
@@ -463,7 +534,7 @@ async fn run_forward_initiate_engine(
                         }
                         let id = next_id;
                         next_id = next_id.wrapping_add(1);
-                        let (tx, rx) = mpsc::channel::<StreamIn>(CHANNEL_CAP);
+                        let (tx, rx) = inbound_channel();
                         inbound_txs.insert(id, tx);
                         let out_tx2 = out_tx.clone();
                         let target2 = target.clone();
@@ -486,16 +557,27 @@ async fn run_forward_initiate_engine(
                 }
                 match frame {
                     Ok(Frame::Data { id, payload }) => {
-                        // Backpressure as before (send().await in the arm BODY, not a select! branch,
-                        // so it cannot lose bytes): a slow consumer slows the session down instead of
-                        // having its stream cut after CHANNEL_CAP frames (second review of #271).
-                        if let Some(tx) = inbound_txs.get(&id) {
-                            let _ = tx.send(StreamIn::Data(payload)).await;
+                        // Never wait on one stream here (see MAX_INBOUND_BUFFER_BYTES): a consumer too far
+                        // behind loses only its own stream; the Close is best effort (try_send -- this
+                        // loop is the outbound queue's only drainer), else the peer's idle timeout ends it.
+                        let zu_weit = match inbound_txs.get(&id) {
+                            Some(tx) => tx.push(StreamIn::Data(payload)) == Err(InboundRefused::OverBudget),
+                            None => false,
+                        };
+                        if zu_weit {
+                            inbound_txs.remove(&id);
+                            eprintln!(
+                                "ct-agent channel: forward stream {id} closed -- its consumer is more than {MAX_INBOUND_BUFFER_BYTES} bytes behind"
+                            );
+                            let _ = out_tx.try_send(Frame::Close {
+                                id,
+                                reason: Some("forward stream inbound buffer full".to_string()),
+                            });
                         }
                     }
                     Ok(Frame::Close { id, .. }) => {
                         if let Some(tx) = inbound_txs.remove(&id) {
-                            let _ = tx.send(StreamIn::Closed).await;
+                            let _ = tx.push(StreamIn::Closed);
                         }
                     }
                     // The initiate side never receives Open -- only ever sends it. A peer that
@@ -551,7 +633,7 @@ async fn run_forward_accept_engine(
 ) {
     let (mux_read, mut mux_write) = tokio::io::split(engine_side);
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
-    let mut inbound_txs: HashMap<u32, mpsc::Sender<StreamIn>> = HashMap::new();
+    let mut inbound_txs: HashMap<u32, InboundTx> = HashMap::new();
     let mut streams: JoinSet<(u32, u64, u64)> = JoinSet::new();
     // AUF-20261005-016: see `read_one_frame`'s own doc for why this is pinned and only
     // replaced once it actually resolves, rather than reconstructed fresh every iteration.
@@ -578,7 +660,7 @@ async fn run_forward_accept_engine(
                                 let _ = out_tx.send(Frame::Close { id, reason: Some(reason) }).await;
                             }
                             Ok(()) => {
-                                let (tx, rx) = mpsc::channel::<StreamIn>(CHANNEL_CAP);
+                                let (tx, rx) = inbound_channel();
                                 inbound_txs.insert(id, tx);
                                 let out_tx2 = out_tx.clone();
                                 streams.spawn(dial_and_pump_forward_target(id, target, out_tx2, rx, idle));
@@ -586,16 +668,27 @@ async fn run_forward_accept_engine(
                         }
                     }
                     Ok(Frame::Data { id, payload }) => {
-                        // Backpressure as before (send().await in the arm BODY, not a select! branch,
-                        // so it cannot lose bytes): a slow consumer slows the session down instead of
-                        // having its stream cut after CHANNEL_CAP frames (second review of #271).
-                        if let Some(tx) = inbound_txs.get(&id) {
-                            let _ = tx.send(StreamIn::Data(payload)).await;
+                        // Never wait on one stream here (see MAX_INBOUND_BUFFER_BYTES): a consumer too far
+                        // behind loses only its own stream; the Close is best effort (try_send -- this
+                        // loop is the outbound queue's only drainer), else the peer's idle timeout ends it.
+                        let zu_weit = match inbound_txs.get(&id) {
+                            Some(tx) => tx.push(StreamIn::Data(payload)) == Err(InboundRefused::OverBudget),
+                            None => false,
+                        };
+                        if zu_weit {
+                            inbound_txs.remove(&id);
+                            eprintln!(
+                                "ct-agent channel: forward stream {id} closed -- its consumer is more than {MAX_INBOUND_BUFFER_BYTES} bytes behind"
+                            );
+                            let _ = out_tx.try_send(Frame::Close {
+                                id,
+                                reason: Some("forward stream inbound buffer full".to_string()),
+                            });
                         }
                     }
                     Ok(Frame::Close { id, .. }) => {
                         if let Some(tx) = inbound_txs.remove(&id) {
-                            let _ = tx.send(StreamIn::Closed).await;
+                            let _ = tx.push(StreamIn::Closed);
                         }
                     }
                     // A read error here means byte sync with the peer's framing is lost (or the
@@ -644,7 +737,7 @@ async fn dial_and_pump_forward_target(
     id: u32,
     target: String,
     outbound: mpsc::Sender<Frame>,
-    inbound: mpsc::Receiver<StreamIn>,
+    inbound: InboundRx,
     idle: Duration,
 ) -> (u32, u64, u64) {
     match TcpStream::connect(&target).await {
@@ -675,6 +768,26 @@ async fn dial_and_pump_forward_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // trace: AUF-20261005-016 -- the engine never waits on one stream: over the byte budget
+    // `push` refuses instead of blocking, and `recv` hands the budget back.
+    #[tokio::test]
+    async fn inbound_queue_refuses_over_budget_and_recv_releases_it() {
+        let (tx, mut rx) = inbound_channel();
+        let chunk = vec![0u8; MAX_INBOUND_BUFFER_BYTES / 2];
+        assert_eq!(tx.push(StreamIn::Data(chunk.clone())), Ok(()));
+        assert_eq!(tx.push(StreamIn::Data(chunk.clone())), Ok(()));
+        assert_eq!(
+            tx.push(StreamIn::Data(vec![0u8; 1])),
+            Err(InboundRefused::OverBudget)
+        );
+        assert!(matches!(rx.recv().await, Some(StreamIn::Data(_))));
+        assert_eq!(tx.push(StreamIn::Data(vec![0u8; 1])), Ok(()));
+        // Closed carries no bytes and is never refused for the budget.
+        assert_eq!(tx.push(StreamIn::Closed), Ok(()));
+        drop(rx);
+        assert_eq!(tx.push(StreamIn::Closed), Err(InboundRefused::Gone));
+    }
 
     #[test]
     fn parse_forward_spec_requires_loopback_and_both_parts() {
@@ -771,7 +884,7 @@ mod tests {
         let mut server = accept.await.unwrap();
 
         let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
-        let (in_tx, in_rx) = mpsc::channel::<StreamIn>(CHANNEL_CAP);
+        let (in_tx, in_rx) = inbound_channel();
         let pump = tokio::spawn(pump_forward_stream(
             1,
             client,
@@ -824,7 +937,7 @@ mod tests {
         let _server = accept.await.unwrap(); // held open -- no EOF on its own
 
         let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
-        let (_in_tx, in_rx) = mpsc::channel::<StreamIn>(CHANNEL_CAP);
+        let (_in_tx, in_rx) = inbound_channel();
         let idle = Duration::from_millis(50);
         let pump = tokio::spawn(pump_forward_stream(1, client, out_tx, in_rx, idle));
 
@@ -863,7 +976,7 @@ mod tests {
         let close_before = events::EVENT_COUNTS.get(events::FORWARD_CLOSE);
 
         let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
-        let (in_tx, in_rx) = mpsc::channel::<StreamIn>(CHANNEL_CAP);
+        let (in_tx, in_rx) = inbound_channel();
         let task = tokio::spawn(dial_and_pump_forward_target(
             1,
             addr.to_string(),
@@ -935,7 +1048,7 @@ mod tests {
 
         let open_before = events::EVENT_COUNTS.get(events::FORWARD_OPEN);
         let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
-        let (_in_tx, in_rx) = mpsc::channel::<StreamIn>(CHANNEL_CAP);
+        let (_in_tx, in_rx) = inbound_channel();
         let (id, bytes_out, bytes_in) = dial_and_pump_forward_target(
             9,
             dead_addr.to_string(),
