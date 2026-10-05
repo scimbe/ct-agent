@@ -8060,3 +8060,240 @@ async fn channel_forward_aborted_client_stops_the_target_and_frees_the_channel()
     .await
     .expect("test hung for 60 s");
 }
+
+// --- DEC-0061 (2026-10-05): flow control per stream (spec: REP-20261005-entwurf-flusskontrolle-
+// forward, section 5). Measured on labor-com/labor-de: one slow receiver stalled every other stream
+// of the same forward (50/50 fast requests timed out while a 64 KiB/s export ran).
+
+/// Target for the flow-control tests: the first byte of each connection picks its role.
+/// `b'B'` = big download (`len` bytes of a fixed pattern, then close), anything else = echo.
+async fn spawn_flow_target(len: usize) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut first = [0u8; 1];
+                if s.read_exact(&mut first).await.is_err() {
+                    return;
+                }
+                if first[0] == b'B' {
+                    let mut sent = 0usize;
+                    let mut chunk = vec![0u8; 64 * 1024];
+                    while sent < len {
+                        let n = chunk.len().min(len - sent);
+                        for (i, b) in chunk[..n].iter_mut().enumerate() {
+                            *b = ((sent + i) % 251) as u8;
+                        }
+                        if s.write_all(&chunk[..n]).await.is_err() {
+                            return;
+                        }
+                        sent += n;
+                    }
+                    let _ = s.shutdown().await;
+                } else {
+                    if s.write_all(&first).await.is_err() {
+                        return;
+                    }
+                    let mut buf = [0u8; 256];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// T1: a receiver that never reads must not stall the other streams of the same forward.
+#[tokio::test]
+async fn channel_forward_slow_receiver_does_not_stall_other_streams() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let target = spawn_flow_target(256 << 20).await;
+        let (bound, a_task, b_task) = spawn_forward_pair(target.to_string(), 256, Duration::from_secs(60));
+        // The slow receiver: asks for a big download and never reads it.
+        let mut slow = tokio::net::TcpStream::connect(bound).await.unwrap();
+        slow.write_all(b"B").await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await; // let its data back up
+        // 50 fast streams on the same forward, all at once.
+        let mut fast = Vec::new();
+        for i in 0..50u8 {
+            fast.push(tokio::spawn(async move {
+                let t = std::time::Instant::now();
+                let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+                c.write_all(&[b'E', i]).await.unwrap();
+                let mut b = [0u8; 2];
+                tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut b))
+                    .await
+                    .map_err(|_| format!("stream {i}: echo stalled behind the slow receiver"))?
+                    .map_err(|e| format!("stream {i}: {e}"))?;
+                if b != [b'E', i] {
+                    return Err(format!("stream {i}: wrong echo {b:?}"));
+                }
+                Ok::<Duration, String>(t.elapsed())
+            }));
+        }
+        let mut errors = Vec::new();
+        for f in fast {
+            if let Err(e) = f.await.unwrap() {
+                errors.push(e);
+            }
+        }
+        assert!(errors.is_empty(), "{} of 50 fast streams stalled: {:?}", errors.len(), &errors[..errors.len().min(3)]);
+        drop(slow);
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 60 s");
+}
+
+/// T2: a large transfer arrives complete and in order, read slowly first and then at full speed.
+#[tokio::test]
+async fn channel_forward_large_transfer_arrives_complete() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        const LEN: usize = 64 << 20;
+        let target = spawn_flow_target(LEN).await;
+        let (bound, a_task, b_task) = spawn_forward_pair(target.to_string(), 16, Duration::from_secs(60));
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        c.write_all(b"B").await.unwrap();
+        let mut got = 0usize;
+        let mut buf = vec![0u8; 64 * 1024];
+        // First 2 s: a slow reader (4 KiB every 10 ms), then full speed.
+        let slow_until = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let want = if std::time::Instant::now() < slow_until { 4096 } else { buf.len() };
+            let n = c.read(&mut buf[..want]).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            for (i, b) in buf[..n].iter().enumerate() {
+                assert_eq!(*b, ((got + i) % 251) as u8, "byte {} corrupted", got + i);
+            }
+            got += n;
+            if std::time::Instant::now() < slow_until {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        assert_eq!(got, LEN, "the transfer must arrive complete");
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 60 s");
+}
+
+/// A forward pair with credit flow control switched per member (mixed-version tests).
+fn spawn_forward_pair_fc(
+    target: String,
+    initiate_fc: bool,
+    accept_fc: bool,
+) -> (
+    SocketAddr,
+    tokio::task::JoinHandle<io::Result<()>>,
+    tokio::task::JoinHandle<io::Result<()>>,
+) {
+    let a = generate_static_keypair();
+    let b = generate_static_keypair();
+    let (a_priv, a_pub) = (a.private, a.public);
+    let (b_priv, b_pub) = (b.private, b.public);
+    let (a_transport, b_transport) = tokio::io::duplex(1 << 16);
+    let idle = Duration::from_secs(60);
+    let (listener, bound) =
+        forward_stream::bind_forward_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+    let a_local =
+        forward_stream::forward_initiate_on_with(listener, target.clone(), 256, idle, initiate_fc);
+    let b_local = forward_stream::forward_accept_local_with(Some(target), None, 256, idle, accept_fc);
+    let a_task = tokio::spawn(async move {
+        let (ar, aw) = tokio::io::split(a_transport);
+        run_channel_session_on_stream(aw, ar, ChannelRole::Initiate, &a_priv, &b_pub, a_local).await
+    });
+    let b_task = tokio::spawn(async move {
+        let (br, bw) = tokio::io::split(b_transport);
+        run_channel_session_on_stream(bw, br, ChannelRole::Accept, &b_priv, &a_pub, b_local).await
+    });
+    (bound, a_task, b_task)
+}
+
+/// One echo round trip through `bound`, with its duration.
+async fn echo_once(bound: SocketAddr, i: u8) -> Duration {
+    let t = std::time::Instant::now();
+    let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+    c.write_all(&[b'E', i]).await.unwrap();
+    let mut b = [0u8; 2];
+    tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut b))
+        .await
+        .expect("echo stalled")
+        .unwrap();
+    assert_eq!(b, [b'E', i]);
+    t.elapsed()
+}
+
+/// T3a: a new initiate side against an accept side WITHOUT flow control (an older agent) gets no
+/// HELLO back and keeps the old behaviour -- the very first stream does not wait for anything.
+#[tokio::test]
+async fn channel_forward_new_initiate_against_old_accept_falls_back_without_waiting() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let target = spawn_flow_target(4 << 20).await;
+        let (bound, a_task, b_task) = spawn_forward_pair_fc(target.to_string(), true, false);
+        let first = echo_once(bound, 1).await;
+        assert!(first < Duration::from_secs(1), "first stream waited {first:?}");
+        // A large transfer still arrives complete without credit.
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        c.write_all(b"B").await.unwrap();
+        let mut all = Vec::new();
+        c.read_to_end(&mut all).await.unwrap();
+        assert_eq!(all.len(), 4 << 20);
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 60 s");
+}
+
+/// T3b: an initiate side without flow control (an older agent) against a new accept side: no
+/// FC_ON is sent, the accept side keeps the old behaviour, data flows both ways.
+#[tokio::test]
+async fn channel_forward_old_initiate_against_new_accept_keeps_working() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let target = spawn_flow_target(4 << 20).await;
+        let (bound, a_task, b_task) = spawn_forward_pair_fc(target.to_string(), false, true);
+        for i in 0..5u8 {
+            assert!(echo_once(bound, i).await < Duration::from_secs(2));
+        }
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        c.write_all(b"B").await.unwrap();
+        let mut all = Vec::new();
+        c.read_to_end(&mut all).await.unwrap();
+        assert_eq!(all.len(), 4 << 20);
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 60 s");
+}
+
+/// T3c (control): with flow control on both sides the slow receiver no longer stalls; with it
+/// off on one side the old head-of-line behaviour remains (documents what the switch means).
+#[tokio::test]
+async fn channel_forward_flow_control_needs_both_sides() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let target = spawn_flow_target(256 << 20).await;
+        let (bound, a_task, b_task) = spawn_forward_pair_fc(target.to_string(), true, true);
+        let mut slow = tokio::net::TcpStream::connect(bound).await.unwrap();
+        slow.write_all(b"B").await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for i in 0..10u8 {
+            assert!(echo_once(bound, i).await < Duration::from_secs(2), "stalled with flow control on both sides");
+        }
+        drop(slow);
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 60 s");
+}
