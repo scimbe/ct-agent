@@ -8297,3 +8297,84 @@ async fn channel_forward_flow_control_needs_both_sides() {
     .await
     .expect("test hung for 60 s");
 }
+
+/// Adversarial review of #274: bulk in BOTH directions at once must not deadlock on credit.
+#[tokio::test]
+async fn channel_forward_full_duplex_bulk_does_not_deadlock_on_credit() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        const LEN: usize = 8 << 20;
+        let (target, _h) = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let h = tokio::spawn(async move {
+                let (s, _) = listener.accept().await.unwrap();
+                let (mut r, mut w) = s.into_split();
+                tokio::io::copy(&mut r, &mut w).await.unwrap(); // echo while reading
+                let _ = w.shutdown().await;
+            });
+            (addr, h)
+        };
+        let (bound, a_task, b_task) = spawn_forward_pair_fc(target.to_string(), true, true);
+        let c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let (mut r, mut w) = c.into_split();
+        let writer = tokio::spawn(async move {
+            let chunk = vec![5u8; 64 * 1024];
+            for _ in 0..(LEN / chunk.len()) {
+                w.write_all(&chunk).await.unwrap();
+            }
+            w.shutdown().await.unwrap();
+        });
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(got.len(), LEN, "echo in both directions must arrive complete");
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("deadlock: full-duplex bulk hung for 60 s");
+}
+
+/// With two halves per stream: a client abort during bulk in both directions still resets the
+/// stream (the #273 path) and both halves end -- the target sees its connection closed.
+#[tokio::test]
+async fn channel_forward_abort_during_full_duplex_ends_both_halves() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = s.into_split();
+            let reader = tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                while let Ok(n) = r.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            });
+            let chunk = vec![3u8; 64 * 1024];
+            while w.write_all(&chunk).await.is_ok() {}
+            let _ = reader.await;
+            let _ = closed_tx.send(());
+        });
+        let (bound, a_task, b_task) = spawn_forward_pair_fc(target.to_string(), true, true);
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let mut buf = vec![0u8; 256 * 1024];
+        c.write_all(&vec![1u8; 512 * 1024]).await.unwrap();
+        c.read_exact(&mut buf).await.unwrap();
+        drop(c); // abort mid-transfer, both directions busy
+        tokio::time::timeout(Duration::from_secs(10), closed_rx)
+            .await
+            .expect("target must see both halves closed within 10 s of the abort")
+            .unwrap();
+        // The forward stays usable.
+        let target2 = spawn_flow_target(1024).await;
+        let _ = target2;
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 60 s");
+}
