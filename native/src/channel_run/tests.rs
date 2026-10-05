@@ -7820,12 +7820,8 @@ async fn read_full_echo_or_clean_refusal(
     Ok(buf)
 }
 
+// trace: AUF-20261005-016 (DEC-0061)
 #[tokio::test]
-// Red acceptance test for the open DEC-0061 defect: it fails against today's main on purpose.
-// Ignored so the default `cargo test` run keeps reporting only real regressions; run it with
-//   cargo test -p ct-agent channel_forward_many_short_parallel_streams -- --ignored
-// and it reports the defect as "connection N: truncated echo -- got M of 65536 bytes".
-#[ignore = "red: DEC-0061, one forwarded stream ending tears down the whole channel session"]
 async fn channel_forward_many_short_parallel_streams_do_not_end_the_session() {
     // DEC-0061 / AUF-20261005-016: #255's own stream tests (above) each drive ONE forwarded
     // connection at a time. Here, 40 short-lived connections race each other through a forward
@@ -7835,10 +7831,11 @@ async fn channel_forward_many_short_parallel_streams_do_not_end_the_session() {
     // error or EOF) must close only that stream: every other within-cap connection gets its
     // full 64 KiB echo, never a truncated one, and -- the actual acceptance -- the channel
     // SESSION survives all of it, proven by one more connection succeeding afterward on the
-    // same forward. Today's main instead tears the whole session down with the forwarded
-    // streams still in flight (the `Err(_) => { streams.abort_all(); ... break; }` arms in
-    // forward_stream.rs are reached by this load even though no grant ended and the peer
-    // transport never actually closed), so this is expected to fail red.
+    // same forward. Before this fix, a full per-stream inbound buffer under this load blocked
+    // the engine's own read loop on a single congested stream's `send().await` (head-of-line),
+    // which stalled the whole mux until the resulting transport-level timeout reached the
+    // `Err(_) => { streams.abort_all(); ... break; }` arms in forward_stream.rs even though no
+    // grant ended -- tearing the whole session down over one stream's own congestion.
     const PAYLOAD_LEN: usize = 64 * 1024;
     const ATTEMPTS: usize = 40;
 
