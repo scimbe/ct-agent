@@ -8460,3 +8460,175 @@ async fn backlog_connections_run_with_credit(handshake_delay: Duration) {
     .await
     .expect("test hung for 60 s");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Live run of #274 (2026-10-05): bulk in both directions froze the forward session over the
+// edge's `:443` relay. This reproduces that path in-process with REAL sockets: each agent talks
+// TLS-over-TCP to a relay that, like the edge (`ct_edge::relay::pump_dir`, crates/edge/src/
+// relay.rs:128), splits each leg with `tokio::io::split` and copies with a 16 KiB buffer.
+
+/// How the test relay flushes a leg after a write.
+#[derive(Clone, Copy, PartialEq)]
+enum RelayFlush {
+    /// Like the edge's `pump_dir`: only after a read shorter than the buffer.
+    OnShortRead,
+    /// After every write.
+    Always,
+}
+
+async fn relay_pump_dir<R, W>(mut r: R, mut w: W, flush: RelayFlush, rate: Option<u64>) -> io::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 16 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = r.read(&mut buf).await?;
+        if n == 0 {
+            let _ = w.shutdown().await;
+            return Ok(total);
+        }
+        total += n as u64;
+        w.write_all(&buf[..n]).await?;
+        if matches!(flush, RelayFlush::Always) || n < buf.len() {
+            w.flush().await?;
+        }
+        if let Some(bps) = rate {
+            // WAN-like leg: hold this direction to `bps` bytes per second.
+            tokio::time::sleep(Duration::from_secs_f64(n as f64 / bps as f64)).await;
+        }
+    }
+}
+
+/// An edge-like relay: accepts two TLS connections (first the initiator, then the acceptor) and
+/// copies between them, each direction in its own pump, like `relay_streams`/`relay_pair`.
+async fn spawn_tls_relay(flush: RelayFlush, rate: Option<u64>) -> SocketAddr {
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert = certified.cert.der().clone();
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+    let scfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(scfg));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (t1, _) = listener.accept().await.unwrap();
+        let a = acceptor.accept(t1).await.unwrap();
+        let (t2, _) = listener.accept().await.unwrap();
+        let b = acceptor.accept(t2).await.unwrap();
+        let (a_recv, a_send) = tokio::io::split(a);
+        let (b_recv, b_send) = tokio::io::split(b);
+        let _ = tokio::try_join!(
+            relay_pump_dir(a_recv, b_send, flush, rate),
+            relay_pump_dir(b_recv, a_send, flush, rate)
+        );
+    });
+    addr
+}
+
+async fn tls_to_relay(relay: SocketAddr) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    let ccfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyServerCert))
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(ccfg));
+    let tcp = tokio::net::TcpStream::connect(relay).await.unwrap();
+    let sni = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    connector.connect(sni, tcp).await.unwrap()
+}
+
+/// Two forward agents (flow control on both) joined through [`spawn_tls_relay`]; returns the
+/// initiate side's local listener address.
+async fn spawn_forward_pair_over_relay(target: String, flush: RelayFlush, rate: Option<u64>, fc: bool) -> SocketAddr {
+    let a = generate_static_keypair();
+    let b = generate_static_keypair();
+    let (a_priv, a_pub) = (a.private, a.public);
+    let (b_priv, b_pub) = (b.private, b.public);
+    let relay = spawn_tls_relay(flush, rate).await;
+    let idle = Duration::from_secs(60);
+    let (listener, bound) =
+        forward_stream::bind_forward_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+    let a_local = forward_stream::forward_initiate_on_with(listener, target.clone(), 256, idle, fc);
+    let b_local = forward_stream::forward_accept_local_with(Some(target), None, 256, idle, fc);
+    let a_tls = tls_to_relay(relay).await;
+    let b_tls = tls_to_relay(relay).await;
+    tokio::spawn(async move {
+        let (ar, aw) = tokio::io::split(a_tls);
+        run_channel_session_on_stream(aw, ar, ChannelRole::Initiate, &a_priv, &b_pub, a_local).await
+    });
+    tokio::spawn(async move {
+        let (br, bw) = tokio::io::split(b_tls);
+        run_channel_session_on_stream(bw, br, ChannelRole::Accept, &b_priv, &a_pub, b_local).await
+    });
+    bound
+}
+
+/// Bulk in both directions at once (a full-duplex echo of 32 MiB beside a 32 MiB download), the
+/// live M4 shape. Returns how long it took, or panics after 60 s.
+async fn bidirectional_bulk_over_relay(flush: RelayFlush, rate: Option<u64>, fc: bool) -> Duration {
+    const LEN: usize = 16 << 20;
+    let target = spawn_flow_target(LEN).await;
+    let bound = spawn_forward_pair_over_relay(target.to_string(), flush, rate, fc).await;
+    let t = std::time::Instant::now();
+    let echo = tokio::spawn(async move {
+        let c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let (mut r, mut w) = c.into_split();
+        let writer = tokio::spawn(async move {
+            w.write_all(b"E").await.unwrap();
+            let chunk = vec![7u8; 64 * 1024];
+            for _ in 0..LEN / chunk.len() {
+                w.write_all(&chunk).await.unwrap();
+            }
+        });
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut got = 0usize;
+        while got < LEN + 1 {
+            let n = r.read(&mut buf).await.unwrap();
+            assert!(n > 0, "echo closed early after {got} bytes");
+            got += n;
+        }
+        writer.await.unwrap();
+    });
+    let download = tokio::spawn(async move {
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        c.write_all(b"B").await.unwrap();
+        let mut all = Vec::new();
+        c.read_to_end(&mut all).await.unwrap();
+        assert_eq!(all.len(), LEN);
+    });
+    tokio::time::timeout(Duration::from_secs(60), async {
+        echo.await.unwrap();
+        download.await.unwrap();
+    })
+    .await
+    .expect("bulk in both directions stalled over the relay");
+    t.elapsed()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channel_forward_bidirectional_bulk_over_a_flushing_relay() {
+    let took = bidirectional_bulk_over_relay(RelayFlush::Always, None, true).await;
+    eprintln!("bidirectional bulk over a flushing relay: {took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channel_forward_bidirectional_bulk_over_an_edge_like_relay() {
+    let took = bidirectional_bulk_over_relay(RelayFlush::OnShortRead, None, true).await;
+    eprintln!("bidirectional bulk over an edge-like relay: {took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channel_forward_bidirectional_bulk_over_a_slow_edge_like_relay() {
+    let took = bidirectional_bulk_over_relay(RelayFlush::OnShortRead, Some(8 << 20), true).await;
+    eprintln!("bidirectional bulk over a slow edge-like relay (flow control on): {took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channel_forward_bidirectional_bulk_over_a_slow_edge_like_relay_without_flow_control() {
+    let took = bidirectional_bulk_over_relay(RelayFlush::OnShortRead, Some(8 << 20), false).await;
+    eprintln!("bidirectional bulk over a slow edge-like relay (flow control off): {took:?}");
+}
