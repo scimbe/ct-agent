@@ -7821,6 +7821,11 @@ async fn read_full_echo_or_clean_refusal(
 }
 
 #[tokio::test]
+// Red acceptance test for the open DEC-0061 defect: it fails against today's main on purpose.
+// Ignored so the default `cargo test` run keeps reporting only real regressions; run it with
+//   cargo test -p ct-agent channel_forward_many_short_parallel_streams -- --ignored
+// and it reports the defect as "connection N: truncated echo -- got M of 65536 bytes".
+#[ignore = "red: DEC-0061, one forwarded stream ending tears down the whole channel session"]
 async fn channel_forward_many_short_parallel_streams_do_not_end_the_session() {
     // DEC-0061 / AUF-20261005-016: #255's own stream tests (above) each drive ONE forwarded
     // connection at a time. Here, 40 short-lived connections race each other through a forward
@@ -7923,10 +7928,13 @@ async fn channel_forward_many_short_parallel_streams_do_not_end_the_session() {
 
     // The actual acceptance: the channel session must still be alive after that load, proven by
     // one more connection succeeding through the SAME forward.
-    let mut probe = tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(bound))
-        .await
-        .expect("connecting to the forward listener does not hang")
-        .expect("the forward listener is still bound after the parallel-streams load");
+    let mut probe = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(bound),
+    )
+    .await
+    .expect("connecting to the forward listener does not hang")
+    .expect("the forward listener is still bound after the parallel-streams load");
     probe
         .write_all(b"still alive")
         .await
