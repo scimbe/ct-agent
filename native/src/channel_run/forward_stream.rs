@@ -398,9 +398,12 @@ fn abort_frame(id: u32) -> Frame {
     }
 }
 
-/// Exact comparison on purpose: only the reset value resets, every other reason half-closes.
+/// Close WITHOUT a reason is the half-close a pump sends on a clean local EOF; Close WITH any
+/// reason (abort, refused, dial failed, max_streams, idle timeout) ends the stream fully, so a
+/// refused or idle client is closed at once instead of half-open until the idle limit
+/// (second adversarial review of #274). An agent before DEC-0061 treats all of them as half-close.
 fn stream_in_for_close(reason: Option<&str>) -> StreamIn {
-    if reason == Some(super::forward_wire::CLOSE_REASON_ABORT) {
+    if reason.is_some() {
         StreamIn::Aborted
     } else {
         StreamIn::Closed
@@ -693,7 +696,9 @@ async fn pump_forward_stream(
     tokio::pin!(down);
     let (mut up_done, mut down_done) = (false, false);
     while !(up_done && down_done) {
-        let deadline = last() + idle;
+        let deadline = last()
+            .checked_add(idle)
+            .unwrap_or_else(|| last() + Duration::from_secs(86_400 * 365));
         tokio::select! {
             r = &mut up, if !up_done => match r {
                 Half::Done => up_done = true,
@@ -706,7 +711,7 @@ async fn pump_forward_stream(
             _ = tokio::time::sleep_until(deadline) => {
                 // Idle: no byte in either direction for a full `idle` (also while waiting for
                 // credit or for a slow local reader -- the timer is outside both halves).
-                if last() + idle <= tokio::time::Instant::now() {
+                if last().checked_add(idle).is_some_and(|d| d <= tokio::time::Instant::now()) {
                     let _ = outbound.send(Frame::Close { id, reason: Some("idle timeout".to_string()) }).await;
                     break;
                 }
@@ -798,6 +803,14 @@ enum ControlOutcome {
     EndSession,
 }
 
+/// How long the initiate side holds back new connections at session start until the peer's HELLO
+/// arrives. With a peer that speaks flow control the HELLO comes after about one round trip
+/// (~100 ms via the edge relay), so every stream -- also connections already waiting in the
+/// listen backlog after a reconnect (#267) -- runs with credit. With an older peer the first accept
+/// of a session waits once for this long, then the session runs in the old mode
+/// (second adversarial review of #274: streams accepted before the HELLO ran without credit).
+const HELLO_WAIT: Duration = Duration::from_millis(500);
+
 /// Upper bound for announced-but-not-yet-opened streams (FC_ON before Open).
 const MAX_PENDING_FC: usize = 1024;
 
@@ -852,6 +865,12 @@ async fn run_forward_initiate_engine(
         let _ = ctrl_tx.send(hello_frame());
     }
     let mut peer_speaks_fc = false;
+    // Accept new connections only once the mode is known (HELLO seen, or HELLO_WAIT passed).
+    let mut accepting = !fc_enabled;
+    let hello_deadline = tokio::time::Instant::now() + HELLO_WAIT;
+    if !fc_enabled {
+        eprintln!("ct-agent channel: forward flow control off on this member ({FORWARD_FLOW_ENV})");
+    }
     let mut pending_fc = std::collections::HashSet::new();
     let mut entries: HashMap<u32, StreamEntry> = HashMap::new();
     let mut streams: JoinSet<u32> = JoinSet::new();
@@ -861,7 +880,11 @@ async fn run_forward_initiate_engine(
 
     loop {
         tokio::select! {
-            accepted = listener.accept() => {
+            _ = tokio::time::sleep_until(hello_deadline), if !accepting => {
+                accepting = true;
+                eprintln!("ct-agent channel: forward flow control off for this session -- the peer sent no HELLO within {} ms (older agent)", HELLO_WAIT.as_millis());
+            }
+            accepted = listener.accept(), if accepting => {
                 match accepted {
                     Ok((tcp, _peer_addr)) => {
                         if entries.len() >= max_streams {
@@ -900,7 +923,13 @@ async fn run_forward_initiate_engine(
                     Ok(Frame::Data { id: CONTROL_ID, payload }) => {
                         if fc_enabled {
                             match apply_control(&payload, &entries, &mut pending_fc) {
-                                ControlOutcome::Hello => peer_speaks_fc = true,
+                                ControlOutcome::Hello => {
+                                    if !peer_speaks_fc {
+                                        eprintln!("ct-agent channel: forward flow control on for this session (credit window {} KiB per stream)", FC_WINDOW / 1024);
+                                    }
+                                    peer_speaks_fc = true;
+                                    accepting = true;
+                                }
                                 ControlOutcome::ResetStream(id) => {
                                     eprintln!("ct-agent channel: forward stream {id} reset -- the peer granted credit beyond the window");
                                     if let Some(e) = entries.remove(&id) {
@@ -1014,6 +1043,13 @@ async fn run_forward_accept_engine(
                 }
                 match frame {
                     Ok(Frame::Open { id, target }) => {
+                        // An Open for an id in use (or for the control id) is a session violation:
+                        // it would overwrite the entry and bypass max_streams (adversarial review).
+                        if id == CONTROL_ID || entries.contains_key(&id) {
+                            streams.abort_all();
+                            eprintln!("ct-agent channel: forward session ended -- protocol violation (Open for stream {id} already in use) -- closed every forwarded stream to its target");
+                            break;
+                        }
                         let credited = pending_fc.remove(&id);
                         if entries.len() >= max_streams {
                             if !ctrl_tx.send(Frame::Close { id, reason: Some(format!("{FORWARD_MAX_STREAMS_ENV} reached")) }) {
@@ -1264,6 +1300,51 @@ mod tests {
             !ctrl.send(hello_frame()),
             "nobody drains: the cap must hold"
         );
+    }
+
+    // Second adversarial review of #274: an Open for an id in use (or for the control id) ends the
+    // session instead of overwriting the entry and bypassing max_streams.
+    #[tokio::test]
+    async fn duplicate_open_ends_the_accept_session() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = target.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let _ = target.accept().await;
+            }
+        });
+        for dup in [7u32, CONTROL_ID] {
+            let (session_side, engine_side) = tokio::io::duplex(1 << 16);
+            let engine = tokio::spawn(run_forward_accept_engine(
+                engine_side,
+                Some(addr.clone()),
+                None,
+                2,
+                Duration::from_secs(30),
+                true,
+            ));
+            let (_r, mut w) = tokio::io::split(session_side);
+            Frame::Open {
+                id: dup,
+                target: addr.clone(),
+            }
+            .write(&mut w)
+            .await
+            .unwrap();
+            if dup != CONTROL_ID {
+                Frame::Open {
+                    id: dup,
+                    target: addr.clone(),
+                }
+                .write(&mut w)
+                .await
+                .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(10), engine)
+                .await
+                .unwrap_or_else(|_| panic!("engine kept running after Open id {dup}"))
+                .unwrap();
+        }
     }
 
     #[test]
