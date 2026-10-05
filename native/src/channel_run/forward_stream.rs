@@ -486,31 +486,16 @@ async fn run_forward_initiate_engine(
                 }
                 match frame {
                     Ok(Frame::Data { id, payload }) => {
-                        // try_send, never the blocking send().await: this arm runs inside the
-                        // same loop that also has to keep reading and writing every OTHER
-                        // stream's frames, so waiting here for one congested stream's own
-                        // consumer would head-of-line block all of them (AUF-20261005-016). A
-                        // full per-stream buffer closes only this stream -- dropping its sender
-                        // makes the pump's own `inbound.recv()` see `None` once it drains, the
-                        // same teardown a `Close` frame triggers below.
+                        // Backpressure as before (send().await in the arm BODY, not a select! branch,
+                        // so it cannot lose bytes): a slow consumer slows the session down instead of
+                        // having its stream cut after CHANNEL_CAP frames (second review of #271).
                         if let Some(tx) = inbound_txs.get(&id) {
-                            if let Err(mpsc::error::TrySendError::Full(_)) =
-                                tx.try_send(StreamIn::Data(payload))
-                            {
-                                inbound_txs.remove(&id);
-                                eprintln!(
-                                    "ct-agent channel: forward stream {id} closed -- its inbound buffer is full"
-                                );
-                                let _ = out_tx.try_send(Frame::Close {
-                                    id,
-                                    reason: Some("forward stream inbound buffer full".to_string()),
-                                });
-                            }
+                            let _ = tx.send(StreamIn::Data(payload)).await;
                         }
                     }
                     Ok(Frame::Close { id, .. }) => {
                         if let Some(tx) = inbound_txs.remove(&id) {
-                            let _ = tx.try_send(StreamIn::Closed);
+                            let _ = tx.send(StreamIn::Closed).await;
                         }
                     }
                     // The initiate side never receives Open -- only ever sends it. A peer that
@@ -601,27 +586,16 @@ async fn run_forward_accept_engine(
                         }
                     }
                     Ok(Frame::Data { id, payload }) => {
-                        // Same try_send rationale as the initiate engine's own match arm, see
-                        // there (AUF-20261005-016): no blocking send().await on one stream's
-                        // buffer inside the loop that also has to service every other stream.
+                        // Backpressure as before (send().await in the arm BODY, not a select! branch,
+                        // so it cannot lose bytes): a slow consumer slows the session down instead of
+                        // having its stream cut after CHANNEL_CAP frames (second review of #271).
                         if let Some(tx) = inbound_txs.get(&id) {
-                            if let Err(mpsc::error::TrySendError::Full(_)) =
-                                tx.try_send(StreamIn::Data(payload))
-                            {
-                                inbound_txs.remove(&id);
-                                eprintln!(
-                                    "ct-agent channel: forward stream {id} closed -- its inbound buffer is full"
-                                );
-                                let _ = out_tx.try_send(Frame::Close {
-                                    id,
-                                    reason: Some("forward stream inbound buffer full".to_string()),
-                                });
-                            }
+                            let _ = tx.send(StreamIn::Data(payload)).await;
                         }
                     }
                     Ok(Frame::Close { id, .. }) => {
                         if let Some(tx) = inbound_txs.remove(&id) {
-                            let _ = tx.try_send(StreamIn::Closed);
+                            let _ = tx.send(StreamIn::Closed).await;
                         }
                     }
                     // A read error here means byte sync with the peer's framing is lost (or the
