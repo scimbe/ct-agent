@@ -23,6 +23,8 @@
 //! Every field the wire hands this parser is peer-controlled, so every variable-length field
 //! is capped ([`MAX_TARGET_WIRE_LEN`], [`MAX_DATA_FRAME_LEN`]) before anything is allocated —
 //! a malformed or hostile length must fail the frame, not the process.
+//
+// trace: AUF-20261005-016
 
 use std::io;
 
@@ -93,43 +95,48 @@ impl Frame {
     /// Read exactly one frame from `r`. `UnexpectedEof` (or any read error) means the peer
     /// closed or the underlying session ended — the caller's loop treats that as "stop", not
     /// as a protocol violation. A malformed frame (bad tag, oversize length, non-utf8 string)
-    /// is `InvalidData`.
+    /// is `InvalidData`. Every error surfaced once the stream id itself has been read carries
+    /// that id in its message (AUF-20261005-016: the caller logs "Art, Stream-Id" without
+    /// needing its own parsing state) — these are still transport/framing-level failures (byte
+    /// sync with the peer is lost), never a single misbehaving stream's fault, so the caller is
+    /// right to end the whole session on any `Err` this returns.
     pub(crate) async fn read<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Frame> {
         let mut tag = [0u8; 1];
         r.read_exact(&mut tag).await?;
         let mut idb = [0u8; 4];
         r.read_exact(&mut idb).await?;
         let id = u32::from_be_bytes(idb);
+        let with_id = |e: io::Error| io::Error::new(e.kind(), format!("stream {id}: {e}"));
         match tag[0] {
             TAG_OPEN => {
-                let target = read_string(r, MAX_TARGET_WIRE_LEN).await?;
+                let target = read_string(r, MAX_TARGET_WIRE_LEN).await.map_err(with_id)?;
                 Ok(Frame::Open { id, target })
             }
             TAG_DATA => {
                 let mut lb = [0u8; 4];
-                r.read_exact(&mut lb).await?;
+                r.read_exact(&mut lb).await.map_err(with_id)?;
                 let len = u32::from_be_bytes(lb) as usize;
                 if len > MAX_DATA_FRAME_LEN {
-                    return Err(io::Error::new(
+                    return Err(with_id(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("forward Data frame of {len} bytes exceeds the {MAX_DATA_FRAME_LEN}-byte cap"),
-                    ));
+                    )));
                 }
                 let mut payload = vec![0u8; len];
-                r.read_exact(&mut payload).await?;
+                r.read_exact(&mut payload).await.map_err(with_id)?;
                 Ok(Frame::Data { id, payload })
             }
             TAG_CLOSE => {
                 let mut has_reason = [0u8; 1];
-                r.read_exact(&mut has_reason).await?;
-                let text = read_string(r, MAX_TARGET_WIRE_LEN).await?;
+                r.read_exact(&mut has_reason).await.map_err(with_id)?;
+                let text = read_string(r, MAX_TARGET_WIRE_LEN).await.map_err(with_id)?;
                 let reason = if has_reason[0] != 0 { Some(text) } else { None };
                 Ok(Frame::Close { id, reason })
             }
-            other => Err(io::Error::new(
+            other => Err(with_id(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown forward frame tag {other}"),
-            )),
+            ))),
         }
     }
 }

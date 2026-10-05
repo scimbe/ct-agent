@@ -51,6 +51,7 @@
 //
 // trace: AUF-20260930-005 (INC-20260930-101)
 // trace: AUF-20261004-022 (ct-agent#267)
+// trace: AUF-20261005-016 (DEC-0061)
 
 use std::collections::HashMap;
 use std::io;
@@ -58,7 +59,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -85,6 +86,18 @@ pub const DEFAULT_MAX_STREAMS: usize = 16;
 pub const FORWARD_IDLE_SECS_ENV: &str = "CT_CHANNEL_FORWARD_IDLE_SECS";
 /// See [`FORWARD_IDLE_SECS_ENV`].
 pub const DEFAULT_IDLE_SECS: u64 = 300;
+
+/// Cancel-safe wrapper around [`Frame::read`] for a `select!` loop (AUF-20261005-016): takes
+/// the mux's read half by value and hands it back alongside the result, so the caller can feed
+/// the SAME half into the next read once this one actually resolved. Reconstructing
+/// `Frame::read(&mut mux_read)` in place every `select!` iteration instead is not cancel-safe —
+/// a losing iteration (another branch, e.g. `listener.accept()`, ready first) drops a read
+/// that may already have consumed some of its bytes (an `Open`'s target string alone can span
+/// several `.await` points), desyncing every frame parsed after it.
+async fn read_one_frame<R: AsyncRead + Unpin>(mut r: R) -> (R, io::Result<Frame>) {
+    let frame = Frame::read(&mut r).await;
+    (r, frame)
+}
 
 /// One direction's read chunk. Matches [`ct_common::noise::noise_pump`]'s own `CHUNK` so a
 /// forwarded byte's round trip through this mux costs no more copying than the base pump would.
@@ -426,11 +439,15 @@ async fn run_forward_initiate_engine(
     max_streams: usize,
     idle: Duration,
 ) {
-    let (mut mux_read, mut mux_write) = tokio::io::split(engine_side);
+    let (mux_read, mut mux_write) = tokio::io::split(engine_side);
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
     let mut inbound_txs: HashMap<u32, mpsc::Sender<StreamIn>> = HashMap::new();
     let mut streams: JoinSet<u32> = JoinSet::new();
     let mut next_id: u32 = 1;
+    // AUF-20261005-016: see `read_one_frame`'s own doc for why this is pinned and only
+    // replaced once it actually resolves, rather than reconstructed fresh every iteration.
+    let frame_fut = read_one_frame(mux_read);
+    tokio::pin!(frame_fut);
 
     loop {
         tokio::select! {
@@ -460,9 +477,18 @@ async fn run_forward_initiate_engine(
                     Err(e) => eprintln!("ct-agent channel: forward listener accept error: {e}"),
                 }
             }
-            frame = Frame::read(&mut mux_read) => {
+            (reader, frame) = &mut frame_fut => {
+                // Only replace the pinned future once it actually resolved -- see
+                // `read_one_frame`'s own doc for why reconstructing it in place every
+                // `select!` iteration instead would desync the framing.
+                if frame.is_ok() {
+                    frame_fut.set(read_one_frame(reader));
+                }
                 match frame {
                     Ok(Frame::Data { id, payload }) => {
+                        // Backpressure as before (send().await in the arm BODY, not a select! branch,
+                        // so it cannot lose bytes): a slow consumer slows the session down instead of
+                        // having its stream cut after CHANNEL_CAP frames (second review of #271).
                         if let Some(tx) = inbound_txs.get(&id) {
                             let _ = tx.send(StreamIn::Data(payload)).await;
                         }
@@ -475,13 +501,20 @@ async fn run_forward_initiate_engine(
                     // The initiate side never receives Open -- only ever sends it. A peer that
                     // sends one anyway gets ignored, not a torn-down session over one bad frame.
                     Ok(Frame::Open { .. }) => {}
-                    // The channel session ended -- an expired or revoked grant among the reasons
-                    // (AUF-20260930-005). Every forwarded connection dies with it, right here, and
-                    // the engine ends so the session can too (ct-agent#267).
-                    Err(_) => {
+                    // A read error here means byte sync with the peer's framing is lost (or the
+                    // transport itself ended) -- unlike the per-stream cases above, there is no
+                    // way to recover just one stream from it, so it is the one thing that ends
+                    // the whole session (AUF-20261005-016: log what kind of error and, when the
+                    // framing got far enough to know it, which stream -- see `Frame::read`'s own
+                    // doc). The channel session ending for its own reasons (an expired or revoked
+                    // grant, AUF-20260930-005) is what surfaces here too. Every forwarded
+                    // connection dies with it, right here, and the engine ends so the session can
+                    // too (ct-agent#267).
+                    Err(e) => {
                         streams.abort_all();
                         eprintln!(
-                            "ct-agent channel: the channel session ended -- closed every forwarded stream"
+                            "ct-agent channel: forward frame read failed ({:?}): {e} -- closed every forwarded stream",
+                            e.kind()
                         );
                         break;
                     }
@@ -516,14 +549,21 @@ async fn run_forward_accept_engine(
     max_streams: usize,
     idle: Duration,
 ) {
-    let (mut mux_read, mut mux_write) = tokio::io::split(engine_side);
+    let (mux_read, mut mux_write) = tokio::io::split(engine_side);
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
     let mut inbound_txs: HashMap<u32, mpsc::Sender<StreamIn>> = HashMap::new();
     let mut streams: JoinSet<(u32, u64, u64)> = JoinSet::new();
+    // AUF-20261005-016: see `read_one_frame`'s own doc for why this is pinned and only
+    // replaced once it actually resolves, rather than reconstructed fresh every iteration.
+    let frame_fut = read_one_frame(mux_read);
+    tokio::pin!(frame_fut);
 
     loop {
         tokio::select! {
-            frame = Frame::read(&mut mux_read) => {
+            (reader, frame) = &mut frame_fut => {
+                if frame.is_ok() {
+                    frame_fut.set(read_one_frame(reader));
+                }
                 match frame {
                     Ok(Frame::Open { id, target }) => {
                         if inbound_txs.len() >= max_streams {
@@ -546,6 +586,9 @@ async fn run_forward_accept_engine(
                         }
                     }
                     Ok(Frame::Data { id, payload }) => {
+                        // Backpressure as before (send().await in the arm BODY, not a select! branch,
+                        // so it cannot lose bytes): a slow consumer slows the session down instead of
+                        // having its stream cut after CHANNEL_CAP frames (second review of #271).
                         if let Some(tx) = inbound_txs.get(&id) {
                             let _ = tx.send(StreamIn::Data(payload)).await;
                         }
@@ -555,13 +598,19 @@ async fn run_forward_accept_engine(
                             let _ = tx.send(StreamIn::Closed).await;
                         }
                     }
-                    // AUF-20260930-005: the session ended (an expired or revoked grant among the
-                    // reasons) -- every target socket this side dialed is closed with the
-                    // JoinSet, which is the accept half of "auf beiden Seiten binnen 5 s".
-                    Err(_) => {
+                    // A read error here means byte sync with the peer's framing is lost (or the
+                    // transport itself ended), so -- unlike the per-stream cases above -- the
+                    // whole session ends with it (AUF-20261005-016, see the initiate engine's own
+                    // match arm for the full rationale and `Frame::read`'s doc for what the
+                    // logged error carries). AUF-20260930-005: an expired or revoked grant is
+                    // among the reasons a session ends this way; every target socket this side
+                    // dialed is closed with the JoinSet, the accept half of "auf beiden Seiten
+                    // binnen 5 s".
+                    Err(e) => {
                         streams.abort_all();
                         eprintln!(
-                            "ct-agent channel: the channel session ended -- closed every forwarded stream to its target"
+                            "ct-agent channel: forward frame read failed ({:?}): {e} -- closed every forwarded stream to its target",
+                            e.kind()
                         );
                         break;
                     }
