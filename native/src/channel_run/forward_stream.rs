@@ -348,6 +348,26 @@ pub(crate) fn forward_accept_local(
 enum StreamIn {
     Data(Vec<u8>),
     Closed,
+    /// The peer reset the stream ([`super::forward_wire::CLOSE_REASON_ABORT`]): close the local
+    /// socket fully and stop, instead of half-closing and draining.
+    Aborted,
+}
+
+/// The Close that resets a stream (see [`super::forward_wire::CLOSE_REASON_ABORT`]).
+fn abort_frame(id: u32) -> Frame {
+    Frame::Close {
+        id,
+        reason: Some(super::forward_wire::CLOSE_REASON_ABORT.to_string()),
+    }
+}
+
+/// Exact comparison on purpose: only the reset value resets, every other reason half-closes.
+fn stream_in_for_close(reason: Option<&str>) -> StreamIn {
+    if reason == Some(super::forward_wire::CLOSE_REASON_ABORT) {
+        StreamIn::Aborted
+    } else {
+        StreamIn::Closed
+    }
 }
 
 /// Byte-transparent pump for ONE forwarded TCP connection (either side: the initiate side's
@@ -384,9 +404,16 @@ async fn pump_forward_stream(
         tokio::select! {
             r = tcp_r.read(&mut buf), if !tcp_eof => {
                 match r {
-                    Ok(0) | Err(_) => {
+                    // A clean EOF is a half-close: the peer may still owe this side a reply.
+                    Ok(0) => {
                         tcp_eof = true;
                         let _ = outbound.send(Frame::Close { id, reason: None }).await;
+                    }
+                    // The local socket itself failed: reset the stream, so the peer stops its target
+                    // instead of streaming into a dead connection (DEC-0061, 2026-10-05).
+                    Err(_) => {
+                        let _ = outbound.send(abort_frame(id)).await;
+                        break;
                     }
                     Ok(n) => {
                         bytes_out += n as u64;
@@ -401,13 +428,17 @@ async fn pump_forward_stream(
                     Some(StreamIn::Data(payload)) => {
                         bytes_in += payload.len() as u64;
                         if tcp_w.write_all(&payload).await.is_err() {
-                            tcp_eof = true;
+                            // Nobody reads the local side any more: reset, do not drain.
+                            let _ = outbound.send(abort_frame(id)).await;
+                            break;
                         }
                     }
                     Some(StreamIn::Closed) | None => {
                         peer_eof = true;
                         let _ = tcp_w.shutdown().await;
                     }
+                    // Dropping both socket halves on return closes the connection fully.
+                    Some(StreamIn::Aborted) => break,
                 }
             }
             _ = tokio::time::sleep(idle) => {
@@ -493,9 +524,9 @@ async fn run_forward_initiate_engine(
                             let _ = tx.send(StreamIn::Data(payload)).await;
                         }
                     }
-                    Ok(Frame::Close { id, .. }) => {
+                    Ok(Frame::Close { id, reason }) => {
                         if let Some(tx) = inbound_txs.remove(&id) {
-                            let _ = tx.send(StreamIn::Closed).await;
+                            let _ = tx.send(stream_in_for_close(reason.as_deref())).await;
                         }
                     }
                     // The initiate side never receives Open -- only ever sends it. A peer that
@@ -593,9 +624,9 @@ async fn run_forward_accept_engine(
                             let _ = tx.send(StreamIn::Data(payload)).await;
                         }
                     }
-                    Ok(Frame::Close { id, .. }) => {
+                    Ok(Frame::Close { id, reason }) => {
                         if let Some(tx) = inbound_txs.remove(&id) {
-                            let _ = tx.send(StreamIn::Closed).await;
+                            let _ = tx.send(stream_in_for_close(reason.as_deref())).await;
                         }
                     }
                     // A read error here means byte sync with the peer's framing is lost (or the

@@ -44,6 +44,13 @@ pub(crate) const MAX_TARGET_WIRE_LEN: usize = 2048;
 /// matching `Vec` is allocated, not a real operating limit.
 pub(crate) const MAX_DATA_FRAME_LEN: usize = 1 << 20;
 
+/// Close `reason` that RESETS a stream instead of half-closing it (DEC-0061, 2026-10-05). Protocol:
+/// a Close without reason, or with any other reason, is a half-close as before (the peer shuts its
+/// target's write side and keeps relaying the target's reply); a Close whose reason is exactly this
+/// value is a reset: the peer closes its target connection fully and drops whatever is still in
+/// flight for the stream. An older peer does not know the value and treats it as a half-close.
+pub(crate) const CLOSE_REASON_ABORT: &str = "abort";
+
 /// One multiplexed frame. See the module doc for the protocol these three carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Frame {

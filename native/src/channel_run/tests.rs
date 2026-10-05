@@ -7957,3 +7957,106 @@ async fn many_short_parallel_streams_body() {
     a_task.abort();
     b_task.abort();
 }
+
+// --- DEC-0061 (2026-10-05): a dead local socket resets the stream, a clean EOF half-closes ------
+//
+// Measured on labor-com/labor-de: a client that aborted a large Docker image export left the
+// accept side relaying the rest (~2 GB) into a connection nobody read; the channel stayed
+// saturated for minutes. A clean EOF must stay a half-close (the reply still arrives); a failed
+// local socket must reset the stream so the peer closes its target.
+
+#[tokio::test]
+async fn channel_forward_half_close_still_delivers_the_whole_reply() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        const REPLY: usize = 1 << 20;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            sock.read_to_end(&mut req).await.unwrap(); // the client's half-close
+            assert_eq!(req, b"request");
+            sock.write_all(&vec![7u8; REPLY]).await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+        let (bound, a_task, b_task) =
+            spawn_forward_pair(target.to_string(), 16, Duration::from_secs(30));
+        let mut client = tokio::net::TcpStream::connect(bound).await.unwrap();
+        client.write_all(b"request").await.unwrap();
+        client.shutdown().await.unwrap(); // half-close: keep reading
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(reply.len(), REPLY, "the reply after a half-close must arrive in full");
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 60 s");
+}
+
+#[tokio::test]
+async fn channel_forward_aborted_client_stops_the_target_and_frees_the_channel() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel::<std::time::Instant>();
+        tokio::spawn(async move {
+            // First connection: an endless download (the image export). It ends only when a
+            // write fails, i.e. when the forward closed this connection.
+            let (mut big, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let chunk = vec![1u8; 64 * 1024];
+                while big.write_all(&chunk).await.is_ok() {}
+                let _ = stopped_tx.send(std::time::Instant::now());
+            });
+            // Every further connection: echo.
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let (bound, a_task, b_task) =
+            spawn_forward_pair(target.to_string(), 16, Duration::from_secs(30));
+
+        let mut downloader = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let mut got = vec![0u8; 256 * 1024];
+        downloader.read_exact(&mut got).await.unwrap();
+        let dropped_at = std::time::Instant::now();
+        drop(downloader); // the client aborts mid-transfer
+
+        let stopped_at = tokio::time::timeout(Duration::from_secs(10), stopped_rx)
+            .await
+            .expect("the target must see its connection closed within 10 s of the client abort")
+            .unwrap();
+        assert!(
+            stopped_at.duration_since(dropped_at) < Duration::from_secs(5),
+            "target kept streaming {:?} after the abort",
+            stopped_at.duration_since(dropped_at)
+        );
+
+        // The channel is free again: short echoes through the same forward stay fast.
+        for i in 0..10u8 {
+            let t = std::time::Instant::now();
+            let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+            c.write_all(&[i]).await.unwrap();
+            let mut b = [0u8; 1];
+            tokio::time::timeout(Duration::from_secs(2), c.read_exact(&mut b))
+                .await
+                .expect("echo stalled after the abort")
+                .unwrap();
+            assert_eq!(b[0], i);
+            assert!(t.elapsed() < Duration::from_secs(2));
+        }
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 60 s");
+}
