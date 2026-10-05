@@ -8567,10 +8567,12 @@ async fn spawn_forward_pair_over_relay(target: String, flush: RelayFlush, rate: 
     bound
 }
 
-/// Bulk in both directions at once (a full-duplex echo of 32 MiB beside a 32 MiB download), the
+/// Bulk in both directions at once (a full-duplex echo of 4 MiB beside a 4 MiB download), the
 /// live M4 shape. Returns how long it took, or panics after 60 s.
 async fn bidirectional_bulk_over_relay(flush: RelayFlush, rate: Option<u64>, fc: bool) -> Duration {
-    const LEN: usize = 16 << 20;
+    // 4 MiB per direction: well beyond credit window and socket buffers, light enough that the
+    // four relay tests do not starve the other transfer tests on a CI runner.
+    const LEN: usize = 4 << 20;
     let target = spawn_flow_target(LEN).await;
     let bound = spawn_forward_pair_over_relay(target.to_string(), flush, rate, fc).await;
     let t = std::time::Instant::now();
