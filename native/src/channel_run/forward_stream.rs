@@ -223,11 +223,20 @@ pub(crate) fn forward_initiate_on_with(
     fc_enabled: bool,
 ) -> LocalDuplex {
     let (session_side, engine_side) = tokio::io::duplex(ENGINE_DUPLEX_BUF);
+    let (up_tx, session_up) = tokio::sync::oneshot::channel();
     let pump = TaskGuard::spawn(async move {
-        run_forward_initiate_engine(engine_side, listener, target, max_streams, idle, fc_enabled)
-            .await;
+        run_forward_initiate_engine(
+            engine_side,
+            listener,
+            target,
+            max_streams,
+            idle,
+            fc_enabled,
+            session_up,
+        )
+        .await;
     });
-    LocalDuplex::with_pump(session_side, pump)
+    LocalDuplex::with_pump_and_first_read(session_side, pump, up_tx)
 }
 
 /// [`FORWARD_MAX_STREAMS_ENV`] and [`FORWARD_IDLE_SECS_ENV`] from the process environment.
@@ -433,7 +442,9 @@ pub(crate) fn flow_control_from_env() -> bool {
     )
 }
 /// Initial credit per stream and direction: covers bandwidth x delay of a desktop stream
-/// (~10 Mbit/s x 100 ms ~ 125 KB) with headroom; 72 streams x 256 KiB = 18 MiB worst case.
+/// (~10 Mbit/s x 100 ms ~ 125 KB) with headroom; 72 streams x 256 KiB = 18 MiB with an honest
+/// peer. A peer ignoring its credit can make a stream hold up to 2 x the window (a full queue plus
+/// one frame of at most the window inside the pump) before the reset (third review of #274).
 pub(crate) const FC_WINDOW: usize = 256 * 1024;
 const CTL_HELLO: u8 = 1;
 const CTL_WINDOW: u8 = 2;
@@ -811,6 +822,29 @@ enum ControlOutcome {
 /// (second adversarial review of #274: streams accepted before the HELLO ran without credit).
 const HELLO_WAIT: Duration = Duration::from_millis(500);
 
+/// The stream id of a finished pump task, removed from `running` -- also for a task that panicked,
+/// so its slot under the stream limit is freed either way.
+fn finished_stream_id(
+    running: &mut HashMap<u32, tokio::task::Id>,
+    done: Result<(tokio::task::Id, u32), tokio::task::JoinError>,
+) -> Option<u32> {
+    let task = match &done {
+        Ok((task, _)) => *task,
+        Err(e) => e.id(),
+    };
+    let id = running.iter().find(|(_, t)| **t == task).map(|(id, _)| *id)?;
+    running.remove(&id);
+    Some(id)
+}
+
+/// Sleep until `deadline`; pending forever without one (its select! branch is disabled then).
+async fn sleep_until_some(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Upper bound for announced-but-not-yet-opened streams (FC_ON before Open).
 const MAX_PENDING_FC: usize = 1024;
 
@@ -855,6 +889,7 @@ async fn run_forward_initiate_engine(
     max_streams: usize,
     idle: Duration,
     fc_enabled: bool,
+    session_up: tokio::sync::oneshot::Receiver<()>,
 ) {
     let (mux_read, mux_write) = tokio::io::split(engine_side);
     let (out_tx, out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
@@ -867,39 +902,53 @@ async fn run_forward_initiate_engine(
     let mut peer_speaks_fc = false;
     // Accept new connections only once the mode is known (HELLO seen, or HELLO_WAIT passed).
     let mut accepting = !fc_enabled;
-    let hello_deadline = tokio::time::Instant::now() + HELLO_WAIT;
+    // HELLO_WAIT counts from the moment the session is up (its first read of our duplex), not from
+    // the engine's start: dial and Noise handshake take seconds in production, and a deadline
+    // running during them would let the backlog after a reconnect start without credit.
+    tokio::pin!(session_up);
+    let mut hello_deadline: Option<tokio::time::Instant> = None;
     if !fc_enabled {
         eprintln!("ct-agent channel: forward flow control off on this member ({FORWARD_FLOW_ENV})");
     }
     let mut pending_fc = std::collections::HashSet::new();
     let mut entries: HashMap<u32, StreamEntry> = HashMap::new();
     let mut streams: JoinSet<u32> = JoinSet::new();
+    // Ids whose pump task still runs -- also after an abort removed their entry. The stream limit
+    // counts these, and an id is never handed out again while its task runs (third review of #274:
+    // abort-close let tasks pile up past max_streams, and a reused id lost its new entry).
+    let mut running: HashMap<u32, tokio::task::Id> = HashMap::new();
     let mut next_id: u32 = 1;
     let frame_fut = read_one_frame(mux_read);
     tokio::pin!(frame_fut);
 
     loop {
         tokio::select! {
-            _ = tokio::time::sleep_until(hello_deadline), if !accepting => {
+            _ = &mut session_up, if !accepting && hello_deadline.is_none() => {
+                hello_deadline = Some(tokio::time::Instant::now() + HELLO_WAIT);
+            }
+            _ = sleep_until_some(hello_deadline), if !accepting && hello_deadline.is_some() => {
                 accepting = true;
                 eprintln!("ct-agent channel: forward flow control off for this session -- the peer sent no HELLO within {} ms (older agent)", HELLO_WAIT.as_millis());
             }
             accepted = listener.accept(), if accepting => {
                 match accepted {
                     Ok((tcp, _peer_addr)) => {
-                        if entries.len() >= max_streams {
+                        if running.len() >= max_streams {
                             drop(tcp);
                             continue;
                         }
-                        let id = next_id;
-                        next_id = next_id.wrapping_add(1).max(1); // 0 is the control stream
+                        let mut id = next_id;
+                        while running.contains_key(&id) {
+                            id = id.wrapping_add(1).max(1);
+                        }
+                        next_id = id.wrapping_add(1).max(1); // 0 is the control stream
                         let credited = peer_speaks_fc;
                         let (tx, rx) = inbound_queue(credited);
                         let credit = credited.then(|| Arc::new(Semaphore::new(FC_WINDOW)));
                         entries.insert(id, StreamEntry { tx, credit: credit.clone() });
                         let out_tx2 = out_tx.clone();
                         let target2 = target.clone();
-                        streams.spawn(async move {
+                        let task = streams.spawn(async move {
                             // FC_ON before the Open: the accept side decides per stream at the Open.
                             if credited && out_tx2.send(fc_on_frame(id)).await.is_err() {
                                 return id;
@@ -910,6 +959,7 @@ async fn run_forward_initiate_engine(
                             }
                             id
                         });
+                        running.insert(id, task.id());
                     }
                     Err(e) => eprintln!("ct-agent channel: forward listener accept error: {e}"),
                 }
@@ -994,8 +1044,8 @@ async fn run_forward_initiate_engine(
                     }
                 }
             }
-            Some(done) = streams.join_next(), if !streams.is_empty() => {
-                if let Ok(id) = done {
+            Some(done) = streams.join_next_with_id(), if !streams.is_empty() => {
+                if let Some(id) = finished_stream_id(&mut running, done) {
                     if let Some(e) = entries.remove(&id) {
                         e.finish();
                     }
@@ -1032,6 +1082,9 @@ async fn run_forward_accept_engine(
     let mut pending_fc = std::collections::HashSet::new();
     let mut entries: HashMap<u32, StreamEntry> = HashMap::new();
     let mut streams: JoinSet<(u32, u64, u64)> = JoinSet::new();
+    // Ids whose dial/pump task still runs, also after an abort removed the entry (see the
+    // initiate engine): the limit counts them, and an Open for one of them is a violation.
+    let mut running: HashMap<u32, tokio::task::Id> = HashMap::new();
     let frame_fut = read_one_frame(mux_read);
     tokio::pin!(frame_fut);
 
@@ -1045,13 +1098,13 @@ async fn run_forward_accept_engine(
                     Ok(Frame::Open { id, target }) => {
                         // An Open for an id in use (or for the control id) is a session violation:
                         // it would overwrite the entry and bypass max_streams (adversarial review).
-                        if id == CONTROL_ID || entries.contains_key(&id) {
+                        if id == CONTROL_ID || entries.contains_key(&id) || running.contains_key(&id) {
                             streams.abort_all();
                             eprintln!("ct-agent channel: forward session ended -- protocol violation (Open for stream {id} already in use) -- closed every forwarded stream to its target");
                             break;
                         }
                         let credited = pending_fc.remove(&id);
-                        if entries.len() >= max_streams {
+                        if running.len() >= max_streams {
                             if !ctrl_tx.send(Frame::Close { id, reason: Some(format!("{FORWARD_MAX_STREAMS_ENV} reached")) }) {
                                 streams.abort_all();
                                 eprintln!("ct-agent channel: forward session ended -- control backlog over its cap (protocol violation)");
@@ -1073,7 +1126,8 @@ async fn run_forward_accept_engine(
                                 let credit = credited.then(|| Arc::new(Semaphore::new(FC_WINDOW)));
                                 entries.insert(id, StreamEntry { tx, credit: credit.clone() });
                                 let flow = credit.map(|credit| PumpFlow { credit });
-                                streams.spawn(dial_and_pump_forward_target(id, target, out_tx.clone(), rx, idle, flow));
+                                let task = streams.spawn(dial_and_pump_forward_target(id, target, out_tx.clone(), rx, idle, flow));
+                                running.insert(id, task.id());
                             }
                         }
                     }
@@ -1143,8 +1197,8 @@ async fn run_forward_accept_engine(
                     }
                 }
             }
-            Some(done) = streams.join_next(), if !streams.is_empty() => {
-                if let Ok((id, ..)) = done {
+            Some(done) = streams.join_next_with_id(), if !streams.is_empty() => {
+                if let Some(id) = finished_stream_id(&mut running, done.map(|(task, (id, ..))| (task, id))) {
                     if let Some(e) = entries.remove(&id) {
                         e.finish();
                     }
@@ -1345,6 +1399,81 @@ mod tests {
                 .unwrap_or_else(|_| panic!("engine kept running after Open id {dup}"))
                 .unwrap();
         }
+    }
+
+    /// A target that accepts and keeps every connection open (the pump stays busy).
+    async fn holding_target() -> String {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = target.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = target.accept().await {
+                held.push(s);
+            }
+        });
+        addr
+    }
+
+    // Third adversarial review of #274: after an abort-close the id's task may still run; an Open
+    // for that id must not create an entry the old task's end would remove -- it ends the session.
+    #[tokio::test]
+    async fn open_for_an_id_whose_task_still_runs_ends_the_accept_session() {
+        let addr = holding_target().await;
+        let (session_side, engine_side) = tokio::io::duplex(1 << 16);
+        let engine = tokio::spawn(run_forward_accept_engine(
+            engine_side,
+            Some(addr.clone()),
+            None,
+            8,
+            Duration::from_secs(30),
+            true,
+        ));
+        let (_r, mut w) = tokio::io::split(session_side);
+        for f in [
+            Frame::Open { id: 5, target: addr.clone() },
+            abort_frame(5),
+            Frame::Open { id: 5, target: addr.clone() },
+        ] {
+            f.write(&mut w).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(10), engine)
+            .await
+            .expect("engine kept running after an Open for a still running id")
+            .unwrap();
+    }
+
+    // Third adversarial review of #274: the stream limit counts running tasks, not entries --
+    // Open + abort-close in a loop must not pile up tasks past max_streams.
+    #[tokio::test]
+    async fn abort_close_does_not_free_a_slot_before_the_task_ends() {
+        let addr = holding_target().await;
+        let (session_side, engine_side) = tokio::io::duplex(1 << 16);
+        let _engine = tokio::spawn(run_forward_accept_engine(
+            engine_side,
+            Some(addr.clone()),
+            None,
+            2,
+            Duration::from_secs(30),
+            true,
+        ));
+        let (r, mut w) = tokio::io::split(session_side);
+        for id in 1..=3u32 {
+            Frame::Open { id, target: addr.clone() }.write(&mut w).await.unwrap();
+            abort_frame(id).write(&mut w).await.unwrap();
+        }
+        // The third Open arrives while the first two tasks still run: refused with the limit.
+        let mut r = r;
+        let refused = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match Frame::read(&mut r).await.unwrap() {
+                    Frame::Close { id: 3, reason: Some(reason) } => break reason,
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("no Close for the third stream");
+        assert!(refused.contains(FORWARD_MAX_STREAMS_ENV), "unexpected reason {refused}");
     }
 
     #[test]

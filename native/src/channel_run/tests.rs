@@ -8244,9 +8244,10 @@ async fn echo_once(bound: SocketAddr, i: u8) -> Duration {
 }
 
 /// T3a: a new initiate side against an accept side WITHOUT flow control (an older agent) gets no
-/// HELLO back and keeps the old behaviour -- the very first stream does not wait for anything.
+/// HELLO back and keeps the old behaviour -- the first stream of the session waits once for at
+/// most HELLO_WAIT (500 ms), then runs without credit.
 #[tokio::test]
-async fn channel_forward_new_initiate_against_old_accept_falls_back_without_waiting() {
+async fn channel_forward_new_initiate_against_old_accept_falls_back_after_the_hello_wait() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let target = spawn_flow_target(4 << 20).await;
         let (bound, a_task, b_task) = spawn_forward_pair_fc(target.to_string(), true, false);
@@ -8287,8 +8288,9 @@ async fn channel_forward_old_initiate_against_new_accept_keeps_working() {
     .expect("test hung for 60 s");
 }
 
-/// T3c (control): with flow control on both sides the slow receiver no longer stalls; with it
-/// off on one side the old head-of-line behaviour remains (documents what the switch means).
+/// T3c (control): with flow control on both sides the slow receiver does not stall the other
+/// streams of the forward. (With it off on one side the old behaviour remains; T3a/T3b cover that
+/// mixed versions keep working, not the stall itself.)
 #[tokio::test]
 async fn channel_forward_flow_control_needs_both_sides() {
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -8380,9 +8382,6 @@ async fn channel_forward_abort_during_full_duplex_ends_both_halves() {
             .await
             .expect("target must see both halves closed within 10 s of the abort")
             .unwrap();
-        // The forward stays usable.
-        let target2 = spawn_flow_target(1024).await;
-        let _ = target2;
         a_task.abort();
         b_task.abort();
     })
@@ -8394,6 +8393,18 @@ async fn channel_forward_abort_during_full_duplex_ends_both_halves() {
 /// session starts (reconnect, #267) must run with credit too -- a slow one must not stall the rest.
 #[tokio::test]
 async fn channel_forward_backlog_connections_at_session_start_run_with_credit() {
+    backlog_connections_run_with_credit(Duration::ZERO).await;
+}
+
+/// Third adversarial review of #274: in production dial and Noise handshake take seconds; the
+/// HELLO wait must start once the session is up, not when the engine starts -- otherwise the
+/// backlog after a reconnect runs without credit.
+#[tokio::test]
+async fn channel_forward_backlog_runs_with_credit_after_a_slow_handshake() {
+    backlog_connections_run_with_credit(Duration::from_millis(1500)).await;
+}
+
+async fn backlog_connections_run_with_credit(handshake_delay: Duration) {
     tokio::time::timeout(Duration::from_secs(60), async {
         let target = spawn_flow_target(256 << 20).await;
         let (listener, bound) =
@@ -8416,10 +8427,12 @@ async fn channel_forward_backlog_connections_at_session_start_run_with_credit() 
         let a_local = forward_stream::forward_initiate_on_with(listener, target.to_string(), 256, idle, true);
         let b_local = forward_stream::forward_accept_local_with(Some(target.to_string()), None, 256, idle, true);
         let a_task = tokio::spawn(async move {
+            tokio::time::sleep(handshake_delay).await; // dial + handshake in production
             let (ar, aw) = tokio::io::split(a_transport);
             run_channel_session_on_stream(aw, ar, ChannelRole::Initiate, &a_priv, &b_pub, a_local).await
         });
         let b_task = tokio::spawn(async move {
+            tokio::time::sleep(handshake_delay).await;
             let (br, bw) = tokio::io::split(b_transport);
             run_channel_session_on_stream(bw, br, ChannelRole::Accept, &b_priv, &a_pub, b_local).await
         });
@@ -8431,6 +8444,14 @@ async fn channel_forward_backlog_connections_at_session_start_run_with_credit() 
                 .unwrap_or_else(|_| panic!("backlog stream {i} stalled behind the slow receiver"))
                 .unwrap();
             assert_eq!(buf, [b'E', i]);
+        }
+        // The backlog echoes may finish before the slow stream backs up. Once it has (it first
+        // fills the autotuned send buffer of its local socket), new streams show whether it runs
+        // with credit -- without, it blocks the whole session.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for i in 0..5u8 {
+            let took = echo_once(bound, 100 + i).await;
+            assert!(took < Duration::from_secs(2), "echo {i} after the backlog took {took:?}");
         }
         drop(slow);
         a_task.abort();

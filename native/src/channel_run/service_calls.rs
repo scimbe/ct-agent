@@ -23,23 +23,40 @@ use tokio::io::ReadBuf;
 pub(crate) struct LocalDuplex {
     stream: tokio::io::DuplexStream,
     _pump: Option<TaskGuard<()>>,
+    /// Fired on the session's first read of this side, i.e. once the session is up (the session
+    /// reads its local side only after the Noise handshake). The forward engine starts its
+    /// HELLO wait from here, not from its own start (third adversarial review of #274).
+    first_read: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl From<tokio::io::DuplexStream> for LocalDuplex {
     fn from(stream: tokio::io::DuplexStream) -> Self {
-        Self { stream, _pump: None }
+        Self { stream, _pump: None, first_read: None }
     }
 }
 
 impl LocalDuplex {
     pub(crate) fn with_pump(stream: tokio::io::DuplexStream, pump: TaskGuard<()>) -> Self {
-        Self { stream, _pump: Some(pump) }
+        Self { stream, _pump: Some(pump), first_read: None }
+    }
+
+    /// [`Self::with_pump`] that also reports the session's first read through `first_read`.
+    pub(crate) fn with_pump_and_first_read(
+        stream: tokio::io::DuplexStream,
+        pump: TaskGuard<()>,
+        first_read: tokio::sync::oneshot::Sender<()>,
+    ) -> Self {
+        Self { stream, _pump: Some(pump), first_read: Some(first_read) }
     }
 }
 
 impl AsyncRead for LocalDuplex {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+        let this = self.get_mut();
+        if let Some(tx) = this.first_read.take() {
+            let _ = tx.send(());
+        }
+        Pin::new(&mut this.stream).poll_read(cx, buf)
     }
 }
 
