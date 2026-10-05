@@ -7799,3 +7799,157 @@ async fn forward_initiator_does_not_reconnect_after_the_grant_was_revoked() {
     assert!(!fwd.looping.is_finished());
     fwd.looping.abort();
 }
+
+/// Reads until `tcp` either delivers exactly `expect_len` bytes or EOFs, returning exactly the
+/// bytes it got. An empty result is a clean refusal (the cap bit before a single echo byte came
+/// back); `expect_len` bytes is a full echo; anything in between is the truncation this test
+/// exists to catch, so it is left in the returned `Vec` rather than folded into an error.
+async fn read_full_echo_or_clean_refusal(
+    tcp: &mut tokio::net::TcpStream,
+    expect_len: usize,
+) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; expect_len];
+    let mut got = 0;
+    while got < expect_len {
+        match tcp.read(&mut buf[got..]).await? {
+            0 => break,
+            n => got += n,
+        }
+    }
+    buf.truncate(got);
+    Ok(buf)
+}
+
+#[tokio::test]
+// Red acceptance test for the open DEC-0061 defect: it fails against today's main on purpose.
+// Ignored so the default `cargo test` run keeps reporting only real regressions; run it with
+//   cargo test -p ct-agent channel_forward_many_short_parallel_streams -- --ignored
+// and it reports the defect as "connection N: truncated echo -- got M of 65536 bytes".
+#[ignore = "red: DEC-0061, one forwarded stream ending tears down the whole channel session"]
+async fn channel_forward_many_short_parallel_streams_do_not_end_the_session() {
+    // DEC-0061 / AUF-20261005-016: #255's own stream tests (above) each drive ONE forwarded
+    // connection at a time. Here, 40 short-lived connections race each other through a forward
+    // whose CT_CHANNEL_FORWARD_MAX_STREAMS is the shipped default of 16, and some of the
+    // within-cap ones are torn down with a hard reset (SO_LINGER 0) instead of a clean FIN --
+    // exactly the "many short parallel streams" load the statement names. A stream ending (by
+    // error or EOF) must close only that stream: every other within-cap connection gets its
+    // full 64 KiB echo, never a truncated one, and -- the actual acceptance -- the channel
+    // SESSION survives all of it, proven by one more connection succeeding afterward on the
+    // same forward. Today's main instead tears the whole session down with the forwarded
+    // streams still in flight (the `Err(_) => { streams.abort_all(); ... break; }` arms in
+    // forward_stream.rs are reached by this load even though no grant ended and the peer
+    // transport never actually closed), so this is expected to fail red.
+    const PAYLOAD_LEN: usize = 64 * 1024;
+    const ATTEMPTS: usize = 40;
+
+    let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+    let target = tokio::spawn(async move {
+        loop {
+            let Ok((mut tcp, _)) = target_listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; PAYLOAD_LEN];
+                loop {
+                    match tcp.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if tcp.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let (bound, a_task, b_task) = spawn_forward_pair(
+        target_addr.to_string(),
+        forward_stream::DEFAULT_MAX_STREAMS,
+        Duration::from_secs(30),
+    );
+
+    // A shared barrier so all 40 connects actually land on the listener at once, rather than
+    // trickling in across however long 40 spawns happen to take to schedule -- the race this
+    // test is after needs the cap-worth of streams genuinely concurrent, not just started close
+    // together.
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(ATTEMPTS));
+    let mut attempts = Vec::new();
+    for i in 0..ATTEMPTS {
+        let start = start.clone();
+        attempts.push(tokio::spawn(async move {
+            let payload = vec![(i % 256) as u8; PAYLOAD_LEN];
+            start.wait().await;
+            let mut tcp = tokio::net::TcpStream::connect(bound)
+                .await
+                .expect("TCP connect to the local forward listener itself still succeeds");
+            if tcp.write_all(&payload).await.is_err() {
+                return Ok(()); // refused before it took a single byte
+            }
+            let echoed = read_full_echo_or_clean_refusal(&mut tcp, PAYLOAD_LEN)
+                .await
+                .map_err(|e| format!("connection {i}: read error instead of a clean EOF: {e}"))?;
+            if !echoed.is_empty() && echoed.len() != PAYLOAD_LEN {
+                return Err(format!(
+                    "connection {i}: truncated echo -- got {} of {PAYLOAD_LEN} bytes",
+                    echoed.len()
+                ));
+            }
+            if echoed.len() == PAYLOAD_LEN && echoed != payload {
+                return Err(format!(
+                    "connection {i}: echo bytes do not match what was sent"
+                ));
+            }
+            if echoed.len() == PAYLOAD_LEN && i % 3 == 0 {
+                // Half-ish of the within-cap connections go down with a hard reset instead of a
+                // clean FIN -- SO_LINGER 0 makes the kernel send RST on drop rather than FIN.
+                let sock = socket2::SockRef::from(&tcp);
+                let _ = sock.set_linger(Some(Duration::ZERO));
+            }
+            Ok(())
+        }));
+    }
+
+    let mut failures = Vec::new();
+    for a in attempts {
+        if let Err(e) = a
+            .await
+            .expect("the per-connection task itself does not panic")
+        {
+            failures.push(e);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "every within-cap connection must get its full echo, never a truncated one: {failures:?}"
+    );
+
+    // The actual acceptance: the channel session must still be alive after that load, proven by
+    // one more connection succeeding through the SAME forward.
+    let mut probe = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(bound),
+    )
+    .await
+    .expect("connecting to the forward listener does not hang")
+    .expect("the forward listener is still bound after the parallel-streams load");
+    probe
+        .write_all(b"still alive")
+        .await
+        .expect("the channel session still accepts bytes on a fresh stream");
+    let mut echoed = [0u8; b"still alive".len()];
+    tokio::time::timeout(Duration::from_secs(5), probe.read_exact(&mut echoed))
+        .await
+        .expect("a fresh connection after the load does not hang waiting for its echo")
+        .expect("the channel session is still open: a fresh connection gets its echo");
+    assert_eq!(
+        &echoed, b"still alive",
+        "the fresh post-load connection's echo must be byte-exact"
+    );
+
+    target.abort();
+    a_task.abort();
+    b_task.abort();
+}
