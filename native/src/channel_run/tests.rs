@@ -8060,3 +8060,577 @@ async fn channel_forward_aborted_client_stops_the_target_and_frees_the_channel()
     .await
     .expect("test hung for 60 s");
 }
+
+// --- DEC-0061 (2026-10-05): flow control per stream (spec: REP-20261005-entwurf-flusskontrolle-
+// forward, section 5). Measured on labor-com/labor-de: one slow receiver stalled every other stream
+// of the same forward (50/50 fast requests timed out while a 64 KiB/s export ran).
+
+/// Target for the flow-control tests: the first byte of each connection picks its role.
+/// `b'B'` = big download (`len` bytes of a fixed pattern, then close), anything else = echo.
+async fn spawn_flow_target(len: usize) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut first = [0u8; 1];
+                if s.read_exact(&mut first).await.is_err() {
+                    return;
+                }
+                if first[0] == b'B' {
+                    let mut sent = 0usize;
+                    let mut chunk = vec![0u8; 64 * 1024];
+                    while sent < len {
+                        let n = chunk.len().min(len - sent);
+                        for (i, b) in chunk[..n].iter_mut().enumerate() {
+                            *b = ((sent + i) % 251) as u8;
+                        }
+                        if s.write_all(&chunk[..n]).await.is_err() {
+                            return;
+                        }
+                        sent += n;
+                    }
+                    let _ = s.shutdown().await;
+                } else {
+                    if s.write_all(&first).await.is_err() {
+                        return;
+                    }
+                    let mut buf = [0u8; 256];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// T1: a receiver that never reads must not stall the other streams of the same forward.
+#[tokio::test]
+async fn channel_forward_slow_receiver_does_not_stall_other_streams() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let target = spawn_flow_target(256 << 20).await;
+        let (bound, a_task, b_task) = spawn_forward_pair(target.to_string(), 256, Duration::from_secs(60));
+        // The slow receiver: asks for a big download and never reads it.
+        let mut slow = connect_slow_receiver(bound).await;
+        slow.write_all(b"B").await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await; // let its data back up
+        // 50 fast streams on the same forward, all at once.
+        let mut fast = Vec::new();
+        for i in 0..50u8 {
+            fast.push(tokio::spawn(async move {
+                let t = std::time::Instant::now();
+                let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+                c.write_all(&[b'E', i]).await.unwrap();
+                let mut b = [0u8; 2];
+                tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut b))
+                    .await
+                    .map_err(|_| format!("stream {i}: echo stalled behind the slow receiver"))?
+                    .map_err(|e| format!("stream {i}: {e}"))?;
+                if b != [b'E', i] {
+                    return Err(format!("stream {i}: wrong echo {b:?}"));
+                }
+                Ok::<Duration, String>(t.elapsed())
+            }));
+        }
+        let mut errors = Vec::new();
+        for f in fast {
+            if let Err(e) = f.await.unwrap() {
+                errors.push(e);
+            }
+        }
+        assert!(errors.is_empty(), "{} of 50 fast streams stalled: {:?}", errors.len(), &errors[..errors.len().min(3)]);
+        drop(slow);
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 60 s");
+}
+
+/// T2: a large transfer arrives complete and in order, read slowly first and then at full speed.
+#[tokio::test]
+async fn channel_forward_large_transfer_arrives_complete() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        const LEN: usize = 64 << 20;
+        let target = spawn_flow_target(LEN).await;
+        let (bound, a_task, b_task) = spawn_forward_pair(target.to_string(), 16, Duration::from_secs(60));
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        c.write_all(b"B").await.unwrap();
+        let mut got = 0usize;
+        let mut buf = vec![0u8; 64 * 1024];
+        // First 2 s: a slow reader (4 KiB every 10 ms), then full speed.
+        let slow_until = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let want = if std::time::Instant::now() < slow_until { 4096 } else { buf.len() };
+            let n = c.read(&mut buf[..want]).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            for (i, b) in buf[..n].iter().enumerate() {
+                assert_eq!(*b, ((got + i) % 251) as u8, "byte {} corrupted", got + i);
+            }
+            got += n;
+            if std::time::Instant::now() < slow_until {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        assert_eq!(got, LEN, "the transfer must arrive complete");
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 60 s");
+}
+
+/// A forward pair with credit flow control switched per member (mixed-version tests).
+fn spawn_forward_pair_fc(
+    target: String,
+    initiate_fc: bool,
+    accept_fc: bool,
+) -> (
+    SocketAddr,
+    tokio::task::JoinHandle<io::Result<()>>,
+    tokio::task::JoinHandle<io::Result<()>>,
+) {
+    let a = generate_static_keypair();
+    let b = generate_static_keypair();
+    let (a_priv, a_pub) = (a.private, a.public);
+    let (b_priv, b_pub) = (b.private, b.public);
+    let (a_transport, b_transport) = tokio::io::duplex(1 << 16);
+    let idle = Duration::from_secs(60);
+    let (listener, bound) =
+        forward_stream::bind_forward_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+    let a_local =
+        forward_stream::forward_initiate_on_with(listener, target.clone(), 256, idle, initiate_fc);
+    let b_local = forward_stream::forward_accept_local_with(Some(target), None, 256, idle, accept_fc);
+    let a_task = tokio::spawn(async move {
+        let (ar, aw) = tokio::io::split(a_transport);
+        run_channel_session_on_stream(aw, ar, ChannelRole::Initiate, &a_priv, &b_pub, a_local).await
+    });
+    let b_task = tokio::spawn(async move {
+        let (br, bw) = tokio::io::split(b_transport);
+        run_channel_session_on_stream(bw, br, ChannelRole::Accept, &b_priv, &a_pub, b_local).await
+    });
+    (bound, a_task, b_task)
+}
+
+/// The slow receiver's socket: a 4 KiB receive buffer, so its stream backs up within moments
+/// instead of first filling several MiB of autotuned kernel buffer -- otherwise the "other streams
+/// stay fast" tests measure latency beside a still-running bulk transfer, which on a loaded CI
+/// runner is a timing flake, not the stall they are about.
+async fn connect_slow_receiver(bound: SocketAddr) -> tokio::net::TcpStream {
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(4096).unwrap();
+    sock.connect(bound).await.unwrap()
+}
+
+/// One echo round trip through `bound`, with its duration.
+async fn echo_once(bound: SocketAddr, i: u8) -> Duration {
+    let t = std::time::Instant::now();
+    let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+    c.write_all(&[b'E', i]).await.unwrap();
+    let mut b = [0u8; 2];
+    tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut b))
+        .await
+        .expect("echo stalled")
+        .unwrap();
+    assert_eq!(b, [b'E', i]);
+    t.elapsed()
+}
+
+/// T3a: a new initiate side against an accept side WITHOUT flow control (an older agent) gets no
+/// HELLO back and keeps the old behaviour -- the first stream of the session waits once for at
+/// most HELLO_WAIT (500 ms), then runs without credit.
+#[tokio::test]
+async fn channel_forward_new_initiate_against_old_accept_falls_back_after_the_hello_wait() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let target = spawn_flow_target(4 << 20).await;
+        let (bound, a_task, b_task) = spawn_forward_pair_fc(target.to_string(), true, false);
+        let first = echo_once(bound, 1).await;
+        assert!(first < Duration::from_secs(1), "first stream waited {first:?}");
+        // A large transfer still arrives complete without credit.
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        c.write_all(b"B").await.unwrap();
+        let mut all = Vec::new();
+        c.read_to_end(&mut all).await.unwrap();
+        assert_eq!(all.len(), 4 << 20);
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 60 s");
+}
+
+/// T3b: an initiate side without flow control (an older agent) against a new accept side: no
+/// FC_ON is sent, the accept side keeps the old behaviour, data flows both ways.
+#[tokio::test]
+async fn channel_forward_old_initiate_against_new_accept_keeps_working() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let target = spawn_flow_target(4 << 20).await;
+        let (bound, a_task, b_task) = spawn_forward_pair_fc(target.to_string(), false, true);
+        for i in 0..5u8 {
+            assert!(echo_once(bound, i).await < Duration::from_secs(2));
+        }
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        c.write_all(b"B").await.unwrap();
+        let mut all = Vec::new();
+        c.read_to_end(&mut all).await.unwrap();
+        assert_eq!(all.len(), 4 << 20);
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 60 s");
+}
+
+/// T3c (control): with flow control on both sides the slow receiver does not stall the other
+/// streams of the forward. (With it off on one side the old behaviour remains; T3a/T3b cover that
+/// mixed versions keep working, not the stall itself.)
+#[tokio::test]
+async fn channel_forward_flow_control_needs_both_sides() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let target = spawn_flow_target(256 << 20).await;
+        let (bound, a_task, b_task) = spawn_forward_pair_fc(target.to_string(), true, true);
+        let mut slow = connect_slow_receiver(bound).await;
+        slow.write_all(b"B").await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for i in 0..10u8 {
+            let took = echo_once(bound, i).await;
+            assert!(took < Duration::from_secs(2), "echo {i} took {took:?} with flow control on both sides");
+        }
+        drop(slow);
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 60 s");
+}
+
+/// Adversarial review of #274: bulk in BOTH directions at once must not deadlock on credit.
+#[tokio::test]
+async fn channel_forward_full_duplex_bulk_does_not_deadlock_on_credit() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        const LEN: usize = 8 << 20;
+        let (target, _h) = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let h = tokio::spawn(async move {
+                let (s, _) = listener.accept().await.unwrap();
+                let (mut r, mut w) = s.into_split();
+                tokio::io::copy(&mut r, &mut w).await.unwrap(); // echo while reading
+                let _ = w.shutdown().await;
+            });
+            (addr, h)
+        };
+        let (bound, a_task, b_task) = spawn_forward_pair_fc(target.to_string(), true, true);
+        let c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let (mut r, mut w) = c.into_split();
+        let writer = tokio::spawn(async move {
+            let chunk = vec![5u8; 64 * 1024];
+            for _ in 0..(LEN / chunk.len()) {
+                w.write_all(&chunk).await.unwrap();
+            }
+            w.shutdown().await.unwrap();
+        });
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(got.len(), LEN, "echo in both directions must arrive complete");
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("deadlock: full-duplex bulk hung for 60 s");
+}
+
+/// With two halves per stream: a client abort during bulk in both directions still resets the
+/// stream (the #273 path) and both halves end -- the target sees its connection closed.
+#[tokio::test]
+async fn channel_forward_abort_during_full_duplex_ends_both_halves() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = s.into_split();
+            let reader = tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                while let Ok(n) = r.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            });
+            let chunk = vec![3u8; 64 * 1024];
+            while w.write_all(&chunk).await.is_ok() {}
+            let _ = reader.await;
+            let _ = closed_tx.send(());
+        });
+        let (bound, a_task, b_task) = spawn_forward_pair_fc(target.to_string(), true, true);
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let mut buf = vec![0u8; 256 * 1024];
+        c.write_all(&vec![1u8; 512 * 1024]).await.unwrap();
+        c.read_exact(&mut buf).await.unwrap();
+        drop(c); // abort mid-transfer, both directions busy
+        tokio::time::timeout(Duration::from_secs(10), closed_rx)
+            .await
+            .expect("target must see both halves closed within 10 s of the abort")
+            .unwrap();
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 60 s");
+}
+
+/// Second adversarial review of #274: connections already waiting in the listen backlog when a
+/// session starts (reconnect, #267) must run with credit too -- a slow one must not stall the rest.
+#[tokio::test]
+async fn channel_forward_backlog_connections_at_session_start_run_with_credit() {
+    backlog_connections_run_with_credit(Duration::ZERO).await;
+}
+
+/// Third adversarial review of #274: in production dial and Noise handshake take seconds; the
+/// HELLO wait must start once the session is up, not when the engine starts -- otherwise the
+/// backlog after a reconnect runs without credit.
+#[tokio::test]
+async fn channel_forward_backlog_runs_with_credit_after_a_slow_handshake() {
+    backlog_connections_run_with_credit(Duration::from_millis(1500)).await;
+}
+
+async fn backlog_connections_run_with_credit(handshake_delay: Duration) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let target = spawn_flow_target(256 << 20).await;
+        let (listener, bound) =
+            forward_stream::bind_forward_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+        // Connections queue in the backlog BEFORE any session exists.
+        let mut slow = connect_slow_receiver(bound).await;
+        slow.write_all(b"B").await.unwrap();
+        let mut fast = Vec::new();
+        for i in 0..10u8 {
+            let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+            c.write_all(&[b'E', i]).await.unwrap();
+            fast.push((i, c));
+        }
+        let a = generate_static_keypair();
+        let b = generate_static_keypair();
+        let (a_priv, a_pub) = (a.private, a.public);
+        let (b_priv, b_pub) = (b.private, b.public);
+        let (a_transport, b_transport) = tokio::io::duplex(1 << 16);
+        let idle = Duration::from_secs(60);
+        let a_local = forward_stream::forward_initiate_on_with(listener, target.to_string(), 256, idle, true);
+        let b_local = forward_stream::forward_accept_local_with(Some(target.to_string()), None, 256, idle, true);
+        let a_task = tokio::spawn(async move {
+            tokio::time::sleep(handshake_delay).await; // dial + handshake in production
+            let (ar, aw) = tokio::io::split(a_transport);
+            run_channel_session_on_stream(aw, ar, ChannelRole::Initiate, &a_priv, &b_pub, a_local).await
+        });
+        let b_task = tokio::spawn(async move {
+            tokio::time::sleep(handshake_delay).await;
+            let (br, bw) = tokio::io::split(b_transport);
+            run_channel_session_on_stream(bw, br, ChannelRole::Accept, &b_priv, &a_pub, b_local).await
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await; // the slow one backs up
+        for (i, mut c) in fast {
+            let mut buf = [0u8; 2];
+            tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("backlog stream {i} stalled behind the slow receiver"))
+                .unwrap();
+            assert_eq!(buf, [b'E', i]);
+        }
+        // The backlog echoes may finish before the slow stream backs up. Once it has (it first
+        // fills the autotuned send buffer of its local socket), new streams show whether it runs
+        // with credit -- without, it blocks the whole session.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for i in 0..5u8 {
+            let took = echo_once(bound, 100 + i).await;
+            assert!(took < Duration::from_secs(2), "echo {i} after the backlog took {took:?}");
+        }
+        drop(slow);
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 60 s");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Live run of #274 (2026-10-05): bulk in both directions froze the forward session over the
+// edge's `:443` relay. This reproduces that path in-process with REAL sockets: each agent talks
+// TLS-over-TCP to a relay that, like the edge (`ct_edge::relay::pump_dir`, crates/edge/src/
+// relay.rs:128), splits each leg with `tokio::io::split` and copies with a 16 KiB buffer.
+
+/// How the test relay flushes a leg after a write.
+#[derive(Clone, Copy, PartialEq)]
+enum RelayFlush {
+    /// Like the edge's `pump_dir`: only after a read shorter than the buffer.
+    OnShortRead,
+    /// After every write.
+    Always,
+}
+
+async fn relay_pump_dir<R, W>(mut r: R, mut w: W, flush: RelayFlush, rate: Option<u64>) -> io::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 16 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = r.read(&mut buf).await?;
+        if n == 0 {
+            let _ = w.shutdown().await;
+            return Ok(total);
+        }
+        total += n as u64;
+        w.write_all(&buf[..n]).await?;
+        if matches!(flush, RelayFlush::Always) || n < buf.len() {
+            w.flush().await?;
+        }
+        if let Some(bps) = rate {
+            // WAN-like leg: hold this direction to `bps` bytes per second.
+            tokio::time::sleep(Duration::from_secs_f64(n as f64 / bps as f64)).await;
+        }
+    }
+}
+
+/// An edge-like relay: accepts two TLS connections (first the initiator, then the acceptor) and
+/// copies between them, each direction in its own pump, like `relay_streams`/`relay_pair`.
+async fn spawn_tls_relay(flush: RelayFlush, rate: Option<u64>) -> SocketAddr {
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert = certified.cert.der().clone();
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+    let scfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(scfg));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (t1, _) = listener.accept().await.unwrap();
+        let a = acceptor.accept(t1).await.unwrap();
+        let (t2, _) = listener.accept().await.unwrap();
+        let b = acceptor.accept(t2).await.unwrap();
+        let (a_recv, a_send) = tokio::io::split(a);
+        let (b_recv, b_send) = tokio::io::split(b);
+        let _ = tokio::try_join!(
+            relay_pump_dir(a_recv, b_send, flush, rate),
+            relay_pump_dir(b_recv, a_send, flush, rate)
+        );
+    });
+    addr
+}
+
+async fn tls_to_relay(relay: SocketAddr) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    let ccfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyServerCert))
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(ccfg));
+    let tcp = tokio::net::TcpStream::connect(relay).await.unwrap();
+    let sni = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    connector.connect(sni, tcp).await.unwrap()
+}
+
+/// Two forward agents (flow control on both) joined through [`spawn_tls_relay`]; returns the
+/// initiate side's local listener address.
+async fn spawn_forward_pair_over_relay(target: String, flush: RelayFlush, rate: Option<u64>, fc: bool) -> SocketAddr {
+    let a = generate_static_keypair();
+    let b = generate_static_keypair();
+    let (a_priv, a_pub) = (a.private, a.public);
+    let (b_priv, b_pub) = (b.private, b.public);
+    let relay = spawn_tls_relay(flush, rate).await;
+    let idle = Duration::from_secs(60);
+    let (listener, bound) =
+        forward_stream::bind_forward_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+    let a_local = forward_stream::forward_initiate_on_with(listener, target.clone(), 256, idle, fc);
+    let b_local = forward_stream::forward_accept_local_with(Some(target), None, 256, idle, fc);
+    let a_tls = tls_to_relay(relay).await;
+    let b_tls = tls_to_relay(relay).await;
+    tokio::spawn(async move {
+        let (ar, aw) = tokio::io::split(a_tls);
+        run_channel_session_on_stream(aw, ar, ChannelRole::Initiate, &a_priv, &b_pub, a_local).await
+    });
+    tokio::spawn(async move {
+        let (br, bw) = tokio::io::split(b_tls);
+        run_channel_session_on_stream(bw, br, ChannelRole::Accept, &b_priv, &a_pub, b_local).await
+    });
+    bound
+}
+
+/// Bulk in both directions at once (a full-duplex echo of 4 MiB beside a 4 MiB download), the
+/// live M4 shape. Returns how long it took, or panics after 60 s.
+async fn bidirectional_bulk_over_relay(flush: RelayFlush, rate: Option<u64>, fc: bool) -> Duration {
+    // 4 MiB per direction: well beyond credit window and socket buffers, light enough that the
+    // four relay tests do not starve the other transfer tests on a CI runner.
+    const LEN: usize = 4 << 20;
+    let target = spawn_flow_target(LEN).await;
+    let bound = spawn_forward_pair_over_relay(target.to_string(), flush, rate, fc).await;
+    let t = std::time::Instant::now();
+    let echo = tokio::spawn(async move {
+        let c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let (mut r, mut w) = c.into_split();
+        let writer = tokio::spawn(async move {
+            w.write_all(b"E").await.unwrap();
+            let chunk = vec![7u8; 64 * 1024];
+            for _ in 0..LEN / chunk.len() {
+                w.write_all(&chunk).await.unwrap();
+            }
+        });
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut got = 0usize;
+        while got < LEN + 1 {
+            let n = r.read(&mut buf).await.unwrap();
+            assert!(n > 0, "echo closed early after {got} bytes");
+            got += n;
+        }
+        writer.await.unwrap();
+    });
+    let download = tokio::spawn(async move {
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        c.write_all(b"B").await.unwrap();
+        let mut all = Vec::new();
+        c.read_to_end(&mut all).await.unwrap();
+        assert_eq!(all.len(), LEN);
+    });
+    tokio::time::timeout(Duration::from_secs(60), async {
+        echo.await.unwrap();
+        download.await.unwrap();
+    })
+    .await
+    .expect("bulk in both directions stalled over the relay");
+    t.elapsed()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channel_forward_bidirectional_bulk_over_a_flushing_relay() {
+    let took = bidirectional_bulk_over_relay(RelayFlush::Always, None, true).await;
+    eprintln!("bidirectional bulk over a flushing relay: {took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channel_forward_bidirectional_bulk_over_an_edge_like_relay() {
+    let took = bidirectional_bulk_over_relay(RelayFlush::OnShortRead, None, true).await;
+    eprintln!("bidirectional bulk over an edge-like relay: {took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channel_forward_bidirectional_bulk_over_a_slow_edge_like_relay() {
+    let took = bidirectional_bulk_over_relay(RelayFlush::OnShortRead, Some(8 << 20), true).await;
+    eprintln!("bidirectional bulk over a slow edge-like relay (flow control on): {took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channel_forward_bidirectional_bulk_over_a_slow_edge_like_relay_without_flow_control() {
+    let took = bidirectional_bulk_over_relay(RelayFlush::OnShortRead, Some(8 << 20), false).await;
+    eprintln!("bidirectional bulk over a slow edge-like relay (flow control off): {took:?}");
+}

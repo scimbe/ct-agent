@@ -56,12 +56,13 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
 use super::forward::accept_forward_request_with;
@@ -210,11 +211,32 @@ pub(crate) fn forward_initiate_on(
     max_streams: usize,
     idle: Duration,
 ) -> LocalDuplex {
+    forward_initiate_on_with(listener, target, max_streams, idle, flow_control_from_env())
+}
+
+/// [`forward_initiate_on`] with credit flow control switched explicitly (tests of mixed versions).
+pub(crate) fn forward_initiate_on_with(
+    listener: Arc<TcpListener>,
+    target: String,
+    max_streams: usize,
+    idle: Duration,
+    fc_enabled: bool,
+) -> LocalDuplex {
     let (session_side, engine_side) = tokio::io::duplex(ENGINE_DUPLEX_BUF);
+    let (up_tx, session_up) = tokio::sync::oneshot::channel();
     let pump = TaskGuard::spawn(async move {
-        run_forward_initiate_engine(engine_side, listener, target, max_streams, idle).await;
+        run_forward_initiate_engine(
+            engine_side,
+            listener,
+            target,
+            max_streams,
+            idle,
+            fc_enabled,
+            session_up,
+        )
+        .await;
     });
-    LocalDuplex::with_pump(session_side, pump)
+    LocalDuplex::with_pump_and_first_read(session_side, pump, up_tx)
 }
 
 /// [`FORWARD_MAX_STREAMS_ENV`] and [`FORWARD_IDLE_SECS_ENV`] from the process environment.
@@ -335,10 +357,34 @@ pub(crate) fn forward_accept_local(
     max_streams: usize,
     idle: Duration,
 ) -> LocalDuplex {
+    forward_accept_local_with(
+        allow_raw,
+        non_loopback_raw,
+        max_streams,
+        idle,
+        flow_control_from_env(),
+    )
+}
+
+/// [`forward_accept_local`] with credit flow control switched explicitly (tests of mixed versions).
+pub(crate) fn forward_accept_local_with(
+    allow_raw: Option<String>,
+    non_loopback_raw: Option<String>,
+    max_streams: usize,
+    idle: Duration,
+    fc_enabled: bool,
+) -> LocalDuplex {
     let (session_side, engine_side) = tokio::io::duplex(ENGINE_DUPLEX_BUF);
     let pump = TaskGuard::spawn(async move {
-        run_forward_accept_engine(engine_side, allow_raw, non_loopback_raw, max_streams, idle)
-            .await;
+        run_forward_accept_engine(
+            engine_side,
+            allow_raw,
+            non_loopback_raw,
+            max_streams,
+            idle,
+            fc_enabled,
+        )
+        .await;
     });
     LocalDuplex::with_pump(session_side, pump)
 }
@@ -361,186 +407,646 @@ fn abort_frame(id: u32) -> Frame {
     }
 }
 
-/// Exact comparison on purpose: only the reset value resets, every other reason half-closes.
+/// Close WITHOUT a reason is the half-close a pump sends on a clean local EOF; Close WITH any
+/// reason (abort, refused, dial failed, max_streams, idle timeout) ends the stream fully, so a
+/// refused or idle client is closed at once instead of half-open until the idle limit
+/// (second adversarial review of #274). An agent before DEC-0061 treats all of them as half-close.
 fn stream_in_for_close(reason: Option<&str>) -> StreamIn {
-    if reason == Some(super::forward_wire::CLOSE_REASON_ABORT) {
+    if reason.is_some() {
         StreamIn::Aborted
     } else {
         StreamIn::Closed
     }
 }
 
-/// Byte-transparent pump for ONE forwarded TCP connection (either side: the initiate side's
-/// locally-accepted client, or the accept side's freshly-dialed target) — the "je TCP-
-/// Verbindung ein byte-transparenter Stream" primitive both engines spawn one of per stream.
-///
-/// Ends when both directions are done: `tcp`'s read side EOFs/errors (sends one `Close` out,
-/// keeps servicing inbound so a peer reply in flight isn't dropped) AND the peer sends `Close`
-/// (shuts `tcp`'s write half). Also ends — sending one `Close{reason: "idle timeout"}` — when a
-/// full `idle` period passes with NEITHER direction moving a byte: `tokio::select!` re-creates
-/// the `sleep(idle)` future fresh every loop iteration, so any activity on either of the other
-/// two branches resets it, exactly the semantics `CT_CHANNEL_FORWARD_IDLE_SECS` promises.
-///
-/// Returns `(bytes_out, bytes_in)`: bytes read from `tcp` and sent to the peer, and bytes
-/// received from the peer and written to `tcp` — the accept side's `forward_open`/`forward_close`
-/// events report these directly.
+// --- Flow control per stream (DEC-0061, spec REP-20261005-entwurf-flusskontrolle-forward, s. 5) ---
+//
+// Control messages travel as `Data` on the reserved stream id 0 (real streams start at 1): an
+// agent without flow control ignores `Data` for an unknown id, so mixed versions keep working.
+//   HELLO      [1, b'C', b'F', b'C', 1]  "I speak credit flow control", sent once per session
+//   WINDOW     [2, id u32 BE, bytes u32 BE]  the receiver of `id` consumed `bytes`: new credit
+//   FC_ON      [3, id u32 BE]  initiate side: stream `id` (opened next) uses credit flow control
+// The initiate side sends FC_ON (before the Open) only after it saw the peer's HELLO, so a stream
+// runs with credit exactly when BOTH sides know it; everything else keeps the old behaviour.
+
+/// The reserved control stream id.
+const CONTROL_ID: u32 = 0;
+/// `CT_CHANNEL_FORWARD_FLOW=off` disables credit flow control on this member (it then behaves like
+/// an agent before DEC-0061: no HELLO, FC_ON ignored). Default: on.
+pub const FORWARD_FLOW_ENV: &str = "CT_CHANNEL_FORWARD_FLOW";
+
+pub(crate) fn flow_control_from_env() -> bool {
+    !matches!(
+        std::env::var(FORWARD_FLOW_ENV).ok().as_deref(),
+        Some("off" | "0" | "false")
+    )
+}
+/// Initial credit per stream and direction: covers bandwidth x delay of a desktop stream
+/// (~10 Mbit/s x 100 ms ~ 125 KB) with headroom; 72 streams x 256 KiB = 18 MiB with an honest
+/// peer. A peer ignoring its credit can make a stream hold up to 2 x the window (a full queue plus
+/// one frame of at most the window inside the pump) before the reset (third review of #274).
+pub(crate) const FC_WINDOW: usize = 256 * 1024;
+const CTL_HELLO: u8 = 1;
+const CTL_WINDOW: u8 = 2;
+const CTL_FC_ON: u8 = 3;
+
+fn hello_frame() -> Frame {
+    Frame::Data {
+        id: CONTROL_ID,
+        payload: vec![CTL_HELLO, b'C', b'F', b'C', 1],
+    }
+}
+
+fn window_frame(id: u32, bytes: u32) -> Frame {
+    let mut p = vec![CTL_WINDOW];
+    p.extend_from_slice(&id.to_be_bytes());
+    p.extend_from_slice(&bytes.to_be_bytes());
+    Frame::Data {
+        id: CONTROL_ID,
+        payload: p,
+    }
+}
+
+fn fc_on_frame(id: u32) -> Frame {
+    let mut p = vec![CTL_FC_ON];
+    p.extend_from_slice(&id.to_be_bytes());
+    Frame::Data {
+        id: CONTROL_ID,
+        payload: p,
+    }
+}
+
+/// A decoded control message; anything unknown or malformed is ignored (forward-compatible).
+enum Control {
+    Hello,
+    Window { id: u32, bytes: u32 },
+    FcOn { id: u32 },
+}
+
+fn parse_control(p: &[u8]) -> Option<Control> {
+    let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    match p {
+        [CTL_HELLO, b'C', b'F', b'C', ..] => Some(Control::Hello),
+        [CTL_WINDOW, rest @ ..] if rest.len() >= 8 => Some(Control::Window {
+            id: be(&rest[..4]),
+            bytes: be(&rest[4..8]),
+        }),
+        [CTL_FC_ON, rest @ ..] if rest.len() >= 4 => Some(Control::FcOn { id: be(&rest[..4]) }),
+        _ => None,
+    }
+}
+
+/// Engine side of one stream's inbound queue.
+enum InTx {
+    /// No flow control (peer without it): bounded, the engine waits on it as before.
+    Bounded(mpsc::Sender<StreamIn>),
+    /// Flow control: never blocks; the peer may not send more than its credit, so more than
+    /// [`FC_WINDOW`] bytes buffered is a protocol violation of this stream.
+    Credited {
+        tx: mpsc::UnboundedSender<StreamIn>,
+        pending: Arc<AtomicUsize>,
+    },
+}
+
+/// Pump side of one stream's inbound queue.
+enum InRx {
+    Bounded(mpsc::Receiver<StreamIn>),
+    Credited {
+        rx: mpsc::UnboundedReceiver<StreamIn>,
+        pending: Arc<AtomicUsize>,
+    },
+}
+
+impl InRx {
+    /// Cancel-safe like the receivers it wraps (the count is only touched after a receive).
+    async fn recv(&mut self) -> Option<StreamIn> {
+        match self {
+            InRx::Bounded(rx) => rx.recv().await,
+            InRx::Credited { rx, pending } => {
+                let msg = rx.recv().await;
+                if let Some(StreamIn::Data(p)) = &msg {
+                    pending.fetch_sub(p.len(), Ordering::Relaxed);
+                }
+                msg
+            }
+        }
+    }
+}
+
+fn inbound_queue(credited: bool) -> (InTx, InRx) {
+    if credited {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(AtomicUsize::new(0));
+        (
+            InTx::Credited {
+                tx,
+                pending: pending.clone(),
+            },
+            InRx::Credited { rx, pending },
+        )
+    } else {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAP);
+        (InTx::Bounded(tx), InRx::Bounded(rx))
+    }
+}
+
+/// One stream as the engine sees it.
+struct StreamEntry {
+    tx: InTx,
+    /// Send credit of this stream's pump (flow control only); the engine adds WINDOW credit.
+    credit: Option<Arc<Semaphore>>,
+}
+
+impl StreamEntry {
+    /// Hand peer data to the pump. Returns `false` when the stream must be reset because the
+    /// peer exceeded its credit. Waits only for a stream WITHOUT flow control (old peer).
+    async fn deliver(&self, payload: Vec<u8>) -> bool {
+        match &self.tx {
+            InTx::Bounded(tx) => {
+                let _ = tx.send(StreamIn::Data(payload)).await;
+                true
+            }
+            InTx::Credited { tx, pending } => {
+                if pending.load(Ordering::Relaxed) + payload.len() > FC_WINDOW {
+                    return false;
+                }
+                pending.fetch_add(payload.len(), Ordering::Relaxed);
+                let _ = tx.send(StreamIn::Data(payload));
+                true
+            }
+        }
+    }
+
+    /// Tell the pump the peer closed (half-close) or reset the stream. The entry itself stays
+    /// until the pump ends: after a half-close this side may still be sending, and its credit
+    /// (WINDOW from the peer) must keep arriving.
+    async fn notify(&self, msg: StreamIn) {
+        match &self.tx {
+            InTx::Bounded(tx) => {
+                let _ = tx.send(msg).await;
+            }
+            InTx::Credited { tx, .. } => {
+                let _ = tx.send(msg);
+            }
+        }
+    }
+
+    /// The stream is gone for good (pump ended or reset): stop any send that waits for credit.
+    fn finish(&self) {
+        if let Some(c) = &self.credit {
+            c.close();
+        }
+    }
+}
+
+/// The send side of a credited stream: the pump takes credit before every `Data` and reports
+/// what it wrote to the local socket back to the peer, batched at half a window.
+struct PumpFlow {
+    credit: Arc<Semaphore>,
+}
+
+/// Byte-transparent pump for ONE forwarded TCP connection (either side). Two halves run
+/// concurrently in this task: "local -> peer" (read the socket, take credit, send `Data`) and
+/// "peer -> local" (write what the peer sent, return credit). Waiting for credit therefore never
+/// stops the half that returns credit (adversarial review of #274: with one combined loop, bulk in
+/// both directions deadlocked each stream on credit). Ends when both halves are done, on a reset,
+/// or after a full `idle` period without a byte in either direction.
 async fn pump_forward_stream(
     id: u32,
     tcp: TcpStream,
     outbound: mpsc::Sender<Frame>,
-    mut inbound: mpsc::Receiver<StreamIn>,
+    mut inbound: InRx,
     idle: Duration,
+    flow: Option<PumpFlow>,
 ) -> (u64, u64) {
+    enum Half {
+        /// This direction finished cleanly (half-close).
+        Done,
+        /// Stop the whole stream now (reset sent or received, or the engine is gone).
+        Stop,
+    }
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
-    let mut buf = vec![0u8; DATA_CHUNK_LEN];
-    let mut bytes_out: u64 = 0;
-    let mut bytes_in: u64 = 0;
-    let mut tcp_eof = false;
-    let mut peer_eof = false;
-    loop {
-        if tcp_eof && peer_eof {
-            break;
+    use std::sync::atomic::AtomicU64;
+    let bytes_out = AtomicU64::new(0);
+    let bytes_in = AtomicU64::new(0);
+    // Last activity as milliseconds since `start` (shared by both halves and the idle timer).
+    let start = tokio::time::Instant::now();
+    let last_ms = AtomicU64::new(0);
+    let touch = || last_ms.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    let last = || start + Duration::from_millis(last_ms.load(Ordering::Relaxed));
+    let out_up = outbound.clone();
+    let credit = flow.as_ref().map(|f| f.credit.clone());
+
+    let up = async {
+        let mut buf = vec![0u8; DATA_CHUNK_LEN];
+        loop {
+            match tcp_r.read(&mut buf).await {
+                // A clean EOF is a half-close: the peer may still owe this side a reply.
+                Ok(0) => {
+                    let _ = out_up.send(Frame::Close { id, reason: None }).await;
+                    return Half::Done;
+                }
+                // The local socket itself failed: reset the stream (DEC-0061, 2026-10-05).
+                Err(_) => {
+                    let _ = out_up.send(abort_frame(id)).await;
+                    return Half::Stop;
+                }
+                Ok(n) => {
+                    if let Some(c) = &credit {
+                        match c.acquire_many(n as u32).await {
+                            Ok(permit) => permit.forget(),
+                            Err(_) => return Half::Stop, // the engine closed the stream
+                        }
+                    }
+                    touch();
+                    bytes_out.fetch_add(n as u64, Ordering::Relaxed);
+                    if out_up
+                        .send(Frame::Data {
+                            id,
+                            payload: buf[..n].to_vec(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Half::Stop; // the engine loop ended
+                    }
+                }
+            }
         }
-        tokio::select! {
-            r = tcp_r.read(&mut buf), if !tcp_eof => {
-                match r {
-                    // A clean EOF is a half-close: the peer may still owe this side a reply.
-                    Ok(0) => {
-                        tcp_eof = true;
-                        let _ = outbound.send(Frame::Close { id, reason: None }).await;
-                    }
-                    // The local socket itself failed: reset the stream, so the peer stops its target
-                    // instead of streaming into a dead connection (DEC-0061, 2026-10-05).
-                    Err(_) => {
+    };
+    let down = async {
+        let mut unreported: usize = 0;
+        loop {
+            match inbound.recv().await {
+                Some(StreamIn::Data(payload)) => {
+                    if tcp_w.write_all(&payload).await.is_err() {
+                        // Nobody reads the local side any more: reset, do not drain.
                         let _ = outbound.send(abort_frame(id)).await;
-                        break;
+                        return Half::Stop;
                     }
-                    Ok(n) => {
-                        bytes_out += n as u64;
-                        if outbound.send(Frame::Data { id, payload: buf[..n].to_vec() }).await.is_err() {
-                            break; // the engine loop ended -- nothing left to deliver to
+                    touch();
+                    bytes_in.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    if flow.is_some() {
+                        unreported += payload.len();
+                        if unreported >= FC_WINDOW / 2 {
+                            let _ = outbound.send(window_frame(id, unreported as u32)).await;
+                            unreported = 0;
                         }
                     }
                 }
-            }
-            msg = inbound.recv(), if !peer_eof => {
-                match msg {
-                    Some(StreamIn::Data(payload)) => {
-                        bytes_in += payload.len() as u64;
-                        if tcp_w.write_all(&payload).await.is_err() {
-                            // Nobody reads the local side any more: reset, do not drain.
-                            let _ = outbound.send(abort_frame(id)).await;
-                            break;
-                        }
-                    }
-                    Some(StreamIn::Closed) | None => {
-                        peer_eof = true;
-                        let _ = tcp_w.shutdown().await;
-                    }
-                    // Dropping both socket halves on return closes the connection fully.
-                    Some(StreamIn::Aborted) => break,
+                Some(StreamIn::Closed) | None => {
+                    let _ = tcp_w.shutdown().await;
+                    return Half::Done;
                 }
+                // Dropping both socket halves on return closes the connection fully.
+                Some(StreamIn::Aborted) => return Half::Stop,
             }
-            _ = tokio::time::sleep(idle) => {
-                let _ = outbound.send(Frame::Close { id, reason: Some("idle timeout".to_string()) }).await;
-                break;
+        }
+    };
+    tokio::pin!(up);
+    tokio::pin!(down);
+    let (mut up_done, mut down_done) = (false, false);
+    while !(up_done && down_done) {
+        let deadline = last()
+            .checked_add(idle)
+            .unwrap_or_else(|| last() + Duration::from_secs(86_400 * 365));
+        tokio::select! {
+            r = &mut up, if !up_done => match r {
+                Half::Done => up_done = true,
+                Half::Stop => break,
+            },
+            r = &mut down, if !down_done => match r {
+                Half::Done => down_done = true,
+                Half::Stop => break,
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                // Idle: no byte in either direction for a full `idle` (also while waiting for
+                // credit or for a slow local reader -- the timer is outside both halves).
+                if last().checked_add(idle).is_some_and(|d| d <= tokio::time::Instant::now()) {
+                    let _ = outbound.send(Frame::Close { id, reason: Some("idle timeout".to_string()) }).await;
+                    break;
+                }
             }
         }
     }
-    (bytes_out, bytes_in)
+    (
+        bytes_out.load(Ordering::Relaxed),
+        bytes_in.load(Ordering::Relaxed),
+    )
 }
 
-/// The initiate side's engine (#255 slice 2): accept TCP connections on `listener` and, for
-/// each, allocate a stream id, tell the peer to open it (`Frame::Open`), then run
-/// [`pump_forward_stream`]. Concurrently demuxes inbound `Data`/`Close` frames from `engine_side`
-/// to the right stream, and serializes every stream's outbound frames back onto it. One
-/// `tokio::select!` loop, so a session end (the peer's transport closing, read/write error)
-/// drops the whole `JoinSet` — and with it every still-forwarding TCP connection — in one place.
-///
-/// AUF-20260930-005 (INC-20260930-101): that session end is also what an expired or revoked grant
-/// produces: every stream is aborted at once and logged. ct-agent#267: the engine then RETURNS, so
-/// its side of the duplex closes and the session pump finishes; in 0.7.36 it stayed alive
-/// refusing connections instead, which kept the session -- and the process -- hanging. What
-/// happens to the listener next is [`run_forward_initiate_reconnect_loop`]'s decision (or, for a
-/// listener this engine owns alone, it is simply dropped and connects are refused).
+/// Upper bound for the engine's own control backlog (frames not yet written). A peer that floods
+/// Opens or violations while not reading would otherwise grow it without limit: session violation.
+const CTRL_BACKLOG_CAP: usize = 4096;
+
+/// The engine's unbounded control queue with a backlog count (decremented by the writer).
+#[derive(Clone)]
+struct CtrlTx {
+    tx: mpsc::UnboundedSender<Frame>,
+    backlog: Arc<AtomicUsize>,
+}
+
+impl CtrlTx {
+    /// Queue a control frame; `false` when the backlog is over its cap (end the session).
+    fn send(&self, f: Frame) -> bool {
+        if self.backlog.fetch_add(1, Ordering::Relaxed) >= CTRL_BACKLOG_CAP {
+            return false;
+        }
+        self.tx.send(f).is_ok()
+    }
+}
+
+fn ctrl_channel() -> (CtrlTx, mpsc::UnboundedReceiver<Frame>, Arc<AtomicUsize>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    (
+        CtrlTx {
+            tx,
+            backlog: backlog.clone(),
+        },
+        rx,
+        backlog,
+    )
+}
+
+/// The engine's only writer: owns the session duplex's write half and serializes the pumps'
+/// bounded queue and the engine's own unbounded control queue onto it. The engine itself never
+/// writes, so a peer that does not read can no longer stop the engine's read loop (DEC-0061 (c)).
+fn spawn_frame_writer<W>(
+    mut mux_write: W,
+    mut out_rx: mpsc::Receiver<Frame>,
+    mut ctrl_rx: mpsc::UnboundedReceiver<Frame>,
+    ctrl_backlog: Arc<AtomicUsize>,
+) -> tokio::task::JoinHandle<()>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            let frame = tokio::select! {
+                biased;
+                f = ctrl_rx.recv() => {
+                    ctrl_backlog.fetch_sub(1, Ordering::Relaxed);
+                    f
+                }
+                f = out_rx.recv() => f,
+            };
+            match frame {
+                Some(f) => {
+                    if f.write(&mut mux_write).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+    })
+}
+
+/// What a control message asks the engine to do.
+enum ControlOutcome {
+    None,
+    /// The peer speaks flow control.
+    Hello,
+    /// Protocol violation of one stream (credit beyond the window): reset that stream.
+    ResetStream(u32),
+    /// Protocol violation of the session (FC_ON flood): end the session.
+    EndSession,
+}
+
+/// How long the initiate side holds back new connections at session start until the peer's HELLO
+/// arrives. With a peer that speaks flow control the HELLO comes after about one round trip
+/// (~100 ms via the edge relay), so every stream -- also connections already waiting in the
+/// listen backlog after a reconnect (#267) -- runs with credit. With an older peer the first accept
+/// of a session waits once for this long, then the session runs in the old mode
+/// (second adversarial review of #274: streams accepted before the HELLO ran without credit).
+const HELLO_WAIT: Duration = Duration::from_millis(500);
+
+/// The stream id of a finished pump task, removed from `running` -- also for a task that panicked,
+/// so its slot under the stream limit is freed either way.
+fn finished_stream_id(
+    running: &mut HashMap<u32, tokio::task::Id>,
+    done: Result<(tokio::task::Id, u32), tokio::task::JoinError>,
+) -> Option<u32> {
+    let task = match &done {
+        Ok((task, _)) => *task,
+        Err(e) => e.id(),
+    };
+    let id = running.iter().find(|(_, t)| **t == task).map(|(id, _)| *id)?;
+    running.remove(&id);
+    Some(id)
+}
+
+/// The accept side's mode line for a session: on with the peer's HELLO (or an FC_ON before the
+/// first Open), off when the first stream opens without either (older agent).
+fn accept_mode_line(peer_speaks_fc: bool) -> String {
+    if peer_speaks_fc {
+        format!(
+            "ct-agent channel: forward flow control on for this session (credit window {} KiB per stream, accept side)",
+            FC_WINDOW / 1024
+        )
+    } else {
+        "ct-agent channel: forward flow control off for this session -- the first stream opened without HELLO (older agent, accept side)".to_string()
+    }
+}
+
+/// Sleep until `deadline`; pending forever without one (its select! branch is disabled then).
+async fn sleep_until_some(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Upper bound for announced-but-not-yet-opened streams (FC_ON before Open).
+const MAX_PENDING_FC: usize = 1024;
+
+/// Handle one control message in either engine.
+fn apply_control(
+    payload: &[u8],
+    streams: &HashMap<u32, StreamEntry>,
+    pending_fc: &mut std::collections::HashSet<u32>,
+) -> ControlOutcome {
+    match parse_control(payload) {
+        Some(Control::Hello) => ControlOutcome::Hello,
+        Some(Control::Window { id, bytes }) => {
+            if let Some(Some(c)) = streams.get(&id).map(|s| s.credit.as_ref()) {
+                // Never more than the window in total: a peer cannot write itself unlimited credit,
+                // and the semaphore can never overflow (adversarial review of #274). More than the
+                // room is a protocol violation of this stream -> reset it (rule in the spec, s. 5).
+                let room = FC_WINDOW.saturating_sub(c.available_permits());
+                if bytes as usize > room {
+                    return ControlOutcome::ResetStream(id);
+                }
+                c.add_permits(bytes as usize);
+            }
+            ControlOutcome::None
+        }
+        Some(Control::FcOn { id }) => {
+            if pending_fc.len() >= MAX_PENDING_FC {
+                return ControlOutcome::EndSession;
+            }
+            pending_fc.insert(id);
+            ControlOutcome::None
+        }
+        None => ControlOutcome::None,
+    }
+}
+
+/// The initiate side's engine (#255): every accepted local connection becomes one stream.
+/// Reads frames cancel-safe (frame_fut), never waits on a credited stream, never writes itself.
 async fn run_forward_initiate_engine(
     engine_side: tokio::io::DuplexStream,
     listener: Arc<TcpListener>,
     target: String,
     max_streams: usize,
     idle: Duration,
+    fc_enabled: bool,
+    session_up: tokio::sync::oneshot::Receiver<()>,
 ) {
-    let (mux_read, mut mux_write) = tokio::io::split(engine_side);
-    let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
-    let mut inbound_txs: HashMap<u32, mpsc::Sender<StreamIn>> = HashMap::new();
+    let (mux_read, mux_write) = tokio::io::split(engine_side);
+    let (out_tx, out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
+    let (ctrl_tx, ctrl_rx, ctrl_backlog) = ctrl_channel();
+    let writer = spawn_frame_writer(mux_write, out_rx, ctrl_rx, ctrl_backlog);
+    tokio::pin!(writer);
+    if fc_enabled {
+        let _ = ctrl_tx.send(hello_frame());
+    }
+    let mut peer_speaks_fc = false;
+    // Accept new connections only once the mode is known (HELLO seen, or HELLO_WAIT passed).
+    let mut accepting = !fc_enabled;
+    // HELLO_WAIT counts from the moment the session is up (its first read of our duplex), not from
+    // the engine's start: dial and Noise handshake take seconds in production, and a deadline
+    // running during them would let the backlog after a reconnect start without credit.
+    tokio::pin!(session_up);
+    let mut hello_deadline: Option<tokio::time::Instant> = None;
+    if !fc_enabled {
+        eprintln!("ct-agent channel: forward flow control off on this member ({FORWARD_FLOW_ENV})");
+    }
+    let mut pending_fc = std::collections::HashSet::new();
+    let mut entries: HashMap<u32, StreamEntry> = HashMap::new();
     let mut streams: JoinSet<u32> = JoinSet::new();
+    // Ids whose pump task still runs -- also after an abort removed their entry. The stream limit
+    // counts these, and an id is never handed out again while its task runs (third review of #274:
+    // abort-close let tasks pile up past max_streams, and a reused id lost its new entry).
+    let mut running: HashMap<u32, tokio::task::Id> = HashMap::new();
     let mut next_id: u32 = 1;
-    // AUF-20261005-016: see `read_one_frame`'s own doc for why this is pinned and only
-    // replaced once it actually resolves, rather than reconstructed fresh every iteration.
     let frame_fut = read_one_frame(mux_read);
     tokio::pin!(frame_fut);
 
     loop {
         tokio::select! {
-            accepted = listener.accept() => {
+            _ = &mut session_up, if !accepting && hello_deadline.is_none() => {
+                hello_deadline = Some(tokio::time::Instant::now() + HELLO_WAIT);
+            }
+            _ = sleep_until_some(hello_deadline), if !accepting && hello_deadline.is_some() => {
+                accepting = true;
+                eprintln!("ct-agent channel: forward flow control off for this session -- the peer sent no HELLO within {} ms (older agent)", HELLO_WAIT.as_millis());
+            }
+            accepted = listener.accept(), if accepting => {
                 match accepted {
                     Ok((tcp, _peer_addr)) => {
-                        if inbound_txs.len() >= max_streams {
-                            // #255 acceptance 3: over the cap, refuse the local connection
-                            // immediately (a deterministic close) rather than silently queuing
-                            // it in the OS backlog -- a caller sees the limit bite at once.
+                        if running.len() >= max_streams {
                             drop(tcp);
                             continue;
                         }
-                        let id = next_id;
-                        next_id = next_id.wrapping_add(1);
-                        let (tx, rx) = mpsc::channel::<StreamIn>(CHANNEL_CAP);
-                        inbound_txs.insert(id, tx);
+                        let mut id = next_id;
+                        while running.contains_key(&id) {
+                            id = id.wrapping_add(1).max(1);
+                        }
+                        next_id = id.wrapping_add(1).max(1); // 0 is the control stream
+                        let credited = peer_speaks_fc;
+                        let (tx, rx) = inbound_queue(credited);
+                        let credit = credited.then(|| Arc::new(Semaphore::new(FC_WINDOW)));
+                        entries.insert(id, StreamEntry { tx, credit: credit.clone() });
                         let out_tx2 = out_tx.clone();
                         let target2 = target.clone();
-                        streams.spawn(async move {
+                        let task = streams.spawn(async move {
+                            // FC_ON before the Open: the accept side decides per stream at the Open.
+                            if credited && out_tx2.send(fc_on_frame(id)).await.is_err() {
+                                return id;
+                            }
                             if out_tx2.send(Frame::Open { id, target: target2 }).await.is_ok() {
-                                pump_forward_stream(id, tcp, out_tx2, rx, idle).await;
+                                let flow = credit.map(|credit| PumpFlow { credit });
+                                pump_forward_stream(id, tcp, out_tx2, rx, idle, flow).await;
                             }
                             id
                         });
+                        running.insert(id, task.id());
                     }
                     Err(e) => eprintln!("ct-agent channel: forward listener accept error: {e}"),
                 }
             }
             (reader, frame) = &mut frame_fut => {
-                // Only replace the pinned future once it actually resolved -- see
-                // `read_one_frame`'s own doc for why reconstructing it in place every
-                // `select!` iteration instead would desync the framing.
+                // Re-arm only after a COMPLETE frame (cancel safety, see read_one_frame).
                 if frame.is_ok() {
                     frame_fut.set(read_one_frame(reader));
                 }
                 match frame {
+                    Ok(Frame::Data { id: CONTROL_ID, payload }) => {
+                        if fc_enabled {
+                            match apply_control(&payload, &entries, &mut pending_fc) {
+                                ControlOutcome::Hello => {
+                                    if !peer_speaks_fc {
+                                        eprintln!("ct-agent channel: forward flow control on for this session (credit window {} KiB per stream)", FC_WINDOW / 1024);
+                                    }
+                                    peer_speaks_fc = true;
+                                    accepting = true;
+                                }
+                                ControlOutcome::ResetStream(id) => {
+                                    eprintln!("ct-agent channel: forward stream {id} reset -- the peer granted credit beyond the window");
+                                    if let Some(e) = entries.remove(&id) {
+                                        e.finish();
+                                        e.notify(StreamIn::Aborted).await;
+                                    }
+                                    if !ctrl_tx.send(abort_frame(id)) {
+                                        streams.abort_all();
+                                        eprintln!("ct-agent channel: forward session ended -- control backlog over its cap (protocol violation)");
+                                        break;
+                                    }
+                                }
+                                ControlOutcome::EndSession => {
+                                    streams.abort_all();
+                                    eprintln!("ct-agent channel: forward session ended -- protocol violation (control flood)");
+                                    break;
+                                }
+                                ControlOutcome::None => {}
+                            }
+                        }
+                    }
                     Ok(Frame::Data { id, payload }) => {
-                        // Backpressure as before (send().await in the arm BODY, not a select! branch,
-                        // so it cannot lose bytes): a slow consumer slows the session down instead of
-                        // having its stream cut after CHANNEL_CAP frames (second review of #271).
-                        if let Some(tx) = inbound_txs.get(&id) {
-                            let _ = tx.send(StreamIn::Data(payload)).await;
+                        let ok = match entries.get(&id) {
+                            Some(e) => e.deliver(payload).await,
+                            None => true,
+                        };
+                        if !ok {
+                            eprintln!("ct-agent channel: forward stream {id} reset -- the peer exceeded its credit");
+                            if let Some(e) = entries.remove(&id) {
+                                e.finish();
+                                e.notify(StreamIn::Aborted).await;
+                            }
+                            if !ctrl_tx.send(abort_frame(id)) {
+                                streams.abort_all();
+                                eprintln!("ct-agent channel: forward session ended -- control backlog over its cap (protocol violation)");
+                                break;
+                            }
                         }
                     }
                     Ok(Frame::Close { id, reason }) => {
-                        if let Some(tx) = inbound_txs.remove(&id) {
-                            let _ = tx.send(stream_in_for_close(reason.as_deref())).await;
+                        let msg = stream_in_for_close(reason.as_deref());
+                        if matches!(msg, StreamIn::Aborted) {
+                            if let Some(e) = entries.remove(&id) {
+                                e.finish();
+                                e.notify(msg).await;
+                            }
+                        } else if let Some(e) = entries.get(&id) {
+                            // Half-close: keep the entry (credit for this side's sending).
+                            e.notify(msg).await;
                         }
                     }
-                    // The initiate side never receives Open -- only ever sends it. A peer that
-                    // sends one anyway gets ignored, not a torn-down session over one bad frame.
+                    // The initiate side never receives Open -- ignored, not a torn-down session.
                     Ok(Frame::Open { .. }) => {}
-                    // A read error here means byte sync with the peer's framing is lost (or the
-                    // transport itself ended) -- unlike the per-stream cases above, there is no
-                    // way to recover just one stream from it, so it is the one thing that ends
-                    // the whole session (AUF-20261005-016: log what kind of error and, when the
-                    // framing got far enough to know it, which stream -- see `Frame::read`'s own
-                    // doc). The channel session ending for its own reasons (an expired or revoked
-                    // grant, AUF-20260930-005) is what surfaces here too. Every forwarded
-                    // connection dies with it, right here, and the engine ends so the session can
-                    // too (ct-agent#267).
+                    // Byte sync with the peer's framing is lost, or the transport ended.
                     Err(e) => {
                         streams.abort_all();
                         eprintln!(
@@ -551,41 +1057,53 @@ async fn run_forward_initiate_engine(
                     }
                 }
             }
-            frame = out_rx.recv() => {
-                // None: out_tx clones always outlive this branch; unreachable in practice
-                if let Some(f) = frame {
-                    if f.write(&mut mux_write).await.is_err() {
-                        break;
+            Some(done) = streams.join_next_with_id(), if !streams.is_empty() => {
+                if let Some(id) = finished_stream_id(&mut running, done) {
+                    if let Some(e) = entries.remove(&id) {
+                        e.finish();
                     }
                 }
             }
-            Some(done) = streams.join_next(), if !streams.is_empty() => {
-                if let Ok(id) = done {
-                    inbound_txs.remove(&id);
-                }
+            _ = &mut writer => {
+                streams.abort_all();
+                eprintln!("ct-agent channel: forward session write side ended -- closed every forwarded stream");
+                break;
             }
         }
     }
 }
 
-/// The accept side's engine (#255 slice 2): for every `Frame::Open` the peer sends, re-check
-/// the already-shipped policy gate ([`accept_forward_request_with`] -- it emits the
-/// `forward_refused` event itself on a refusal) and, if allowed, dial `target` and run
-/// [`pump_forward_stream`], emitting `forward_open`/`forward_close` around it. Same one-loop,
-/// one-`JoinSet` shape as [`run_forward_initiate_engine`] and the same session-end teardown.
+/// The accept side's engine (#255 slice 2): for every `Frame::Open` the peer sends, re-check the
+/// policy gate and, if allowed, dial `target` and pump it. A stream uses credit flow control when
+/// the initiate side announced it with FC_ON before the Open.
 async fn run_forward_accept_engine(
     engine_side: tokio::io::DuplexStream,
     allow_raw: Option<String>,
     non_loopback_raw: Option<String>,
     max_streams: usize,
     idle: Duration,
+    fc_enabled: bool,
 ) {
-    let (mux_read, mut mux_write) = tokio::io::split(engine_side);
-    let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
-    let mut inbound_txs: HashMap<u32, mpsc::Sender<StreamIn>> = HashMap::new();
+    let (mux_read, mux_write) = tokio::io::split(engine_side);
+    let (out_tx, out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
+    let (ctrl_tx, ctrl_rx, ctrl_backlog) = ctrl_channel();
+    let writer = spawn_frame_writer(mux_write, out_rx, ctrl_rx, ctrl_backlog);
+    tokio::pin!(writer);
+    if fc_enabled {
+        let _ = ctrl_tx.send(hello_frame());
+    } else {
+        eprintln!("ct-agent channel: forward flow control off on this member ({FORWARD_FLOW_ENV})");
+    }
+    // The accept side logs the session's mode too (live run of #274: in operation either node must
+    // show whether a session runs with credit): "on" when the peer's HELLO arrives, "off" when the
+    // first stream opens without it (older agent).
+    let mut mode_logged = !fc_enabled;
+    let mut pending_fc = std::collections::HashSet::new();
+    let mut entries: HashMap<u32, StreamEntry> = HashMap::new();
     let mut streams: JoinSet<(u32, u64, u64)> = JoinSet::new();
-    // AUF-20261005-016: see `read_one_frame`'s own doc for why this is pinned and only
-    // replaced once it actually resolves, rather than reconstructed fresh every iteration.
+    // Ids whose dial/pump task still runs, also after an abort removed the entry (see the
+    // initiate engine): the limit counts them, and an Open for one of them is a violation.
+    let mut running: HashMap<u32, tokio::task::Id> = HashMap::new();
     let frame_fut = read_one_frame(mux_read);
     tokio::pin!(frame_fut);
 
@@ -597,46 +1115,107 @@ async fn run_forward_accept_engine(
                 }
                 match frame {
                     Ok(Frame::Open { id, target }) => {
-                        if inbound_txs.len() >= max_streams {
-                            let _ = out_tx
-                                .send(Frame::Close { id, reason: Some(format!("{FORWARD_MAX_STREAMS_ENV} reached")) })
-                                .await;
+                        // An Open for an id in use (or for the control id) is a session violation:
+                        // it would overwrite the entry and bypass max_streams (adversarial review).
+                        if id == CONTROL_ID || entries.contains_key(&id) || running.contains_key(&id) {
+                            streams.abort_all();
+                            eprintln!("ct-agent channel: forward session ended -- protocol violation (Open for stream {id} already in use) -- closed every forwarded stream to its target");
+                            break;
+                        }
+                        let credited = pending_fc.remove(&id);
+                        if !mode_logged {
+                            mode_logged = true;
+                            eprintln!("{}", accept_mode_line(credited));
+                        }
+                        if running.len() >= max_streams {
+                            if !ctrl_tx.send(Frame::Close { id, reason: Some(format!("{FORWARD_MAX_STREAMS_ENV} reached")) }) {
+                                streams.abort_all();
+                                eprintln!("ct-agent channel: forward session ended -- control backlog over its cap (protocol violation)");
+                                break;
+                            }
                             continue;
                         }
                         match accept_forward_request_with(&target, allow_raw.as_deref(), non_loopback_raw.as_deref()) {
                             Err(reason) => {
                                 // accept_forward_request_with already emitted forward_refused.
-                                let _ = out_tx.send(Frame::Close { id, reason: Some(reason) }).await;
+                                if !ctrl_tx.send(Frame::Close { id, reason: Some(reason) }) {
+                                    streams.abort_all();
+                                    eprintln!("ct-agent channel: forward session ended -- control backlog over its cap (protocol violation)");
+                                    break;
+                                }
                             }
                             Ok(()) => {
-                                let (tx, rx) = mpsc::channel::<StreamIn>(CHANNEL_CAP);
-                                inbound_txs.insert(id, tx);
-                                let out_tx2 = out_tx.clone();
-                                streams.spawn(dial_and_pump_forward_target(id, target, out_tx2, rx, idle));
+                                let (tx, rx) = inbound_queue(credited);
+                                let credit = credited.then(|| Arc::new(Semaphore::new(FC_WINDOW)));
+                                entries.insert(id, StreamEntry { tx, credit: credit.clone() });
+                                let flow = credit.map(|credit| PumpFlow { credit });
+                                let task = streams.spawn(dial_and_pump_forward_target(id, target, out_tx.clone(), rx, idle, flow));
+                                running.insert(id, task.id());
+                            }
+                        }
+                    }
+                    Ok(Frame::Data { id: CONTROL_ID, payload }) => {
+                        if fc_enabled {
+                            match apply_control(&payload, &entries, &mut pending_fc) {
+                                ControlOutcome::ResetStream(id) => {
+                                    eprintln!("ct-agent channel: forward stream {id} reset -- the peer granted credit beyond the window");
+                                    if let Some(e) = entries.remove(&id) {
+                                        e.finish();
+                                        e.notify(StreamIn::Aborted).await;
+                                    }
+                                    if !ctrl_tx.send(abort_frame(id)) {
+                                        streams.abort_all();
+                                        eprintln!("ct-agent channel: forward session ended -- control backlog over its cap (protocol violation)");
+                                        break;
+                                    }
+                                }
+                                ControlOutcome::EndSession => {
+                                    streams.abort_all();
+                                    eprintln!("ct-agent channel: forward session ended -- protocol violation (control flood) -- closed every forwarded stream to its target");
+                                    break;
+                                }
+                                ControlOutcome::Hello => {
+                                    if !mode_logged {
+                                        mode_logged = true;
+                                        eprintln!("{}", accept_mode_line(true));
+                                    }
+                                }
+                                ControlOutcome::None => {}
                             }
                         }
                     }
                     Ok(Frame::Data { id, payload }) => {
-                        // Backpressure as before (send().await in the arm BODY, not a select! branch,
-                        // so it cannot lose bytes): a slow consumer slows the session down instead of
-                        // having its stream cut after CHANNEL_CAP frames (second review of #271).
-                        if let Some(tx) = inbound_txs.get(&id) {
-                            let _ = tx.send(StreamIn::Data(payload)).await;
+                        let ok = match entries.get(&id) {
+                            Some(e) => e.deliver(payload).await,
+                            None => true,
+                        };
+                        if !ok {
+                            eprintln!("ct-agent channel: forward stream {id} reset -- the peer exceeded its credit");
+                            if let Some(e) = entries.remove(&id) {
+                                e.finish();
+                                e.notify(StreamIn::Aborted).await;
+                            }
+                            if !ctrl_tx.send(abort_frame(id)) {
+                                streams.abort_all();
+                                eprintln!("ct-agent channel: forward session ended -- control backlog over its cap (protocol violation)");
+                                break;
+                            }
                         }
                     }
                     Ok(Frame::Close { id, reason }) => {
-                        if let Some(tx) = inbound_txs.remove(&id) {
-                            let _ = tx.send(stream_in_for_close(reason.as_deref())).await;
+                        let msg = stream_in_for_close(reason.as_deref());
+                        if matches!(msg, StreamIn::Aborted) {
+                            if let Some(e) = entries.remove(&id) {
+                                e.finish();
+                                e.notify(msg).await;
+                            }
+                        } else if let Some(e) = entries.get(&id) {
+                            // Half-close: keep the entry (credit for this side's sending).
+                            e.notify(msg).await;
                         }
                     }
-                    // A read error here means byte sync with the peer's framing is lost (or the
-                    // transport itself ended), so -- unlike the per-stream cases above -- the
-                    // whole session ends with it (AUF-20261005-016, see the initiate engine's own
-                    // match arm for the full rationale and `Frame::read`'s doc for what the
-                    // logged error carries). AUF-20260930-005: an expired or revoked grant is
-                    // among the reasons a session ends this way; every target socket this side
-                    // dialed is closed with the JoinSet, the accept half of "auf beiden Seiten
-                    // binnen 5 s".
+                    // AUF-20260930-005: the session ended -- every target socket this side dialed
+                    // is closed with the JoinSet ("auf beiden Seiten binnen 5 s").
                     Err(e) => {
                         streams.abort_all();
                         eprintln!(
@@ -647,18 +1226,17 @@ async fn run_forward_accept_engine(
                     }
                 }
             }
-            frame = out_rx.recv() => {
-                // None: out_tx clones always outlive this branch; unreachable in practice
-                if let Some(f) = frame {
-                    if f.write(&mut mux_write).await.is_err() {
-                        break;
+            Some(done) = streams.join_next_with_id(), if !streams.is_empty() => {
+                if let Some(id) = finished_stream_id(&mut running, done.map(|(task, (id, ..))| (task, id))) {
+                    if let Some(e) = entries.remove(&id) {
+                        e.finish();
                     }
                 }
             }
-            Some(done) = streams.join_next(), if !streams.is_empty() => {
-                if let Ok((id, ..)) = done {
-                    inbound_txs.remove(&id);
-                }
+            _ = &mut writer => {
+                streams.abort_all();
+                eprintln!("ct-agent channel: forward session write side ended -- closed every forwarded stream to its target");
+                break;
             }
         }
     }
@@ -675,8 +1253,9 @@ async fn dial_and_pump_forward_target(
     id: u32,
     target: String,
     outbound: mpsc::Sender<Frame>,
-    inbound: mpsc::Receiver<StreamIn>,
+    inbound: InRx,
     idle: Duration,
+    flow: Option<PumpFlow>,
 ) -> (u32, u64, u64) {
     match TcpStream::connect(&target).await {
         Ok(tcp) => {
@@ -684,7 +1263,8 @@ async fn dial_and_pump_forward_target(
                 events::FORWARD_OPEN,
                 serde_json::json!({ "target": target }),
             );
-            let (bytes_out, bytes_in) = pump_forward_stream(id, tcp, outbound, inbound, idle).await;
+            let (bytes_out, bytes_in) =
+                pump_forward_stream(id, tcp, outbound, inbound, idle, flow).await;
             events::emit(
                 events::FORWARD_CLOSE,
                 serde_json::json!({ "target": target, "bytes_in": bytes_in, "bytes_out": bytes_out }),
@@ -706,6 +1286,268 @@ async fn dial_and_pump_forward_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T4 (DEC-0061): a peer that sends more than its credit resets only that stream -- the
+    // engine sees `deliver` refuse instead of waiting (no session end, no stall).
+    #[tokio::test]
+    async fn credited_stream_refuses_more_than_its_window() {
+        let (tx, mut rx) = inbound_queue(true);
+        let entry = StreamEntry {
+            tx,
+            credit: Some(Arc::new(Semaphore::new(FC_WINDOW))),
+        };
+        assert!(
+            entry.deliver(vec![0u8; FC_WINDOW]).await,
+            "a full window is allowed"
+        );
+        assert!(
+            !entry.deliver(vec![0u8; 1]).await,
+            "one byte over the window is a violation"
+        );
+        assert!(matches!(rx.recv().await, Some(StreamIn::Data(d)) if d.len() == FC_WINDOW));
+        assert!(
+            entry.deliver(vec![0u8; 1]).await,
+            "credit returns once the pump took the data"
+        );
+        entry.finish();
+        assert!(
+            entry.credit.as_ref().unwrap().acquire().await.is_err(),
+            "finish stops waiting senders"
+        );
+    }
+
+    // Spec s. 5: credit beyond the window is a stream violation; an FC_ON flood and a control
+    // backlog over its cap are session violations.
+    #[tokio::test]
+    async fn credit_beyond_the_window_resets_only_that_stream() {
+        let mut streams = HashMap::new();
+        let credit = Arc::new(Semaphore::new(FC_WINDOW));
+        let (tx, _rx) = inbound_queue(true);
+        streams.insert(
+            5u32,
+            StreamEntry {
+                tx,
+                credit: Some(credit.clone()),
+            },
+        );
+        let mut pending = std::collections::HashSet::new();
+        // The full window is still available: any further credit is beyond it.
+        let Frame::Data { payload, .. } = window_frame(5, 1) else {
+            panic!()
+        };
+        assert!(matches!(
+            apply_control(&payload, &streams, &mut pending),
+            ControlOutcome::ResetStream(5)
+        ));
+        // After the pump took 64 KiB, exactly that much may come back.
+        credit.acquire_many(65536).await.unwrap().forget();
+        let Frame::Data { payload, .. } = window_frame(5, 65536) else {
+            panic!()
+        };
+        assert!(matches!(
+            apply_control(&payload, &streams, &mut pending),
+            ControlOutcome::None
+        ));
+        assert_eq!(credit.available_permits(), FC_WINDOW);
+    }
+
+    #[test]
+    fn fc_on_flood_ends_the_session() {
+        let streams = HashMap::new();
+        let mut pending = std::collections::HashSet::new();
+        for id in 1..=MAX_PENDING_FC as u32 {
+            let Frame::Data { payload, .. } = fc_on_frame(id) else {
+                panic!()
+            };
+            assert!(matches!(
+                apply_control(&payload, &streams, &mut pending),
+                ControlOutcome::None
+            ));
+        }
+        let Frame::Data { payload, .. } = fc_on_frame(u32::MAX) else {
+            panic!()
+        };
+        assert!(matches!(
+            apply_control(&payload, &streams, &mut pending),
+            ControlOutcome::EndSession
+        ));
+    }
+
+    #[test]
+    fn control_backlog_over_its_cap_refuses() {
+        let (ctrl, _rx, _backlog) = ctrl_channel();
+        for _ in 0..CTRL_BACKLOG_CAP {
+            assert!(ctrl.send(hello_frame()));
+        }
+        assert!(
+            !ctrl.send(hello_frame()),
+            "nobody drains: the cap must hold"
+        );
+    }
+
+    // Second adversarial review of #274: an Open for an id in use (or for the control id) ends the
+    // session instead of overwriting the entry and bypassing max_streams.
+    #[tokio::test]
+    async fn duplicate_open_ends_the_accept_session() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = target.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let _ = target.accept().await;
+            }
+        });
+        for dup in [7u32, CONTROL_ID] {
+            let (session_side, engine_side) = tokio::io::duplex(1 << 16);
+            let engine = tokio::spawn(run_forward_accept_engine(
+                engine_side,
+                Some(addr.clone()),
+                None,
+                2,
+                Duration::from_secs(30),
+                true,
+            ));
+            let (_r, mut w) = tokio::io::split(session_side);
+            Frame::Open {
+                id: dup,
+                target: addr.clone(),
+            }
+            .write(&mut w)
+            .await
+            .unwrap();
+            if dup != CONTROL_ID {
+                Frame::Open {
+                    id: dup,
+                    target: addr.clone(),
+                }
+                .write(&mut w)
+                .await
+                .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(10), engine)
+                .await
+                .unwrap_or_else(|_| panic!("engine kept running after Open id {dup}"))
+                .unwrap();
+        }
+    }
+
+    /// A target that accepts and keeps every connection open (the pump stays busy).
+    async fn holding_target() -> String {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = target.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = target.accept().await {
+                held.push(s);
+            }
+        });
+        addr
+    }
+
+    // Third adversarial review of #274: after an abort-close the id's task may still run; an Open
+    // for that id must not create an entry the old task's end would remove -- it ends the session.
+    #[tokio::test]
+    async fn open_for_an_id_whose_task_still_runs_ends_the_accept_session() {
+        let addr = holding_target().await;
+        let (session_side, engine_side) = tokio::io::duplex(1 << 16);
+        let engine = tokio::spawn(run_forward_accept_engine(
+            engine_side,
+            Some(addr.clone()),
+            None,
+            8,
+            Duration::from_secs(30),
+            true,
+        ));
+        let (_r, mut w) = tokio::io::split(session_side);
+        for f in [
+            Frame::Open { id: 5, target: addr.clone() },
+            abort_frame(5),
+            Frame::Open { id: 5, target: addr.clone() },
+        ] {
+            f.write(&mut w).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(10), engine)
+            .await
+            .expect("engine kept running after an Open for a still running id")
+            .unwrap();
+    }
+
+    // Third adversarial review of #274: the stream limit counts running tasks, not entries --
+    // Open + abort-close in a loop must not pile up tasks past max_streams.
+    #[tokio::test]
+    async fn abort_close_does_not_free_a_slot_before_the_task_ends() {
+        let addr = holding_target().await;
+        let (session_side, engine_side) = tokio::io::duplex(1 << 16);
+        let _engine = tokio::spawn(run_forward_accept_engine(
+            engine_side,
+            Some(addr.clone()),
+            None,
+            2,
+            Duration::from_secs(30),
+            true,
+        ));
+        let (r, mut w) = tokio::io::split(session_side);
+        for id in 1..=3u32 {
+            Frame::Open { id, target: addr.clone() }.write(&mut w).await.unwrap();
+            abort_frame(id).write(&mut w).await.unwrap();
+        }
+        // The third Open arrives while the first two tasks still run: refused with the limit.
+        let mut r = r;
+        let refused = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match Frame::read(&mut r).await.unwrap() {
+                    Frame::Close { id: 3, reason: Some(reason) } => break reason,
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("no Close for the third stream");
+        assert!(refused.contains(FORWARD_MAX_STREAMS_ENV), "unexpected reason {refused}");
+    }
+
+    // Live run of #274: the accept side names the session's mode like the initiate side does.
+    #[test]
+    fn accept_mode_line_names_on_and_off() {
+        assert!(accept_mode_line(true).contains("forward flow control on for this session"));
+        assert!(accept_mode_line(true).contains("accept side"));
+        assert!(accept_mode_line(false).contains("forward flow control off for this session"));
+        assert!(accept_mode_line(false).contains("older agent"));
+    }
+
+    #[test]
+    fn control_messages_round_trip_and_unknown_is_ignored() {
+        let Frame::Data { id, payload } = window_frame(7, 4096) else {
+            panic!()
+        };
+        assert_eq!(id, CONTROL_ID);
+        assert!(matches!(
+            parse_control(&payload),
+            Some(Control::Window { id: 7, bytes: 4096 })
+        ));
+        let Frame::Data { payload, .. } = fc_on_frame(9) else {
+            panic!()
+        };
+        assert!(matches!(
+            parse_control(&payload),
+            Some(Control::FcOn { id: 9 })
+        ));
+        let Frame::Data { payload, .. } = hello_frame() else {
+            panic!()
+        };
+        assert!(matches!(parse_control(&payload), Some(Control::Hello)));
+        assert!(parse_control(&[99, 1, 2]).is_none());
+        assert!(
+            parse_control(&[CTL_WINDOW, 1]).is_none(),
+            "short WINDOW is ignored, not a panic"
+        );
+    }
+
+    fn in_tx_bounded(tx: &InTx) -> &mpsc::Sender<StreamIn> {
+        match tx {
+            InTx::Bounded(t) => t,
+            InTx::Credited { .. } => panic!("test expects a bounded inbound queue"),
+        }
+    }
 
     #[test]
     fn parse_forward_spec_requires_loopback_and_both_parts() {
@@ -802,13 +1644,14 @@ mod tests {
         let mut server = accept.await.unwrap();
 
         let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
-        let (in_tx, in_rx) = mpsc::channel::<StreamIn>(CHANNEL_CAP);
+        let (in_tx, in_rx) = inbound_queue(false);
         let pump = tokio::spawn(pump_forward_stream(
             1,
             client,
             out_tx,
             in_rx,
             Duration::from_secs(30),
+            None,
         ));
 
         // tcp -> outbound Data frame
@@ -823,7 +1666,7 @@ mod tests {
         );
 
         // inbound Data -> tcp
-        in_tx
+        in_tx_bounded(&in_tx)
             .send(StreamIn::Data(b"from-peer".to_vec()))
             .await
             .unwrap();
@@ -840,7 +1683,7 @@ mod tests {
                 reason: None
             }
         );
-        in_tx.send(StreamIn::Closed).await.unwrap();
+        in_tx_bounded(&in_tx).send(StreamIn::Closed).await.unwrap();
         let (bytes_out, bytes_in) = pump.await.unwrap();
         assert_eq!(bytes_out, "from-target".len() as u64);
         assert_eq!(bytes_in, "from-peer".len() as u64);
@@ -855,9 +1698,9 @@ mod tests {
         let _server = accept.await.unwrap(); // held open -- no EOF on its own
 
         let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
-        let (_in_tx, in_rx) = mpsc::channel::<StreamIn>(CHANNEL_CAP);
+        let (_in_tx, in_rx) = inbound_queue(false);
         let idle = Duration::from_millis(50);
-        let pump = tokio::spawn(pump_forward_stream(1, client, out_tx, in_rx, idle));
+        let pump = tokio::spawn(pump_forward_stream(1, client, out_tx, in_rx, idle, None));
 
         let closed = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
             .await
@@ -894,16 +1737,20 @@ mod tests {
         let close_before = events::EVENT_COUNTS.get(events::FORWARD_CLOSE);
 
         let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
-        let (in_tx, in_rx) = mpsc::channel::<StreamIn>(CHANNEL_CAP);
+        let (in_tx, in_rx) = inbound_queue(false);
         let task = tokio::spawn(dial_and_pump_forward_target(
             1,
             addr.to_string(),
             out_tx,
             in_rx,
             Duration::from_secs(30),
+            None,
         ));
 
-        in_tx.send(StreamIn::Data(b"hello".to_vec())).await.unwrap();
+        in_tx_bounded(&in_tx)
+            .send(StreamIn::Data(b"hello".to_vec()))
+            .await
+            .unwrap();
         assert_eq!(
             out_rx.recv().await.unwrap(),
             Frame::Data {
@@ -919,7 +1766,7 @@ mod tests {
                 reason: None
             }
         );
-        in_tx.send(StreamIn::Closed).await.unwrap();
+        in_tx_bounded(&in_tx).send(StreamIn::Closed).await.unwrap();
 
         let (id, bytes_out, bytes_in) = task.await.unwrap();
         assert_eq!(id, 1);
@@ -966,13 +1813,14 @@ mod tests {
 
         let open_before = events::EVENT_COUNTS.get(events::FORWARD_OPEN);
         let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
-        let (_in_tx, in_rx) = mpsc::channel::<StreamIn>(CHANNEL_CAP);
+        let (_in_tx, in_rx) = inbound_queue(false);
         let (id, bytes_out, bytes_in) = dial_and_pump_forward_target(
             9,
             dead_addr.to_string(),
             out_tx,
             in_rx,
             Duration::from_secs(30),
+            None,
         )
         .await;
 
