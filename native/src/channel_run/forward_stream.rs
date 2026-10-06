@@ -52,6 +52,7 @@
 // trace: AUF-20260930-005 (INC-20260930-101)
 // trace: AUF-20261004-022 (ct-agent#267)
 // trace: AUF-20261005-016 (DEC-0061)
+// trace: AUF-20261006-070 (DEC-0061)
 
 use std::collections::HashMap;
 use std::io;
@@ -108,6 +109,11 @@ const DATA_CHUNK_LEN: usize = 16 * 1024;
 /// (every stream's frames, serialized onto the wire by one writer). Backpressure, not data
 /// loss: a full queue makes the sender's `.send().await` wait rather than drop a byte.
 const CHANNEL_CAP: usize = 64;
+
+/// Bound on waiting to hand a stream's control/close frame to the shared outbound queue
+/// (AUF-20261006-070, Befund a of the #274 review): a peer that stopped reading must not be
+/// able to wedge a pump -- including its idle branch -- by leaving the queue full forever.
+const CLOSE_SEND_GRACE: Duration = Duration::from_secs(2);
 
 /// The application duplex [`run_channel_session_on_stream`](super::run_channel_session_on_stream)
 /// pumps has its own internal buffer too; this is that buffer's size for a forward session,
@@ -399,6 +405,22 @@ enum StreamIn {
     Aborted,
 }
 
+/// Hand a stream's control/close frame to the shared outbound queue without ever waiting on it
+/// forever (AUF-20261006-070, Befund a of the #274 review): try immediately, then wait up to
+/// [`CLOSE_SEND_GRACE`], then give up. `false` means the frame was dropped (queue still full
+/// after the grace) or the queue is already closed -- either way the caller must end the
+/// stream's pump on the spot instead of staying half-open.
+async fn send_or_drop(out: &mpsc::Sender<Frame>, frame: Frame) -> bool {
+    match out.try_send(frame) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Full(frame)) => matches!(
+            tokio::time::timeout(CLOSE_SEND_GRACE, out.send(frame)).await,
+            Ok(Ok(()))
+        ),
+    }
+}
+
 /// The Close that resets a stream (see [`super::forward_wire::CLOSE_REASON_ABORT`]).
 fn abort_frame(id: u32) -> Frame {
     Frame::Close {
@@ -641,14 +663,19 @@ async fn pump_forward_stream(
         let mut buf = vec![0u8; DATA_CHUNK_LEN];
         loop {
             match tcp_r.read(&mut buf).await {
-                // A clean EOF is a half-close: the peer may still owe this side a reply.
+                // A clean EOF is a half-close: the peer may still owe this side a reply. But a
+                // dropped Close (the peer stopped reading) must not half-open the stream either
+                // -- end it fully (AUF-20261006-070, Befund a).
                 Ok(0) => {
-                    let _ = out_up.send(Frame::Close { id, reason: None }).await;
-                    return Half::Done;
+                    return if send_or_drop(&out_up, Frame::Close { id, reason: None }).await {
+                        Half::Done
+                    } else {
+                        Half::Stop
+                    };
                 }
                 // The local socket itself failed: reset the stream (DEC-0061, 2026-10-05).
                 Err(_) => {
-                    let _ = out_up.send(abort_frame(id)).await;
+                    let _ = send_or_drop(&out_up, abort_frame(id)).await;
                     return Half::Stop;
                 }
                 Ok(n) => {
@@ -681,7 +708,7 @@ async fn pump_forward_stream(
                 Some(StreamIn::Data(payload)) => {
                     if tcp_w.write_all(&payload).await.is_err() {
                         // Nobody reads the local side any more: reset, do not drain.
-                        let _ = outbound.send(abort_frame(id)).await;
+                        let _ = send_or_drop(&outbound, abort_frame(id)).await;
                         return Half::Stop;
                     }
                     touch();
@@ -689,7 +716,11 @@ async fn pump_forward_stream(
                     if flow.is_some() {
                         unreported += payload.len();
                         if unreported >= FC_WINDOW / 2 {
-                            let _ = outbound.send(window_frame(id, unreported as u32)).await;
+                            // Without credit the peer could never make progress again, so a
+                            // dropped WINDOW ends the stream too (AUF-20261006-070).
+                            if !send_or_drop(&outbound, window_frame(id, unreported as u32)).await {
+                                return Half::Stop;
+                            }
                             unreported = 0;
                         }
                     }
@@ -723,7 +754,14 @@ async fn pump_forward_stream(
                 // Idle: no byte in either direction for a full `idle` (also while waiting for
                 // credit or for a slow local reader -- the timer is outside both halves).
                 if last().checked_add(idle).is_some_and(|d| d <= tokio::time::Instant::now()) {
-                    let _ = outbound.send(Frame::Close { id, reason: Some("idle timeout".to_string()) }).await;
+                    let _ = send_or_drop(
+                        &outbound,
+                        Frame::Close {
+                            id,
+                            reason: Some("idle timeout".to_string()),
+                        },
+                    )
+                    .await;
                     break;
                 }
             }
@@ -907,7 +945,8 @@ async fn run_forward_initiate_engine(
     let (mux_read, mux_write) = tokio::io::split(engine_side);
     let (out_tx, out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
     let (ctrl_tx, ctrl_rx, ctrl_backlog) = ctrl_channel();
-    let writer = spawn_frame_writer(mux_write, out_rx, ctrl_rx, ctrl_backlog);
+    let writer =
+        TaskGuard::from_handle(spawn_frame_writer(mux_write, out_rx, ctrl_rx, ctrl_backlog));
     tokio::pin!(writer);
     if fc_enabled {
         let _ = ctrl_tx.send(hello_frame());
@@ -962,11 +1001,13 @@ async fn run_forward_initiate_engine(
                         let out_tx2 = out_tx.clone();
                         let target2 = target.clone();
                         let task = streams.spawn(async move {
-                            // FC_ON before the Open: the accept side decides per stream at the Open.
-                            if credited && out_tx2.send(fc_on_frame(id)).await.is_err() {
+                            // FC_ON before the Open: the accept side decides per stream at the
+                            // Open. Neither send waits forever on a peer that stopped reading
+                            // (AUF-20261006-070).
+                            if credited && !send_or_drop(&out_tx2, fc_on_frame(id)).await {
                                 return id;
                             }
-                            if out_tx2.send(Frame::Open { id, target: target2 }).await.is_ok() {
+                            if send_or_drop(&out_tx2, Frame::Open { id, target: target2 }).await {
                                 let flow = credit.map(|credit| PumpFlow { credit });
                                 pump_forward_stream(id, tcp, out_tx2, rx, idle, flow).await;
                             }
@@ -1087,7 +1128,8 @@ async fn run_forward_accept_engine(
     let (mux_read, mux_write) = tokio::io::split(engine_side);
     let (out_tx, out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
     let (ctrl_tx, ctrl_rx, ctrl_backlog) = ctrl_channel();
-    let writer = spawn_frame_writer(mux_write, out_rx, ctrl_rx, ctrl_backlog);
+    let writer =
+        TaskGuard::from_handle(spawn_frame_writer(mux_write, out_rx, ctrl_rx, ctrl_backlog));
     tokio::pin!(writer);
     if fc_enabled {
         let _ = ctrl_tx.send(hello_frame());
@@ -1272,12 +1314,14 @@ async fn dial_and_pump_forward_target(
             (id, bytes_out, bytes_in)
         }
         Err(e) => {
-            let _ = outbound
-                .send(Frame::Close {
+            let _ = send_or_drop(
+                &outbound,
+                Frame::Close {
                     id,
                     reason: Some(format!("dial failed: {e}")),
-                })
-                .await;
+                },
+            )
+            .await;
             (id, 0, 0)
         }
     }
@@ -1837,5 +1881,241 @@ mod tests {
             open_before,
             "a failed dial never opens"
         );
+    }
+
+    // AUF-20261006-070 (Befund a): a stream's control/close frames must never wait forever on a
+    // full shared queue -- a peer that stopped reading used to wedge the pump (also its idle
+    // branch), holding the local socket and its max_streams slot open indefinitely.
+
+    #[tokio::test]
+    async fn gegenstelle_liest_nicht_idle_gibt_stream_frei() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let local = TcpStream::connect(addr).await.unwrap();
+        let mut peer = accept.await.unwrap();
+
+        let (out_tx, _out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
+        for _ in 0..CHANNEL_CAP {
+            out_tx
+                .try_send(Frame::Close {
+                    id: 0,
+                    reason: None,
+                })
+                .unwrap();
+        }
+        let (_in_tx, in_rx) = inbound_queue(false);
+        let pump = tokio::spawn(pump_forward_stream(
+            1,
+            local,
+            out_tx,
+            in_rx,
+            Duration::from_millis(100),
+            None,
+        ));
+
+        match tokio::time::timeout(Duration::from_millis(3100), pump).await {
+            Ok(join) => join.unwrap(),
+            Err(_) => panic!(
+                "idle pump did not end within idle + grace + margin although the gegenstelle never reads (AUF-20261006-070)"
+            ),
+        };
+
+        let mut buf = [0u8; 1];
+        match tokio::time::timeout(Duration::from_millis(1000), peer.read(&mut buf)).await {
+            Ok(Ok(0)) => {}
+            other => panic!("expected the local socket to be closed (EOF), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gegenstelle_liest_nicht_eof_gibt_stream_frei() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let local = TcpStream::connect(addr).await.unwrap();
+        let mut peer = accept.await.unwrap();
+
+        let (out_tx, _out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
+        for _ in 0..CHANNEL_CAP {
+            out_tx
+                .try_send(Frame::Close {
+                    id: 0,
+                    reason: None,
+                })
+                .unwrap();
+        }
+        let (_in_tx, in_rx) = inbound_queue(false);
+        // Idle at 60 s so only the EOF path (not the idle branch) can end this pump.
+        let pump = tokio::spawn(pump_forward_stream(
+            1,
+            local,
+            out_tx,
+            in_rx,
+            Duration::from_secs(60),
+            None,
+        ));
+
+        peer.shutdown().await.unwrap(); // local's read side now sees a clean EOF
+
+        match tokio::time::timeout(Duration::from_millis(3000), pump).await {
+            Ok(join) => join.unwrap(),
+            Err(_) => panic!(
+                "pump on a clean local EOF did not end within grace + margin although the gegenstelle never reads (AUF-20261006-070)"
+            ),
+        };
+
+        let mut buf = [0u8; 1];
+        match tokio::time::timeout(Duration::from_millis(1000), peer.read(&mut buf)).await {
+            Ok(Ok(0)) => {}
+            other => panic!("expected the local socket to be closed (EOF), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gegenstelle_liest_nicht_schreibfehler_gibt_stream_frei() {
+        // No independent witness for the write-error send at F:684 here: a closed socket delivers
+        // EOF to the read side at the same time, so this may end via either path (named in the PR
+        // text, AUF-20261006-070).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let local = TcpStream::connect(addr).await.unwrap();
+        let peer = accept.await.unwrap();
+
+        let (out_tx, _out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
+        for _ in 0..CHANNEL_CAP {
+            out_tx
+                .try_send(Frame::Close {
+                    id: 0,
+                    reason: None,
+                })
+                .unwrap();
+        }
+        let (in_tx, in_rx) = inbound_queue(false);
+        // Idle at 60 s so only the write/read-error path (not the idle branch) can end this pump.
+        let pump = tokio::spawn(pump_forward_stream(
+            1,
+            local,
+            out_tx,
+            in_rx,
+            Duration::from_secs(60),
+            None,
+        ));
+
+        in_tx_bounded(&in_tx)
+            .send(StreamIn::Data(b"to-local".to_vec()))
+            .await
+            .unwrap();
+        drop(peer); // local's write (and read) now fail
+
+        match tokio::time::timeout(Duration::from_millis(3000), pump).await {
+            Ok(join) => join.unwrap(),
+            Err(_) => panic!(
+                "pump on a local write/read error did not end within grace + margin although the gegenstelle never reads (AUF-20261006-070)"
+            ),
+        };
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn schreiber_endet_mit_der_engine() {
+        assert_eq!(
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks(),
+            0,
+            "nothing spawned yet"
+        );
+
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let (session_side, engine_side) = tokio::io::duplex(4);
+        let (_session_up_tx, session_up) = tokio::sync::oneshot::channel();
+        let engine = tokio::spawn(run_forward_initiate_engine(
+            engine_side,
+            listener,
+            "127.0.0.1:1".to_string(),
+            8,
+            Duration::from_secs(30),
+            true, // fc_enabled: queues a HELLO frame right away, no stream needed to wedge the writer
+            session_up,
+        ));
+
+        let mut alive = 0;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            alive = tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks();
+            if alive == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            alive, 2,
+            "engine task and its frame writer task should both be alive before the abort"
+        );
+
+        engine.abort();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if tokio::runtime::Handle::current()
+                    .metrics()
+                    .num_alive_tasks()
+                    == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the frame writer task must end with the engine (AUF-20261006-070)");
+
+        drop(session_side); // held, unread, until here -- reading it would free the writer itself
+    }
+
+    #[tokio::test]
+    async fn gegenstelle_liest_nicht_neue_verbindung_haengt_nicht_laenger_als_die_frist() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = Arc::new(listener);
+        let (session_side, engine_side) = tokio::io::duplex(4);
+        let (_session_up_tx, session_up) = tokio::sync::oneshot::channel();
+        let _engine = tokio::spawn(run_forward_initiate_engine(
+            engine_side,
+            listener,
+            "127.0.0.1:1".to_string(),
+            100,
+            Duration::from_secs(60),
+            false, // fc_enabled off: no HELLO/FC_ON, only Open fills the queue (named in the PR text)
+            session_up,
+        ));
+
+        // CHANNEL_CAP+1, not CHANNEL_CAP: the writer dequeues one frame before it blocks on the
+        // tiny duplex, which frees one extra queue slot beyond CHANNEL_CAP itself.
+        let mut held = Vec::with_capacity(CHANNEL_CAP + 1);
+        for _ in 0..CHANNEL_CAP + 1 {
+            held.push(TcpStream::connect(addr).await.unwrap());
+        }
+        // Settle time for the engine to accept and queue all CHANNEL_CAP+1 Open frames; the
+        // gegenstelle (session_side) never reads, so the writer is already stuck on the first one.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut extra = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        match tokio::time::timeout(Duration::from_millis(3100), extra.read(&mut buf)).await {
+            Ok(Ok(0)) => {}
+            Ok(Err(_)) => {} // a reset also signals the connection was closed, not left hanging
+            Ok(Ok(n)) => panic!(
+                "expected the connection whose Open could not be queued to see EOF, got {n} bytes"
+            ),
+            Err(_) => panic!(
+                "a new connection waited longer than the grace + margin for its Open (AUF-20261006-070)"
+            ),
+        }
+
+        drop(session_side); // held, unread, for the whole test
+        drop(held);
     }
 }
