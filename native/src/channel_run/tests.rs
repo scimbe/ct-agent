@@ -8634,3 +8634,175 @@ async fn channel_forward_bidirectional_bulk_over_a_slow_edge_like_relay_without_
     let took = bidirectional_bulk_over_relay(RelayFlush::OnShortRead, Some(8 << 20), false).await;
     eprintln!("bidirectional bulk over a slow edge-like relay (flow control off): {took:?}");
 }
+
+// trace: REQ-0006, AUF-20261006-060 (DEC-0061)
+// Part A of the follow-the-move preparation (REQ-0006): `join_addr_for_attempt`/`join_addr_now`
+// have no caller outside these tests yet -- Part B (AUF-20261006-061) wires them into the
+// broker/relay dial loops. These tests need no network and no DNS: the resolver is a closure
+// (tests 1-3) or, for `join_addr_now`, a plain `fn` with a static counter (tests 5-6), since the
+// field/parameter type is a `fn` pointer, not a boxed closure.
+
+#[test]
+fn join_addr_for_attempt_folgt_dem_aufloeser_auf_20261006_060() {
+    use std::cell::Cell;
+    use std::net::SocketAddr;
+    let a: SocketAddr = "203.0.113.10:1".parse().unwrap();
+    let b: SocketAddr = "203.0.113.20:2".parse().unwrap();
+    let calls = Cell::new(0);
+    let resolve = |_raw: &str| -> Result<SocketAddr, String> {
+        let n = calls.get();
+        calls.set(n + 1);
+        Ok(if n == 0 { a } else { b })
+    };
+    let start: SocketAddr = "203.0.113.1:1".parse().unwrap();
+    let first = join_addr_for_attempt("broker.example:1234", start, resolve);
+    assert_eq!(first, a, "the first attempt follows the resolver to A");
+    let second = join_addr_for_attempt("broker.example:1234", first, resolve);
+    assert_eq!(
+        second, b,
+        "a later attempt re-resolves and follows a moved broker/relay to B, not stuck on A"
+    );
+}
+
+#[test]
+fn join_addr_for_attempt_faellt_auf_die_letzte_adresse_zurueck_auf_20261006_060() {
+    use std::net::SocketAddr;
+    let last: SocketAddr = "203.0.113.1:1".parse().unwrap();
+    let resolve = |_raw: &str| -> Result<SocketAddr, String> { Err("lookup failed".to_string()) };
+    let result = join_addr_for_attempt("broker.example:1234", last, resolve);
+    assert_eq!(
+        result, last,
+        "a failed resolve falls back to the last known address instead of panicking"
+    );
+}
+
+#[test]
+fn join_addr_for_attempt_ip_literal_ruft_den_aufloeser_nie_auf_20261006_060() {
+    use std::cell::Cell;
+    use std::net::SocketAddr;
+    let calls = Cell::new(0);
+    let resolve = |_raw: &str| -> Result<SocketAddr, String> {
+        calls.set(calls.get() + 1);
+        Err("must not be called for an IP literal".to_string())
+    };
+    let last: SocketAddr = "203.0.113.1:1".parse().unwrap();
+    let literal: SocketAddr = "203.0.113.5:9443".parse().unwrap();
+    let result = join_addr_for_attempt("203.0.113.5:9443", last, resolve);
+    assert_eq!(result, literal, "an IP literal is returned as-is");
+    assert_eq!(
+        calls.get(),
+        0,
+        "an IP literal must never reach the resolver, even though `last` differs"
+    );
+}
+
+#[test]
+fn from_lookup_bewahrt_die_rohen_werte_auf_20261006_060() {
+    use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+    use ed25519_dalek::Signer;
+    use std::net::SocketAddr;
+
+    let id = ChannelIdentity::generate();
+    let op = SigningKey::from_bytes(&[9u8; 32]);
+    let g = ChannelGrant {
+        channel: ChannelId([0xD0u8; 32]),
+        holder: id.holder.verifying_key().to_bytes(),
+        direction: Direction::Initiate,
+        rights: Rights::ReadWrite,
+        delegable: false,
+        expires_at: 1_000,
+    };
+    let grant_hex = hex_encode(
+        &SignedChannelGrant {
+            grant: g.clone(),
+            signature: op.sign(&g.signing_bytes()).to_bytes(),
+        }
+        .encode(),
+    );
+
+    let pairs: Vec<(&str, String)> = vec![
+        ("CT_CHANNEL_ROLE", "initiate".into()),
+        ("CT_CHANNEL_BROKER", " 127.0.0.1:4433 ".into()),
+        ("CT_CHANNEL_RELAY", " 127.0.0.1:4434 ".into()),
+        ("CT_CHANNEL_LISTEN", "203.0.113.5:7000".into()),
+        ("CT_CHANNEL_GRANT", grant_hex),
+        ("CT_CHANNEL_HOLDER_KEY", id.holder_key_hex()),
+        ("CT_CHANNEL_NOISE_KEY", id.noise_key_hex()),
+    ];
+    let m: HashMap<String, String> = pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    let cfg = ChannelJoinCliConfig::from_lookup(move |k| m.get(k).cloned()).expect(
+        "a host:port with surrounding whitespace parses, same as before this field existed",
+    );
+
+    assert_eq!(
+        cfg.broker_raw, "127.0.0.1:4433",
+        "the raw broker value is trimmed but otherwise untouched"
+    );
+    assert_eq!(
+        cfg.broker_addr,
+        "127.0.0.1:4433".parse::<SocketAddr>().unwrap(),
+        "the resolved broker address is unaffected by the new field"
+    );
+    assert_eq!(
+        cfg.relay_raw, "127.0.0.1:4434",
+        "the raw relay value is trimmed but otherwise untouched"
+    );
+    assert_eq!(
+        cfg.relay_addr,
+        "127.0.0.1:4434".parse::<SocketAddr>().unwrap(),
+        "the resolved relay address is unaffected by the new field"
+    );
+}
+
+#[tokio::test]
+async fn join_addr_now_ip_literal_auf_20261006_060() {
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn resolver(_raw: &str) -> Result<SocketAddr, String> {
+        CALLS.fetch_add(1, Ordering::SeqCst);
+        Err("must not be called for an IP literal".to_string())
+    }
+    let last: SocketAddr = "203.0.113.1:1".parse().unwrap();
+    let literal: SocketAddr = "203.0.113.5:9443".parse().unwrap();
+    let result = join_addr_now("203.0.113.5:9443", last, resolver).await;
+    assert_eq!(result, literal, "an IP literal is returned as-is");
+    assert_eq!(
+        CALLS.load(Ordering::SeqCst),
+        0,
+        "an IP literal must never reach the resolver"
+    );
+}
+
+#[tokio::test]
+async fn join_addr_now_folgt_dem_aufloeser_auf_20261006_060() {
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn resolver(_raw: &str) -> Result<SocketAddr, String> {
+        match CALLS.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok("203.0.113.10:1".parse().unwrap()),
+            1 => Ok("203.0.113.20:2".parse().unwrap()),
+            _ => Err("lookup failed".to_string()),
+        }
+    }
+    let a: SocketAddr = "203.0.113.10:1".parse().unwrap();
+    let b: SocketAddr = "203.0.113.20:2".parse().unwrap();
+    let start: SocketAddr = "203.0.113.1:1".parse().unwrap();
+
+    let first = join_addr_now("broker.example:1234", start, resolver).await;
+    assert_eq!(first, a, "the first attempt follows the resolver to A");
+    let second = join_addr_now("broker.example:1234", first, resolver).await;
+    assert_eq!(
+        second, b,
+        "the second attempt re-resolves and follows the resolver to B"
+    );
+    let third = join_addr_now("broker.example:1234", second, resolver).await;
+    assert_eq!(
+        third, b,
+        "a failed resolve on the third attempt falls back to the last known address B"
+    );
+}

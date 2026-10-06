@@ -19,8 +19,16 @@ pub struct ChannelJoinCliConfig {
     pub role: ChannelRole,
     /// Edge rendezvous endpoint (`CT_CHANNEL_BROKER`, `CT_EDGE_CHANNEL_LISTEN` on the plane).
     pub broker_addr: SocketAddr,
+    /// The raw, trimmed `CT_CHANNEL_BROKER` value `broker_addr` was resolved from (a host:port
+    /// name or an IP:port literal) -- kept alongside the resolved address so a later join
+    /// attempt can re-resolve a hostname instead of being stuck with the address learned at
+    /// startup. Not yet read outside `from_lookup` and the tests (AUF-20261006-061).
+    pub broker_raw: String,
     /// Edge relay endpoint used on direct-dial failure (`CT_CHANNEL_RELAY`).
     pub relay_addr: SocketAddr,
+    /// The raw, trimmed `CT_CHANNEL_RELAY` value `relay_addr` was resolved from -- same
+    /// purpose as `broker_raw`.
+    pub relay_raw: String,
     /// The operator-signed channel grant this member holds (`CT_CHANNEL_GRANT`, hex).
     pub grant: ct_common::channel::SignedChannelGrant,
     /// The holder ed25519 private key that proves possession (`CT_CHANNEL_HOLDER_KEY`, hex). SECRET.
@@ -115,6 +123,11 @@ pub struct ChannelJoinCliConfig {
     /// [`crate::channel_run::service_calls::call_persistent_enabled_from`]. Has no effect outside
     /// persistent CALL_SERVICE mode.
     pub call_reconnect: bool,
+    /// The resolver `join_addr_for_attempt`/`join_addr_now` use to re-resolve `broker_raw`/
+    /// `relay_raw` on a later join attempt -- `resolve_socket_addr` in `from_lookup`, a plain
+    /// fn pointer (not a closure) so the field stays `Copy`-free but trivially constructible in
+    /// tests. Not yet read outside the tests (AUF-20261006-061).
+    pub join_resolve: fn(&str) -> Result<SocketAddr, String>,
 }
 
 /// Parse the optional `CT_CHANNEL_CIRCUIT_RELAY` libp2p circuit-relay multiaddr (#136 N-wire):
@@ -290,6 +303,59 @@ pub(crate) fn resolve_socket_addr(raw: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("{raw:?} resolved to no addresses"))
 }
 
+// trace: REQ-0006, AUF-20261006-060 (DEC-0061)
+/// How long [`join_addr_now`] waits for `resolve` on its blocking thread before falling back
+/// to `last` -- same value as `RESOLVE_TIMEOUT` in `config.rs`.
+const JOIN_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The address to dial on THIS join attempt (REQ-0006): a moved broker/relay is followed
+/// without a restart, because `raw` (`broker_raw`/`relay_raw`) is re-resolved every time this
+/// is called instead of once at startup. An IP:port literal is returned as-is -- `resolve` is
+/// not called at all, so the common case and the tests stay resolver-free. Otherwise
+/// `resolve(raw)` is tried: `Ok` wins; `Err` returns `last`, the caller's own last-good
+/// address, so a resolver outage never takes a working broker/relay away. Pure: no state, no
+/// process-wide memory (unlike `AgentConfig::resolve_edge_or` in `config.rs`, there is no
+/// multi-caller "newest known address" to share here -- each ladder has exactly one caller).
+#[allow(dead_code)] // bis AUF-20261006-061 (Teil B) ohne Aufrufer
+pub(crate) fn join_addr_for_attempt(
+    raw: &str,
+    last: SocketAddr,
+    resolve: impl Fn(&str) -> Result<SocketAddr, String>,
+) -> SocketAddr {
+    if let Ok(sa) = raw.parse::<SocketAddr>() {
+        return sa;
+    }
+    resolve(raw).unwrap_or(last)
+}
+
+/// Async wrapper around [`join_addr_for_attempt`] for a `fn`-pointer resolver such as
+/// [`resolve_socket_addr`] (`ChannelJoinCliConfig::join_resolve`): an IP:port literal returns
+/// immediately, no `spawn_blocking`. A hostname is resolved on a blocking thread --
+/// `resolve_socket_addr` calls the blocking `ToSocketAddrs::to_socket_addrs`, and running that
+/// on the async reactor would stall every other task on this runtime for the lookup's duration
+/// -- under `JOIN_RESOLVE_TIMEOUT`. A timeout, a `JoinError` (the blocking task panicked) or an
+/// `Err` from `resolve` all fall back to `last`, same as the sync version.
+#[allow(dead_code)] // bis AUF-20261006-061 (Teil B) ohne Aufrufer
+pub(crate) async fn join_addr_now(
+    raw: &str,
+    last: SocketAddr,
+    resolve: fn(&str) -> Result<SocketAddr, String>,
+) -> SocketAddr {
+    if let Ok(sa) = raw.parse::<SocketAddr>() {
+        return sa;
+    }
+    let owned = raw.to_string();
+    match tokio::time::timeout(
+        JOIN_RESOLVE_TIMEOUT,
+        tokio::task::spawn_blocking(move || resolve(&owned)),
+    )
+    .await
+    {
+        Ok(Ok(Ok(addr))) => addr,
+        _ => last,
+    }
+}
+
 impl ChannelJoinCliConfig {
     pub fn from_env() -> Result<Self, String> {
         Self::from_lookup(|k| std::env::var(k).ok())
@@ -347,6 +413,12 @@ impl ChannelJoinCliConfig {
         };
         let broker_addr = addr("CT_CHANNEL_BROKER", "edge rendezvous host:port")?;
         let relay_addr = addr("CT_CHANNEL_RELAY", "edge relay host:port")?;
+        // AUF-20261006-060: kept alongside the resolved addresses above so a later join
+        // attempt can re-resolve a hostname instead of being stuck with the startup address
+        // (REQ-0006) -- not yet read outside the tests (AUF-20261006-061 wires it in).
+        let raw = |k: &str| f(k).unwrap_or_default().trim().to_string();
+        let broker_raw = raw("CT_CHANNEL_BROKER");
+        let relay_raw = raw("CT_CHANNEL_RELAY");
         // #121/#173: relay-only mode. `CT_CHANNEL_RELAY_ONLY` forces it on; otherwise it is
         // auto-detected below from the advertised listen address. Parsed BEFORE CT_CHANNEL_LISTEN
         // because a relay-only member has no dialable address, so CT_CHANNEL_LISTEN is OPTIONAL in
@@ -492,7 +564,9 @@ impl ChannelJoinCliConfig {
         Ok(Self {
             role,
             broker_addr,
+            broker_raw,
             relay_addr,
+            relay_raw,
             grant,
             holder,
             own_noise_private,
@@ -509,6 +583,7 @@ impl ChannelJoinCliConfig {
             relay_addr_direct,
             front_door_only,
             call_reconnect,
+            join_resolve: resolve_socket_addr,
         })
     }
 }
