@@ -397,6 +397,33 @@ The session window bounds that queue for the whole session.
 5. *What it does not do.* The window bounds bytes on their way to the peer's engine. It does not
    bound what the peer's engine holds per stream (credit per stream: 256 KiB each) and it does
    not shape bandwidth between streams.
+<!-- trace: AUF-20261007-005, AUF-20261007-012 (slice ii: rules 6 to 8) -->
+
+6. *Both directions.* Each member is sender under the window the peer announced and receiver
+   under its own; the two windows are independent. The accept side takes the peer's window only
+   from a `HELLO` that arrives before the first `Open`, the initiate side only from one that
+   arrives before its first stream (rule 1), so both ends count the same bytes from the first.
+   The window does not depend on the credit per stream: a stream the initiate side opened
+   without `FC_ON` (the accept side's `HELLO` reached it after `HELLO_WAIT`) counts against the
+   accept side's window like any other, because the initiate side acknowledges its bytes.
+7. *Dead peer.* A sender with unacknowledged stream data (rule 2: in its queue towards the
+   peer or beyond, not what still waits) that receives **no frame at all** from
+   the peer for 30 s (`SESSION_DEAD_AFTER`, checked every quarter of it) ends the forward
+   **session** with one line on stderr: every stream of the session is reset, the channel's
+   reconnect dials a new one. Any frame counts, not only `SWINDOW`: on a slow path the
+   acknowledgement waits behind up to one window of the peer's own data (measured: 16 uploads at
+   62 500 B/s held a 4-byte answer's acknowledgement back for more than 3 s), and a peer that
+   still sends is not dead. Not dead, therefore: a peer that reads slowly, as long as one frame
+   in 30 s arrives. Taken for dead: a path that passes less than one frame in 30 s in the
+   direction towards the sender, and a peer that takes nothing. A session without a window in
+   force has no such check and ends as before (stream idle time, the channel's keepalive).
+8. *`Close` and `Open` behind a full queue.* A stream that ends puts its `Close` on the same
+   queue as the data. With that queue full it waits `CLOSE_SEND_GRACE` (2 s) at a time and goes
+   on waiting as long as the session's writer wrote at least one frame during that time; only a
+   writer that stood still for a whole grace drops the frame and resets the stream. A fixed 2 s
+   (the state of #276) dropped the `Close`/`Open` of streams whose peer was reading, only slowly.
+   Limit: a path that passes less than one frame per 2 s (below about 8 KiB/s with full
+   chunks) can still lose a `Close`; that stream then ends at the peer by its idle time.
 
 ## Environment variables (agent-card & marketplace-offer CLI, #144/#152)
 
