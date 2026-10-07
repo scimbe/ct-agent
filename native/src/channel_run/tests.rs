@@ -10338,3 +10338,57 @@ async fn belegter_name_haelt_denselben_host_mit_anderem_port_nicht_auf_auf_20261
     FREI.store(true, Ordering::SeqCst);
     let _ = haengt.await;
 }
+
+// AUF-20261007-005 (replaces -078/-081): with the session window a new connection is answered
+// while sixteen uploads keep a slow relay full. Measured on the base of this change (PR #276):
+// 64 s for the same request, 3.8 MiB of stream data ahead of its Open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channel_forward_new_connection_is_answered_while_uploads_fill_a_slow_relay() {
+    let tl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = tl.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = tl.accept().await {
+            tokio::spawn(async move {
+                let mut first = [0u8; 1];
+                if tcp.read_exact(&mut first).await.is_err() {
+                    return;
+                }
+                if first[0] == b'P' {
+                    let _ = tcp.write_all(b"pong").await;
+                    let _ = tcp.shutdown().await;
+                }
+                let mut sink = vec![0u8; 64 * 1024];
+                while matches!(tcp.read(&mut sink).await, Ok(n) if n > 0) {}
+            });
+        }
+    });
+    let bound =
+        spawn_forward_pair_over_relay(target.to_string(), RelayFlush::Always, Some(62_500), true)
+            .await;
+    async fn ask(bound: SocketAddr) -> Duration {
+        let t = std::time::Instant::now();
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        c.write_all(b"P").await.unwrap();
+        let mut all = Vec::new();
+        c.read_to_end(&mut all).await.unwrap();
+        assert_eq!(all, b"pong");
+        t.elapsed()
+    }
+    tokio::time::timeout(Duration::from_secs(20), ask(bound))
+        .await
+        .expect("the session did not come up");
+    for _ in 0..16 {
+        tokio::spawn(async move {
+            let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+            let chunk = vec![7u8; 64 * 1024];
+            if c.write_all(b"U").await.is_ok() {
+                while c.write_all(&chunk).await.is_ok() {}
+            }
+        });
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let took = tokio::time::timeout(Duration::from_secs(15), ask(bound))
+        .await
+        .expect("a new connection waited more than 15 s behind sixteen uploads");
+    eprintln!("new connection behind sixteen uploads over a 62 500 B/s relay: {took:?}");
+}
