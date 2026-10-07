@@ -26,6 +26,16 @@ pub(crate) struct ServeSessionCtx {
     pub(crate) relay_addr: SocketAddr,
     pub(crate) broker_ladder: Vec<ChannelDialRung>,
     pub(crate) relay_ladder: Vec<ChannelDialRung>,
+    // trace: REQ-0006, AUF-20261006-069 (DEC-0061)
+    /// The raw `CT_CHANNEL_BROKER` / `CT_CHANNEL_RELAY` / `CT_CHANNEL_FRONT_DOOR` values the
+    /// ladders above were resolved from: the key under which [`ladder_known`] looks up the
+    /// address the background refresher learned last.
+    pub(crate) broker_raw: String,
+    pub(crate) relay_raw: String,
+    pub(crate) front_door_raw: Option<String>,
+    /// Re-resolves those names in the background; `None` without a front-door cert (the
+    /// ladders are not dialed then) or when every value is an IP literal.
+    pub(crate) join_refresh: Option<JoinRefresher>,
     pub(crate) front_door_cert: Option<CertificateDer<'static>>,
     /// Bound once (Accept + not relay-only) and cloned per session; `None` for relay-only members
     /// (they can't be dialed directly) — those serve purely over the edge relay.
@@ -34,6 +44,52 @@ pub(crate) struct ServeSessionCtx {
     pub(crate) direct_upgrade: bool,
     /// ct-agent#22 (b), mirrors [`ChannelJoinCliConfig::accept_race`] (`CT_CHANNEL_ACCEPT_RACE`).
     pub(crate) accept_race: bool,
+}
+
+impl ServeSessionCtx {
+    // trace: REQ-0006, AUF-20261006-069 (DEC-0061)
+    /// Build the context of a persistent serve member from its config -- the ONE place that
+    /// copies the raw join names next to the ladders and starts the background refresher.
+    /// Must be called inside the runtime (the refresher is a spawned task, aborted with the
+    /// context).
+    pub(crate) fn from_cfg(
+        cfg: &ChannelJoinCliConfig,
+        request: ChannelJoinRequest,
+        listener: Option<Endpoint>,
+    ) -> Self {
+        let broker_ladder = cfg.broker_ladder();
+        let relay_ladder = cfg.relay_ladder();
+        let fd = cfg.front_door_raw.as_deref();
+        // Without a front-door cert the ladders are never dialed: nothing to refresh.
+        let join_refresh = cfg.front_door_cert.as_ref().and_then(|_| {
+            let mut names = ladder_names(&broker_ladder, &cfg.broker_raw, fd);
+            names.extend(ladder_names(&relay_ladder, &cfg.relay_raw, fd));
+            JoinRefresher::spawn(names, cfg.join_resolve)
+        });
+        Self {
+            request,
+            holder: cfg.holder.clone(),
+            role: cfg.role,
+            own_noise_private: cfg.own_noise_private,
+            broker_addr: cfg.broker_addr,
+            relay_addr: cfg.relay_addr,
+            broker_ladder,
+            relay_ladder,
+            broker_raw: cfg.broker_raw.clone(),
+            relay_raw: cfg.relay_raw.clone(),
+            front_door_raw: cfg.front_door_raw.clone(),
+            join_refresh,
+            front_door_cert: cfg.front_door_cert.clone(),
+            listener,
+            direct_upgrade: cfg.direct_upgrade,
+            accept_race: cfg.accept_race,
+        }
+    }
+
+    /// `start` (one of the two ladders) with the addresses the refresher learned last.
+    fn known(&self, start: &[ChannelDialRung], direct_raw: &str) -> Vec<ChannelDialRung> {
+        ladder_known(start, direct_raw, self.front_door_raw.as_deref())
+    }
 }
 
 /// #200: present the grant to the broker and park until the edge pairs the NEXT peer, returning that
@@ -55,7 +111,21 @@ pub(crate) struct ServeSessionCtx {
 pub(crate) async fn admit_one_peer(ctx: &ServeSessionCtx) -> Result<ChannelJoinOutcome, BoxError> {
     let outcome = match &ctx.front_door_cert {
         Some(edge_cert) => {
-            present_channel_join_via_ladder(&ctx.broker_ladder, &ctx.request, &ctx.holder, edge_cert.clone(), DIRECT_DIAL_TIMEOUT).await?
+            // AUF-20261006-069: the rungs carry the address the background refresher learned
+            // last -- a lookup, never a wait for DNS. A failed join asks for a refresh.
+            let rungs = ctx.known(&ctx.broker_ladder, &ctx.broker_raw);
+            let joined = present_channel_join_via_ladder(
+                &rungs,
+                &ctx.request,
+                &ctx.holder,
+                edge_cert.clone(),
+                DIRECT_DIAL_TIMEOUT,
+            )
+            .await;
+            if let (Err(_), Some(refresh)) = (&joined, &ctx.join_refresh) {
+                refresh.kick();
+            }
+            joined?
         }
         None => {
             // #25: name the path -- rung log lines exist only on the ladder above, and
@@ -103,9 +173,14 @@ pub(crate) async fn serve_admitted_session(
     ctx: std::sync::Arc<ServeSessionCtx>,
     admission: ChannelJoinOutcome,
 ) -> Result<(), BoxError> {
+    // AUF-20261006-069: as in `admit_one_peer` -- a lookup, never a wait for DNS.
+    let relay_rungs = match &ctx.front_door_cert {
+        Some(_) => ctx.known(&ctx.relay_ladder, &ctx.relay_raw),
+        None => Vec::new(),
+    };
     let relay = match &ctx.front_door_cert {
         Some(edge_cert) => RelayFallback::Ladder {
-            rungs: &ctx.relay_ladder,
+            rungs: &relay_rungs,
             edge_cert: edge_cert.clone(),
             direct_timeout: DIRECT_DIAL_TIMEOUT,
         },
