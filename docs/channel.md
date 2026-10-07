@@ -343,6 +343,61 @@ Any name other than `localhost` counts as non-loopback even if it happens to res
 the gate refuses to resolve a name in order to judge it, because the name may resolve differently a
 moment later, between the check and the dial.
 
+### Flow control on a forward session -- control messages and the session window
+
+<!-- trace: AUF-20261007-005, AUF-20261007-012 -->
+
+Control messages travel as `Data` on the reserved stream id `0`; real streams start at `1`. An
+agent that does not know a message ignores `Data` for an unknown id, so mixed versions keep
+working. All integers are big-endian.
+
+| Message | Bytes | Sent by | Meaning |
+|---|---|---|---|
+| `HELLO` v1 | `01 'C' 'F' 'C' 01` | both, once, first frame of the session | "I speak credit flow control per stream" |
+| `HELLO` v2 | `01 'C' 'F' 'C' 02` + window `u32` | both, once, first frame of the session | as v1, and: "you may have at most *window* bytes of stream data on their way to me without my acknowledgement" (`0`: no session window) |
+| `WINDOW` | `02` + id `u32` + bytes `u32` | receiver of stream *id* | the local socket took *bytes*: new credit for that stream |
+| `FC_ON` | `03` + id `u32` | initiate side, before the `Open` | stream *id* uses credit flow control; a `Close` for the id before its `Open` withdraws it |
+| `SWINDOW` | `04` + bytes `u32` | receiver, only to a peer whose `HELLO` said version >= 2 | my engine took *bytes* of stream data off the session |
+
+**Why a second window.** Credit per stream bounds what one stream may queue, not what all streams
+together put ahead of a new one. With 16 uploads over a 62 500 B/s path, 3.8 MiB waited ahead of
+a new stream's `Open` and its first bytes arrived after 64 s (measured, AUF-20261006-078/-081).
+The session window bounds that queue for the whole session.
+
+**Rules.**
+
+1. *Negotiation.* A member announces its window in its `HELLO` (this version: 256 KiB,
+   `SESSION_WINDOW`). A sender uses the window the **peer** announced, capped at 16 MiB. A v1
+   `HELLO`, a v2 `HELLO` with window `0`, no `HELLO` within 500 ms (`HELLO_WAIT`) or
+   `CT_CHANNEL_FORWARD_FLOW=off` on either side all mean: **no session window in that direction**,
+   and the session behaves exactly as before this change. A member recognises "no v2" by the
+   fifth byte of the `HELLO` and by nothing else; it never infers it from silence after a v2
+   `HELLO`. An agent before this change matches only the first four bytes of a `HELLO` and
+   therefore reads a v2 `HELLO` as v1: it keeps credit per stream and gets no `SWINDOW`. A
+   window below four chunks (64 KiB) other than `0` is a protocol violation.
+2. *Sender.* With a window in force the sender never has more stream data unacknowledged than the
+   window. `Open`, `Close` and control messages cost nothing. A quarter of the window (at most
+   four chunks) is reserved for the **first** chunk of each stream, so the first bytes of a new
+   stream do not queue behind the streams already waiting; an acknowledgement refills that
+   reserve first. The sum of both parts is the window -- the reserve is not extra. A first
+   chunk uses the rest of the window while the reserve is used up; a later chunk never uses the
+   reserve. Unacknowledged is what the sender put in its queue towards the peer: a chunk that
+   still waits for the window or for room in that queue is not, cannot be acknowledged, and
+   returns its part of the window when its stream is reset while it waits.
+3. *Receiver.* The receiver acknowledges every `Data` byte for a stream id other than `0` when
+   its engine **reads the frame** -- also bytes it then drops (stream reset, unknown id). A slow
+   target therefore cannot hold the session's window; holding back one stream is what the credit
+   per stream is for. It sends `SWINDOW` when a quarter of its window is unacknowledged and at
+   the latest 100 ms (`SESSION_ACK_DELAY`) after the first unacknowledged byte, so no byte stays
+   unacknowledged for good and a sender waiting for the window always gets it back.
+4. *Violations end the session, not a stream.* A `SWINDOW` that acknowledges more than is
+   unacknowledged, and a window below the minimum, end the forward session with one line on
+   stderr; every stream of the session is reset. The session window is shared state -- there is
+   no single stream to blame.
+5. *What it does not do.* The window bounds bytes on their way to the peer's engine. It does not
+   bound what the peer's engine holds per stream (credit per stream: 256 KiB each) and it does
+   not shape bandwidth between streams.
+
 ## Environment variables (agent-card & marketplace-offer CLI, #144/#152)
 
 `ct-agent channel agent-card` and the `--serve`-time `CapacityOffer` both reuse
