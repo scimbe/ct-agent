@@ -58,6 +58,9 @@ pub struct ChannelJoinCliConfig {
     /// set, the dial ladder tries the direct broker/relay first, then this front door over
     /// TLS-TCP with the `ct-edge-channel` ALPN.
     pub front_door: Option<SocketAddr>,
+    /// AUF-20261006-069: the raw (trimmed) `CT_CHANNEL_FRONT_DOOR` value, `None` when
+    /// unset/empty -- what the background refresher re-resolves (see [`JoinRefresher`]).
+    pub front_door_raw: Option<String>,
     /// The edge's TLS certificate (DER) the `:443` front-door dial trusts
     /// (`CT_CHANNEL_FRONT_DOOR_CERT`, hex) — the trust anchor a front-door TLS-TCP dial
     /// needs (#106). Present ⇒ `run_channel_join_command` admits over the broker *ladder*
@@ -335,11 +338,10 @@ pub(crate) fn join_addr_for_attempt(
 /// on the async reactor would stall every other task on this runtime for the lookup's duration
 /// -- under `JOIN_RESOLVE_TIMEOUT`. A timeout, a `JoinError` (the blocking task panicked) or an
 /// `Err` from `resolve` all fall back to `last`, same as the sync version.
-#[allow(dead_code)] // bis AUF-20261006-061 (Teil B) ohne Aufrufer
 pub(crate) async fn join_addr_now(
     raw: &str,
     last: SocketAddr,
-    resolve: fn(&str) -> Result<SocketAddr, String>,
+    resolve: impl FnOnce(&str) -> Result<SocketAddr, String> + Send + 'static,
 ) -> SocketAddr {
     if let Ok(sa) = raw.parse::<SocketAddr>() {
         return sa;
@@ -353,6 +355,231 @@ pub(crate) async fn join_addr_now(
     {
         Ok(Ok(Ok(addr))) => addr,
         _ => last,
+    }
+}
+
+// trace: REQ-0006, AUF-20261006-069 (DEC-0061)
+/// The address last resolved for each raw `host:port` of the join ladders (broker, relay,
+/// front door). Written only by [`join_addr_remember`], read by the data path through
+/// [`join_addr_known`] -- which therefore never waits for DNS. Bounded by the number of
+/// configured names (at most three).
+static JOIN_LAST_GOOD: std::sync::Mutex<Vec<(String, SocketAddr)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The names with a lookup under way on a blocking thread. A lookup that outlives
+/// `JOIN_RESOLVE_TIMEOUT` (a hanging `getaddrinfo`) keeps its thread; without this list every
+/// further round would add one more thread per name, and the process end waits for all of
+/// them. At most one lookup per name.
+static JOIN_IN_FLIGHT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The claim on one name in [`JOIN_IN_FLIGHT`]. It moves INTO the blocking closure, so the
+/// name is released when the lookup thread ends (also on a panic, also when the closure is
+/// dropped unrun) -- not when the waiting side gives up.
+struct JoinInFlight(String);
+
+impl JoinInFlight {
+    fn claim(raw: &str) -> Option<Self> {
+        use ct_common::sync::MutexExt;
+        let mut flying = JOIN_IN_FLIGHT.lock_safe();
+        if flying.iter().any(|h| h == raw) {
+            return None;
+        }
+        flying.push(raw.to_string());
+        Some(Self(raw.to_string()))
+    }
+}
+
+impl Drop for JoinInFlight {
+    fn drop(&mut self) {
+        use ct_common::sync::MutexExt;
+        JOIN_IN_FLIGHT.lock_safe().retain(|h| *h != self.0);
+    }
+}
+
+/// How often the [`JoinRefresher`] re-resolves the join names when nothing asks for it.
+pub(crate) const JOIN_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The pause after every refresh round: however often a failing serve loop asks
+/// ([`JoinRefresher::kick`]), the resolver is asked at most once per this gap.
+pub(crate) const JOIN_REFRESH_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The address to dial NOW for `raw`, without resolving: an IP:port literal is itself; a name
+/// is the address [`join_addr_refresh`] learned last, or `start` (resolved at process start)
+/// while there is none. Never blocks and never awaits -- safe on the admission path.
+pub(crate) fn join_addr_known(raw: &str, start: SocketAddr) -> SocketAddr {
+    use ct_common::sync::MutexExt;
+    if let Ok(sa) = raw.parse::<SocketAddr>() {
+        return sa;
+    }
+    JOIN_LAST_GOOD
+        .lock_safe()
+        .iter()
+        .find(|(h, _)| h == raw)
+        .map_or(start, |(_, a)| *a)
+}
+
+/// Write `now` as the address of `raw` if it differs from the known one (`start` while none
+/// is remembered), and log the change. Compare and write happen under ONE lock, so two
+/// answers for the same name cannot interleave. The log line is written AFTER the lock is
+/// released: [`join_addr_known`] takes the same lock on the admission path, and a blocking
+/// stderr must not hold an admission.
+fn join_addr_remember(raw: &str, start: SocketAddr, now: SocketAddr) {
+    use ct_common::sync::MutexExt;
+    let last = {
+        let mut known = JOIN_LAST_GOOD.lock_safe();
+        let last = known
+            .iter()
+            .find(|(h, _)| h == raw)
+            .map_or(start, |(_, a)| *a);
+        if now == last {
+            return;
+        }
+        match known.iter_mut().find(|(h, _)| h == raw) {
+            Some(entry) => entry.1 = now,
+            None => known.push((raw.to_string(), now)),
+        }
+        last
+    };
+    eprintln!("ct-agent channel: join address of {raw} changed: {last} -> {now}");
+}
+
+/// Re-resolve `raw` once via [`join_addr_now`] (off the reactor) and return the address known
+/// afterwards. The LOOKUP ITSELF remembers its answer ([`join_addr_remember`]), on its own
+/// thread: an answer that comes after `JOIN_RESOLVE_TIMEOUT` is still used, it is not thrown
+/// away with the wait. A failed lookup is logged and writes nothing; a lookup that is still
+/// running when the wait ends is logged once here. While an earlier lookup of the same name is
+/// still on its thread ([`JoinInFlight`]) nothing is started: the known address is returned
+/// at once. No lock is held across the await.
+pub(crate) async fn join_addr_refresh(
+    raw: &str,
+    start: SocketAddr,
+    resolve: fn(&str) -> Result<SocketAddr, String>,
+) -> SocketAddr {
+    use ct_common::sync::MutexExt;
+    if let Ok(sa) = raw.parse::<SocketAddr>() {
+        return sa;
+    }
+    let last = join_addr_known(raw, start);
+    let Some(flight) = JoinInFlight::claim(raw) else {
+        return last;
+    };
+    join_addr_now(raw, last, move |r: &str| {
+        let _flight = flight;
+        let now = resolve(r).map_err(|e| {
+            eprintln!("ct-agent channel: lookup of {r} failed: {e}");
+            e
+        })?;
+        join_addr_remember(r, start, now);
+        Ok(now)
+    })
+    .await;
+    if JOIN_IN_FLIGHT.lock_safe().iter().any(|h| h == raw) {
+        eprintln!(
+            "ct-agent channel: lookup of {raw} still running after {JOIN_RESOLVE_TIMEOUT:?}: \
+             its answer is used when it comes, the name is not asked again until then"
+        );
+    }
+    join_addr_known(raw, start)
+}
+
+/// `start` with every endpoint replaced by its currently known address: a direct rung looks
+/// up `direct_raw`, the front-door rungs `front_door_raw` (left alone when `None`). Number,
+/// order and kind of the rungs are untouched. A lookup only -- see [`join_addr_known`].
+pub(crate) fn ladder_known(
+    start: &[ChannelDialRung],
+    direct_raw: &str,
+    front_door_raw: Option<&str>,
+) -> Vec<ChannelDialRung> {
+    start
+        .iter()
+        .map(|rung| {
+            let raw = if rung.kind.is_front_door() {
+                front_door_raw
+            } else {
+                Some(direct_raw)
+            };
+            ChannelDialRung {
+                endpoint: raw.map_or(rung.endpoint, |r| join_addr_known(r, rung.endpoint)),
+                kind: rung.kind,
+            }
+        })
+        .collect()
+}
+
+/// The `(raw name, start address)` pairs behind the rungs of `start` -- only for rungs that
+/// are IN the ladder (no direct name under `CT_CHANNEL_FRONT_DOOR_ONLY`), each name once.
+pub(crate) fn ladder_names(
+    start: &[ChannelDialRung],
+    direct_raw: &str,
+    front_door_raw: Option<&str>,
+) -> Vec<(String, SocketAddr)> {
+    let mut names: Vec<(String, SocketAddr)> = Vec::new();
+    for rung in start {
+        let raw = if rung.kind.is_front_door() {
+            front_door_raw
+        } else {
+            Some(direct_raw)
+        };
+        if let Some(raw) = raw {
+            if !names.iter().any(|(n, _)| n == raw) {
+                names.push((raw.to_string(), rung.endpoint));
+            }
+        }
+    }
+    names
+}
+
+/// The ONE background task that keeps [`JOIN_LAST_GOOD`] fresh for a serve member: every
+/// `JOIN_REFRESH_INTERVAL`, or earlier when [`Self::kick`] reports a failed join, it
+/// re-resolves each name once, then pauses `JOIN_REFRESH_MIN_GAP`. The task ends with this
+/// value ([`crate::task_guard::TaskGuard`]).
+pub(crate) struct JoinRefresher {
+    kick: std::sync::Arc<tokio::sync::Notify>,
+    _task: crate::task_guard::TaskGuard<()>,
+}
+
+impl JoinRefresher {
+    /// `None` when there is nothing to refresh (every name is an IP:port literal): no task.
+    pub(crate) fn spawn(
+        names: Vec<(String, SocketAddr)>,
+        resolve: fn(&str) -> Result<SocketAddr, String>,
+    ) -> Option<Self> {
+        let mut todo: Vec<(String, SocketAddr)> = Vec::new();
+        for (raw, start) in names {
+            if raw.parse::<SocketAddr>().is_err() && !todo.iter().any(|(n, _)| *n == raw) {
+                todo.push((raw, start));
+            }
+        }
+        if todo.is_empty() {
+            return None;
+        }
+        let kick = std::sync::Arc::new(tokio::sync::Notify::new());
+        let asked = kick.clone();
+        let task = crate::task_guard::TaskGuard::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(JOIN_REFRESH_INTERVAL) => {}
+                    _ = asked.notified() => {}
+                }
+                for (raw, start) in &todo {
+                    join_addr_refresh(raw, *start, resolve).await;
+                }
+                tokio::time::sleep(JOIN_REFRESH_MIN_GAP).await;
+            }
+        });
+        Some(Self { kick, _task: task })
+    }
+
+    /// Ask for a refresh round now (a join just failed). Never blocks; a kick during a
+    /// running round is kept for exactly one more round.
+    pub(crate) fn kick(&self) {
+        self.kick.notify_one();
+    }
+}
+
+impl Drop for JoinRefresher {
+    fn drop(&mut self) {
+        eprintln!("ct-agent channel: join address refresher ended (its serve member is gone)");
     }
 }
 
@@ -419,6 +646,7 @@ impl ChannelJoinCliConfig {
         let raw = |k: &str| f(k).unwrap_or_default().trim().to_string();
         let broker_raw = raw("CT_CHANNEL_BROKER");
         let relay_raw = raw("CT_CHANNEL_RELAY");
+        let front_door_raw = Some(raw("CT_CHANNEL_FRONT_DOOR")).filter(|s| !s.is_empty());
         // #121/#173: relay-only mode. `CT_CHANNEL_RELAY_ONLY` forces it on; otherwise it is
         // auto-detected below from the advertised listen address. Parsed BEFORE CT_CHANNEL_LISTEN
         // because a relay-only member has no dialable address, so CT_CHANNEL_LISTEN is OPTIONAL in
@@ -574,6 +802,7 @@ impl ChannelJoinCliConfig {
             advertise_addr,
             relay_only,
             front_door,
+            front_door_raw,
             front_door_cert,
             circuit_relay,
             relay_gate_addr,

@@ -691,24 +691,20 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // and fully concurrent; central must e2e the concurrent case (the regression bar: N concurrent
     // builds all succeed, no `role unreachable` fallbacks, single-request builds unchanged).
     let shared_listener: Option<Endpoint> = match cfg.role {
-        ChannelRole::Accept if !cfg.relay_only => Some(crate::transport::build_direct_listener_at(cfg.listen_addr)?.0),
+        ChannelRole::Accept if !cfg.relay_only => {
+            Some(crate::transport::build_direct_listener_at(cfg.listen_addr)?.0)
+        }
         _ => None,
     };
-    let ctx = std::sync::Arc::new(ServeSessionCtx {
-        request: request.clone(),
-        holder: cfg.holder.clone(),
-        role: cfg.role,
-        own_noise_private: cfg.own_noise_private,
-        broker_addr: cfg.broker_addr,
-        relay_addr: cfg.relay_addr,
-        broker_ladder: broker_ladder.clone(),
-        relay_ladder: relay_ladder.clone(),
-        front_door_cert: front_door_cert.clone(),
-        listener: shared_listener,
-        direct_upgrade: cfg.direct_upgrade,
-        accept_race: cfg.accept_race,
-    });
-    let max = serve_concurrency_from_env(std::env::var("CT_CHANNEL_SERVE_CONCURRENCY").ok().as_deref());
+    // AUF-20261006-069: built in `ServeSessionCtx::from_cfg` (serving.rs), which also starts
+    // the background refresher for the join names.
+    let serve_ctx = ServeSessionCtx::from_cfg(&cfg, request.clone(), shared_listener);
+    let ctx = std::sync::Arc::new(serve_ctx);
+    let max = serve_concurrency_from_env(
+        std::env::var("CT_CHANNEL_SERVE_CONCURRENCY")
+            .ok()
+            .as_deref(),
+    );
     eprintln!("ct-agent channel: persistent serve — up to {max} concurrent sessions (#200)");
     let admit_ctx = ctx.clone();
     serve_loop_concurrent(
