@@ -995,19 +995,16 @@ async fn pump_forward_stream(
                     first_chunk = false;
                     touch();
                     bytes_out.fetch_add(n as u64, Ordering::Relaxed);
-                    if out_up
-                        .send(Frame::Data {
-                            id,
-                            payload: buf[..n].to_vec(),
-                        })
-                        .await
-                        .is_err()
-                    {
+                    let Ok(room) = out_up.reserve().await else {
                         return Half::Stop; // the engine loop ended
-                    }
+                    };
                     if let Some(sending) = held {
                         sending.queued();
                     }
+                    room.send(Frame::Data {
+                        id,
+                        payload: buf[..n].to_vec(),
+                    });
                 }
             }
         }
@@ -1185,7 +1182,10 @@ fn finished_stream_id(
         Ok((task, _)) => *task,
         Err(e) => e.id(),
     };
-    let id = running.iter().find(|(_, t)| **t == task).map(|(id, _)| *id)?;
+    let id = running
+        .iter()
+        .find(|(_, t)| **t == task)
+        .map(|(id, _)| *id)?;
     running.remove(&id);
     Some(id)
 }
@@ -1200,6 +1200,15 @@ fn accept_mode_line(peer_speaks_fc: bool) -> String {
         )
     } else {
         "ct-agent channel: forward flow control off for this session -- the first stream opened without HELLO (older agent, accept side)".to_string()
+    }
+}
+
+/// Why a session runs without the peer's session window.
+fn window_off_reason(window: Option<u32>, late: bool) -> &'static str {
+    match window {
+        None => "the peer speaks protocol v1",
+        Some(w) if late && w > 0 => "the peer's HELLO arrived after the wait for it had ended",
+        Some(_) => "the peer granted none",
     }
 }
 
@@ -1371,6 +1380,7 @@ async fn run_forward_initiate_engine(
                         if fc_enabled {
                             match apply_control(&payload, &entries, &mut pending_fc) {
                                 ControlOutcome::Hello(window) => {
+                                    let late = accepting;
                                     if !accepting {
                                         match SessionSend::from_hello(window.unwrap_or(0)) {
                                             Ok(s) => session_send = s,
@@ -1385,7 +1395,7 @@ async fn run_forward_initiate_engine(
                                         eprintln!("ct-agent channel: forward flow control on for this session (credit window {} KiB per stream)", FC_WINDOW / 1024);
                                         match &session_send {
                                             Some(s) => eprintln!("ct-agent channel: forward session window {} KiB for this session", (s.budget_cap + s.first_cap) / 1024),
-                                            None => eprintln!("ct-agent channel: forward session window off for this session -- the peer granted none"),
+                                            None => eprintln!("ct-agent channel: forward session window off for this session -- {}", window_off_reason(window, late)),
                                         }
                                     }
                                     // The peer's HELLO is the first frame it writes, so no Data
@@ -1650,7 +1660,8 @@ async fn run_forward_accept_engine(
                                         eprintln!("{}", accept_mode_line(true));
                                         match &session_send {
                                             Some(s) => eprintln!("ct-agent channel: forward session window {} KiB for this session (accept side)", (s.budget_cap + s.first_cap) / 1024),
-                                            None => eprintln!("ct-agent channel: forward session window off for this session -- the peer granted none (accept side)"),
+                                            // never late here: this line prints only before the first Open (mode_logged is set with opened)
+                                            None => eprintln!("ct-agent channel: forward session window off for this session -- {} (accept side)", window_off_reason(window, false)),
                                         }
                                     }
                                 }
@@ -1968,9 +1979,15 @@ mod tests {
         ));
         let (_r, mut w) = tokio::io::split(session_side);
         for f in [
-            Frame::Open { id: 5, target: addr.clone() },
+            Frame::Open {
+                id: 5,
+                target: addr.clone(),
+            },
             abort_frame(5),
-            Frame::Open { id: 5, target: addr.clone() },
+            Frame::Open {
+                id: 5,
+                target: addr.clone(),
+            },
         ] {
             f.write(&mut w).await.unwrap();
         }
@@ -1996,7 +2013,13 @@ mod tests {
         ));
         let (r, mut w) = tokio::io::split(session_side);
         for id in 1..=3u32 {
-            Frame::Open { id, target: addr.clone() }.write(&mut w).await.unwrap();
+            Frame::Open {
+                id,
+                target: addr.clone(),
+            }
+            .write(&mut w)
+            .await
+            .unwrap();
             abort_frame(id).write(&mut w).await.unwrap();
         }
         // The third Open arrives while the first two tasks still run: refused with the limit.
@@ -2004,14 +2027,20 @@ mod tests {
         let refused = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match Frame::read(&mut r).await.unwrap() {
-                    Frame::Close { id: 3, reason: Some(reason) } => break reason,
+                    Frame::Close {
+                        id: 3,
+                        reason: Some(reason),
+                    } => break reason,
                     _ => continue,
                 }
             }
         })
         .await
         .expect("no Close for the third stream");
-        assert!(refused.contains(FORWARD_MAX_STREAMS_ENV), "unexpected reason {refused}");
+        assert!(
+            refused.contains(FORWARD_MAX_STREAMS_ENV),
+            "unexpected reason {refused}"
+        );
     }
 
     // Live run of #274: the accept side names the session's mode like the initiate side does.
@@ -2794,6 +2823,79 @@ mod tests {
         assert_eq!(s.budget.available_permits(), s.budget_cap - 4500);
         assert!(s.acknowledge(4500));
         assert_eq!(s.unacknowledged(), 0);
+    }
+
+    #[test]
+    fn window_off_reason_nennt_die_ursache() {
+        assert_eq!(
+            window_off_reason(None, false),
+            "the peer speaks protocol v1"
+        );
+        assert_eq!(window_off_reason(None, true), "the peer speaks protocol v1");
+        assert_eq!(
+            window_off_reason(Some(SESSION_WINDOW as u32), true),
+            "the peer's HELLO arrived after the wait for it had ended"
+        );
+        assert_eq!(window_off_reason(Some(0), false), "the peer granted none");
+        assert_eq!(window_off_reason(Some(0), true), "the peer granted none");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quittung_direkt_nach_dem_einreihen_ist_keine_verletzung() {
+        const BYTES: usize = 64 << 20;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let local = TcpStream::connect(addr).await.unwrap();
+        let mut peer = accept.await.unwrap();
+        let session = SessionSend::from_hello(SESSION_WINDOW as u32)
+            .unwrap()
+            .unwrap();
+        let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
+        let (_in_tx, in_rx) = inbound_queue(false);
+        let _pump = tokio::spawn(pump_forward_stream(
+            1,
+            local,
+            out_tx,
+            in_rx,
+            Duration::from_secs(30),
+            Some(PumpFlow {
+                credit: None,
+                session: Some(session.clone()),
+            }),
+        ));
+        let _feeder = tokio::spawn(async move {
+            let _ = peer.write_all(&vec![7u8; BYTES]).await;
+            peer
+        });
+        let s = session.clone();
+        let engine = tokio::task::spawn_blocking(move || {
+            let mut got = 0usize;
+            let mut frames = 0usize;
+            while got < BYTES {
+                match out_rx.try_recv() {
+                    Ok(Frame::Data { payload, .. }) => {
+                        got += payload.len();
+                        frames += 1;
+                        if !s.acknowledge(payload.len()) {
+                            return Err((frames, got));
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(mpsc::error::TryRecvError::Empty) => std::hint::spin_loop(),
+                    Err(_) => return Err((frames, got)),
+                }
+            }
+            Ok(frames)
+        });
+        let r = tokio::time::timeout(Duration::from_secs(60), engine)
+            .await
+            .expect("zeit")
+            .unwrap();
+        assert!(
+            r.is_ok(),
+            "frame in der queue, aber nicht als gesendet gebucht: {r:?}"
+        );
     }
 
     /// Free permits of both parts: never more than the window, whatever a peer or a reset does.
