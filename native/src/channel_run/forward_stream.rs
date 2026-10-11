@@ -2958,6 +2958,87 @@ mod tests {
         assert_eq!(total, 2 * DATA_CHUNK_LEN);
     }
 
+    // M21d: der Zaehler steigt nach dem Eintritt einmal und steht dann.
+    #[tokio::test(start_paused = true)]
+    async fn ein_einzelner_fortschritt_verlaengert_nur_um_eine_frist() {
+        let (tx, mut rx) = mpsc::channel::<Frame>(1);
+        tx.send(abort_frame(1)).await.unwrap();
+        let ahead = tx.clone();
+        tokio::spawn(async move { ahead.send(abort_frame(2)).await });
+        tokio::task::yield_now().await;
+        let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let count = written.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(CLOSE_SEND_GRACE / 2).await;
+            let _ = rx.recv().await;
+            count.fetch_add(1, Ordering::Relaxed);
+            std::future::pending::<()>().await;
+            drop(rx);
+        });
+        let t0 = tokio::time::Instant::now();
+        let close = Frame::Close {
+            id: 3,
+            reason: None,
+        };
+        let sent = tokio::time::timeout(
+            CLOSE_SEND_GRACE * 4,
+            WRITTEN.scope(written, send_or_drop(&tx, close)),
+        )
+        .await;
+        let took = t0.elapsed();
+        assert!(
+            matches!(sent, Ok(false)),
+            "{sent:?} after {took:?}: one step of the writer kept the wait alive"
+        );
+        assert!(
+            took >= CLOSE_SEND_GRACE * 2 && took < CLOSE_SEND_GRACE * 3,
+            "dropped after {took:?}, expected after two graces"
+        );
+    }
+
+    // M33b: die Accept-Seite gibt ihren Stream-Tasks den Zaehler des Schreibers mit.
+    #[tokio::test]
+    async fn accept_seite_langsam_lesende_gegenstelle_bekommt_jedes_close() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = l.local_addr().unwrap().to_string();
+        drop(l); // nobody listens there: every dial fails, every stream answers with a Close
+        let (session_side, engine_side) = tokio::io::duplex(4);
+        let _engine = tokio::spawn(run_forward_accept_engine(
+            engine_side,
+            Some(target.clone()),
+            None,
+            100,
+            Duration::from_secs(60),
+            false,
+        ));
+        let (mut r, mut w) = tokio::io::split(session_side);
+        for id in 1..=(CHANNEL_CAP + 3) as u32 {
+            let open = Frame::Open {
+                id,
+                target: target.clone(),
+            };
+            open.write(&mut w).await.unwrap();
+        }
+        for step in [CLOSE_SEND_GRACE / 2, CLOSE_SEND_GRACE * 3 / 4] {
+            tokio::time::sleep(step).await;
+            assert!(matches!(
+                Frame::read(&mut r).await,
+                Ok(Frame::Close { .. })
+            ));
+        }
+        let mut frames = frames_of(r);
+        let mut closes = 2;
+        while let Ok(Some(f)) = tokio::time::timeout(Duration::from_secs(1), frames.recv()).await {
+            assert!(matches!(f, Frame::Close { .. }), "unexpected: {f:?}");
+            closes += 1;
+        }
+        assert_eq!(
+            closes,
+            CHANNEL_CAP + 3,
+            "Close frames that reached a peer that was reading"
+        );
+    }
+
     /// Free permits of both parts: never more than the window, whatever a peer or a reset does.
     fn session_permits(s: &SessionSend) -> usize {
         s.first.available_permits() + s.budget.available_permits()
