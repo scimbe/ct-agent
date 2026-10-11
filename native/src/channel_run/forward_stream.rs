@@ -2898,6 +2898,66 @@ mod tests {
         );
     }
 
+    /// Bytes aus der Queue vor und nach der Quittung, wenn der Rest des Fensters belegt ist.
+    async fn folge_chunks_vor_der_quittung(window: usize) -> (usize, usize) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let local = TcpStream::connect(addr).await.unwrap();
+        let mut peer = accept.await.unwrap();
+        let s = SessionSend::from_hello(window as u32).unwrap().unwrap();
+        s.take(false, s.budget_cap).await.unwrap().queued();
+        let (out_tx, mut out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
+        let (_in_tx, in_rx) = inbound_queue(false);
+        let _pump = tokio::spawn(pump_forward_stream(
+            1,
+            local,
+            out_tx,
+            in_rx,
+            Duration::from_secs(30),
+            Some(PumpFlow {
+                credit: None,
+                session: Some(s.clone()),
+            }),
+        ));
+        peer.write_all(&vec![7u8; 2 * DATA_CHUNK_LEN])
+            .await
+            .unwrap();
+        let mut before = 0;
+        loop {
+            let wait = if before == 0 {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_millis(300)
+            };
+            match tokio::time::timeout(wait, out_rx.recv()).await {
+                Ok(Some(Frame::Data { payload, .. })) => before += payload.len(),
+                Ok(other) => panic!("unerwartet: {other:?}"),
+                Err(_) => break,
+            }
+        }
+        assert!(s.acknowledge(s.budget_cap));
+        let mut total = before;
+        while total < 2 * DATA_CHUNK_LEN {
+            match tokio::time::timeout(Duration::from_secs(10), out_rx.recv()).await {
+                Ok(Some(Frame::Data { payload, .. })) => total += payload.len(),
+                other => panic!("der rest fehlt nach {total} bytes: {other:?}"),
+            }
+        }
+        (before, total)
+    }
+
+    // W10: mit SESSION_WINDOW fasst die Reserve vier Chunks; ein Folge-Chunk darf sie nicht nehmen.
+    #[tokio::test]
+    async fn folge_chunks_nehmen_die_reserve_nicht() {
+        let (before, total) = folge_chunks_vor_der_quittung(SESSION_WINDOW).await;
+        assert!(
+            (1..=DATA_CHUNK_LEN).contains(&before),
+            "{before} bytes vor der quittung"
+        );
+        assert_eq!(total, 2 * DATA_CHUNK_LEN);
+    }
+
     /// Free permits of both parts: never more than the window, whatever a peer or a reset does.
     fn session_permits(s: &SessionSend) -> usize {
         s.first.available_permits() + s.budget.available_permits()
