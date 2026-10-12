@@ -12,7 +12,9 @@
 #
 # Secrets are never put on a command line: tokens come from the environment or a hidden prompt,
 # files that hold secrets are mode 0600. Run it again after a failure: keys, the registration, the
-# member entries and the grants that already exist are reused, nothing is overwritten.
+# member entries and the grants that already exist are reused. It overwrites only files it created
+# itself. With --yes it accepts defaults only: overwriting a different ssh owner key, appending to
+# ~/.ssh/config and turning on the TCP forward each need their own switch (see --help).
 set -euo pipefail
 umask 077
 
@@ -64,6 +66,12 @@ Every question has a variable of the same name; a variable that is set is never 
   CT_AGENT_ORIGIN          tunnel: what to publish               (default 127.0.0.1:8080)
   CT_QS_OWNER_KEY_FILE     ssh-tunnel client: file holding the owner key printed by the host
 
+Switches that --yes does NOT imply (each is a separate, explicit decision):
+  --enable-forward           ssh-channel: turn on the opt-in TCP forward
+  --allow-ssh-key-overwrite  ssh-tunnel client: replace a different ~/.ssh/ct-agent-<host>.owner
+  --append-ssh-config        ssh-tunnel client: append the stanza to ~/.ssh/config
+                             (without it, --yes prints the stanza for you to add)
+
 Options: --yes (no questions), --workdir DIR, --inbox FILE (read pasted blocks from a file),
 --docker (tunnel only), --no-demo-origin, --rekey (channel register --rekey), --green is implied by
 ssh-tunnel. Tuning for slow links: CT_QS_WAIT (seconds to wait for the test line, default 90),
@@ -73,7 +81,7 @@ USAGE
 }
 
 # --- arguments -------------------------------------------------------------------
-CMD=""; ROLE="${CT_QS_ROLE:-}"; ASSUME_YES=0; DO_CLEAN=0; DOCKER=0; DEMO_ORIGIN=1; REKEY="${CT_CHANNEL_REKEY:-0}"
+CMD=""; ROLE="${CT_QS_ROLE:-}"; ASSUME_YES=0; DO_CLEAN=0; DOCKER=0; DEMO_ORIGIN=1; ENABLE_FORWARD=0; ALLOW_KEY_OVERWRITE=0; APPEND_SSH_CONFIG=0; REKEY="${CT_CHANNEL_REKEY:-0}"
 INBOX_FILE="${CT_QS_INBOX_FILE:-}"
 WORK="${CT_QS_WORKDIR:-./ct-quickstart}"
 CT_QS_SIDE="${CT_QS_SIDE:-}"
@@ -88,6 +96,9 @@ while [ $# -gt 0 ]; do
     --docker)         DOCKER=1 ;;
     --no-demo-origin) DEMO_ORIGIN=0 ;;
     --rekey)          REKEY=1 ;;
+    --enable-forward) ENABLE_FORWARD=1 ;;
+    --allow-ssh-key-overwrite) ALLOW_KEY_OVERWRITE=1 ;;
+    --append-ssh-config) APPEND_SSH_CONFIG=1 ;;
     --clean)          DO_CLEAN=1 ;;
     -h|--help)        usage 0 ;;
     *)                die "unknown argument: $1 (try --help)" ;;
@@ -154,6 +165,30 @@ port_open() { # host port
   (exec 3<>"/dev/tcp/$1/$2") >/dev/null 2>&1
 }
 pid_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+
+# Values that end up in the .env (which setup.sh sources) are checked against a narrow pattern first and
+# written quoted when they hold anything beyond a plain word.
+RE_HOST='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'
+RE_URL='^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$'
+RE_ORIGIN='^[A-Za-z0-9.-]+:[0-9]+$'
+RE_TOKEN='^[A-Za-z0-9._~+/=-]+$'
+need() { # label value regex
+  [[ "$2" =~ $3 ]] || die "$1 holds characters it should not (allowed pattern: $3) -- nothing was written"
+}
+env_kv() { # NAME VALUE -> a line safe to source
+  if [[ "$2" =~ ^[A-Za-z0-9._~:/+=@%,-]*$ ]]; then printf '%s=%s\n' "$1" "$2"
+  else printf "%s='%s'\n" "$1" "${2//\'/\'\\\'\'}"; fi
+}
+
+# A process is "ours" only if its start time and command line equal what was recorded right after the start
+# (a recycled pid or someone else's ct-agent never matches). No record: never killed.
+proc_sig() { ps -p "$1" -o lstart=,command= 2>/dev/null | sed 's/  */ /g'; }
+sigfile_of() { printf '%s/run/%s.sig' "$WORK" "$(basename "$1" .pid)"; }
+record_sig() { # PIDFILE
+  local p; p="$(cat "$1" 2>/dev/null || true)"
+  if pid_alive "$p"; then proc_sig "$p" > "$(sigfile_of "$1")"; fi
+  return 0
+}
 kill_tree() {
   local p="$1" c
   for c in $(pgrep -P "$p" 2>/dev/null || true); do kill_tree "$c"; done
@@ -308,17 +343,17 @@ cp_add_member() { # side channel holder noise attest
 issue_grant() { # side channel holder direction
   local side="$1" f="$WORK/grants/$1.grant" m="$WORK/grants/$1.meta" exp g
   if [ -s "$f" ] && [ -s "$m" ]; then
-    local mch mexp; mch="$(sed -n 's/^channel=//p' "$m")"; mexp="$(sed -n 's/^expires=//p' "$m")"
-    if [ "$mch" = "$2" ] && [ "${mexp:-0}" -gt $(( $(now) + 600 )) ]; then
+    local mch mexp mop; mch="$(sed -n 's/^channel=//p' "$m")"; mexp="$(sed -n 's/^expires=//p' "$m")"; mop="$(sed -n 's/^operator=//p' "$m")"
+    if [ "$mch" = "$2" ] && [ "$mop" = "$OPERATOR_PUB" ] && [ "$REKEY" != 1 ] && [ "${mexp:-0}" -gt $(( $(now) + 600 )) ]; then
       ok "grant for '$side' still valid -- reusing it"; return
     fi
-    warn "grant for '$side' is expired or for another channel -- signing a new one"
+    warn "grant for '$side' is expired, for another channel or operator key, or --rekey was given -- signing a new one"
   fi
   exp=$(( $(now) + ${CT_QS_GRANT_HOURS} * 3600 ))
   g="$(CT_CHANNEL_OPERATOR_KEY="$OPERATOR_KEY" CT_GRANT_CHANNEL="$2" CT_GRANT_MEMBER_HOLDER="$3" \
        CT_GRANT_DIRECTION="$4" CT_GRANT_EXPIRES="$exp" "$CTA" channel grant)" || die "signing the grant for '$side' failed"
   printf '%s\n' "$g" > "$f"; chmod 600 "$f"
-  printf 'channel=%s\nexpires=%s\n' "$2" "$exp" > "$m"
+  printf 'channel=%s\nexpires=%s\noperator=%s\n' "$2" "$exp" "$OPERATOR_PUB" > "$m"
   ok "grant for '$side' signed (valid ${CT_QS_GRANT_HOURS} h)"
 }
 
@@ -386,7 +421,7 @@ block() { # title, then lines on stdin
 channel_common() {
   stage "settings" "set the variable named in the message and re-run"
   ask CT_AGENT_CP_URL "Control plane" "$DEFAULT_CP"
-  CP="${CT_AGENT_CP_URL%/}"
+  CP="${CT_AGENT_CP_URL%/}"; need "CT_AGENT_CP_URL" "$CP" "$RE_URL"
   CT_QS_GRANT_HOURS="${CT_QS_GRANT_HOURS:-24}"
   case "$CT_QS_GRANT_HOURS" in ""|*[!0-9]*) die "CT_QS_GRANT_HOURS must be a whole number of hours" ;; esac
   stage "install the CLI" "install curl, or put ct-agent on PATH, then re-run"
@@ -405,12 +440,13 @@ stop_pidfile() {
   local f="$1" p
   [ -f "$f" ] || return 0
   p="$(cat "$f" 2>/dev/null || true)"
-  if pid_alive "$p" && ps -p "$p" -o command= 2>/dev/null | grep -qE 'ct-agent|http\.server'; then
+  local sf; sf="$(sigfile_of "$f")"
+  if pid_alive "$p" && [ -s "$sf" ] && [ "$(proc_sig "$p")" = "$(cat "$sf")" ]; then
     kill_tree "$p"; ok "stopped pid $p ($(basename "$f"))"
   elif pid_alive "$p"; then
-    warn "pid $p ($(basename "$f")) is not a process of this script any more -- left running"
+    warn "pid $p ($(basename "$f")) cannot be shown to be this script's process -- left running"
   fi
-  rm -f "$f"
+  rm -f "$f" "$sf"
 }
 stop_runs() {
   local f
@@ -488,6 +524,7 @@ channel_run_single() {
   apid=$!; echo "$apid" > "$WORK/run/accept.pid"; FG_PIDS="$apid"
   sleep "${CT_QS_A_HEAD_START:-5}"
   pid_alive "$apid" || { tail_log "$WORK/logs/accept.log"; die "member A exited right after start"; }
+  record_sig "$WORK/run/accept.pid"
   ok "member A is waiting at the edge"
 
   stage "send the test line from B (initiate)" "see $WORK/logs/initiate.log; A's log is $WORK/logs/accept.log"
@@ -523,6 +560,7 @@ ssh_channel_run_single() {
     pa=$!; echo "$pa" > "$WORK/run/accept.pid"; disown "$pa" 2>/dev/null || true
     sleep "${CT_QS_A_HEAD_START:-5}"
     pid_alive "$pa" || { tail_log "$WORK/logs/accept.log"; die "member A exited right after start"; }
+    record_sig "$WORK/run/accept.pid"
   fi
   stage "start member B (initiate, listener on 127.0.0.1:$port)" "see $WORK/logs/initiate.log; stop everything with: $0 --clean"
   if pid_alive "$pb"; then ok "member B already running (pid $pb)"; else
@@ -537,6 +575,7 @@ ssh_channel_run_single() {
     [ "$(now)" -lt "$deadline" ] || { tail_log "$WORK/logs/initiate.log"; die "the listener did not come up within ${waitfor}s"; }
     sleep 1
   done
+  record_sig "$WORK/run/initiate.pid"
   ok "listener is up on 127.0.0.1:$port"
   stage "probe the forward" "make sure sshd listens on the target ($tgt) of the accepting side"
   if port_open 127.0.0.1 "$port"; then
@@ -662,7 +701,10 @@ member_start() {
 cmd_channel() {
   [ "$CMD" = ssh-channel ] && FORWARD=1
   [ "$FORWARD" -eq 0 ] || forward_warning
-  [ "$FORWARD" -eq 0 ] || confirm "Enable the TCP forward anyway?" || die "aborted"
+  if [ "$FORWARD" -eq 1 ] && [ "$ENABLE_FORWARD" -ne 1 ]; then
+    [ "$ASSUME_YES" -eq 0 ] || die "the TCP forward is opt-in: add --enable-forward to turn it on without questions"
+    confirm "Enable the TCP forward anyway?" || die "aborted"
+  fi
   channel_common
   case "$ROLE" in
     "")       channel_single ;;
@@ -683,15 +725,19 @@ redeem() { # sets AGENT_JOIN_TOKEN / AGENT_TOKEN from CT_BOOTSTRAP
   bundle="$(printf '%s' "$resp" | sed -n 's/.*"secret":"\([^"]*\)".*/\1/p')"
   AGENT_JOIN_TOKEN="$(printf '%s' "$bundle" | sed -n 's/.*CT_JOIN_TOKEN=\([^;"]*\).*/\1/p')"
   AGENT_TOKEN="$(printf '%s' "$bundle" | sed -n 's/.*CT_AGENT_TOKEN=\([^;"]*\).*/\1/p')"
+  unset CT_BOOTSTRAP
+  [[ "$AGENT_JOIN_TOKEN" =~ $RE_TOKEN && "$AGENT_TOKEN" =~ $RE_TOKEN ]] || { AGENT_JOIN_TOKEN=""; AGENT_TOKEN=""; die "the control plane returned a token with unexpected characters -- nothing was written"; }
   [ -n "$AGENT_JOIN_TOKEN" ] && [ -n "$AGENT_TOKEN" ] || die "the control plane answered, but the answer holds no tokens"
   ok "token redeemed"
 }
 
-write_tunnel_env() { # origin [extra lines on stdin]
-  local f="$WORK/.env" tmp="$WORK/.env.new"
-  { printf 'CT_AGENT_JOIN_TOKEN=%s\nCT_AGENT_TOKEN=%s\nCT_AGENT_CP_URL=%s\nCT_AGENT_HOSTNAME=%s\nCT_AGENT_ORIGIN=%s\nCT_AGENT_ORIGIN_PROTO=tcp\n' \
-      "$AGENT_JOIN_TOKEN" "$AGENT_TOKEN" "$CP" "$HOSTNAME_" "$1"
-    cat
+write_tunnel_env() { # origin [NAME=VALUE ...]
+  local f="$WORK/.env" tmp="$WORK/.env.new" origin="$1" kv; shift
+  {
+    env_kv CT_AGENT_JOIN_TOKEN "$AGENT_JOIN_TOKEN"; env_kv CT_AGENT_TOKEN "$AGENT_TOKEN"
+    env_kv CT_AGENT_CP_URL "$CP"; env_kv CT_AGENT_HOSTNAME "$HOSTNAME_"
+    env_kv CT_AGENT_ORIGIN "$origin"; env_kv CT_AGENT_ORIGIN_PROTO tcp
+    for kv in "$@"; do env_kv "${kv%%=*}" "${kv#*=}"; done
   } > "$tmp"
   chmod 600 "$tmp"
   [ ! -f "$f" ] || cp -p "$f" "$WORK/.env.bak"
@@ -705,7 +751,7 @@ run_setup() { # extra args...
   out="$WORK/logs/setup.log"
   # setup.sh prints the routing token in its Gelb hint; the redaction keeps it out of the terminal and the log
   set +e
-  (cd "$WORK" && bash "$s" "$@") 2>&1 | redact "$AGENT_TOKEN" "$AGENT_JOIN_TOKEN" | tee "$out"
+  (cd "$WORK" && env -u CT_BOOTSTRAP bash "$s" "$@") 2>&1 | redact "$AGENT_TOKEN" "$AGENT_JOIN_TOKEN" | tee "$out"
   rc=${PIPESTATUS[0]}
   set -e
   [ "$rc" -eq 0 ] || return 1
@@ -721,31 +767,32 @@ demo_origin() { # host:port
   command -v python3 >/dev/null 2>&1 || { warn "nothing listens on $1 and python3 is missing -- start your service there"; return; }
   mkdir -p "$WORK/site"; [ -f "$WORK/site/index.html" ] || echo "<h1>ct-agent quickstart</h1>" > "$WORK/site/index.html"
   (cd "$WORK/site" && nohup python3 -m http.server 8080 --bind 127.0.0.1 >"$WORK/logs/demo-origin.log" 2>&1 & echo $! > "$WORK/run/demo-origin.pid")
-  sleep 1
+  sleep 1; record_sig "$WORK/run/demo-origin.pid"
   ok "started a throw-away web server on 127.0.0.1:8080 (pid $(cat "$WORK/run/demo-origin.pid")); '--clean' stops it"
 }
 
 tunnel_questions() {
   ask CT_AGENT_CP_URL "Control plane" "$DEFAULT_CP"
-  CP="${CT_AGENT_CP_URL%/}"
+  CP="${CT_AGENT_CP_URL%/}"; need "CT_AGENT_CP_URL" "$CP" "$RE_URL"
   if [ -f "$WORK/.env" ] && grep -q '^CT_AGENT_TOKEN=' "$WORK/.env"; then
     ok ".env found in $WORK -- reusing hostname and tokens"
     HOSTNAME_="$(envval CT_AGENT_HOSTNAME)"; AGENT_TOKEN="$(envval CT_AGENT_TOKEN)"; AGENT_JOIN_TOKEN="$(envval CT_AGENT_JOIN_TOKEN)"
     ORIGIN="$(envval CT_AGENT_ORIGIN)"
+    need "CT_AGENT_HOSTNAME in .env" "$HOSTNAME_" "$RE_HOST"; need "CT_AGENT_ORIGIN in .env" "$ORIGIN" "$RE_ORIGIN"
+    need "CT_AGENT_TOKEN in .env" "$AGENT_TOKEN" "$RE_TOKEN"; need "CT_AGENT_JOIN_TOKEN in .env" "$AGENT_JOIN_TOKEN" "$RE_TOKEN"
     if [ -n "${CT_AGENT_HOSTNAME:-}" ] && [ "$CT_AGENT_HOSTNAME" != "$HOSTNAME_" ]; then
       die "$WORK/.env is for $HOSTNAME_, not $CT_AGENT_HOSTNAME. Use --clean first, or another --workdir"
     fi
     return
   fi
   ask CT_AGENT_HOSTNAME "Hostname of the tunnel (as on the Install page)" ""
-  HOSTNAME_="$CT_AGENT_HOSTNAME"
+  HOSTNAME_="$CT_AGENT_HOSTNAME"; need "CT_AGENT_HOSTNAME" "$HOSTNAME_" "$RE_HOST"
   ask CT_BOOTSTRAP "Bootstrap token of the Install page (hidden)" "" secret
   ask CT_AGENT_ORIGIN "What to publish (host:port on this machine)" "127.0.0.1:8080"
-  ORIGIN="$CT_AGENT_ORIGIN"
+  ORIGIN="$CT_AGENT_ORIGIN"; need "CT_AGENT_ORIGIN" "$ORIGIN" "$RE_ORIGIN"
   stage "redeem the token" "create a fresh token on the Install page and re-run (a token works once)"
   redeem
-  write_tunnel_env "$ORIGIN" </dev/null
-  CT_BOOTSTRAP=""
+  write_tunnel_env "$ORIGIN"
   ok ".env written ($WORK/.env, mode 0600)"
 }
 
@@ -763,6 +810,7 @@ tunnel_up() {
   run_setup ${args[@]+"${args[@]}"} || die "setup.sh failed"
   if [ "$DOCKER" -eq 0 ]; then
     pid_alive "$(cat "$WORK/ct-agent.pid" 2>/dev/null || true)" || die "the agent is not running after setup"
+    record_sig "$WORK/ct-agent.pid"
     ok "agent running, pid $(cat "$WORK/ct-agent.pid")"
   fi
   case "$TIER" in
@@ -806,15 +854,32 @@ cmd_ssh_tunnel_client() {
   stage "write the ssh config" "check that $ssh_dir is writable"
   mkdir -p "$ssh_dir"; chmod 700 "$ssh_dir"
   dest="$ssh_dir/ct-agent-$CT_AGENT_HOSTNAME.owner"
-  if [ -f "$dest" ] && ! cmp -s "$kf" "$dest"; then confirm "$dest exists and differs -- overwrite it?" || die "kept the existing key; nothing changed"; fi
+  if [ -f "$dest" ] && ! cmp -s "$kf" "$dest" && [ "$ALLOW_KEY_OVERWRITE" -ne 1 ]; then
+    [ "$ASSUME_YES" -eq 0 ] || die "$dest exists and differs -- add --allow-ssh-key-overwrite to replace it; nothing changed"
+    confirm "$dest exists and differs -- overwrite it?" || die "kept the existing key; nothing changed"
+  fi
   cp "$kf" "$dest"; chmod 600 "$dest"
   if grep -qs "^Host $CT_AGENT_HOSTNAME\$" "$ssh_dir/config"; then
     ok "$ssh_dir/config already has a stanza for $CT_AGENT_HOSTNAME -- left as it is"
   else
     stanza="$("$CTA" ssh-config "$CT_AGENT_HOSTNAME" --user "$CT_QS_SSH_USER" --owner-key-file "$dest")" || die "ct-agent ssh-config failed"
-    confirm "Append the stanza for $CT_AGENT_HOSTNAME to $ssh_dir/config?" || die "not appended; the stanza is: $stanza"
+    # the stanza calls the CLI by name; make it the absolute path when ct-agent is not on PATH
+    if ! command -v ct-agent >/dev/null 2>&1; then
+      case "$CTA" in *[!A-Za-z0-9._/+-]*) stanza="${stanza//ProxyCommand ct-agent /ProxyCommand \'$CTA\' }" ;; *) stanza="${stanza//ProxyCommand ct-agent /ProxyCommand $CTA }" ;; esac
+    fi
+    if [ "$APPEND_SSH_CONFIG" -ne 1 ]; then
+      if [ "$ASSUME_YES" -eq 1 ]; then
+        printf '%s\n' "$stanza" >&2
+        DONE_MSG="the stanza above was NOT added to $ssh_dir/config (--yes does not edit it). Add it yourself or re-run with --append-ssh-config."
+        return 0
+      fi
+      confirm "Append the stanza for $CT_AGENT_HOSTNAME to $ssh_dir/config?" || die "not appended; the stanza is: $stanza"
+    fi
     printf '\n%s\n' "$stanza" >> "$ssh_dir/config"; chmod 600 "$ssh_dir/config"
     ok "stanza appended to $ssh_dir/config"
+  fi
+  if ! command -v ct-agent >/dev/null 2>&1; then
+    DONE_MSG="ready, using $CTA in the ssh config (ct-agent is not on your PATH). Connect with:  ssh $CT_AGENT_HOSTNAME"; return 0
   fi
   DONE_MSG="ready. Connect with:  ssh $CT_AGENT_HOSTNAME   (you get the shell prompt of the agent host if sshd accepts your login)"
 }
@@ -830,18 +895,26 @@ cmd_ssh_tunnel() {
   command -v curl >/dev/null 2>&1 || die "curl is required"
   if port_open 127.0.0.1 22; then ok "sshd answers on 127.0.0.1:22"; else warn "nothing listens on 127.0.0.1:22 -- the tunnel will come up, ssh will be refused until sshd runs"; fi
   tunnel_questions
+  stage "install the CLI" "install curl, or put ct-agent on PATH"
+  ensure_cli
   if [ "$(envval CT_AGENT_ORIGIN_TLS)" = terminate ]; then
     ok "the agent is already configured for ssh (terminate mode) -- resuming"
+    if ! pid_alive "$(cat "$WORK/ct-agent.pid" 2>/dev/null || true)"; then
+      stage "restart the agent" "see $WORK/ct-agent.log"
+      run_setup --yes || die "setup.sh failed while restarting the agent"
+      pid_alive "$(cat "$WORK/ct-agent.pid" 2>/dev/null || true)" && record_sig "$WORK/ct-agent.pid"
+    fi
   else
     [ "$ORIGIN" = "127.0.0.1:8080" ] || warn "the first phase needs an origin that serves plain HTTP; $ORIGIN will be replaced by 127.0.0.1:22 afterwards"
     tunnel_up
     stage "get the certificate (tier Grün)" "read $WORK/logs/certificate.log; at tier Rot/Gelb wait and re-run"
     local cdir="$WORK/ct-agent-cert" i=0 cwait="${CT_QS_CERT_WAIT:-180}"
-    if [ -n "$(ls -A "$cdir" 2>/dev/null || true)" ]; then ok "certificate pair already in $cdir"; else
+    cert_done() { [ -s "$cdir/fullchain.pem" ] && [ -s "$cdir/privkey.pem" ]; }
+    if cert_done; then ok "certificate pair already in $cdir"; else
       mkdir -p "$cdir"
       (cd "$WORK" && CT_AGENT_CP_URL="$CP" CT_AGENT_TOKEN="$AGENT_TOKEN" CT_AGENT_HOSTNAME="$HOSTNAME_" CT_ACME_CERT_OUT_DIR="$cdir" \
         nohup "$CTA" certificate >"$WORK/logs/certificate.log" 2>&1 & echo $! > "$WORK/run/certificate.pid")
-      while [ -z "$(ls -A "$cdir" 2>/dev/null || true)" ]; do
+      while ! cert_done; do
         pid_alive "$(cat "$WORK/run/certificate.pid")" || { tail_log "$WORK/logs/certificate.log"; die "ct-agent certificate stopped before it wrote the pair"; }
         [ "$i" -lt "$cwait" ] || { tail_log "$WORK/logs/certificate.log"; die "no certificate after ${cwait}s"; }
         i=$((i+2)); sleep 2
@@ -850,11 +923,7 @@ cmd_ssh_tunnel() {
     fi
     stage "switch the agent to ssh" "see $WORK/ct-agent.log; the previous .env is in $WORK/.env.bak"
     stop_pidfile "$WORK/ct-agent.pid"; sleep 1
-    write_tunnel_env "127.0.0.1:22" <<EOF
-CT_AGENT_MODE=browser
-CT_AGENT_ORIGIN_TLS=terminate
-CT_ACME_CERT_OUT_DIR=$cdir
-EOF
+    write_tunnel_env "127.0.0.1:22" CT_AGENT_MODE=browser CT_AGENT_ORIGIN_TLS=terminate "CT_ACME_CERT_OUT_DIR=$cdir"
     ok ".env switched to 127.0.0.1:22 / terminate (old one kept as .env.bak)"
     run_setup --yes || die "setup.sh failed in the second phase"
   fi

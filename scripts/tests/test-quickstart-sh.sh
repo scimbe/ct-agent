@@ -20,7 +20,11 @@ check() { # description, command...
 }
 mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 
-T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+T="$(mktemp -d)"
+# Long-running stub processes record their pid here; the test kills exactly those, never by name.
+PIDS="$T/stub.pids"; : > "$PIDS"
+killrec() { local p; while read -r p; do [ -z "$p" ] || kill "$p" 2>/dev/null || true; done < "$PIDS"; : > "$PIDS"; }
+trap 'killrec; rm -rf "$T"' EXIT
 BIN="$T/bin"; mkdir -p "$BIN"
 SECRET_TOKEN="TESTBEARER-s3cr3t-value"
 SECRET_BOOT="TESTBOOT-s3cr3t-value"
@@ -55,12 +59,14 @@ case "$1 $2" in
   "channel "*|"channel ")
     # run: accept waits for the initiator's line on a shared file; initiate drops its stdin there
     echo "run role=${CT_CHANNEL_ROLE:-} serve=${CT_CHANNEL_SERVE:-} allow=${CT_CHANNEL_FORWARD_ALLOW:-} fwd=${CT_CHANNEL_FORWARD:-} front=${CT_CHANNEL_FRONT_DOOR:-}" >> "$STUB_LOG"
-    if [ -n "${CT_CHANNEL_FORWARD:-}" ]; then echo "CT_CHANNEL_FORWARD ${CT_CHANNEL_FORWARD%%=*} -> ${CT_CHANNEL_FORWARD#*=}"; sleep 30; exit 0; fi
-    if [ "${CT_CHANNEL_SERVE:-}" = 1 ]; then sleep 30; exit 0; fi
+    if [ -n "${CT_CHANNEL_FORWARD:-}" ]; then echo "CT_CHANNEL_FORWARD ${CT_CHANNEL_FORWARD%%=*} -> ${CT_CHANNEL_FORWARD#*=}"; echo $$ >> "$STUB_PIDS"; exec sleep 30; fi
+    if [ "${CT_CHANNEL_SERVE:-}" = 1 ]; then echo $$ >> "$STUB_PIDS"; exec sleep 30; fi
     case "${CT_CHANNEL_ROLE:-}" in
-      accept)   i=0; while [ ! -s "$STUB_BUS" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done; cat "$STUB_BUS"; sleep 30 ;;
+      accept)   i=0; while [ ! -s "$STUB_BUS" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done; cat "$STUB_BUS"; echo $$ >> "$STUB_PIDS"; exec sleep 30 ;;
       initiate) cat > "$STUB_BUS" ;;
     esac ;;
+  "ssh-owner init") echo "ownerkey-$(rnd 16)" ;;
+  "ssh-config "*)   echo "# ct-agent ssh"; echo "Host $2"; echo "  ProxyCommand ct-agent ssh $2 --owner-key-file k"; echo "  User tester" ;;
   "login "*|"login ")
     mkdir -p "$HOME/.ct-agent"; echo "{\"access_token\":\"$STUB_TOKEN\"}" > "$HOME/.ct-agent/oidc-token.json" ;;
   *) echo "stub ct-agent: unexpected: $*" >&2; exit 2 ;;
@@ -84,7 +90,7 @@ code=200; body=""
 case "$url" in
   */network-info)     body='{"channel_broker_port": 7001, "channel_relay_port": 7002, "channel_relay_gate_port": 443}' ;;
   */pki/ca)           printf '\001\002\003' ;;
-  */bootstrap/redeem) body="{\"secret\":\"CT_JOIN_TOKEN=joinsecret123;CT_AGENT_TOKEN=agentsecret456\"}" ;;
+  */bootstrap/redeem) body="{\"secret\":\"CT_JOIN_TOKEN=joinsecret123;CT_AGENT_TOKEN=${STUB_EVIL_TOKEN:-agentsecret456}\"}" ;;
   */members)          code="${STUB_MEMBER_CODE:-201}" ;;
   https://*)          code=200 ;;
 esac
@@ -96,18 +102,21 @@ STUB
 cat > "$BIN/setup.sh" <<'STUB'
 #!/usr/bin/env bash
 echo "setup.sh $*" >> "$STUB_LOG"
-. ./.env 2>/dev/null
+# like the real setup.sh: a CT_BOOTSTRAP in the environment is redeemed here (single use)
+[ -z "${CT_BOOTSTRAP:-}" ] || echo "setup-redeems-bootstrap" >> "$STUB_LOG"
+set -a; . ./.env 2>/dev/null; set +a
 echo "token is $CT_AGENT_TOKEN"
-( sleep 120 ) >/dev/null 2>&1 & echo $! > ct-agent.pid
+echo "cert-dir is ${CT_ACME_CERT_OUT_DIR:-none}" >> "$STUB_LOG"
+sleep 120 >/dev/null 2>&1 & echo $! > ct-agent.pid; echo $! >> "$STUB_PIDS"
 echo "done — current tier: gelb"
 STUB
 chmod +x "$BIN"/*
 
 run_qs() { # workdir, then args; env comes from the caller via E=(...)
   local wd="$1"; shift
-  env -i PATH="$BIN:$PATH" HOME="$T/home" STUB_LOG="$T/stub.log" STUB_BUS="$T/bus" STUB_CURL_STDIN="$T/curl.stdin" \
+  env -i PATH="$BIN:$PATH" HOME="$T/home" STUB_LOG="$T/stub.log" STUB_PIDS="$PIDS" STUB_BUS="$T/bus" STUB_CURL_STDIN="$T/curl.stdin" \
     STUB_TOKEN="$SECRET_TOKEN" CT_QS_SETUP_SH="$BIN/setup.sh" CT_QS_WORKDIR="$wd" CT_QS_A_HEAD_START=1 CT_QS_WAIT=20 \
-    "${E[@]}" bash "$QS" "$@"
+    "${E[@]}" bash "$QS" "$@" </dev/null
 }
 reset() { rm -rf "$T/home" "$T/stub.log" "$T/bus" "$T/curl.stdin"; mkdir -p "$T/home"; : > "$T/stub.log"; : > "$T/curl.stdin"; E=(); }
 
@@ -132,7 +141,7 @@ done
 check "bearer token not in any argv" ! grep -q "$SECRET_TOKEN" "$T/stub.log"
 check "bearer token not in the output" ! grep -q "$SECRET_TOKEN" <<<"$out1"
 check "bearer token travelled through curl's stdin" grep -q "Authorization: Bearer $SECRET_TOKEN" "$T/curl.stdin"
-pkill -f "sleep 30" 2>/dev/null || true
+killrec
 
 # ---- 2. resume: second run reuses keys and grants; 409 on member add is fine ------------------------
 n_before="$(grep -c 'channel operator-init' "$T/stub.log")"
@@ -146,13 +155,17 @@ check "resume did not mint a second operator key" [ "$(grep -c 'channel operator
 check "resume did not sign new grants" [ "$(grep -c 'channel grant' "$T/stub.log")" -eq "$g_before" ]
 check "409 on member add is reported as already added" grep -q 'already added (409)' <<<"$out2"
 check "resume says it reuses the key" grep -q 'reusing it' <<<"$out2"
-pkill -f "sleep 30" 2>/dev/null || true
+killrec
 
 # ---- 2b. ssh-channel: forward settings, the warning, the finished ssh line ------------------------------
 reset
 mkdir -p "$T/home/.ct-agent"; echo "{\"access_token\":\"$SECRET_TOKEN\"}" > "$T/home/.ct-agent/oidc-token.json"
 E=(CT_QS_SSH_USER=tester)
-out2b="$(run_qs "$T/w2b" ssh-channel --yes 2>&1)"; rc=$?
+out2a="$(run_qs "$T/w2a" ssh-channel --yes 2>&1)"; rc=$?
+check "ssh-channel --yes alone does not turn the forward on" [ "$rc" -ne 0 ]
+check "the refusal names --enable-forward" grep -q -- '--enable-forward' <<<"$out2a"
+check "no forward listener was started without the switch" ! grep -q 'fwd=127' "$T/stub.log"
+out2b="$(run_qs "$T/w2b" ssh-channel --yes --enable-forward 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] || echo "$out2b" | tail -12 >&2
 check "ssh-channel --yes exits 0" [ "$rc" -eq 0 ]
 check "the accepting side serves with forward allowed to 127.0.0.1:22" grep -q 'run role=accept serve=1 allow=127.0.0.1:22' "$T/stub.log"
@@ -162,7 +175,7 @@ check "the forward warning stays visible and points to channel.md" grep -q 'docs
 check "the warning does not state a measured duration" ! grep -q 'seconds' <<<"$out2b"
 check "the finished ssh line is printed" grep -q 'ssh -p 2222 .*tester@127.0.0.1' <<<"$out2b"
 run_qs "$T/w2b" --clean --yes >/dev/null 2>&1
-pkill -f "sleep 30" 2>/dev/null || true
+killrec
 
 # ---- 3. a refused register names the failed stage and the next action ----------------------------------
 reset
@@ -193,7 +206,7 @@ check "bootstrap token not in any argv" ! grep -q "$SECRET_BOOT" "$T/stub.log"
 check "bootstrap token not in the output" ! grep -q "$SECRET_BOOT" <<<"$out5"
 check "routing token from setup.sh output is redacted" ! grep -q 'agentsecret456' <<<"$out5"
 check "routing token is redacted in setup.log too" ! grep -q 'agentsecret456' "$T/w5/logs/setup.log"
-pkill -f "sleep 120" 2>/dev/null || true
+killrec
 
 # rerun reuses .env and does not redeem again
 n="$(grep -c 'bootstrap/redeem' "$T/stub.log")"
@@ -201,7 +214,7 @@ out6="$(run_qs "$T/w5" tunnel --yes --no-demo-origin 2>&1)"; rc=$?
 check "tunnel rerun exits 0" [ "$rc" -eq 0 ]
 check "tunnel rerun reuses .env" grep -q '.env found' <<<"$out6"
 check "tunnel rerun did not redeem again" [ "$(grep -c 'bootstrap/redeem' "$T/stub.log")" -eq "$n" ]
-pkill -f "sleep 120" 2>/dev/null || true
+killrec
 
 # ---- 5. --clean only touches the script's own directory ---------------------------------------------------------
 reset
@@ -225,13 +238,13 @@ check "the foreign file is untouched after the refusal" [ -f "$T/foreign2/file" 
 mkdir -p "$T/w7"; E=()
 run_qs "$T/w7" tunnel --yes >/dev/null 2>&1 || true   # creates the workdir and marker, fails at the missing token
 echo mine > "$T/w7/my-notes.txt"
-sleep 100 & spid=$!; echo "$spid" > "$T/w7/run/other.pid"
+sleep 100 & spid=$!; echo "$spid" >> "$PIDS"; echo "$spid" > "$T/w7/run/other.pid"
 run_qs "$T/w7" --clean --yes >/dev/null 2>&1; rc=$?
 check "--clean succeeds" [ "$rc" -eq 0 ]
 check "a foreign file in the workdir survives --clean" [ -f "$T/w7/my-notes.txt" ]
 check "the script's own marker is gone" [ ! -e "$T/w7/.ct-quickstart" ]
 check "a recycled pid of a foreign process is not killed" kill -0 "$spid"
-kill "$spid" 2>/dev/null
+killrec
 
 # a bootstrap token with odd characters is refused before it is sent
 reset
@@ -239,6 +252,95 @@ E=(CT_AGENT_HOSTNAME=demo.example.test 'CT_BOOTSTRAP=ab"cd' CT_AGENT_ORIGIN=127.
 outb="$(run_qs "$T/w8" tunnel --yes --no-demo-origin 2>&1)"; rc=$?
 check "a bootstrap token with a quote is refused" [ "$rc" -ne 0 ]
 check "it was not sent to the control plane" ! grep -q 'bootstrap/redeem' "$T/stub.log"
+
+# ---- 5b. review round 2 ---------------------------------------------------------------------------------------
+# A: a workdir with spaces, a server token with a command substitution, a hostname with shell characters
+reset
+E=(CT_AGENT_HOSTNAME=demo.example.test "CT_BOOTSTRAP=$SECRET_BOOT" CT_AGENT_ORIGIN=127.0.0.1:9)
+outA="$(run_qs "$T/w a b" tunnel --yes --no-demo-origin 2>&1)"; rc=$?
+check "A: tunnel works in a workdir with spaces" [ "$rc" -eq 0 ]
+killrec
+reset
+EVIL="$T/pwned"
+E=(CT_AGENT_HOSTNAME=demo.example.test "CT_BOOTSTRAP=$SECRET_BOOT" CT_AGENT_ORIGIN=127.0.0.1:9 "STUB_EVIL_TOKEN=\$(touch $EVIL)")
+outA2="$(run_qs "$T/w5c" tunnel --yes --no-demo-origin 2>&1)"; rc=$?
+check "A: a server token with a command substitution is refused" [ "$rc" -ne 0 ]
+check "A: it was never executed" [ ! -e "$EVIL" ]
+check "A: no .env was written for it" [ ! -e "$T/w5c/.env" ]
+reset
+E=(CT_AGENT_HOSTNAME='demo.example.test;touch x' "CT_BOOTSTRAP=$SECRET_BOOT" CT_AGENT_ORIGIN=127.0.0.1:9)
+outA3="$(run_qs "$T/w5d" tunnel --yes --no-demo-origin 2>&1)"; rc=$?
+check "A: a hostname with shell characters is refused" [ "$rc" -ne 0 ]
+check "A: nothing was redeemed for it" ! grep -q 'bootstrap/redeem' "$T/stub.log"
+
+# D: only privkey.pem.new present is not a finished pair
+reset
+E=(CT_AGENT_HOSTNAME=demo.example.test "CT_BOOTSTRAP=$SECRET_BOOT" CT_AGENT_ORIGIN=127.0.0.1:9 CT_QS_CERT_WAIT=4)
+mkdir -p "$T/wh/ct-agent-cert"; : > "$T/wh/.ct-quickstart"; : > "$T/wh/ct-agent-cert/privkey.pem.new"
+outD="$(run_qs "$T/wh" ssh-tunnel --yes --no-demo-origin 2>&1)"; rc=$?
+check "D: a half-written pair (privkey.pem.new only) is not counted as done" [ "$rc" -ne 0 ]
+check "D: the run did not skip the certificate stage" ! grep -q 'certificate pair already' <<<"$outD"
+check "B: setup.sh did not see the one-time token" ! grep -q 'setup-redeems-bootstrap' "$T/stub.log"
+killrec
+
+# B/C: resume with a still-exported CT_BOOTSTRAP, then the agent died in terminate mode
+reset
+E=(CT_AGENT_HOSTNAME=demo.example.test "CT_BOOTSTRAP=$SECRET_BOOT" CT_AGENT_ORIGIN=127.0.0.1:9 CT_QS_CERT_WAIT=4)
+mkdir -p "$T/w r/ct-agent-cert"; : > "$T/w r/.ct-quickstart"
+echo c > "$T/w r/ct-agent-cert/fullchain.pem"; echo k > "$T/w r/ct-agent-cert/privkey.pem"
+outR="$(run_qs "$T/w r" ssh-tunnel --yes --no-demo-origin 2>&1)"; rc=$?
+check "D: a complete pair is accepted" grep -q 'certificate pair already' <<<"$outR"
+check "ssh-tunnel host run exits 0 with the pair present" [ "$rc" -eq 0 ]
+check "A: CT_ACME_CERT_OUT_DIR reached setup.sh intact" grep -q "cert-dir is $T/w r/ct-agent-cert" "$T/stub.log"
+check "B: setup.sh never got the one-time token" ! grep -q 'setup-redeems-bootstrap' "$T/stub.log"
+killrec; : > "$T/w r/gone"; unlink "$T/w r/ct-agent.pid" 2>/dev/null; s0="$(grep -c '^setup.sh' "$T/stub.log")"
+outC="$(run_qs "$T/w r" ssh-tunnel --yes --no-demo-origin 2>&1)"; rc=$?
+check "C: re-run in terminate mode with a dead agent exits 0" [ "$rc" -eq 0 ]
+check "C: setup.sh ran again to restart the agent" [ "$(grep -c '^setup.sh' "$T/stub.log")" -gt "$s0" ]
+check "B: still no token redeemed by setup.sh after the resume" ! grep -q 'setup-redeems-bootstrap' "$T/stub.log"
+killrec
+
+# H: a foreign process whose pid file points into the workdir (no recorded signature) is never killed
+reset
+E=(CT_AGENT_HOSTNAME=demo.example.test "CT_BOOTSTRAP=$SECRET_BOOT" CT_AGENT_ORIGIN=127.0.0.1:9)
+run_qs "$T/wf" tunnel --yes --no-demo-origin >/dev/null 2>&1; killrec
+sleep 90 & fp=$!; echo "$fp" >> "$PIDS"; echo "$fp" > "$T/wf/ct-agent.pid"; unlink "$T/wf/run/ct-agent.sig" 2>/dev/null
+run_qs "$T/wf" --clean --yes >/dev/null 2>&1
+check "H: a process with a pid file but no recorded signature survives --clean" kill -0 "$fp"
+killrec
+
+# F: grants are bound to the operator key; --rekey discards them
+reset
+mkdir -p "$T/home/.ct-agent"; echo "{\"access_token\":\"$SECRET_TOKEN\"}" > "$T/home/.ct-agent/oidc-token.json"
+run_qs "$T/wg" channel --yes >/dev/null 2>&1; killrec
+g1="$(grep -c 'channel grant' "$T/stub.log")"
+unlink "$T/bus" 2>/dev/null
+run_qs "$T/wg" channel --yes >/dev/null 2>&1; killrec
+check "F: same operator key reuses the grants" [ "$(grep -c 'channel grant' "$T/stub.log")" -eq "$g1" ]
+unlink "$T/bus" 2>/dev/null
+run_qs "$T/wg" channel --yes --rekey >/dev/null 2>&1; killrec
+check "F: after --rekey new grants are signed" [ "$(grep -c 'channel grant' "$T/stub.log")" -gt "$g1" ]
+
+# E/G: ssh-tunnel client
+reset
+printf 'k' > "$T/owner.key"
+mkdir -p "$T/home/.ssh"; printf 'old' > "$T/home/.ssh/ct-agent-demo.example.test.owner"
+E=(CT_AGENT_HOSTNAME=demo.example.test CT_QS_OWNER_KEY_FILE="$T/owner.key" CT_QS_SSH_USER=tester)
+outG="$(run_qs "$T/wc" ssh-tunnel --role client --yes 2>&1)"; rc=$?
+check "G: --yes does not overwrite a different owner key" [ "$rc" -ne 0 ] && [ "$(cat "$T/home/.ssh/ct-agent-demo.example.test.owner")" = old ]
+check "G: the refusal names the switch" grep -q -- '--allow-ssh-key-overwrite' <<<"$outG"
+unlink "$T/home/.ssh/ct-agent-demo.example.test.owner"
+outG2="$(run_qs "$T/wc" ssh-tunnel --role client --yes 2>&1)"; rc=$?
+check "G: --yes without --append-ssh-config leaves ~/.ssh/config alone" [ "$rc" -eq 0 ] && [ ! -e "$T/home/.ssh/config" ]
+outG3="$(run_qs "$T/wc" ssh-tunnel --role client --yes --append-ssh-config 2>&1)"; rc=$?
+check "G: --append-ssh-config appends" [ "$rc" -eq 0 ] && grep -q '^Host demo.example.test' "$T/home/.ssh/config"
+# E: ct-agent is only in the workdir, not on PATH -> the stanza must carry its absolute path
+reset
+mkdir -p "$T/we"; : > "$T/we/.ct-quickstart"; cp "$BIN/ct-agent" "$T/we/ct-agent"
+env -i PATH=/usr/bin:/bin HOME="$T/home" STUB_LOG="$T/stub.log" CT_QS_WORKDIR="$T/we" CT_AGENT_HOSTNAME=demo.example.test \
+  CT_QS_OWNER_KEY_FILE="$T/owner.key" CT_QS_SSH_USER=tester bash "$QS" ssh-tunnel --role client --yes --append-ssh-config >/dev/null 2>&1; rc=$?
+check "E: client run without ct-agent on PATH succeeds" [ "$rc" -eq 0 ]
+check "E: the stanza calls the CLI by absolute path" grep -q "ProxyCommand $T/we/ct-agent " "$T/home/.ssh/config"
 
 # ---- 6. several machines: the pasted-block round trip -----------------------------------------------------------
 reset

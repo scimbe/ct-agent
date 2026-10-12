@@ -218,7 +218,7 @@ without any broker) are in the [channel reference](channel.md#modes).
 
 **Status:** `ssh-config` and `ssh-owner show` checked offline; not run end to end (needs tier Grün).
 
-**Short path:** `scripts/quickstart.sh ssh-tunnel` on the agent host (it prints what tier Grün needs first), then `scripts/quickstart.sh ssh-tunnel --role client` on the client. The steps below are the manual reference.
+**Short path:** `scripts/quickstart.sh ssh-tunnel` on the agent host (it prints what tier Grün needs first), then `scripts/quickstart.sh ssh-tunnel --role client` on the client. `--yes` accepts defaults only: replacing a different `~/.ssh/ct-agent-<host>.owner` needs `--allow-ssh-key-overwrite`, and adding the stanza to `~/.ssh/config` needs `--append-ssh-config` (without it the stanza is printed for you to add). The steps below are the manual reference.
 
 **Script status:** tested with stubs (no network); not yet run against a real service. The tier-Grün path has not been run end to end by anyone.
 
@@ -287,7 +287,7 @@ login still applies on top.
 
 **Status:** run end to end with v0.7.39 against the hosted edge (front door :443, relay): login, scp of 50 MiB in both directions, 5 parallel sessions, restart of the accepting side. Measured: login median 0.78 s, about 1.9 MiB/s over the relay.
 
-**Short path:** `scripts/quickstart.sh ssh-channel` does section 2 plus the forward and prints the finished `ssh` line; `--role operator|member` for several machines. The forward warning below applies and the script repeats it. The steps below are the manual reference.
+**Short path:** `scripts/quickstart.sh ssh-channel` does section 2 plus the forward and prints the finished `ssh` line; `--role operator|member` for several machines. The forward is opt-in even with `--yes`: add `--enable-forward` to turn it on without a question. The forward warning below applies and the script repeats it. The steps below are the manual reference.
 
 **Script status:** tested with stubs (no network); not yet run against a real service.
 
