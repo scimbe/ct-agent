@@ -6313,8 +6313,9 @@ async fn admit_one_shot_with_retry_gives_a_named_error_when_the_window_closes_95
 /// A revoked grant is refused for good: the one-shot initiator must stop after the first
 /// refusal instead of re-asking the edge every 3 s for the whole window. Another definitive
 /// refusal (here `pairing`) keeps the bounded retry.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn admit_one_shot_with_retry_stops_at_once_on_a_revoked_grant() {
+    // Paused time: the 3 s retry interval and the window pass instantly and exactly.
     use ct_common::channel::ChannelId;
     use std::sync::atomic::{AtomicU32, Ordering};
     let channel = ChannelId([0x33u8; 32]);
@@ -6323,7 +6324,7 @@ async fn admit_one_shot_with_retry_stops_at_once_on_a_revoked_grant() {
         calls.fetch_add(1, Ordering::SeqCst);
         async { Err::<ChannelJoinOutcome, BoxError>(AdmissionRefused::boxed_with_category("edge broker refused the channel join", Some("grant-revoked"))) }
     };
-    let err = admit_one_shot_with_retry(std::time::Duration::from_secs(30), &channel, admit)
+    let err = admit_one_shot_with_retry(std::time::Duration::from_secs(10), &channel, admit)
         .await
         .expect_err("a revoked grant is refused");
     assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one attempt");
@@ -6334,8 +6335,13 @@ async fn admit_one_shot_with_retry_stops_at_once_on_a_revoked_grant() {
         calls.fetch_add(1, Ordering::SeqCst);
         async { Err::<ChannelJoinOutcome, BoxError>(AdmissionRefused::boxed_with_category("edge broker refused the channel join", Some("pairing"))) }
     };
-    let _ = admit_one_shot_with_retry(std::time::Duration::from_millis(50), &channel, admit).await;
-    assert!(calls.load(Ordering::SeqCst) >= 1);
+    // Same window, a refusal that can still clear up: tried at 0, 3, 6, 9 s and once more at the
+    // deadline, then the named timeout error.
+    let err = admit_one_shot_with_retry(std::time::Duration::from_secs(10), &channel, admit)
+        .await
+        .expect_err("the window closes without an acceptor");
+    assert_eq!(calls.load(Ordering::SeqCst), 5, "a pairing refusal is retried until the window closes");
+    assert!(err.to_string().contains("no acceptor for channel"), "{err}");
     assert!(!is_revoked_grant_refusal(&AdmissionRefused::boxed_with_category("x", Some("pairing"))));
 }
 
