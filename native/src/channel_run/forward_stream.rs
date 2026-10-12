@@ -1,4 +1,4 @@
-//! The channel TCP forward's stream engine (scimbe/ct-agent#255 slice 2, AUF-20260929-029):
+//! The channel TCP forward's stream engine (scimbe/ct-agent#255 slice 2):
 //! the initiate-side local listener and the byte-transparent per-connection pump that rides
 //! [`super::forward_wire`]'s framing inside one already-established A2A Noise session.
 //!
@@ -86,7 +86,7 @@ pub const FORWARD_IDLE_SECS_ENV: &str = "CT_CHANNEL_FORWARD_IDLE_SECS";
 /// See [`FORWARD_IDLE_SECS_ENV`].
 pub const DEFAULT_IDLE_SECS: u64 = 300;
 
-/// Cancel-safe wrapper around [`Frame::read`] for a `select!` loop (AUF-20261005-016): takes
+/// Cancel-safe wrapper around [`Frame::read`] for a `select!` loop: takes
 /// the mux's read half by value and hands it back alongside the result, so the caller can feed
 /// the SAME half into the next read once this one actually resolved. Reconstructing
 /// `Frame::read(&mut mux_read)` in place every `select!` iteration instead is not cancel-safe —
@@ -108,7 +108,7 @@ const DATA_CHUNK_LEN: usize = 16 * 1024;
 const CHANNEL_CAP: usize = 64;
 
 /// Bound on waiting to hand a stream's control/close frame to the shared outbound queue
-/// (AUF-20261006-070, Befund a of the #274 review): a peer that stopped reading must not be
+/// (Befund a of the #274 review): a peer that stopped reading must not be
 /// able to wedge a pump -- including its idle branch -- by leaving the queue full forever.
 const CLOSE_SEND_GRACE: Duration = Duration::from_secs(2);
 
@@ -403,12 +403,12 @@ enum StreamIn {
 }
 
 /// Hand a stream's control/close frame to the shared outbound queue without ever waiting on it
-/// forever (AUF-20261006-070, Befund a of the #274 review): try immediately, then wait up to
+/// forever (Befund a of the #274 review): try immediately, then wait up to
 /// [`CLOSE_SEND_GRACE`], then give up. `false` means the frame was dropped (queue still full
 /// after the grace) or the queue is already closed -- either way the caller must end the
 /// stream's pump on the spot instead of staying half-open.
 ///
-/// AUF-20261007-005 (merge review of #276, finding 1): the grace is not an absolute deadline. A
+/// Merge review of #276, finding 1: the grace is not an absolute deadline. A
 /// peer that reads slowly still reads -- as long as the session's writer wrote at least one frame
 /// during a grace, the wait goes on. Only a writer that stood still for a whole grace drops the
 /// frame. Outside an engine's stream task (no [`WRITTEN`]) the grace counts once, as before.
@@ -451,7 +451,7 @@ fn abort_frame(id: u32) -> Frame {
 /// Close WITHOUT a reason is the half-close a pump sends on a clean local EOF; Close WITH any
 /// reason (abort, refused, dial failed, max_streams, idle timeout) ends the stream fully, so a
 /// refused or idle client is closed at once instead of half-open until the idle limit
-/// (second adversarial review of #274). An agent before DEC-0061 treats all of them as half-close.
+/// (second adversarial review of #274). An agent from before the flow-control change treats all of them as half-close.
 fn stream_in_for_close(reason: Option<&str>) -> StreamIn {
     if reason.is_some() {
         StreamIn::Aborted
@@ -460,7 +460,7 @@ fn stream_in_for_close(reason: Option<&str>) -> StreamIn {
     }
 }
 
-// --- Flow control per stream (DEC-0061, spec REP-20261005-entwurf-flusskontrolle-forward, s. 5) ---
+// --- Flow control per stream (s. 5 of the design) ---
 //
 // Control messages travel as `Data` on the reserved stream id 0 (real streams start at 1): an
 // agent without flow control ignores `Data` for an unknown id, so mixed versions keep working.
@@ -469,7 +469,7 @@ fn stream_in_for_close(reason: Option<&str>) -> StreamIn {
 //   FC_ON      [3, id u32 BE]  initiate side: stream `id` (opened next) uses credit flow control
 //   SWINDOW    [4, bytes u32 BE]  the receiver's engine took `bytes` of stream data off the session
 //
-// Session window (HELLO version 2, AUF-20261007-005): the HELLO carries a fifth field, the window
+// Session window (HELLO version 2): the HELLO carries a fifth field, the window
 // in bytes its sender grants the peer for ALL streams together (0: none):
 //   HELLO v2   [1, b'C', b'F', b'C', 2, window u32 BE]
 // A sender with a window from the peer never has more stream data unacknowledged than that window.
@@ -486,7 +486,7 @@ fn stream_in_for_close(reason: Option<&str>) -> StreamIn {
 /// The reserved control stream id.
 const CONTROL_ID: u32 = 0;
 /// `CT_CHANNEL_FORWARD_FLOW=off` disables credit flow control on this member (it then behaves like
-/// an agent before DEC-0061: no HELLO, FC_ON ignored). Default: on.
+/// an agent from before the flow-control change: no HELLO, FC_ON ignored). Default: on.
 pub const FORWARD_FLOW_ENV: &str = "CT_CHANNEL_FORWARD_FLOW";
 
 pub(crate) fn flow_control_from_env() -> bool {
@@ -508,7 +508,7 @@ const CTL_SWINDOW: u8 = 4;
 const HELLO_V2: u8 = 2;
 /// The session window this member grants a peer: how much stream data may be on its way to this
 /// engine without an acknowledgement. It bounds what waits ahead of a new stream's Open and first
-/// bytes on a slow path (AUF-20261006-078/-081: 3.8 MiB ahead of an Open at 62 500 B/s, 64 s).
+/// bytes on a slow path (measured: 3.8 MiB ahead of an Open at 62 500 B/s, 64 s).
 pub(crate) const SESSION_WINDOW: usize = 256 * 1024;
 /// Smallest window a peer may grant (other than 0): four chunks.
 const SESSION_WINDOW_MIN: usize = 4 * DATA_CHUNK_LEN;
@@ -516,7 +516,7 @@ const SESSION_WINDOW_MIN: usize = 4 * DATA_CHUNK_LEN;
 const SESSION_WINDOW_MAX: usize = 16 * 1024 * 1024;
 /// The receiver acknowledges at the latest this long after the first unacknowledged byte.
 const SESSION_ACK_DELAY: Duration = Duration::from_millis(100);
-/// Dead-peer detection of a session with a session window (AUF-20261007-005): stream data is
+/// Dead-peer detection of a session with a session window: stream data is
 /// unacknowledged and NO frame came from the peer for this long. Any frame counts, not only an
 /// acknowledgement: on a slow path the acknowledgement waits behind up to a window of the peer's
 /// own data, and a peer that still sends is not dead. A peer that reads acknowledges within
@@ -960,7 +960,7 @@ async fn pump_forward_stream(
             match tcp_r.read(&mut buf).await {
                 // A clean EOF is a half-close: the peer may still owe this side a reply. But a
                 // dropped Close (the peer stopped reading) must not half-open the stream either
-                // -- end it fully (AUF-20261006-070, Befund a).
+                // -- end it fully (Befund a).
                 Ok(0) => {
                     return if send_or_drop(&out_up, Frame::Close { id, reason: None }).await {
                         Half::Done
@@ -968,7 +968,7 @@ async fn pump_forward_stream(
                         Half::Stop
                     };
                 }
-                // The local socket itself failed: reset the stream (DEC-0061, 2026-10-05).
+                // The local socket itself failed: reset the stream.
                 Err(_) => {
                     let _ = send_or_drop(&out_up, abort_frame(id)).await;
                     return Half::Stop;
@@ -1022,7 +1022,7 @@ async fn pump_forward_stream(
                         unreported += payload.len();
                         if unreported >= FC_WINDOW / 2 {
                             // Without credit the peer could never make progress again, so a
-                            // dropped WINDOW ends the stream too (AUF-20261006-070).
+                            // dropped WINDOW ends the stream too.
                             if !send_or_drop(&outbound, window_frame(id, unreported as u32)).await {
                                 return Half::Stop;
                             }
@@ -1114,7 +1114,7 @@ fn ctrl_channel() -> (CtrlTx, mpsc::UnboundedReceiver<Frame>, Arc<AtomicUsize>) 
 
 /// The engine's only writer: owns the session duplex's write half and serializes the pumps'
 /// bounded queue and the engine's own unbounded control queue onto it. The engine itself never
-/// writes, so a peer that does not read can no longer stop the engine's read loop (DEC-0061 (c)).
+/// writes, so a peer that does not read can no longer stop the engine's read loop.
 fn spawn_frame_writer<W>(
     mut mux_write: W,
     mut out_rx: mpsc::Receiver<Frame>,
@@ -1349,7 +1349,7 @@ async fn run_forward_initiate_engine(
                         let session = session_send.clone();
                         let task = streams.spawn(WRITTEN.scope(written.clone(), async move {
                             // Without flow control the Open takes the pumps' queue and never waits
-                            // forever on a peer that stopped reading (AUF-20261006-070).
+                            // forever on a peer that stopped reading.
                             if credited
                                 || send_or_drop(&out_tx2, Frame::Open { id, target: target2 }).await
                             {
@@ -1804,7 +1804,7 @@ async fn dial_and_pump_forward_target(
 mod tests {
     use super::*;
 
-    // T4 (DEC-0061): a peer that sends more than its credit resets only that stream -- the
+    // T4: a peer that sends more than its credit resets only that stream -- the
     // engine sees `deliver` refuse instead of waiting (no session end, no stall).
     #[tokio::test]
     async fn credited_stream_refuses_more_than_its_window() {
@@ -2117,7 +2117,6 @@ mod tests {
         assert!(non_loopback.contains("loopback"), "{non_loopback}");
     }
 
-    // ct-agent#267
     #[test]
     fn reconnect_backoff_doubles_from_one_second_to_thirty_and_resets_after_a_healthy_session() {
         let short = Duration::from_millis(10);
@@ -2136,7 +2135,6 @@ mod tests {
         );
     }
 
-    // ct-agent#267
     #[test]
     fn only_a_recorded_grant_end_or_an_expired_own_grant_stops_the_reconnect() {
         assert_eq!(
@@ -2380,7 +2378,7 @@ mod tests {
         assert!(never_opened, "a failed dial never opens");
     }
 
-    // AUF-20261006-070 (Befund a): a stream's control/close frames must never wait forever on a
+    // Finding a of the #274 review: a stream's control/close frames must never wait forever on a
     // full shared queue -- a peer that stopped reading used to wedge the pump (also its idle
     // branch), holding the local socket and its max_streams slot open indefinitely.
 
@@ -2414,7 +2412,7 @@ mod tests {
         match tokio::time::timeout(Duration::from_millis(3100), pump).await {
             Ok(join) => join.unwrap(),
             Err(_) => panic!(
-                "idle pump did not end within idle + grace + margin although the gegenstelle never reads (AUF-20261006-070)"
+                "idle pump did not end within idle + grace + margin although the gegenstelle never reads"
             ),
         };
 
@@ -2458,7 +2456,7 @@ mod tests {
         match tokio::time::timeout(Duration::from_millis(3000), pump).await {
             Ok(join) => join.unwrap(),
             Err(_) => panic!(
-                "pump on a clean local EOF did not end within grace + margin although the gegenstelle never reads (AUF-20261006-070)"
+                "pump on a clean local EOF did not end within grace + margin although the gegenstelle never reads"
             ),
         };
 
@@ -2473,7 +2471,6 @@ mod tests {
     async fn gegenstelle_liest_nicht_schreibfehler_gibt_stream_frei() {
         // No independent witness for the write-error send at F:684 here: a closed socket delivers
         // EOF to the read side at the same time, so this may end via either path
-        // (AUF-20261006-070).
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
@@ -2509,7 +2506,7 @@ mod tests {
         match tokio::time::timeout(Duration::from_millis(3000), pump).await {
             Ok(join) => join.unwrap(),
             Err(_) => panic!(
-                "pump on a local write/read error did not end within grace + margin although the gegenstelle never reads (AUF-20261006-070)"
+                "pump on a local write/read error did not end within grace + margin although the gegenstelle never reads"
             ),
         };
     }
@@ -2567,7 +2564,7 @@ mod tests {
             }
         })
         .await
-        .expect("the frame writer task must end with the engine (AUF-20261006-070)");
+        .expect("the frame writer task must end with the engine");
 
         drop(session_side); // held, unread, until here -- reading it would free the writer itself
     }
@@ -2608,7 +2605,7 @@ mod tests {
                 "expected the connection whose Open could not be queued to see EOF, got {n} bytes"
             ),
             Err(_) => panic!(
-                "a new connection waited longer than the grace + margin for its Open (AUF-20261006-070)"
+                "a new connection waited longer than the grace + margin for its Open"
             ),
         }
 
@@ -2661,7 +2658,7 @@ mod tests {
         );
     }
 
-    // --- Session window (AUF-20261007-005, replaces AUF-20261006-078 and -081) ---
+    // --- Session window ---
 
     /// The frames an engine writes, read by a task of their own: `Frame::read` is not cancel-safe,
     /// so a test must not put a timeout around it.
@@ -3041,7 +3038,7 @@ mod tests {
         s.first.available_permits() + s.budget.available_permits()
     }
 
-    // Review of AUF-20261007-005 (W1, W2): bytes a pump only holds are not owed. The peer cannot
+    // Review (W1, W2): bytes a pump only holds are not owed. The peer cannot
     // acknowledge them, the dead-peer check does not see them, and giving them back after an
     // acknowledgement never leaves more permits than the window (measured before: 278528 of
     // 262144).
@@ -3074,7 +3071,7 @@ mod tests {
     }
 
     // A stream's first chunk uses the rest of the window while the reserve for first chunks is
-    // used up (review of AUF-20261007-005: 100 new streams left 192 KiB of the window unused).
+    // used up (review: 100 new streams left 192 KiB of the window unused).
     #[tokio::test]
     async fn a_first_chunk_takes_the_rest_of_the_window_when_the_reserve_is_used_up() {
         let s = SessionSend::from_hello(SESSION_WINDOW as u32)
@@ -3293,7 +3290,7 @@ mod tests {
         acknowledged(&mut frames, (SESSION_WINDOW / 4) as u32).await;
     }
 
-    // Review of AUF-20261007-005 (W3, open since AUF-20261006-078): an FC_ON whose stream is
+    // Review (W3): an FC_ON whose stream is
     // closed before its Open is over. Pairs of FC_ON and Close do not add up to the control flood
     // that ends the session (measured before: session ended at pair 1025); FC_ONs alone still do.
     #[tokio::test]
@@ -3520,7 +3517,7 @@ mod tests {
         }
         arrives(&arrived, want, Duration::from_secs(30)).await;
     }
-    // ---- AUF-20261007-005, slice (ii): the other direction, the dead peer, the coupled grace ----
+    // ---- Session window, slice (ii): the other direction, the dead peer, the coupled grace ----
 
     /// A target that writes until its connection ends.
     async fn blasting_target() -> String {
@@ -3733,7 +3730,7 @@ mod tests {
         );
     }
 
-    // Review of AUF-20261007-005 (W1): a healthy peer that falls silent is not a dead one. The
+    // Review (W1): a healthy peer that falls silent is not a dead one. The
     // path is jammed, chunks wait for room in the engine's queue holding a part of the window;
     // the peer acknowledges exactly what it read and resets the waiting streams, then reads and
     // acknowledges the rest and says nothing more. Nothing it could have is unacknowledged, so
@@ -3813,7 +3810,7 @@ mod tests {
         drop(waiting);
     }
 
-    // Review of AUF-20261007-005 (W2): the HELLO of the accept side reaches the initiate side
+    // Review (W2): the HELLO of the accept side reaches the initiate side
     // after HELLO_WAIT, both ends with the session window. The initiate side then opens its
     // streams without credit; what the accept side sends on them still counts against the window,
     // because the initiate side acknowledges it (measured before: "acknowledged more than was
@@ -3984,7 +3981,7 @@ mod tests {
         }
     }
 
-    // Review of AUF-20261007-005 (W2, mirror gaps): what was tested on one engine only, on the
+    // Review (W2, mirror gaps): what was tested on one engine only, on the
     // other one too, and a HELLO of a later version.
 
     #[test]

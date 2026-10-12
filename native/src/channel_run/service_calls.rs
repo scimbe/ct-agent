@@ -88,7 +88,7 @@ pub(crate) enum ChannelLocal {
     /// different mode -- a stream handler the operator explicitly configured either runs, or
     /// the session fails loud, never a quiet downgrade to an unconfigured default.
     Stream(Result<StreamHandlerProcess, std::sync::Arc<io::Error>>),
-    /// scimbe/ct-agent#255 slice 2 (AUF-20260929-029): the channel TCP forward, either side.
+    /// scimbe/ct-agent#255 slice 2: the channel TCP forward, either side.
     /// `Err` only ever comes from the initiate side (a bad `CT_CHANNEL_FORWARD` value, or its
     /// loopback listener failing to bind) -- captured at construction, same "fail loud on
     /// every poll, never a silent downgrade" contract as `Stream` above.
@@ -1828,7 +1828,7 @@ pub(crate) fn enrich_manifest_list(registry_url: &str, body: serde_json::Value) 
 /// (pre-admission paths) or not applicable (`Pipe`/one-shot `--call` mode never dispatches
 /// through a registry at all) — identical to today's always-anonymous `dispatch()` behaviour.
 pub(crate) fn channel_local(peer: Option<[u8; 32]>) -> ChannelLocal {
-    // scimbe/ct-agent#255 slice 2 (AUF-20260929-029), initiate side: CT_CHANNEL_FORWARD turns
+    // scimbe/ct-agent#255 slice 2, initiate side: CT_CHANNEL_FORWARD turns
     // this session into a TCP port-forward client -- an EXCLUSIVE mode, same posture as
     // CT_AGENT_STREAM_HANDLER_CMD below (no ping/serve/call semantics share this session).
     // Checked first because, like that branch, a construction failure (a bad spec, or the
