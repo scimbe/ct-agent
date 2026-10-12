@@ -258,7 +258,7 @@ where
     A: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<ChannelJoinOutcome, BoxError>>,
 {
-    let deadline = std::time::Instant::now() + window;
+    let deadline = tokio::time::Instant::now() + window;
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
@@ -271,7 +271,7 @@ where
                 return result; // never valid again: stop at once, the error carries the operator hint
             }
         }
-        let now = std::time::Instant::now();
+        let now = tokio::time::Instant::now();
         if now >= deadline {
             let reason = match &result {
                 Ok(outcome) => format!("-- the peer may be between park windows (#21), offline, or parked at a different pairer (last outcome: {outcome:?})"),
@@ -301,7 +301,7 @@ where
                 next_check - now
             ),
         }
-        tokio::time::sleep_until(next_check.into()).await;
+        tokio::time::sleep_until(next_check).await;
     }
 }
 

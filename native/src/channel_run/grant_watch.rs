@@ -138,9 +138,8 @@ impl std::fmt::Debug for WatchSetup {
     }
 }
 
-/// How a session starts its watch: the peer's grant is only known once it has verified, so
-/// the source is built then, from that grant.
-/// Builds the status source for a verified peer grant.
+/// Builds the status source for a verified peer grant. The grant is only known once the peer has
+/// verified, so a session starts its watch then.
 pub type SourceFactory = Arc<dyn Fn(&SignedChannelGrant) -> Arc<dyn GrantStatusSource> + Send + Sync>;
 
 #[derive(Clone)]
@@ -212,8 +211,11 @@ impl CpStatusSource {
 /// A 404 is ambiguous on its own: a control plane that has the endpoint answers it for a channel
 /// it does not know (and says so in the body, `{"state":"unknown-channel"}`: the channel is gone,
 /// so the session ends), while one that lacks the endpoint answers an empty or foreign 404
-/// (unsupported). Everything else that is not a plain answer is unreadable and fails closed after
-/// the grace.
+/// (unsupported). A 403 is the same kind of ambiguous: only one that says in its body what the
+/// control plane itself decided (`{"state":"asker-not-member"}`) ends the session at once, since a
+/// proxy in front of the control plane can answer a bare 403 and that would otherwise end every
+/// forward session together. Everything else that is not a plain answer is unreadable and fails
+/// closed after the grace.
 pub fn classify_answer(code: u16, body: &str) -> Result<GrantState, StatusError> {
     let state = serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -221,9 +223,10 @@ pub fn classify_answer(code: u16, body: &str) -> Result<GrantState, StatusError>
     match code {
         404 if state.as_deref() == Some("unknown-channel") => Ok(GrantState::NotMember),
         404 => Err(StatusError::Unsupported),
-        // 403 means the control plane no longer counts this member as one: nothing about the
-        // peer can be asked, and nothing this member does on the channel is authorized.
-        403 => Ok(GrantState::NotMember),
+        // The control plane no longer counts this member as one: nothing about the peer can be
+        // asked, and nothing this member does on the channel is authorized. Only when the control
+        // plane said so itself; a bare 403 is unreadable (see above).
+        403 if state.as_deref() == Some("asker-not-member") => Ok(GrantState::NotMember),
         200..=299 => match state.as_deref() {
             Some("valid") => Ok(GrantState::Valid),
             Some("revoked") => Ok(GrantState::Revoked),
@@ -453,10 +456,15 @@ mod tests {
             Ok(NotMember),
             "a CP that has the endpoint and no such channel: the channel is gone"
         );
-        assert_eq!(classify_answer(403, ""), Ok(NotMember));
+        assert_eq!(
+            classify_answer(403, r#"{"state":"asker-not-member"}"#),
+            Ok(NotMember),
+            "the control plane itself says the asker is no longer a member"
+        );
         assert_eq!(classify_answer(200, r#"{"state":"valid","checked_at":1}"#), Ok(Valid));
         assert_eq!(classify_answer(200, r#"{"state":"revoked"}"#), Ok(Revoked));
-        for (code, body) in [(405, ""), (500, ""), (502, "bad gateway"), (401, ""), (429, ""), (200, "{}"), (200, "garbage")] {
+        for (code, body) in [(405, ""), (500, ""), (502, "bad gateway"), (401, ""), (429, ""), (200, "{}"), (200, "garbage"),
+            (403, ""), (403, "<html>forbidden</html>"), (403, r#"{"error":"denied"}"#)] {
             assert!(
                 matches!(classify_answer(code, body), Err(StatusError::Unreadable(_))),
                 "{code} {body:?} fails closed after the grace"
