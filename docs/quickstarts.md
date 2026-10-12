@@ -29,6 +29,10 @@ relay first and then the `:443` front door ([transport ladders](channel.md#trans
 
 **Status:** steps 2–3 run with v0.7.39; the portal steps not run.
 
+**Short path:** `scripts/quickstart.sh tunnel` asks for the hostname and the token of the Install page (hidden), writes the `.env`, runs `setup.sh` and checks the public URL. The steps below are the manual reference.
+
+**Script status:** tested with stubs (no network); not yet run against a real service.
+
 **Result:** a service listening on `127.0.0.1:8080` of your machine answers under your tunnel's
 public hostname, although your machine only ever dials out.
 
@@ -86,6 +90,10 @@ recorded events), stop with `kill $(cat ct-agent.pid)`.
 ## 2. Channel
 
 **Status:** run end to end with v0.7.39 against a self-hosted edge and control plane (front door :443, relay).
+
+**Short path:** `scripts/quickstart.sh channel` runs the whole path on one machine (you are the operator and both members), sends a test line and reports success or the first failed stage. For several machines use `--role operator` and `--role member`; they exchange a few pasted text blocks (public values and the grant only; three rounds). The steps below are the manual reference.
+
+**Script status:** tested with stubs (no network); not yet run against a real service.
 
 **Result:** bytes typed on member B appear on member A, end-to-end encrypted (Noise_IK). The
 edge brokers and relays the connection and sees only ciphertext.
@@ -210,6 +218,10 @@ without any broker) are in the [channel reference](channel.md#modes).
 
 **Status:** `ssh-config` and `ssh-owner show` checked offline; not run end to end (needs tier Grün).
 
+**Short path:** `scripts/quickstart.sh ssh-tunnel` on the agent host (it prints what tier Grün needs first), then `scripts/quickstart.sh ssh-tunnel --role client` on the client. The steps below are the manual reference.
+
+**Script status:** tested with stubs (no network); not yet run against a real service. The tier-Grün path has not been run end to end by anyone.
+
 **Result:** `ssh <name>.example.org` reaches the sshd of a machine that has no open port. The
 tunnel's hostname is the SSH host; the client speaks SSH inside TLS to the edge on `:443`.
 
@@ -274,6 +286,10 @@ login still applies on top.
 ## 4. SSH over a channel
 
 **Status:** run end to end with v0.7.39 against the hosted edge (front door :443, relay): login, scp of 50 MiB in both directions, 5 parallel sessions, restart of the accepting side. Measured: login median 0.78 s, about 1.9 MiB/s over the relay.
+
+**Short path:** `scripts/quickstart.sh ssh-channel` does section 2 plus the forward and prints the finished `ssh` line; `--role operator|member` for several machines. The forward warning below applies and the script repeats it. The steps below are the manual reference.
+
+**Script status:** tested with stubs (no network); not yet run against a real service.
 
 **Result:** `ssh -p 2222 <user>@127.0.0.1` on the client reaches the sshd of the accepting
 machine, which stays bound to its loopback and is never published. There is no `ssh`
