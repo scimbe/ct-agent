@@ -48,11 +48,6 @@
 //! [`FORWARD_RECONNECT_MIN`] doubling up to [`FORWARD_RECONNECT_MAX`]; connections made in the
 //! meantime wait in the listen backlog and are served by the next session. After a grant end the
 //! listener stays open but refuses every connection with a log line (#264), without reconnecting.
-//
-// trace: AUF-20260930-005 (INC-20260930-101)
-// trace: AUF-20261004-022 (ct-agent#267)
-// trace: AUF-20261005-016 (DEC-0061)
-// trace: AUF-20261006-070 (DEC-0061)
 
 use std::collections::HashMap;
 use std::io;
