@@ -75,7 +75,7 @@ const MAGIC: &[u8; 5] = b"CTPG1";
 pub(crate) const PRELUDE_LEN: usize = MAGIC.len() + SignedChannelGrant::WIRE_LEN;
 /// How long a peer has, after the Noise handshake, to present its grant.
 pub(crate) const PEER_GRANT_TIMEOUT: Duration = Duration::from_secs(10);
-/// The budget a session gets when its grant whose grant ended: within it every forwarded
+/// The budget a session gets once its grant has ended: within it every forwarded
 /// stream of that session is closed on BOTH members and no new one is opened. Nothing here ever
 /// waits this out -- [`GrantLifetime`] ends the session on the next poll of its plaintext side --
 /// it is the bound the tests assert against, named once so they and this doc cannot drift apart.

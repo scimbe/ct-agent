@@ -353,7 +353,9 @@ concerns the direct-connect path `serve_direct`, not the forward.)
   agent keeps polling in case the control plane is upgraded. Every other failure -- timeout, `5xx`,
   `405`, TLS error, an unreadable answer -- is fail-closed: the session ends when the grace has
   passed since the last valid answer (or the last "not supported" one). A `404` whose JSON body is `{"state":"unknown-channel"}` means the channel is gone and
-  ends the session at once.
+  ends the session at once. A `403` ends it at once only when its JSON body says what the control
+  plane decided (`{"state":"asker-not-member"}`: this member was withdrawn); a bare `403` can come
+  from a proxy in front of the control plane, so it is an unreadable answer and waits out the grace.
 - An initiator that is refused with `[grant-revoked]` stops at once instead of retrying for its
   75 s window: a revoked grant never becomes valid again, so it needs a newly issued one.
 
