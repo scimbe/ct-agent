@@ -1,0 +1,262 @@
+<!-- Commands in this page are taken from `ct-agent --help`, `docs/channel.md` and `scripts/setup.sh`
+     of the same release (v0.7.39). -->
+# Quickstarts
+
+Four short paths from a fresh machine to a visible result. For what separates them, read the
+comparison table in the [README](../README.md#tunnel-or-channel) first.
+
+| | You want | Section |
+|---|---|---|
+| 1 | a website or TCP service on your machine reachable under a public hostname | [Tunnel](#1-tunnel) |
+| 2 | two members to exchange bytes end-to-end encrypted, without either opening a port | [Channel](#2-channel) |
+| 3 | `ssh <hostname>` to a machine behind NAT, through a tunnel | [SSH over a tunnel](#3-ssh-over-a-tunnel) |
+| 4 | `ssh` to a machine behind NAT, through a channel | [SSH over a channel](#4-ssh-over-a-channel) |
+
+Placeholders are written in angle brackets (`<name>.example.org`, `<edge-host>`). Secrets are never
+typed on a command line in these steps; they come from the environment or a `0600` file.
+
+A note on QUIC: `ct-agent` speaks QUIC (UDP) where it can and falls back to TLS over TCP `:443`
+by itself. You do not choose it per path. A tunnel registers over QUIC first (the
+`CT_AGENT_REGISTER_TCP_ONLY=1` switch pins it to TCP), a channel tries direct QUIC to the edge's broker and
+relay first and then the `:443` front door ([transport ladders](channel.md#transport-selection-the-dial-ladders)).
+`ct-agent ssh` always uses TLS over TCP `:443`.
+
+---
+
+## 1. Tunnel
+
+**Result:** a service listening on `127.0.0.1:8080` of your machine answers under your tunnel's
+public hostname, although your machine only ever dials out.
+
+1. Create the tunnel in the portal of your CADS-Tunnel control plane (for the hosted deployment,
+   `https://bunsenbrenner.org/portal/tunnels`) and open its **Install** page. It shows a
+   short-lived bootstrap token and the hostname of the tunnel.
+2. Start something to publish, here a throw-away web server on loopback:
+
+   ```bash
+   python3 -m http.server 8080 --bind 127.0.0.1
+   ```
+
+3. In a second terminal, in an empty directory, run the guided setup. On the first run it
+   writes `.env.example` and stops:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh -o setup.sh
+   bash setup.sh
+   ```
+
+4. Copy the template and fill in the values from the Install page, then run the script again:
+
+   ```bash
+   cp .env.example .env
+   # edit .env:
+   #   CT_BOOTSTRAP=<token from the Install page>
+   #   CT_AGENT_CP_URL=https://bunsenbrenner.org
+   #   CT_AGENT_HOSTNAME=<name>.example.org     # as shown on the Install page
+   #   CT_AGENT_ORIGIN=127.0.0.1:8080
+   #   CT_AGENT_ORIGIN_PROTO=tcp
+   bash setup.sh
+   ```
+
+   Add `--docker` to run the agent as a container instead of directly on the host. The
+   direct-host path asks for confirmation (`--yes` skips it) because it should run on an isolated VM,
+   container or dedicated host.
+
+5. **You are done when** the script ends with `done — current tier: …` and `ct-agent.log`
+   shows the agent registered; then open `https://<name>.example.org/` in a browser or:
+
+   ```bash
+   curl -I https://<name>.example.org/
+   ```
+
+   The tier (Rot, Gelb, Grün) tells whose certificate the browser sees. At Gelb the origin must serve
+   plain HTTP. To move to Grün (your own certificate), the script prints the exact
+   `ct-agent certificate` command to run.
+
+Check later with `ct-agent status` (needs `CT_AGENT_METRICS_LISTEN`, otherwise it prints the last
+recorded events), stop with `kill $(cat ct-agent.pid)`.
+
+---
+
+## 2. Channel
+
+**Result:** bytes typed on member B appear on member A, end-to-end encrypted (Noise_IK). The
+edge brokers and relays the connection and sees only ciphertext.
+
+Roles: an **operator** owns the channel and signs grants; **member A** accepts, **member B**
+initiates. One person can be all three.
+
+1. On every machine, install the CLI only (no `.env`, no running agent needed):
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh | bash -s -- --client-only
+   sudo install -m 0755 ./ct-agent /usr/local/bin/ct-agent
+   ```
+
+2. Operator: log in once (prints a code and a URL to open in any browser), then create the operator key:
+
+   ```bash
+   CT_OIDC_ISSUER=https://auth.bunsenbrenner.org/realms/ct-demo ct-agent login
+   eval "$(ct-agent channel operator-init)"      # sets CT_CHANNEL_OPERATOR_KEY; the comment line shows operator_pubkey
+   ```
+
+3. Each member creates a local identity and sends the two **public** values
+   (`CT_CHANNEL_HOLDER_PUBKEY`, `CT_CHANNEL_NOISE_PUBKEY`) to the operator. The private keys stay
+   on the member's machine.
+
+   ```bash
+   ct-agent channel init > member.env && chmod 600 member.env
+   grep PUBKEY member.env
+   ```
+
+4. Member B derives the channel id from the operator's public key and A's holder public key, and sends
+   `channel_id` and `noise_attestation` back to the operator:
+
+   ```bash
+   . ./member.env
+   CT_CHANNEL_OPERATOR_PUBKEY=<operator_pubkey> CT_CHANNEL_BRIDGE_HOLDER=<A's holder pubkey> \
+     ct-agent channel member-material
+   ```
+
+5. Operator: register the channel with the control plane, then sign one grant per member
+   (`CT_GRANT_DIRECTION` is `accept` for A and `initiate` for B; `CT_GRANT_EXPIRES` is Unix seconds):
+
+   ```bash
+   CT_AGENT_CP_URL=https://bunsenbrenner.org CT_CHANNEL_ID=<channel_id> ct-agent channel register
+
+   CT_GRANT_CHANNEL=<channel_id> CT_GRANT_MEMBER_HOLDER=<member holder pubkey> \
+   CT_GRANT_DIRECTION=initiate CT_GRANT_EXPIRES=$(( $(date +%s) + 86400 )) \
+     ct-agent channel grant           # prints the member's CT_CHANNEL_GRANT
+   ```
+
+   Then add both members to the channel at the control plane. This is not a `ct-agent`
+   subcommand; without it every join is refused with `edge broker refused the channel join`
+   (see the [note on admission](channel.md#modes)).
+
+6. Member A (accept) and member B (initiate) start with the same edge addresses. Both use the
+   `:443` front door only, which keeps both halves in the same pairer
+   ([why](channel.md#pairing-reality-until-cads-tunnel495-lands)). Take the front-door address from
+   your operator; its certificate comes from `GET <control-plane>/pki/ca`:
+
+   ```bash
+   . ./member.env
+   export CT_CHANNEL_BROKER=<edge-host>:4435 CT_CHANNEL_RELAY=<edge-host>:4436
+   export CT_CHANNEL_FRONT_DOOR=<edge-host>:443 CT_CHANNEL_FRONT_DOOR_CERT=<hex DER of the edge CA>
+   export CT_CHANNEL_FRONT_DOOR_ONLY=1 CT_CHANNEL_RELAY_ONLY=1
+   export CT_CHANNEL_GRANT=<the member's grant>
+
+   # member A
+   CT_CHANNEL_ROLE=accept ct-agent channel > received.txt
+
+   # member B
+   echo "hello from B" | CT_CHANNEL_ROLE=initiate ct-agent channel
+   ```
+
+7. **You are done when** `received.txt` on A contains `hello from B`. Without a service handler
+   `ct-agent channel` is a raw pipe: stdin goes to the peer and the peer's bytes arrive on stdout.
+
+Other modes (a held service session with one JSON line per call, a persistent server, a call
+without any broker) are in the [channel reference](channel.md#modes).
+
+---
+
+## 3. SSH over a tunnel
+
+**Result:** `ssh <name>.example.org` reaches the sshd of a machine that has no open port. The
+tunnel's hostname is the SSH host; the client speaks SSH inside TLS to the edge on `:443`.
+
+Prerequisite: a tunnel from [section 1](#1-tunnel) at tier **Grün**, because the agent must
+terminate TLS with the hostname's own certificate (an sshd cannot).
+
+**On the machine running sshd (agent host):**
+
+1. Get the certificate pair, using the values from the Install page; `ct-agent certificate` keeps it renewed:
+
+   ```bash
+   CT_AGENT_CP_URL=https://bunsenbrenner.org CT_AGENT_TOKEN=<routing token> \
+   CT_AGENT_HOSTNAME=<name>.example.org CT_ACME_CERT_OUT_DIR=./ct-agent-cert \
+     ct-agent certificate
+   ```
+
+2. Stop the agent from section 1 (`kill $(cat ct-agent.pid)`), add these lines to its `.env` and run
+   `bash setup.sh` again (direct-host mode; it restores the identity kept in `./.ct-agent-state`):
+
+   ```bash
+   CT_AGENT_MODE=browser
+   CT_AGENT_ORIGIN=127.0.0.1:22
+   CT_AGENT_ORIGIN_TLS=terminate
+   CT_ACME_CERT_OUT_DIR=./ct-agent-cert
+   ```
+
+   In terminate mode the agent terminates the client's TLS with the certificate pair from that
+   directory, forwards the SSH bytes to sshd, and fails at startup if the pair cannot be loaded. It
+   also needs a state directory, because it generates an owner key there at its first start. Print the
+   key with:
+
+   ```bash
+   CT_AGENT_STATE_DIR=./.ct-agent-state ct-agent ssh-owner show
+   ```
+
+**On the client:**
+
+3. Install the CLI (step 1 of [section 2](#2-channel)) and write the SSH config. `--owner-key` stores the key
+   in `~/.ssh/ct-agent-<name>.example.org.owner` (mode `0600`) and references that file:
+
+   ```bash
+   ct-agent ssh-config <name>.example.org --user <your-login> --owner-key <owner key> >> ~/.ssh/config
+   ```
+
+4. Connect:
+
+   ```bash
+   ssh <name>.example.org
+   ```
+
+**You are done when** you get the shell prompt of the agent host. If the connection fails, ssh
+shows the diagnostics of the ProxyCommand on stderr, prefixed `ct-agent ssh:`. For a private CA
+add `--ca <pem-file>` to `ssh-config`.
+
+Owner authentication is on by default: before the first SSH byte the agent sends a challenge and the
+client answers with the owner key, so reaching the hostname is not enough to talk to sshd. sshd's own
+login still applies on top.
+
+---
+
+## 4. SSH over a channel
+
+**Result:** `ssh -p 2222 <user>@127.0.0.1` on the client reaches the sshd of the accepting
+machine, which stays bound to its loopback and is never published. There is no `ssh`
+subcommand for channels; it is the generic **TCP forward** (`CT_CHANNEL_FORWARD`, off
+by default) used with port 22.
+
+> The forward is opt-in. The reference says not to enable it in production until grant revocation
+> ends running forwarded streams ([#45](https://github.com/scimbe/ct-agent/issues/45)); see
+> [TCP forward over a paired channel](channel.md#tcp-forward-over-a-paired-channel-255--opt-in-default-off).
+
+1. Set up the channel as in [section 2](#2-channel), steps 1 to 5. The machine with the sshd is
+   member A (accept), the client is member B (initiate).
+2. On member A, allow exactly one target and start the accept side. Without
+   `CT_CHANNEL_FORWARD_ALLOW` every forward request is refused:
+
+   ```bash
+   . ./member.env      # plus the CT_CHANNEL_* edge settings and CT_CHANNEL_GRANT from section 2, step 6
+   CT_CHANNEL_ROLE=accept CT_CHANNEL_FORWARD_ALLOW=127.0.0.1:22 ct-agent channel
+   ```
+
+3. On member B, open the local listener (loopback only) that is forwarded to that target:
+
+   ```bash
+   . ./member.env      # same settings, B's own grant
+   CT_CHANNEL_ROLE=initiate CT_CHANNEL_FORWARD=127.0.0.1:2222=127.0.0.1:22 ct-agent channel
+   ```
+
+   It prints `CT_CHANNEL_FORWARD 127.0.0.1:2222 -> 127.0.0.1:22 …`.
+
+4. In a second terminal on B:
+
+   ```bash
+   ssh -p 2222 <user>@127.0.0.1
+   ```
+
+**You are done when** you get the shell prompt of member A's machine. The forward reconnects after
+a session end, and stops for good only when the grant expires or is revoked.
