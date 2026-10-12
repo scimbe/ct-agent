@@ -346,19 +346,21 @@ concerns the direct-connect path `serve_direct`, not the forward.)
   anything else, so a forward without `CT_AGENT_CP_URL` still starts as before**, with one warning
   line: `revocation re-check disabled: no control-plane URL`. A revoked grant then does not end the
   session (the edge still cuts a relayed leg). Set `CT_CHANNEL_REVOCATION=require` to make the
-  missing address a startup error instead; unset or `warn` is the default.
+  missing address an error at process start instead (before any connection is made, exit code 1); a value other than `require`/`warn` is also refused at start. Unset or `warn` is the default.
 - **Old control plane.** A control plane without the re-check endpoint answers a bare `404`
   (empty or non-JSON body) over the verified TLS connection. That means "revocation not supported
   by this control plane": the session keeps running, with one warning line per session, and the
   agent keeps polling in case the control plane is upgraded. Every other failure -- timeout, `5xx`,
   `405`, TLS error, an unreadable answer -- is fail-closed: the session ends when the grace has
-  passed. A `404` whose JSON body is `{"state":"unknown-channel"}` means the channel is gone and
+  passed since the last valid answer (or the last "not supported" one). A `404` whose JSON body is `{"state":"unknown-channel"}` means the channel is gone and
   ends the session at once.
+- An initiator that is refused with `[grant-revoked]` stops at once instead of retrying for its
+  75 s window: a revoked grant never becomes valid again, so it needs a newly issued one.
 
 | Variable | Meaning |
 |---|---|
 | `CT_CHANNEL_GRANT_RECHECK_SECS` | Re-check interval of a forward session (default 30, minimum 5) |
-| `CT_CHANNEL_GRANT_RECHECK_GRACE_SECS` | How long the control plane may stay unreadable before the session is ended, counted from the last valid answer (default 90, at least one interval). A `valid` answer never ends a session; a `revoked`/`not-member` answer ends it at once |
+| `CT_CHANNEL_GRANT_RECHECK_GRACE_SECS` | The grace for an answer that **cannot be read** (timeout, `5xx`, `405`, TLS error, garbage): the session ends when no valid answer has come for this long (default 90, at least one interval). It does not apply to a definite answer: `revoked` or `not-member` ends the session at once, `valid` resets the clock |
 
 ### Accept side — the gate
 
