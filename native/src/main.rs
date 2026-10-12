@@ -76,6 +76,7 @@ USAGE:
     ct-agent channel member-material      Derive this member's channel_id/attestation
     ct-agent channel join-pipeline-role   Derive a published pipeline role's channel_id
     ct-agent channel grant                As operator, sign a member's channel grant
+    ct-agent channel grant-revoke         As operator, revoke one issued channel grant at the control plane
     ct-agent channel invite               As operator, sign a cross-account channel invitation
     ct-agent channel bind-topology        As operator, sign a Topology Editor operator-binding proof
     ct-agent channel register [--rekey]   Register a channel authority with the CP (--rekey: rotate it)
@@ -745,6 +746,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("{}", req.issue());
             return Ok(());
         }
+        // `ct-agent channel grant-revoke`: as the operator, put ONE issued grant on the control
+        // plane's revocation list (CT_REVOKE_GRANT=<its hex>, or the CT_GRANT_* fields it was
+        // issued with). The edge then refuses it and cuts live relays carrying it; a running
+        // forward ends at its next re-check. Reads CT_AGENT_CP_URL + CT_CHANNEL_OPERATOR_KEY.
+        if std::env::args().nth(2).as_deref() == Some("grant-revoke") {
+            let req = ct_agent::channel_run::GrantRevokeRequest::from_env()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            let out = req
+                .send()
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("ct-agent channel grant-revoke: {e}").into() })?;
+            println!(
+                "{} grant {}",
+                if out.already { "already revoked:" } else { "revoked:" },
+                ct_agent::codec::hex_encode(&req.target().digest)
+            );
+            return Ok(());
+        }
         // scimbe/ct-agent#9 `ct-agent channel invite`: as the operator, sign an invitation for
         // an identity you don't already have holder/noise material for (the cross-account case
         // `channel grant` can't cover). Reads CT_CHANNEL_OPERATOR_KEY + CT_INVITE_*, pure local
@@ -955,7 +974,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // #239 discipline already applied to unrecognized top-level subcommands.
         if let Some(sub) = std::env::args().nth(2) {
             const KNOWN: &[&str] = &[
-                "init", "operator-init", "member-material", "join-pipeline-role", "grant",
+                "init", "operator-init", "member-material", "join-pipeline-role", "grant", "grant-revoke",
                 "invite", "bind-topology", "super-peer", "register", "allowlist", "agent-card",
             ];
             if !KNOWN.contains(&sub.as_str()) {

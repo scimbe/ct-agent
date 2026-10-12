@@ -1349,8 +1349,8 @@ fn bridge_traced(
 /// the portal's own confirmation-before-calling UX is separate, not-yet-built work -- this
 /// tool existing safely does not mean the portal should call it without one yet. Only
 /// `bridge/cert-status` (needs cross-process state -- the `channel --serve` process and the
-/// `certificate` renewal daemon are separate processes, not yet wired to share tier state) and
-/// `bridge/channel-revoke` remain, same list this feature's plan already scoped.
+/// `certificate` renewal daemon are separate processes, not yet wired to share tier state) remains;
+/// `bridge/channel-revoke` revokes one grant of this agent's own channel.
 ///
 /// What the read-only tools return (CADS-Tunnel#763, the portal renders these directly):
 /// `bridge/config` is the non-secret summary from [`bridge_config_summary`] -- role/broker/relay
@@ -1439,6 +1439,45 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
                     .map_err(|e| format!("GET .../channels/{channel_hex}/members: invalid JSON response: {e}"))
             })?;
             Ok(body)
+        }),
+    );
+    reg.register_ctx(
+        "bridge/channel-revoke",
+        "Revoke ONE channel grant of this agent's own channel at the control plane (owner session): \
+         the edge refuses it from then on and cuts relays carrying it, and a running forward ends \
+         at its next re-check. Argument: {\"grant\": \"<the signed grant, hex>\"}. The grant must \
+         belong to THIS agent's channel (CT_CHANNEL_ID / CT_GRANT_CHANNEL). Needs CT_AGENT_CP_URL \
+         and a usable OIDC credential, like `bridge/channel-members`. The portal should confirm \
+         with the owner before calling it.",
+        bridge_traced("bridge/channel-revoke", move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
+            if ctx.peer != Some(bridge_peer) {
+                return Err("bridge/channel-revoke: caller is not this agent's configured bridge peer".to_string());
+            }
+            let env = |k: &str| std::env::var(k).ok();
+            let cp_url = env("CT_AGENT_CP_URL")
+                .ok_or_else(|| "bridge/channel-revoke: this agent has no CT_AGENT_CP_URL configured".to_string())?;
+            let own = req_hex32_aliased(&env, "CT_CHANNEL_ID", "CT_GRANT_CHANNEL", "64 hex channel id")?;
+            let grant = args
+                .get("grant")
+                .and_then(|g| g.as_str())
+                .ok_or_else(|| "bridge/channel-revoke: argument `grant` (hex) is required".to_string())
+                .and_then(|g| super::grant_revoke::decode_grant_hex(g).map_err(|e| format!("bridge/channel-revoke: {e}")))?;
+            if grant.grant.channel.0 != own {
+                return Err("bridge/channel-revoke: that grant belongs to another channel than this agent's own".to_string());
+            }
+            let out = tokio::runtime::Handle::current().block_on(async {
+                let token = crate::login::resolve_oidc_token_with_retry(
+                    crate::login::OIDC_REFRESH_RETRY_ATTEMPTS,
+                    crate::login::OIDC_REFRESH_RETRY_BASE,
+                )
+                .await?;
+                super::grant_revoke::revoke_as_owner(&cp_url, &token, &grant).await
+            })?;
+            Ok(serde_json::json!({
+                "revoked": true,
+                "already": out.already,
+                "grant_digest": hex_encode(&super::grant_watch::grant_digest(&grant)),
+            }))
         }),
     );
     reg.register_ctx(
