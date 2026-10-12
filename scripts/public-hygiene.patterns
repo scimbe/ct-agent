@@ -4,14 +4,14 @@
 # PUBLIC_HYGIENE_EXTRA_PATTERNS (same format) or PUBLIC_HYGIENE_EXTRA_SHA256 (sha256 of
 # the lowercased token), both kept outside the repository.
 # A line carrying the marker "public-hygiene: allow" is skipped.
-tracker-id	[A-Z]{3,4}-[0-9]{8}(-[0-9]{1,4})?|[A-Z]{3}-[0-9]{4}([^0-9]|$)	^(CVE|RFC|ISO|BCP|STD|FIPS|ADR|PEP|GHSA|CWE|SHA|MD|AES|DES|SEC)-
+tracker-id	[A-Z]{3,4}-[0-9]{8}(-[0-9]{1,4})?|[A-Z]{3}-[0-9]{4}([^0-9]|$)	^(CVE|RFC|ISO|BCP|STD|FIPS|ADR|PEP|GHSA|CWE|SHA|MD|AES|DES|SEC)-[0-9]{1,6}[^0-9]?$
 ulid-like	(^|[^A-Za-z0-9])[0-9A-HJKMNP-TV-Z]{26}($|[^A-Za-z0-9])	
 task-handle	(^|[^A-Za-z0-9])[a-z]+/task-[0-9A-Za-z]{20,}|task-[0-9A-Za-z]{26}($|[^A-Za-z0-9])	
 sandbox-path	/workspace/\.[A-Za-z]	
 mac-home	/Users/[A-Za-z0-9._-]+	^/Users/(Shared|user|username|name|example|you|me)$
 linux-home	/home/[a-z][a-z0-9._-]*	^/home/(coder|runner|user|username|node|vscode|ubuntu|app|appuser|nonroot|example|test|me|x|rust)$
 provider-host	[A-Za-z0-9-]+\.vps\.[a-z]+\.(net|com|us)|(^|[^A-Za-z0-9])vps-[0-9a-f]{6,}	
-email	[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}	(@(example\.(com|org|net)|[A-Za-z0-9.-]+\.(invalid|test|example|localhost))$)|^noreply@|users\.noreply\.github\.com$|^scimbe@gmail\.com$
+email	[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}	(@(example\.(com|org|net)|[A-Za-z0-9.-]+\.(invalid|test|example|localhost))$)|^noreply@|users\.noreply\.github\.com$|^scimbe@gmail\.com$|^git@github\.com$
 secret-token	gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{15,}|(^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[bpas]-[A-Za-z0-9-]{10,}	
 secret-header	-----BEGIN [A-Z ]*PRIVATE KEY-----	
 auth-value	[Aa]uthorization:[ ]*(Bearer|Basic|token)[ ]+[A-Za-z0-9._~+/=-]{12,}	

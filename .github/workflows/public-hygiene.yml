@@ -32,7 +32,20 @@ jobs:
           # Optional, not in the repository; absent on fork PRs.
           PUBLIC_HYGIENE_EXTRA_PATTERNS: ${{ secrets.PUBLIC_HYGIENE_EXTRA_PATTERNS }}
           PUBLIC_HYGIENE_EXTRA_SHA256: ${{ secrets.PUBLIC_HYGIENE_EXTRA_SHA256 }}
-        run: bash scripts/check-public-hygiene.sh diff "$BASE_SHA" "$HEAD_SHA"
+        # The PR cannot weaken its own check: when the base revision already has the script and
+        # its patterns, they are taken from there. (The three files are exempt from the diff scan
+        # because they must contain the shapes they look for; running the base copy is what
+        # keeps a PR from editing them to pass.) The self-test above still runs from the PR.
+        run: |
+          check=scripts/check-public-hygiene.sh
+          if git cat-file -e "$BASE_SHA:scripts/check-public-hygiene.sh" 2>/dev/null \
+             && git cat-file -e "$BASE_SHA:scripts/public-hygiene.patterns" 2>/dev/null; then
+            mkdir -p "$RUNNER_TEMP/hygiene"
+            git show "$BASE_SHA:scripts/check-public-hygiene.sh" > "$RUNNER_TEMP/hygiene/check-public-hygiene.sh"
+            git show "$BASE_SHA:scripts/public-hygiene.patterns" > "$RUNNER_TEMP/hygiene/public-hygiene.patterns"
+            check="$RUNNER_TEMP/hygiene/check-public-hygiene.sh"
+          fi
+          bash "$check" diff "$BASE_SHA" "$HEAD_SHA"
 
       - name: Report on the whole tree (informational)
         if: github.event_name == 'workflow_dispatch'
