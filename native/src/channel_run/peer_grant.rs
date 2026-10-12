@@ -508,10 +508,7 @@ impl<P: AsyncWrite + Unpin> AsyncWrite for PeerGrantGate<P> {
                             if let Some(plan) = &g.check.watch {
                                 let (tx, rx) = oneshot::channel();
                                 this.life.watch = Some(rx);
-                                let setup = WatchSetup {
-                                    source: (plan.factory)(&peer),
-                                    config: plan.config,
-                                };
+                                let setup = WatchSetup::new((plan.factory)(&peer), plan.config);
                                 tokio::spawn(watch_peer_grant(setup, tx));
                             }
                             if let Some(w) = g.reader.take() {
@@ -1050,6 +1047,18 @@ mod tests {
 
     /// A forward never runs without the peer's grant, whatever the opt-in says; without an
     /// operator key it refuses to join rather than silently skipping the check.
+    #[test]
+    fn a_forward_without_a_control_plane_url_starts_with_a_warning_unless_revocation_is_required() {
+        use super::super::{resolve_cp, revocation_required};
+        assert_eq!(resolve_cp(None, false), Ok(None), "as before: no silent break of existing setups");
+        assert!(resolve_cp(None, true).unwrap_err().contains("CT_CHANNEL_REVOCATION=require"));
+        assert_eq!(resolve_cp(Some("https://cp".into()), true), Ok(Some("https://cp".into())));
+        assert_eq!(revocation_required(None), Ok(false));
+        assert_eq!(revocation_required(Some("warn")), Ok(false));
+        assert_eq!(revocation_required(Some(" require ")), Ok(true));
+        assert!(revocation_required(Some("yes")).is_err(), "a typo must not silently disable the switch");
+    }
+
     #[test]
     fn a_forward_forces_the_peer_grant_check() {
         let none = |_: &str| None;
