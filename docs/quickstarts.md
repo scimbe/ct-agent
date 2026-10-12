@@ -107,6 +107,11 @@ initiates. One person can be all three.
    eval "$(ct-agent channel operator-init)"      # sets CT_CHANNEL_OPERATOR_KEY; the comment line shows operator_pubkey
    ```
 
+   Keep the private operator key (`CT_CHANNEL_OPERATOR_KEY`) beyond this shell session, in a `0600`
+   file. `ct-agent channel grant` signs with it, so without it you cannot issue further grants for the
+   channel. Registering again with a different key needs `--rekey` and stops every grant signed by the
+   old key from verifying.
+
 3. Each member creates a local identity and sends the two **public** values
    (`CT_CHANNEL_HOLDER_PUBKEY`, `CT_CHANNEL_NOISE_PUBKEY`) to the operator. The private keys stay
    on the member's machine.
@@ -136,7 +141,8 @@ initiates. One person can be all three.
    Adding a member is an HTTP call to the control plane, `POST /me/channels/<channel_id>/members`, as the
    channel's owner (the same account you logged in with). It takes the member's `holder_pubkey`,
    `noise_pubkey` and `noise_attestation`, and the control plane verifies the attestation. Put a bearer
-   token of that account into a file (`umask 077; ...  > token`, for example with
+   token of that account (it is valid only a few minutes: add the members right after `ct-agent login`,
+   and log in again on a `401`) into a file (`umask 077; ...  > token`, for example with
    `scripts/channel-ops/mint-oidc-token.sh` from the CADS-Tunnel repository) and let curl read the header
    from stdin so the token never appears in the process list. Repeat for both members; a `409` means the
    member is already added:
@@ -163,8 +169,10 @@ initiates. One person can be all three.
 
 6. Member A (accept) and member B (initiate) start with the same edge addresses. Both use the
    `:443` front door only, which keeps both halves in the same pairer
-   ([why](channel.md#pairing-reality-until-cads-tunnel495-lands)). Take the front-door address from
-   your operator; its certificate is the control plane's CA, which `GET <control-plane>/pki/ca` returns as raw DER.
+   ([why](channel.md#pairing-reality-until-cads-tunnel495-lands)). Get the edge values from the control
+   plane: `curl -fsS <control-plane>/network-info` returns `channel_broker_port`, `channel_relay_port`
+   and `channel_relay_gate_port` (the `:443` front door); the host is the control plane's host. The
+   front-door certificate is the control plane's CA, which `GET <control-plane>/pki/ca` returns as raw DER.
    Convert it to hex once:
 
    ```bash
@@ -180,7 +188,7 @@ initiates. One person can be all three.
    export CT_CHANNEL_FRONT_DOOR_ONLY=1 CT_CHANNEL_RELAY_ONLY=1
    export CT_CHANNEL_GRANT=<the member's grant>
 
-   # member A
+   # member A (start this first; an initiating side that comes earlier waits a long time per attempt)
    CT_CHANNEL_ROLE=accept ct-agent channel > received.txt
 
    # member B
@@ -188,7 +196,9 @@ initiates. One person can be all three.
    ```
 
 7. **You are done when** `received.txt` on A contains `hello from B` (after a few seconds). A does not
-   exit by itself after receiving; stop it with Ctrl-C. Without a service handler
+   exit by itself after receiving; stop it with Ctrl-C. Keep A's stdin open (a terminal is fine): with stdin at end-of-file, for
+   example under `nohup` or `</dev/null`, A silently loses the data
+   ([#299](https://github.com/scimbe/ct-agent/issues/299)). The forward mode in section 4 is not affected. Without a service handler
    `ct-agent channel` is a raw pipe: stdin goes to the peer and the peer's bytes arrive on stdout.
 
 Other modes (a held service session with one JSON line per call, a persistent server, a call
@@ -263,7 +273,7 @@ login still applies on top.
 
 ## 4. SSH over a channel
 
-**Status:** run end to end with v0.7.39 against a self-hosted edge and control plane (front door :443, relay).
+**Status:** run end to end with v0.7.39 against the hosted edge (front door :443, relay): login, scp of 50 MiB in both directions, 5 parallel sessions, restart of the accepting side. Measured: login median 0.78 s, about 1.9 MiB/s over the relay.
 
 **Result:** `ssh -p 2222 <user>@127.0.0.1` on the client reaches the sshd of the accepting
 machine, which stays bound to its loopback and is never published. There is no `ssh`
@@ -279,12 +289,14 @@ by default) used with port 22.
 
 1. Set up the channel as in [section 2](#2-channel), steps 1 to 5. The machine with the sshd is
    member A (accept), the client is member B (initiate).
-2. On member A, allow exactly one target and start the accept side. Without
-   `CT_CHANNEL_FORWARD_ALLOW` every forward request is refused:
+2. Start member A first. Allow exactly one target and start the accept side with `CT_CHANNEL_SERVE=1`:
+   without it the accept side takes exactly one session and then exits, so the login does not come back
+   after B restarts; with it A stays parked at the broker and serves every paired session (up to
+   `CT_CHANNEL_SERVE_CONCURRENCY`, default 8). Without `CT_CHANNEL_FORWARD_ALLOW` every forward request is refused:
 
    ```bash
    . ./member.env      # plus the CT_CHANNEL_* edge settings and CT_CHANNEL_GRANT from section 2, step 6
-   CT_CHANNEL_ROLE=accept CT_CHANNEL_FORWARD_ALLOW=127.0.0.1:22 ct-agent channel
+   CT_CHANNEL_ROLE=accept CT_CHANNEL_SERVE=1 CT_CHANNEL_FORWARD_ALLOW=127.0.0.1:22 ct-agent channel
    ```
 
 3. On member B, open the local listener (loopback only) that is forwarded to that target:
