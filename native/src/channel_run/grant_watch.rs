@@ -505,9 +505,7 @@ mod tests {
                 let n = sock.read(&mut buf).await.unwrap();
                 raw.extend_from_slice(&buf[..n]);
                 let text = String::from_utf8_lossy(&raw).to_string();
-                if let Some((head, body)) = text.split_once("
-
-") {
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
                     let want = head
                         .lines()
                         .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
@@ -521,11 +519,7 @@ mod tests {
                 }
             }
             let body = r#"{"state":"valid","checked_at":1}"#;
-            let resp = format!("HTTP/1.1 200 OK
-content-type: application/json
-content-length: {}
-
-{body}", body.len());
+            let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
             sock.write_all(resp.as_bytes()).await.unwrap();
             let _ = got_tx.send(String::from_utf8_lossy(&raw).to_string());
         });
@@ -535,9 +529,7 @@ content-length: {}
         assert_eq!(src.status().await, Ok(GrantState::Valid));
         let raw = got_rx.await.unwrap();
         assert!(raw.starts_with("POST /channel/grant-status HTTP/1.1"), "{raw}");
-        let body: serde_json::Value = serde_json::from_str(raw.split_once("
-
-").unwrap().1).unwrap();
+        let body: serde_json::Value = serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
         let hex = |b: &[u8]| crate::codec::hex_encode(b);
         assert_eq!(body["channel"], hex(&channel));
         assert_eq!(body["asker"], hex(&holder.verifying_key().to_bytes()));
