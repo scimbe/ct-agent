@@ -135,6 +135,9 @@ if [ "$DO_CLEAN" -eq 1 ]; then
   [ -d "$WORK" ] || die "$WORK does not exist -- nothing to clean"
   WORK="$(cd "$WORK" && pwd)"
 else
+  if [ -d "$WORK" ] && [ ! -f "$WORK/.ct-quickstart" ] && [ -n "$(ls -A "$WORK" 2>/dev/null)" ]; then
+    die "$WORK exists, is not empty and was not created by this script -- use an empty or new directory (--workdir DIR)"
+  fi
   mkdir -p "$WORK"; WORK="$(cd "$WORK" && pwd)"
   [ -f "$WORK/.ct-quickstart" ] || : > "$WORK/.ct-quickstart"
   mkdir -p "$WORK/logs" "$WORK/run" "$WORK/grants"
@@ -391,32 +394,45 @@ channel_common() {
 }
 
 forward_warning() {
-  warn "The TCP forward is opt-in. The reference says not to enable it in production until grant revocation"
-  warn "ends running forwarded streams (ct-agent#45). Measured: on the relay path, removing the member at the"
-  warn "control plane ended a running forwarded SSH session within about 30 seconds and refused new joins;"
-  warn "for peers that upgraded to a direct connection this was not measured."
+  warn "The TCP forward is opt-in and off by default. Read the current limits of grant revocation for running"
+  warn "forwarded streams first (docs/channel.md, section 'TCP forward over a paired channel'; ct-agent#45)."
+  warn "Do not enable it in production unless that section says it is safe for your case."
 }
 
 # --- stop what this script started --------------------------------------------------------
+# stop_pidfile FILE -- kills the process only if it still looks like one this script starts (PIDs get reused).
+stop_pidfile() {
+  local f="$1" p
+  [ -f "$f" ] || return 0
+  p="$(cat "$f" 2>/dev/null || true)"
+  if pid_alive "$p" && ps -p "$p" -o command= 2>/dev/null | grep -qE 'ct-agent|http\.server'; then
+    kill_tree "$p"; ok "stopped pid $p ($(basename "$f"))"
+  elif pid_alive "$p"; then
+    warn "pid $p ($(basename "$f")) is not a process of this script any more -- left running"
+  fi
+  rm -f "$f"
+}
 stop_runs() {
-  local f p
-  for f in "$WORK"/run/*.pid "$WORK/ct-agent.pid"; do
-    [ -f "$f" ] || continue
-    p="$(cat "$f" 2>/dev/null || true)"
-    if pid_alive "$p" && ps -p "$p" -o command= 2>/dev/null | grep -qE 'ct-agent|http\.server|python'; then
-      kill_tree "$p"; ok "stopped pid $p ($(basename "$f"))"
-    fi
-    rm -f "$f"
-  done
+  local f
+  for f in "$WORK"/run/*.pid "$WORK/ct-agent.pid"; do stop_pidfile "$f"; done
 }
 
 do_clean() {
   [ -f "$WORK/.ct-quickstart" ] || die "$WORK was not created by this script (no .ct-quickstart marker) -- refusing to remove it"
   case "$WORK" in /|"$HOME"|"${HOME:-/nonexistent}/") die "refusing to remove $WORK" ;; esac
-  confirm "Stop what runs from $WORK and delete the directory (keys, grants, logs)?" || die "aborted"
+  confirm "Stop what runs from $WORK and delete the files this script created there (keys, grants, logs)?" || die "aborted"
   stop_runs
-  rm -rf "$WORK"
-  DONE_MSG="removed $WORK. Not touched: your login (ct-agent login), ~/.ssh, and the channel registration at the control plane."
+  local x
+  for x in logs run grants accept initiate site ct-agent-cert .ct-agent-state \
+           operator.env inbox.txt received.txt .env .env.bak .env.new ct-agent setup.sh ssh-owner.key ssh-owner.key.new \
+           ct-agent.pid ct-agent.log .ct-quickstart; do
+    [ -e "$WORK/$x" ] && rm -rf "${WORK:?}/$x"
+  done
+  if rmdir "$WORK" 2>/dev/null; then
+    DONE_MSG="removed $WORK. Not touched: your login (ct-agent login), ~/.ssh, and the channel registration at the control plane."
+  else
+    DONE_MSG="removed the files this script created in $WORK; the directory stays because it holds other files. Your login, ~/.ssh and the channel registration were not touched."
+  fi
 }
 
 # =============================================================================================
@@ -661,6 +677,7 @@ cmd_channel() {
 # =============================================================================================
 redeem() { # sets AGENT_JOIN_TOKEN / AGENT_TOKEN from CT_BOOTSTRAP
   local resp bundle
+  case "$CT_BOOTSTRAP" in *[!A-Za-z0-9._~-]*) die "the bootstrap token holds characters a token never has -- copy it again from the Install page" ;; esac
   resp="$(printf '{"token":"%s"}' "$CT_BOOTSTRAP" | curl -fsSL -X POST -H 'content-type: application/json' \
           --data-binary @- "$CP/bootstrap/redeem")" || die "redeeming the token failed -- it may be expired or already used; create a new one on the Install page"
   bundle="$(printf '%s' "$resp" | sed -n 's/.*"secret":"\([^"]*\)".*/\1/p')"
@@ -832,7 +849,7 @@ cmd_ssh_tunnel() {
       ok "certificate pair written to $cdir (ct-agent certificate keeps running and renews it)"
     fi
     stage "switch the agent to ssh" "see $WORK/ct-agent.log; the previous .env is in $WORK/.env.bak"
-    if pid_alive "$(cat "$WORK/ct-agent.pid" 2>/dev/null || true)"; then kill "$(cat "$WORK/ct-agent.pid")" 2>/dev/null || true; sleep 1; fi
+    stop_pidfile "$WORK/ct-agent.pid"; sleep 1
     write_tunnel_env "127.0.0.1:22" <<EOF
 CT_AGENT_MODE=browser
 CT_AGENT_ORIGIN_TLS=terminate

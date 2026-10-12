@@ -158,7 +158,8 @@ check "ssh-channel --yes exits 0" [ "$rc" -eq 0 ]
 check "the accepting side serves with forward allowed to 127.0.0.1:22" grep -q 'run role=accept serve=1 allow=127.0.0.1:22' "$T/stub.log"
 check "the initiating side forwards 2222 to 22" grep -q 'run role=initiate .*fwd=127.0.0.1:2222=127.0.0.1:22' "$T/stub.log"
 check "the front door is the :443 door" grep -q 'front=bunsenbrenner.org:443' "$T/stub.log"
-check "the forward warning stays visible" grep -q 'ct-agent#45' <<<"$out2b"
+check "the forward warning stays visible and points to channel.md" grep -q 'docs/channel.md' <<<"$out2b"
+check "the warning does not state a measured duration" ! grep -q 'seconds' <<<"$out2b"
 check "the finished ssh line is printed" grep -q 'ssh -p 2222 .*tester@127.0.0.1' <<<"$out2b"
 run_qs "$T/w2b" --clean --yes >/dev/null 2>&1
 pkill -f "sleep 30" 2>/dev/null || true
@@ -211,6 +212,33 @@ check "--clean refuses a directory without the marker" [ "$rc" -ne 0 ]
 check "the foreign directory is untouched" [ -f "$T/foreign/file" ]
 run_qs "$T/w5" --clean --yes >/dev/null 2>&1; rc=$?
 check "--clean removes its own directory" [ "$rc" -eq 0 ] && [ ! -e "$T/w5" ]
+
+# a foreign, non-empty directory is refused as a working directory
+mkdir -p "$T/foreign2"; echo keep > "$T/foreign2/file"
+E=()
+outf="$(run_qs "$T/foreign2" channel --yes 2>&1)"; rc=$?
+check "a foreign non-empty directory is refused as workdir" [ "$rc" -ne 0 ]
+check "the refusal says why" grep -q 'not empty and was not created by this script' <<<"$outf"
+check "no marker was written into the foreign directory" [ ! -e "$T/foreign2/.ct-quickstart" ]
+check "the foreign file is untouched after the refusal" [ -f "$T/foreign2/file" ]
+# --clean removes only known files; a foreign file in the workdir survives and so does the directory
+mkdir -p "$T/w7"; E=()
+run_qs "$T/w7" tunnel --yes >/dev/null 2>&1 || true   # creates the workdir and marker, fails at the missing token
+echo mine > "$T/w7/my-notes.txt"
+sleep 100 & spid=$!; echo "$spid" > "$T/w7/run/other.pid"
+run_qs "$T/w7" --clean --yes >/dev/null 2>&1; rc=$?
+check "--clean succeeds" [ "$rc" -eq 0 ]
+check "a foreign file in the workdir survives --clean" [ -f "$T/w7/my-notes.txt" ]
+check "the script's own marker is gone" [ ! -e "$T/w7/.ct-quickstart" ]
+check "a recycled pid of a foreign process is not killed" kill -0 "$spid"
+kill "$spid" 2>/dev/null
+
+# a bootstrap token with odd characters is refused before it is sent
+reset
+E=(CT_AGENT_HOSTNAME=demo.example.test 'CT_BOOTSTRAP=ab"cd' CT_AGENT_ORIGIN=127.0.0.1:9)
+outb="$(run_qs "$T/w8" tunnel --yes --no-demo-origin 2>&1)"; rc=$?
+check "a bootstrap token with a quote is refused" [ "$rc" -ne 0 ]
+check "it was not sent to the control plane" ! grep -q 'bootstrap/redeem' "$T/stub.log"
 
 # ---- 6. several machines: the pasted-block round trip -----------------------------------------------------------
 reset
