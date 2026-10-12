@@ -6346,6 +6346,97 @@ async fn admit_one_shot_with_retry_stops_at_once_on_a_revoked_grant() {
     assert!(!is_revoked_grant_refusal(&AdmissionRefused::boxed_with_category("x", Some("pairing"))));
 }
 
+/// The refusal as it really reaches the initiator: an edge that answers the join with
+/// `NO grant-revoked`, walked through the dial ladder (which wraps it in `ChannelDialError`), then
+/// through the one-shot retry. The initiator must give up at once, not re-ask every 3 s.
+#[tokio::test]
+async fn a_revoked_grant_refused_over_the_dial_path_is_final() {
+    use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+    use ct_edge::channel_broker::admit_channel_join_on_duplex;
+    use ct_edge::transport::build_tcp_tls_listener_at;
+    use ed25519_dalek::Signer;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
+
+    let op = SigningKey::from_bytes(&[8u8; 32]);
+    let op_pub = op.verifying_key().to_bytes();
+    let channel = [0x0Au8; 32];
+    let holder = SigningKey::from_bytes(&[0x13u8; 32]);
+    let g = ChannelGrant {
+        channel: ChannelId(channel),
+        holder: holder.verifying_key().to_bytes(),
+        direction: Direction::Initiate,
+        rights: Rights::ReadWrite,
+        delegable: false,
+        expires_at: 1_000,
+    };
+    let grant = SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() };
+    let request = ChannelJoinRequest { grant, endpoint: "203.0.113.8:7008".to_string() };
+
+    let (listener, acceptor, edge_cert) =
+        build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap()).await.expect("tls listener");
+    let fd_addr = listener.local_addr().expect("front-door addr");
+    let joins = Arc::new(AtomicU32::new(0));
+    let edge_joins = joins.clone();
+    let edge = tokio::spawn(async move {
+        loop {
+            let (tcp, peer) = listener.accept().await.expect("accept tcp");
+            edge_joins.fetch_add(1, Ordering::SeqCst);
+            let tls = acceptor.accept(tcp).await.expect("tls accept");
+            let (mut stream, ..) = admit_channel_join_on_duplex(
+                tls,
+                peer,
+                500u64,
+                std::time::Duration::from_secs(5),
+                &move |c: ChannelId, _h: [u8; 32]| {
+                    let ok = c.0 == channel;
+                    async move { ok.then_some((op_pub, None, None)) }
+                },
+            )
+            .await
+            .expect("the join is admitted up to the verdict");
+            // `NO | len | category`, as `encode_channel_refusal` frames it (the category is not in
+            // the vocabulary of the pinned dev-dependency edge, so it is framed by hand).
+            let mut frame = b"NO".to_vec();
+            frame.push(GRANT_REVOKED_CATEGORY.len() as u8);
+            frame.extend_from_slice(GRANT_REVOKED_CATEGORY.as_bytes());
+            stream.write_all(&frame).await.expect("refusal");
+            stream.shutdown().await.ok();
+        }
+    });
+    let rungs = vec![ChannelDialRung { endpoint: fd_addr, kind: ChannelDialKind::FrontDoor }];
+    let join = || {
+        present_channel_join_via_ladder(
+            &rungs,
+            &request,
+            &holder,
+            edge_cert.clone(),
+            std::time::Duration::from_millis(400),
+        )
+    };
+
+    // The shape that really arrives: not an AdmissionRefused itself, but one inside the dial error.
+    let err = join().await.expect_err("the revoked grant is refused");
+    assert!(err.downcast_ref::<AdmissionRefused>().is_none(), "arrives wrapped: {err:?}");
+    assert!(err.downcast_ref::<ChannelDialError>().is_some(), "arrives wrapped: {err:?}");
+    assert!(is_revoked_grant_refusal(&err), "recognized as final through the wrapper: {err}");
+    assert!(is_definitive_admission_refusal(&err));
+
+    // The one-shot initiator stops after that one refusal; a retry would wait out its 3 s interval.
+    let before = joins.load(Ordering::SeqCst);
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        admit_one_shot_with_retry(std::time::Duration::from_secs(30), &ChannelId(channel), join),
+    )
+    .await
+    .expect("returns at once instead of retrying every 3 s")
+    .expect_err("refused");
+    assert!(err.to_string().contains("[grant-revoked]"), "{err}");
+    assert_eq!(joins.load(Ordering::SeqCst) - before, 1, "exactly one join attempt");
+    edge.abort();
+}
+
 #[test]
 fn accept_race_flag_is_opt_in_22() {
     // ct-agent#22 (b) (frozen): the race is OPT-IN until the edge advertises abandoned-park
