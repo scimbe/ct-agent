@@ -61,6 +61,7 @@ use ct_common::channel::{Direction, SignedChannelGrant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::oneshot;
 
+use super::grant_watch::{watch_peer_grant, WatchPlan, WatchSetup};
 use super::ChannelRole;
 
 /// Switch for the peer-grant check (off by default; see the module doc for the rollout).
@@ -96,18 +97,32 @@ impl PeerGrantPolicy {
 
     /// [`from_env`](Self::from_env) over a variable lookup (the testable seam).
     pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, String> {
-        if !crate::envflag::flag_named(
-            REQUIRE_PEER_GRANT_ENV,
-            f(REQUIRE_PEER_GRANT_ENV).as_deref(),
-            false,
-        ) {
+        Self::from_lookup_for(f, false)
+    }
+
+    /// [`from_env`](Self::from_env) for a session that may be a TCP forward: a forward is
+    /// never admitted without the peer's grant, whatever [`REQUIRE_PEER_GRANT_ENV`] says,
+    /// because the grant is what lets the control plane end the session later.
+    pub fn from_env_for(forward: bool) -> Result<Option<Self>, String> {
+        Self::from_lookup_for(|k| std::env::var(k).ok(), forward)
+    }
+
+    /// The testable seam of the two above.
+    pub fn from_lookup_for(f: impl Fn(&str) -> Option<String>, forward: bool) -> Result<Option<Self>, String> {
+        if !forward
+            && !crate::envflag::flag_named(
+                REQUIRE_PEER_GRANT_ENV,
+                f(REQUIRE_PEER_GRANT_ENV).as_deref(),
+                false,
+            )
+        {
             return Ok(None);
         }
         let raw = f(OPERATOR_PUBKEY_ENV).unwrap_or_default();
         let operator = crate::codec::hex_decode::<32>(raw.trim()).ok_or_else(|| {
             format!(
-                "{REQUIRE_PEER_GRANT_ENV} is on but {OPERATOR_PUBKEY_ENV} is not a 64-hex operator public key \
-                 -- the peer's grant cannot be checked, refusing to join"
+                "the peer's grant must be checked ({REQUIRE_PEER_GRANT_ENV} is on, or this is a forward) but \
+                 {OPERATOR_PUBKEY_ENV} is not a 64-hex operator public key -- refusing to join"
             )
         })?;
         Ok(Some(Self { operator }))
@@ -123,6 +138,9 @@ pub struct PeerGrantCheck {
     pub own_grant: SignedChannelGrant,
     pub peer_holder: [u8; 32],
     pub role: ChannelRole,
+    /// Re-check the verified peer grant against the control plane while the session runs
+    /// (the accept side of a forward). `None`: only expiry and an explicit revoke end it.
+    pub watch: Option<WatchPlan>,
 }
 
 impl PeerGrantCheck {
@@ -233,6 +251,9 @@ struct GrantLifetime {
     /// The revocation channel; `None` once nobody can revoke any more (the handle was dropped
     /// without being used, or the session has ended).
     revoke: Option<oneshot::Receiver<String>>,
+    /// The control-plane re-check of the peer's grant (see `grant_watch`); `None` when this
+    /// session does not run one or it has ended. Its reason arrives already worded.
+    watch: Option<oneshot::Receiver<String>>,
     /// Set exactly once, the operator-facing reason the session ended.
     ended: Option<String>,
     /// ct-agent#267: the caller's record of that end, when the session runs inside
@@ -263,6 +284,15 @@ impl GrantLifetime {
         if expired {
             return self.end("the channel grant expired".to_string());
         }
+        let watched = match self.watch.as_mut() {
+            Some(rx) => std::future::Future::poll(Pin::new(rx), cx),
+            None => Poll::Pending,
+        };
+        match watched {
+            Poll::Ready(Ok(why)) => return self.end(why),
+            Poll::Ready(Err(_)) => self.watch = None,
+            Poll::Pending => {}
+        }
         let revoked = match self.revoke.as_mut() {
             Some(rx) => std::future::Future::poll(Pin::new(rx), cx),
             None => Poll::Pending,
@@ -288,6 +318,7 @@ impl GrantLifetime {
         );
         self.expiry = None;
         self.revoke = None;
+        self.watch = None;
         if let Some(record) = &self.record {
             record.set(&why);
         }
@@ -354,6 +385,7 @@ impl<P> PeerGrantGate<P> {
             life: GrantLifetime {
                 expiry,
                 revoke: Some(revoke),
+                watch: None,
                 ended: None,
                 record: GRANT_END_RECORD.try_with(GrantEndRecord::clone).ok(),
             },
@@ -473,6 +505,15 @@ impl<P: AsyncWrite + Unpin> AsyncWrite for PeerGrantGate<P> {
                                 .expires_at
                                 .min(peer.grant.expires_at);
                             this.life.expiry = Some(GrantLifetime::timer(ends_at));
+                            if let Some(plan) = &g.check.watch {
+                                let (tx, rx) = oneshot::channel();
+                                this.life.watch = Some(rx);
+                                let setup = WatchSetup {
+                                    source: (plan.factory)(&peer),
+                                    config: plan.config,
+                                };
+                                tokio::spawn(watch_peer_grant(setup, tx));
+                            }
                             if let Some(w) = g.reader.take() {
                                 w.wake();
                             }
@@ -580,6 +621,7 @@ mod tests {
                 ),
                 peer_holder: peer,
                 role,
+                watch: None,
             }
         }
     }
@@ -939,5 +981,84 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// A scripted control plane for the re-check: the listed states, then `Valid` forever.
+    struct Seq(Mutex<std::collections::VecDeque<crate::channel_run::grant_watch::GrantState>>);
+    impl crate::channel_run::grant_watch::GrantStatusSource for Seq {
+        fn status(&self) -> crate::channel_run::grant_watch::StatusFuture<'_> {
+            let next = self.0.lock().unwrap().pop_front();
+            Box::pin(async move { Ok(next.unwrap_or(crate::channel_run::grant_watch::GrantState::Valid)) })
+        }
+    }
+
+    fn watched_accept_gate(
+        f: &Fixture,
+        states: Vec<crate::channel_run::grant_watch::GrantState>,
+    ) -> (tokio::io::DuplexStream, PeerGrantGate<tokio::io::DuplexStream>) {
+        let mut check = f.check(ChannelRole::Accept);
+        let src: Arc<dyn crate::channel_run::grant_watch::GrantStatusSource> = Arc::new(Seq(Mutex::new(states.into())));
+        check.watch = Some(WatchPlan {
+            factory: Arc::new(move |_peer| src.clone()),
+            config: crate::channel_run::grant_watch::WatchConfig {
+                interval: Duration::from_secs(30),
+                grace: Duration::from_secs(90),
+            },
+        });
+        let (app, local) = tokio::io::duplex(4096);
+        (app, PeerGrantGate::new(local, Some(check)))
+    }
+
+    async fn present_initiator_grant(f: &Fixture, gate: &mut PeerGrantGate<tokio::io::DuplexStream>) {
+        let mut prelude = vec![0u8; PRELUDE_LEN];
+        gate.read_exact(&mut prelude).await.unwrap();
+        let peer = grant(&f.operator, CHANNEL, f.initiator, Direction::Initiate, crate::codec::now_unix() + 3600);
+        gate.write_all(&prelude_of(&peer)).await.unwrap();
+    }
+
+    /// K1: the accept side asks the control plane about the verified peer grant, and a
+    /// `revoked` answer ends the session within one interval and closes the local side -- with
+    /// no help from the edge, the peer or the clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_revoked_peer_grant_found_by_the_recheck_ends_the_session() {
+        use crate::channel_run::grant_watch::GrantState::*;
+        let f = Fixture::new();
+        let (mut app, mut gate) = watched_accept_gate(&f, vec![Valid, Revoked]);
+        present_initiator_grant(&f, &mut gate).await;
+
+        let mut more = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(120), gate.read(&mut more))
+            .await
+            .expect("the revoked answer at the second tick ends the session")
+            .expect("as an EOF");
+        assert_eq!(n, 0);
+        let mut rest = Vec::new();
+        app.read_to_end(&mut rest).await.unwrap();
+        assert!(gate.write_all(b"late").await.is_err(), "nothing reaches the local side afterwards");
+    }
+
+    /// And the other direction: valid answers never end a session that is otherwise healthy.
+    #[tokio::test(start_paused = true)]
+    async fn valid_answers_leave_the_session_running() {
+        let f = Fixture::new();
+        let (_app, mut gate) = watched_accept_gate(&f, vec![]);
+        present_initiator_grant(&f, &mut gate).await;
+        let mut more = [0u8; 1];
+        let r = tokio::time::timeout(Duration::from_secs(600), gate.read(&mut more)).await;
+        assert!(r.is_err(), "still open after twenty re-checks: {r:?}");
+    }
+
+    /// A forward never runs without the peer's grant, whatever the opt-in says; without an
+    /// operator key it refuses to join rather than silently skipping the check.
+    #[test]
+    fn a_forward_forces_the_peer_grant_check() {
+        let none = |_: &str| None;
+        assert_eq!(PeerGrantPolicy::from_lookup_for(none, false).unwrap(), None);
+        assert!(PeerGrantPolicy::from_lookup_for(none, true).unwrap_err().contains(OPERATOR_PUBKEY_ENV));
+        let keyed = |k: &str| (k == OPERATOR_PUBKEY_ENV).then(|| "07".repeat(32));
+        assert_eq!(
+            PeerGrantPolicy::from_lookup_for(keyed, true).unwrap(),
+            Some(PeerGrantPolicy { operator: [7; 32] })
+        );
     }
 }

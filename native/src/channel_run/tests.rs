@@ -7370,12 +7370,14 @@ fn spawn_gated_forward_pair(target: String, expires_at: u64) -> GatedForwardPair
         own_grant: sign(a_holder, ct_common::channel::Direction::Initiate),
         peer_holder: b_holder,
         role: ChannelRole::Initiate,
+        watch: None,
     };
     let b_check = PeerGrantCheck {
         policy,
         own_grant: sign(b_holder, ct_common::channel::Direction::Accept),
         peer_holder: a_holder,
         role: ChannelRole::Accept,
+        watch: None,
     };
 
     let a = generate_static_keypair();
@@ -7604,12 +7606,14 @@ fn forward_grant_checks(expires_at: u64) -> (PeerGrantCheck, PeerGrantCheck) {
             own_grant: sign(a_holder, ct_common::channel::Direction::Initiate),
             peer_holder: b_holder,
             role: ChannelRole::Initiate,
+            watch: None,
         },
         PeerGrantCheck {
             policy,
             own_grant: sign(b_holder, ct_common::channel::Direction::Accept),
             peer_holder: a_holder,
             role: ChannelRole::Accept,
+            watch: None,
         },
     )
 }

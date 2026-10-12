@@ -169,7 +169,7 @@ where
     };
     // The attestation binds the Noise key to `peer_holder` only; the peer's operator-signed grant
     // binds `peer_holder` to this channel (checked inside the session when enabled).
-    let local = gate_local(local, request, role, peer_holder)?;
+    let local = gate_local(local, request, role, peer_holder, holder)?;
     // #104: built once, moved into whichever single relay-fallback call site below
     // actually fires (they're mutually exclusive). `None` whenever direct_upgrade is off
     // (the default) or the edge reported no reflexive address for this admission.
@@ -344,19 +344,42 @@ where
 /// `local` behind the peer-grant check when [`REQUIRE_PEER_GRANT_ENV`] is on (see `peer_grant`),
 /// a pass-through otherwise. `peer_holder` is the holder admission attested the pinned Noise key
 /// with. Fails when the check is on but cannot run (no operator key configured).
+///
+/// A TCP forward session (`CT_CHANNEL_FORWARD` / `CT_CHANNEL_FORWARD_ALLOW`) always runs the check,
+/// and its accept side also re-checks the peer's grant against the control plane every
+/// `CT_CHANNEL_GRANT_RECHECK_SECS`, because only that can end a forward after the grant was
+/// revoked once the edge is out of the data path. It needs `CT_AGENT_CP_URL` for that and refuses
+/// to join without it.
 pub(crate) fn gate_local<P>(
     local: P,
     request: &ChannelJoinRequest,
     role: ChannelRole,
     peer_holder: [u8; 32],
+    holder: &SigningKey,
 ) -> Result<PeerGrantGate<P>, BoxError> {
-    let check = PeerGrantPolicy::from_env()?.map(|policy| PeerGrantCheck {
+    let forward = forward_session_configured();
+    let watch = if forward && role == ChannelRole::Accept {
+        let cp_url = std::env::var("CT_AGENT_CP_URL").ok().filter(|s| !s.trim().is_empty()).ok_or(
+            "a forward session needs CT_AGENT_CP_URL to re-check the peer's grant while it runs -- refusing to join",
+        )?;
+        let config = grant_watch::WatchConfig::from_env()?;
+        Some(grant_watch::WatchPlan::control_plane(&cp_url, holder, &request.grant, config))
+    } else {
+        None
+    };
+    let check = PeerGrantPolicy::from_env_for(forward)?.map(|policy| PeerGrantCheck {
         policy,
         own_grant: request.grant.clone(),
         peer_holder,
         role,
+        watch,
     });
     Ok(PeerGrantGate::new(local, check))
+}
+
+/// Whether this process runs a TCP forward session, on either side.
+fn forward_session_configured() -> bool {
+    std::env::var(forward_stream::FORWARD_ENV).is_ok() || forward::forward_allow_configured()
 }
 
 /// The peer's attested Noise key and the holder that attested it.
@@ -414,7 +437,7 @@ where
             return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
         }
     };
-    let local = gate_local(local, request, role, peer_holder)?;
+    let local = gate_local(local, request, role, peer_holder, holder)?;
     // The DCUtR session runs the Noise_IK over the relay bi-stream as its base leg, punching to
     // direct in the background. Initiator opens the bi-stream; acceptor accepts the edge-opened one.
     let (relay_send, relay_recv) = open_relay_channel_streams(relay_conn, role).await?;
@@ -853,6 +876,9 @@ pub use session::*;
 // Security audit: the peer's grant, checked end to end after the Noise handshake (opt-in).
 mod peer_grant;
 pub use peer_grant::*;
+
+// Control-plane re-check of the peer's grant while a forward session runs.
+pub(crate) mod grant_watch;
 
 mod errors;
 pub(crate) use errors::*;
