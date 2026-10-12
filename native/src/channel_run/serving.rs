@@ -26,7 +26,6 @@ pub(crate) struct ServeSessionCtx {
     pub(crate) relay_addr: SocketAddr,
     pub(crate) broker_ladder: Vec<ChannelDialRung>,
     pub(crate) relay_ladder: Vec<ChannelDialRung>,
-    // trace: REQ-0006, AUF-20261006-069 (DEC-0061)
     /// The raw `CT_CHANNEL_BROKER` / `CT_CHANNEL_RELAY` / `CT_CHANNEL_FRONT_DOOR` values the
     /// ladders above were resolved from: the key under which [`ladder_known`] looks up the
     /// address the background refresher learned last.
@@ -47,7 +46,6 @@ pub(crate) struct ServeSessionCtx {
 }
 
 impl ServeSessionCtx {
-    // trace: REQ-0006, AUF-20261006-069 (DEC-0061)
     /// Build the context of a persistent serve member from its config -- the ONE place that
     /// copies the raw join names next to the ladders and starts the background refresher.
     /// Must be called inside the runtime (the refresher is a spawned task, aborted with the
@@ -111,7 +109,7 @@ impl ServeSessionCtx {
 pub(crate) async fn admit_one_peer(ctx: &ServeSessionCtx) -> Result<ChannelJoinOutcome, BoxError> {
     let outcome = match &ctx.front_door_cert {
         Some(edge_cert) => {
-            // AUF-20261006-069: the rungs carry the address the background refresher learned
+            // The rungs carry the address the background refresher learned
             // last -- a lookup, never a wait for DNS. A failed join asks for a refresh.
             let rungs = ctx.known(&ctx.broker_ladder, &ctx.broker_raw);
             let joined = present_channel_join_via_ladder(
@@ -173,7 +171,7 @@ pub(crate) async fn serve_admitted_session(
     ctx: std::sync::Arc<ServeSessionCtx>,
     admission: ChannelJoinOutcome,
 ) -> Result<(), BoxError> {
-    // AUF-20261006-069: as in `admit_one_peer` -- a lookup, never a wait for DNS.
+    // As in `admit_one_peer` -- a lookup, never a wait for DNS.
     let relay_rungs = match &ctx.front_door_cert {
         Some(_) => ctx.known(&ctx.relay_ladder, &ctx.relay_raw),
         None => Vec::new(),
@@ -515,14 +513,13 @@ pub(crate) async fn run_one_admission_session(
     run_one_admission_session_with_local(cfg, request, broker_ladder, relay_ladder, front_door_cert, local).await
 }
 
-/// ct-agent#267 (AUF-20261004-022): the plane-brokered one-shot path with `CT_CHANNEL_FORWARD`
+/// ct-agent#267: the plane-brokered one-shot path with `CT_CHANNEL_FORWARD`
 /// set. Binds the forward listener ONCE and keeps re-admitting sessions over it with backoff
 /// ([`super::forward_stream::run_forward_initiate_reconnect_loop`]) instead of running exactly
 /// one session: a peer restart or a relay/network drop no longer ends the forward, only a grant
 /// that expired or was revoked does. A bad spec or a listener that cannot bind still fails loudly
 /// before any admission, as `channel_local`'s forward branch does.
 //
-// trace: AUF-20261004-022 (ct-agent#267)
 pub(crate) async fn run_forward_initiate_sessions(
     raw_spec: &str,
     cfg: &ChannelJoinCliConfig,
