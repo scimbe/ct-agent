@@ -1,4 +1,3 @@
-<!-- trace: AUF-20260929-020 -->
 # `ct-agent channel` — reference
 
 The Agent-Fabric channel subsystem: end-to-end encrypted (Noise_IK) sessions between two
@@ -333,24 +332,39 @@ concerns the direct-connect path `serve_direct`, not the forward.)
   revocation list. Name the grant with `CT_REVOKE_GRANT=<its hex>`, or give the `CT_GRANT_*` fields
   it was issued with (signing is deterministic, so they reproduce it). Needs `CT_AGENT_CP_URL` and
   `CT_CHANNEL_OPERATOR_KEY`; the request is signed with the operator key, no login required.
-  Revoking twice is not an error.
+  A grant that this operator key did not sign is refused before anything is sent. On success the
+  command prints the grant's digest, channel, holder and expiry. Revoking twice is not an error.
 - `bridge/channel-revoke` (bridge peer only): the same for this agent's own channel, authorized by
   the owner session. Argument `{"grant": "<hex>"}`.
 - The edge refuses a revoked grant at admission and cuts live relays carrying it at its next
   sweep (30 s). A forward session also **re-checks the peer's grant against the control plane**
   on its accept side, so it ends even when no edge is in the data path (direct, upgraded,
   hole-punched). Withdrawing a member ends their sessions the same way.
-- The re-check needs the end-to-end peer-grant exchange (a forward behaves as if
-  `CT_CHANNEL_REQUIRE_PEER_GRANT=1` and needs `CT_CHANNEL_OPERATOR_PUBKEY`) and the control plane's
-  address, `CT_AGENT_CP_URL`, on the accepting member. **The agent does not derive the address from
-  anything else, so a forward without `CT_AGENT_CP_URL` still starts as before**, with one warning
-  line: `revocation re-check disabled: no control-plane URL`. A revoked grant then does not end the
+- **Upgrade note.** A forward now enforces the peer-grant check on **both** sides: each member
+  presents its grant and verifies the other's. Update both members before relying on a forward
+  between them; an updated member refuses a peer that does not present a grant. Every forward
+  member therefore **needs `CT_CHANNEL_OPERATOR_PUBKEY`** (64 hex): without it the member refuses
+  to join, whatever `CT_CHANNEL_REQUIRE_PEER_GRANT` says.
+- The re-check runs on the accepting member and needs the control plane's address,
+  `CT_AGENT_CP_URL`, which must be `https` (plain `http` is accepted only to a loopback host). The
+  agent does not derive the address from anything else. **With `CT_CHANNEL_OPERATOR_PUBKEY` set, a
+  forward without `CT_AGENT_CP_URL` still starts**, with one warning line:
+  `revocation re-check disabled: no control-plane URL`. A revoked grant then does not end the
   session (the edge still cuts a relayed leg). Set `CT_CHANNEL_REVOCATION=require` to make the
-  missing address an error at process start instead (before any connection is made, exit code 1); a value other than `require`/`warn` is also refused at start. Unset or `warn` is the default.
-- **Old control plane.** A control plane without the re-check endpoint answers a bare `404`
-  (empty or non-JSON body) over the verified TLS connection. That means "revocation not supported
-  by this control plane": the session keeps running, with one warning line per session, and the
-  agent keeps polling in case the control plane is upgraded. Every other failure -- timeout, `5xx`,
+  missing address an error instead, and to treat a control plane without the re-check endpoint as
+  unreadable (below). In the `ct-agent channel` entry with the accept role, a missing address under
+  `require`, a non-`https` address, a value of `CT_CHANNEL_REVOCATION` other than `require`/`warn`
+  and a malformed `CT_CHANNEL_GRANT_RECHECK_*` value are all refused at process start, before any
+  connection is made (exit code 1); other entry points report the same errors when the session is
+  built. Unset or `warn` is the default.
+- The first status question is asked as soon as the session is admitted, then every interval. If
+  the re-check task itself dies, the session ends rather than running unwatched.
+- **Old control plane.** A control plane without the re-check endpoint answers a `404` that does
+  not carry `{"state":"unknown-channel"}` (any other body, including an empty or non-JSON one)
+  over the verified TLS connection. That means "revocation not supported by this control plane":
+  the session keeps running, with one warning line per session, and the agent keeps polling in
+  case the control plane is upgraded. **Under `CT_CHANNEL_REVOCATION=require` this answer is
+  treated as unreadable**, so the session ends once the grace has passed. Every other failure -- timeout, `5xx`,
   `405`, TLS error, an unreadable answer -- is fail-closed: the session ends when the grace has
   passed since the last valid answer (or the last "not supported" one). A `404` whose JSON body is `{"state":"unknown-channel"}` means the channel is gone and
   ends the session at once. A `403` ends it at once only when its JSON body says what the control
@@ -384,8 +398,6 @@ moment later, between the check and the dial.
 
 ### Flow control on a forward session -- control messages and the session window
 
-<!-- trace: AUF-20261007-005, AUF-20261007-012 -->
-
 Control messages travel as `Data` on the reserved stream id `0`; real streams start at `1`. An
 agent that does not know a message ignores `Data` for an unknown id, so mixed versions keep
 working. All integers are big-endian.
@@ -400,7 +412,7 @@ working. All integers are big-endian.
 
 **Why a second window.** Credit per stream bounds what one stream may queue, not what all streams
 together put ahead of a new one. With 16 uploads over a 62 500 B/s path, 3.8 MiB waited ahead of
-a new stream's `Open` and its first bytes arrived after 64 s (measured, AUF-20261006-078/-081).
+a new stream's `Open` and its first bytes arrived after 64 s (measured).
 The session window bounds that queue for the whole session.
 
 **Rules.**
@@ -436,7 +448,6 @@ The session window bounds that queue for the whole session.
 5. *What it does not do.* The window bounds bytes on their way to the peer's engine. It does not
    bound what the peer's engine holds per stream (credit per stream: 256 KiB each) and it does
    not shape bandwidth between streams.
-<!-- trace: AUF-20261007-005, AUF-20261007-012 (slice ii: rules 6 to 8) -->
 
 6. *Both directions.* Each member is sender under the window the peer announced and receiver
    under its own; the two windows are independent. The accept side takes the peer's window only
