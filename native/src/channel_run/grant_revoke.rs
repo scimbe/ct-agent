@@ -12,7 +12,7 @@
 //! - the channel's owner session (bridge tool; the OIDC bearer the portal already uses).
 
 use ct_common::channel::SignedChannelGrant;
-use ed25519_dalek::{Signer as _, SigningKey};
+use ed25519_dalek::{Signer as _, SigningKey, Verifier as _};
 
 use super::grant_watch::grant_digest;
 use crate::codec::{hex_decode, hex_encode};
@@ -22,8 +22,17 @@ use crate::codec::{hex_decode, hex_encode};
 /// `channel grant`; signing is deterministic, so the same fields give the same grant.
 pub const REVOKE_GRANT_ENV: &str = "CT_REVOKE_GRANT";
 
-/// Wire size of a signed grant (signature 64 + channel 32 + holder 32 + 3 flags + expiry 8).
-const GRANT_LEN: usize = 139;
+/// The most of a control-plane error body that is shown to the operator.
+const BODY_SNIPPET_CHARS: usize = 200;
+
+fn snippet(body: &str) -> String {
+    let body = body.trim();
+    let mut out: String = body.chars().take(BODY_SNIPPET_CHARS).collect();
+    if body.chars().count() > BODY_SNIPPET_CHARS {
+        out.push_str("...");
+    }
+    out
+}
 
 /// Mirror of `ct_common::channel::grant_revoke_signing_bytes` (not in the pinned tag yet; the
 /// control plane pins the same bytes).
@@ -39,8 +48,12 @@ pub fn revoke_signing_bytes(channel: &[u8; 32], digest: &[u8; 32], expires_at: u
 
 /// Decode a grant given as hex.
 pub fn decode_grant_hex(s: &str) -> Result<SignedChannelGrant, String> {
-    let bytes = hex_decode::<GRANT_LEN>(s.trim())
-        .ok_or("the grant must be the hex `ct-agent channel grant` printed (278 hex characters)")?;
+    let bytes = hex_decode::<{ SignedChannelGrant::WIRE_LEN }>(s.trim()).ok_or_else(|| {
+        format!(
+            "the grant must be the hex `ct-agent channel grant` printed ({} hex characters)",
+            SignedChannelGrant::WIRE_LEN * 2
+        )
+    })?;
     SignedChannelGrant::decode(&bytes).map_err(|e| format!("the grant is malformed: {e}"))
 }
 
@@ -109,7 +122,28 @@ impl GrantRevokeRequest {
                 decode_grant_hex(&issued.issue())?
             }
         };
+        // The control plane would refuse a grant this operator did not sign; say so before sending.
+        operator
+            .verifying_key()
+            .verify(&grant.grant.signing_bytes(), &ed25519_dalek::Signature::from_bytes(&grant.signature))
+            .map_err(|_| {
+                "that grant was not signed by the operator key in CT_CHANNEL_OPERATOR_KEY; nothing was sent"
+                    .to_string()
+            })?;
         Ok(Self { cp_url, operator, grant })
+    }
+
+    /// What the operator sees after a successful revoke: which grant it was.
+    pub fn describe(&self, out: &RevokeOutcome) -> String {
+        let g = &self.grant.grant;
+        format!(
+            "{} grant {} (channel {}, holder {}, expires {})",
+            if out.already { "already revoked:" } else { "revoked:" },
+            hex_encode(&self.target().digest),
+            hex_encode(&g.channel.0),
+            hex_encode(&g.holder),
+            g.expires_at
+        )
     }
 
     pub fn target(&self) -> RevokeTarget {
@@ -147,14 +181,17 @@ pub fn interpret(status: u16, body: &str) -> Result<RevokeOutcome, String> {
     match status {
         200 => {
             let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("unreadable answer: {e}"))?;
+            if v.get("revoked").and_then(|r| r.as_bool()) != Some(true) {
+                return Err(format!("the control plane answered 200 without confirming the revocation: {}", snippet(body)));
+            }
             Ok(RevokeOutcome { already: v.get("already").and_then(|a| a.as_bool()).unwrap_or(false) })
         }
-        400 => Err(format!("the control plane rejected the request as malformed: {}", body.trim())),
+        400 => Err(format!("the control plane rejected the request as malformed: {}", snippet(body))),
         403 => Err("not authorized: the operator signature does not match the key this channel was registered with \
                     (or you are not the channel's owner)"
             .to_string()),
         404 | 405 => Err("the control plane does not know this channel, or is too old to keep a grant revocation list".to_string()),
-        s => Err(format!("the control plane answered {s}: {}", body.trim())),
+        s => Err(format!("the control plane answered {s}: {}", snippet(body))),
     }
 }
 
@@ -252,5 +289,71 @@ mod tests {
         assert!(interpret(403, "").unwrap_err().contains("not authorized"));
         assert!(interpret(404, "").unwrap_err().contains("too old"));
         assert!(interpret(500, "boom").unwrap_err().contains("500"));
+    }
+
+    #[test]
+    fn a_200_that_does_not_say_revoked_is_not_a_success() {
+        for body in ["{}", r#"{"already":true}"#, r#"{"revoked":false}"#, r#"{"revoked":"yes"}"#, "ok"] {
+            assert!(interpret(200, body).is_err(), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_error_body_is_cut() {
+        let err = interpret(500, &"x".repeat(5000)).unwrap_err();
+        assert!(err.len() < 400, "{} bytes", err.len());
+        assert!(err.ends_with("..."));
+    }
+
+    #[test]
+    fn the_grant_length_is_the_one_the_wire_format_defines() {
+        let g = SignedChannelGrant {
+            grant: ChannelGrant {
+                channel: ChannelId([1; 32]),
+                holder: [2; 32],
+                direction: Direction::Both,
+                rights: Rights::Read,
+                delegable: false,
+                expires_at: 1,
+            },
+            signature: [3; 64],
+        };
+        assert_eq!(g.encode().len(), SignedChannelGrant::WIRE_LEN);
+        assert!(decode_grant_hex(&hex_encode(&g.encode())).is_ok());
+        assert!(decode_grant_hex(&hex_encode(&g.encode()[1..])).is_err(), "one byte short");
+    }
+
+    #[test]
+    fn a_grant_the_operator_did_not_sign_is_refused_before_sending() {
+        let holder = SigningKey::from_bytes(&[0x02; 32]).verifying_key().to_bytes();
+        let issue_with = |operator_key: u8| {
+            let env = [
+                ("CT_AGENT_CP_URL", "https://cp.example".to_string()),
+                ("CT_CHANNEL_OPERATOR_KEY", hex_encode(&[operator_key; 32])),
+                ("CT_GRANT_CHANNEL", hex_encode(&[0x5c; 32])),
+                ("CT_GRANT_MEMBER_HOLDER", hex_encode(&holder)),
+                ("CT_GRANT_DIRECTION", "initiate".to_string()),
+                ("CT_GRANT_EXPIRES", "4000000000".to_string()),
+            ];
+            hex_encode(&GrantRevokeRequest::from_lookup(lookup(&env)).unwrap().grant.encode())
+        };
+        let foreign = issue_with(0x09);
+        let env = [
+            ("CT_AGENT_CP_URL", "https://cp.example".to_string()),
+            ("CT_CHANNEL_OPERATOR_KEY", hex_encode(&[0x01; 32])),
+            (REVOKE_GRANT_ENV, foreign),
+        ];
+        let err = GrantRevokeRequest::from_lookup(lookup(&env)).err().unwrap();
+        assert!(err.contains("not signed by the operator key"), "{err}");
+        // and the operator's own grant says which one it was
+        let own = [
+            ("CT_AGENT_CP_URL", "https://cp.example".to_string()),
+            ("CT_CHANNEL_OPERATOR_KEY", hex_encode(&[0x01; 32])),
+            (REVOKE_GRANT_ENV, issue_with(0x01)),
+        ];
+        let req = GrantRevokeRequest::from_lookup(lookup(&own)).unwrap();
+        let line = req.describe(&RevokeOutcome { already: false });
+        assert!(line.starts_with("revoked: grant "), "{line}");
+        assert!(line.contains(&hex_encode(&[0x5c; 32])) && line.contains(&hex_encode(&holder)) && line.contains("expires 4000000000"), "{line}");
     }
 }

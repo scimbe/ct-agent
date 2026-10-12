@@ -5,12 +5,16 @@
 //! the edge is no longer in the data path either, so the member itself has to ask. The accept
 //! side of a forward session therefore asks the control plane every `interval` whether the
 //! peer's grant (identified by the SHA-256 of its signed bytes) is still good, and ends the
-//! session when the answer is `revoked` or `not-member`.
+//! session when the answer is `revoked` or `not-member`. The first question is asked at once,
+//! when the watch starts, so a peer whose grant was revoked before the join does not run for a
+//! whole interval.
 //!
 //! Fail-closed: an answer that cannot be read (timeout, 5xx, 405, TLS error, garbage) does not end
 //! the session at once, but if no `valid` answer has arrived for `grace` the session ends. A bare
 //! 404 means the control plane does not have the endpoint (an old one): the session keeps running
-//! with one warning and the polling goes on. A definite `revoked`/`not-member` ends it at once.
+//! with one warning and the polling goes on, unless `CT_CHANNEL_REVOCATION=require` is set: then
+//! such an answer is as good as unreadable (a misrouted 404 or a rolled-back control plane must not
+//! keep a revoked session open for ever). A definite `revoked`/`not-member` ends it at once.
 //!
 //! The digest and the signed bytes are computed here, not taken from `ct-common`: this crate
 //! pins `ct-common` by release tag, and the helpers do not exist in a tag yet. The golden
@@ -43,6 +47,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct WatchConfig {
     pub interval: Duration,
     pub grace: Duration,
+    /// `CT_CHANNEL_REVOCATION=require`: a control plane without the endpoint counts as unreadable.
+    pub require: bool,
 }
 
 impl WatchConfig {
@@ -67,7 +73,14 @@ impl WatchConfig {
         Ok(Self {
             interval: Duration::from_secs(interval),
             grace: Duration::from_secs(grace),
+            require: false,
         })
+    }
+
+    /// The same timing with the strict mode switched on or off.
+    pub fn requiring(mut self, require: bool) -> Self {
+        self.require = require;
+        self
     }
 }
 
@@ -248,14 +261,24 @@ impl GrantStatusSource for CpStatusSource {
 pub async fn watch_peer_grant(setup: WatchSetup, mut end: oneshot::Sender<String>) {
     let mut last_valid = tokio::time::Instant::now();
     let mut warned = false;
+    let mut first = true;
     loop {
-        tokio::select! {
-            _ = tokio::time::sleep(setup.config.interval) => {}
-            _ = end.closed() => return,
+        // The first question is asked at once; only the later ones wait out the interval.
+        if !std::mem::take(&mut first) {
+            tokio::select! {
+                _ = tokio::time::sleep(setup.config.interval) => {}
+                _ = end.closed() => return,
+            }
         }
         let verdict = tokio::select! {
             v = setup.source.status() => v,
             _ = end.closed() => return,
+        };
+        let verdict = match verdict {
+            Err(StatusError::Unsupported) if setup.config.require => {
+                Err(StatusError::Unreadable("the control plane has no /channel/grant-status".to_string()))
+            }
+            v => v,
         };
         let reason = match verdict {
             Ok(GrantState::Valid) => {
@@ -307,8 +330,8 @@ mod tests {
 
     #[test]
     fn digest_and_status_bytes_match_the_control_plane_vectors() {
-        // Same vector the control plane pins (CADS-Tunnel ct-common
-        // grant_digest_and_revoke_bytes_are_pinned_for_cross_repo_use).
+        // Same vector the control plane pins (the control plane's
+        // ct-common test grant_digest_and_revoke_bytes_are_pinned_for_cross_repo_use).
         let signed = SignedChannelGrant {
             grant: ChannelGrant {
                 channel: ChannelId([0x11; 32]),
@@ -361,7 +384,7 @@ mod tests {
     }
 
     fn setup(src: Arc<Script>) -> WatchSetup {
-        WatchSetup::new(src, WatchConfig { interval: Duration::from_secs(30), grace: Duration::from_secs(90) })
+        WatchSetup::new(src, WatchConfig { interval: Duration::from_secs(30), grace: Duration::from_secs(90), require: false })
     }
 
     async fn run(src: Arc<Script>) -> (Option<String>, Duration) {
@@ -382,7 +405,7 @@ mod tests {
         ]))
         .await;
         assert!(why.unwrap().contains("revoked"));
-        assert_eq!(after, Duration::from_secs(90), "third tick, not before");
+        assert_eq!(after, Duration::from_secs(60), "third check (the first is at once), not before");
     }
 
     #[tokio::test(start_paused = true)]
@@ -393,11 +416,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_unreadable_state_is_tolerated_for_the_grace_and_then_fails_closed() {
-        // Valid at 30 s, then the control plane goes away: the session survives until 90 s
-        // after the last valid answer (120 s), and not a tick longer.
+        // Valid at 0 s, then the control plane goes away: the session survives until 90 s
+        // after the last valid answer, and not a tick longer.
         let (why, after) = run(Script::new(vec![Ok(GrantState::Valid)])).await;
         assert!(why.unwrap().contains("failing closed"));
-        assert_eq!(after, Duration::from_secs(120));
+        assert_eq!(after, Duration::from_secs(90));
     }
 
     #[tokio::test(start_paused = true)]
@@ -405,11 +428,11 @@ mod tests {
         let (why, after) = run(Script::new(vec![
             Err(StatusError::Unreadable("blip".into())),
             Err(StatusError::Unreadable("blip".into())),
-            Ok(GrantState::Valid), // at 90 s
+            Ok(GrantState::Valid), // at 60 s
         ]))
         .await;
         assert!(why.unwrap().contains("failing closed"));
-        assert_eq!(after, Duration::from_secs(180), "the clock restarted at the valid answer");
+        assert_eq!(after, Duration::from_secs(150), "the clock restarted at the valid answer");
     }
 
     #[tokio::test(start_paused = true)]
@@ -428,7 +451,7 @@ mod tests {
         tokio::spawn(watch_peer_grant(s, tx));
         let why = rx.await.unwrap();
         assert!(why.contains("revoked"), "an upgraded control plane takes effect on a running session: {why}");
-        assert_eq!(started.elapsed(), Duration::from_secs(120), "three unsupported ticks did not end it");
+        assert_eq!(started.elapsed(), Duration::from_secs(90), "three unsupported checks did not end it");
         let got = notices.lock().unwrap();
         assert_eq!(got.len(), 1, "one warning per session, not one per tick: {got:?}");
         assert!(got[0].contains("WARNING") && got[0].contains("grant-status"));
@@ -443,7 +466,89 @@ mod tests {
         v.push(Err(StatusError::Unreadable("down".into())));
         let (why, after) = run(Script::new(v)).await;
         assert!(why.unwrap().contains("failing closed"));
-        assert_eq!(after, Duration::from_secs(30 * 100 + 30 * 3), "ends one grace after the last answer");
+        assert_eq!(after, Duration::from_secs(30 * 99 + 30 * 3), "ends one grace after the last answer");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn under_require_a_control_plane_without_the_endpoint_fails_closed_after_the_grace() {
+        let mut s = setup(Script::new((0..10).map(|_| Err(StatusError::Unsupported)).collect()));
+        s.config.require = true;
+        let (tx, rx) = oneshot::channel();
+        let started = tokio::time::Instant::now();
+        tokio::spawn(watch_peer_grant(s, tx));
+        let why = rx.await.unwrap();
+        assert!(why.contains("failing closed") && why.contains("grant-status"), "{why}");
+        assert_eq!(started.elapsed(), Duration::from_secs(90), "one grace after the watch started");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_question_is_asked_at_once() {
+        let (why, after) = run(Script::new(vec![Ok(GrantState::Revoked)])).await;
+        assert!(why.unwrap().contains("revoked"));
+        assert_eq!(after, Duration::ZERO, "a grant revoked before the join does not run for an interval");
+    }
+
+    /// `ask` against a loopback server: the path, the JSON fields and a signature that verifies
+    /// over the signed bytes on the wire.
+    #[tokio::test]
+    async fn the_control_plane_request_has_the_path_the_fields_and_a_valid_signature() {
+        use ed25519_dalek::Verifier as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (got_tx, got_rx) = oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = l.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some((head, body)) = text.split_once("
+
+") {
+                    let want = head
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                        .unwrap_or(0);
+                    if body.len() >= want {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let body = r#"{"state":"valid","checked_at":1}"#;
+            let resp = format!("HTTP/1.1 200 OK
+content-type: application/json
+content-length: {}
+
+{body}", body.len());
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            let _ = got_tx.send(String::from_utf8_lossy(&raw).to_string());
+        });
+        let holder = SigningKey::from_bytes(&[0x31; 32]);
+        let (channel, peer, digest) = ([0x11u8; 32], [0x22u8; 32], [0x33u8; 32]);
+        let src = CpStatusSource::new(&format!("http://{addr}/"), holder.clone(), channel, peer, digest);
+        assert_eq!(src.status().await, Ok(GrantState::Valid));
+        let raw = got_rx.await.unwrap();
+        assert!(raw.starts_with("POST /channel/grant-status HTTP/1.1"), "{raw}");
+        let body: serde_json::Value = serde_json::from_str(raw.split_once("
+
+").unwrap().1).unwrap();
+        let hex = |b: &[u8]| crate::codec::hex_encode(b);
+        assert_eq!(body["channel"], hex(&channel));
+        assert_eq!(body["asker"], hex(&holder.verifying_key().to_bytes()));
+        assert_eq!(body["peer"], hex(&peer));
+        assert_eq!(body["grant_digest"], hex(&digest));
+        let ts = body["ts"].as_u64().unwrap();
+        let sig = ed25519_dalek::Signature::from_bytes(&crate::codec::hex_decode::<64>(body["sig"].as_str().unwrap()).unwrap());
+        holder
+            .verifying_key()
+            .verify(&status_signing_bytes(&channel, &peer, &digest, ts), &sig)
+            .expect("the signature on the wire covers the signed bytes");
     }
 
     #[test]

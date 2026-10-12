@@ -757,11 +757,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .send()
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("ct-agent channel grant-revoke: {e}").into() })?;
-            println!(
-                "{} grant {}",
-                if out.already { "already revoked:" } else { "revoked:" },
-                ct_agent::codec::hex_encode(&req.target().digest)
-            );
+            println!("{}", req.describe(&out));
             return Ok(());
         }
         // scimbe/ct-agent#9 `ct-agent channel invite`: as the operator, sign an invitation for

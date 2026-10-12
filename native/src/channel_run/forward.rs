@@ -141,8 +141,7 @@ pub fn accept_forward_request_with(
     }
 }
 
-/// Whether [`FORWARD_ALLOW_ENV`] is configured at all (scimbe/ct-agent#255 slice 2,
-/// AUF-20260929-029): `channel_local`'s switch for whether THIS session should run as the
+/// Whether [`FORWARD_ALLOW_ENV`] is configured at all (scimbe/ct-agent#255 slice 2): `channel_local`'s switch for whether THIS session should run as the
 /// accept side of a channel TCP forward ([`super::forward_stream::forward_accept_local`])
 /// instead of whatever it would otherwise build. Mirrors [`parse_forward_allowlist`]'s own
 /// "unset or empty means off" rule exactly, so the two can never disagree about whether the
@@ -226,7 +225,7 @@ mod tests {
         }
     }
 
-    /// #255 acceptance 1 + AUF-20260929-020 criterion 1: the shipped default refuses.
+    /// #255 acceptance 1: the shipped default refuses.
     #[test]
     fn an_unset_or_empty_allowlist_refuses_every_target() {
         for raw in [None, Some(""), Some("   "), Some(",,"), Some(" , ")] {
@@ -337,7 +336,7 @@ mod tests {
         assert_eq!(redacted_target(&long).chars().count(), MAX_TARGET_LEN);
     }
 
-    /// AUF-20260929-020 criterion 1: the refusal is observable — one counted
+    /// The refusal is observable — one counted
     /// `forward_refused` event per refused request, and none for a granted one.
     #[test]
     fn a_refused_request_writes_a_forward_refused_event() {

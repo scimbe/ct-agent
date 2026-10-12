@@ -50,8 +50,6 @@
 //! listener stays open but refuses every connection with a log line (#264), without reconnecting.
 //
 // See ct-agent#255 and ct-agent#267.
-// trace: AUF-20261005-016 (DEC-0061)
-// trace: AUF-20261006-070 (DEC-0061)
 
 use std::collections::HashMap;
 use std::io;
