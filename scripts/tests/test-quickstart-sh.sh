@@ -59,7 +59,30 @@ case "$1 $2" in
   "channel "*|"channel ")
     # run: accept waits for the initiator's line on a shared file; initiate drops its stdin there
     echo "run role=${CT_CHANNEL_ROLE:-} serve=${CT_CHANNEL_SERVE:-} allow=${CT_CHANNEL_FORWARD_ALLOW:-} fwd=${CT_CHANNEL_FORWARD:-} front=${CT_CHANNEL_FRONT_DOOR:-}" >> "$STUB_LOG"
-    if [ -n "${CT_CHANNEL_FORWARD:-}" ]; then echo "CT_CHANNEL_FORWARD ${CT_CHANNEL_FORWARD%%=*} -> ${CT_CHANNEL_FORWARD#*=}"; echo $$ >> "$STUB_PIDS"; exec sleep 30; fi
+    if [ -n "${CT_CHANNEL_FORWARD:-}" ] || [ "${CT_CHANNEL_SERVE:-}" = 1 ]; then
+      # a forward session checks the peer's grant against the operator key: without it the real agent refuses
+      echo "opk=${CT_CHANNEL_OPERATOR_PUBKEY:-}" >> "$STUB_LOG"
+      case "${CT_CHANNEL_OPERATOR_PUBKEY:-}" in
+        ""|*[!0-9a-f]*) echo "ct-agent channel: peer's grant must be checked ... CT_CHANNEL_OPERATOR_PUBKEY is not a 64-hex value" >&2; exit 1 ;;
+      esac
+    fi
+    if [ -n "${CT_CHANNEL_FORWARD:-}" ]; then
+      echo "CT_CHANNEL_FORWARD ${CT_CHANNEL_FORWARD%%=*} -> ${CT_CHANNEL_FORWARD#*=}"
+      fp="${CT_CHANNEL_FORWARD%%=*}"; fp="${fp##*:}"
+      if [ -n "${STUB_REJECT_SESSION:-}" ]; then
+        echo "ct-agent channel: forward session refused: stub peer rejected the grant" >&2
+        python3 -c 'import socket,sys,time
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(("127.0.0.1",int(sys.argv[1]))); s.listen(5)
+while True:
+    c,_=s.accept(); c.close()' "$fp" &
+      else
+        python3 -c 'import socket,sys
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(("127.0.0.1",int(sys.argv[1]))); s.listen(5)
+while True:
+    c,_=s.accept(); c.sendall(b"SSH-2.0-stub\r\n"); c.close()' "$fp" &
+      fi
+      echo $! >> "$STUB_PIDS"; echo $$ >> "$STUB_PIDS"; exec sleep 30
+    fi
     if [ "${CT_CHANNEL_SERVE:-}" = 1 ]; then echo $$ >> "$STUB_PIDS"; exec sleep 30; fi
     case "${CT_CHANNEL_ROLE:-}" in
       accept)   i=0; while [ ! -s "$STUB_BUS" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done; cat "$STUB_BUS"; echo $$ >> "$STUB_PIDS"; exec sleep 30 ;;
@@ -177,8 +200,42 @@ check "the front door is the :443 door" grep -q 'front=bunsenbrenner.org:443' "$
 check "the forward warning stays visible and points to channel.md" grep -q 'docs/channel.md' <<<"$out2b"
 check "the warning does not state a measured duration" ! grep -q 'seconds' <<<"$out2b"
 check "the finished ssh line is printed" grep -q 'ssh -p 2222 .*tester@127.0.0.1' <<<"$out2b"
+check "the banner through the forward is what makes it OK" grep -q 'sshd answered through the channel: SSH-2.0-stub' <<<"$out2b"
+opkw="$(sed -n 's/.*operator_pubkey = \([0-9a-f]\{64\}\).*/\1/p' "$T/w2b/operator.env" | head -1)"
+check "both members got the operator pubkey from the script (caller env had none)" [ "$(grep -c "^opk=$opkw\$" "$T/stub.log")" -eq 2 ]
 run_qs "$T/w2b" --clean --yes >/dev/null 2>&1
 killrec
+
+# ---- 2c. the forward only counts when data comes back; the probe must not silence later warnings --------------
+reset
+mkdir -p "$T/home/.ct-agent"; echo "{\"access_token\":\"$SECRET_TOKEN\"}" > "$T/home/.ct-agent/oidc-token.json"
+E=(CT_QS_SSH_USER=tester STUB_REJECT_SESSION=1)
+out2c="$(run_qs "$T/w2c" ssh-channel --yes --enable-forward 2>&1)"; rc=$?
+check "P: a forward without data from the far side ends non-zero" [ "$rc" -ne 0 ]
+check "P: the result is FAILED, not OK" grep -q 'RESULT: FAILED' <<<"$out2c"
+check "P: no OK result is printed" ! grep -q 'RESULT: OK' <<<"$out2c"
+check "P: the reason from the agent log is shown" grep -q 'stub peer rejected the grant' <<<"$out2c"
+run_qs "$T/w2c" --clean --yes >/dev/null 2>&1
+killrec
+# Q: the probe's stderr redirect is limited to the probe -- a later warning still reaches stderr
+QSRC="$(cd "$(dirname "$QS")" && pwd)/$(basename "$QS")"
+errQ="$(QSRC="$QSRC" CT_QS_WORKDIR="$T/wq" bash -c '
+  set -- --yes tunnel; . "$QSRC"
+  port=$((30000 + $$ % 20000))
+  python3 -c "import socket,sys
+s=socket.socket(); s.bind((\"127.0.0.1\",int(sys.argv[1]))); s.listen(5)
+c,_=s.accept(); c.sendall(b\"SSH-2.0-x\\r\\n\"); c.close()" "$port" &
+  sleep 1
+  banner=""
+  if port_open 127.0.0.1 "$port" && { exec 4<>"/dev/tcp/127.0.0.1/$port"; } 2>/dev/null; then :; fi
+  warn "after-probe-warning"' 2>&1 >/dev/null </dev/null)"
+check "Q: the script has no bare exec with a stderr redirect left" ! grep -nE '^[[:space:]]*exec [0-9]*[<>&].*2>' "$QS"
+check "Q: a warning after the probe still reaches stderr" grep -q 'after-probe-warning' <<<"$errQ"
+# R: without a known operator pubkey the members are not started, with a plain message
+errR="$(QSRC="$QSRC" CT_QS_WORKDIR="$T/wq" WORKR="$T/wr" bash -c 'set -- --yes tunnel; . "$QSRC"; WORK="$WORKR"; OPERATOR_PUB=""; run_side accept true; echo STARTED' 2>&1 </dev/null)"; rcR=$?
+check "R: an unknown operator pubkey aborts before any member starts" [ "$rcR" -ne 0 ]
+check "R: the message is plain text and names the key" grep -q 'operator public key is unknown' <<<"$errR"
+check "R: the member command never ran" ! grep -q STARTED <<<"$errR"
 
 # ---- 3. a refused register names the failed stage and the next action ----------------------------------
 reset

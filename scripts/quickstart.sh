@@ -399,13 +399,23 @@ edge_values() {
   ok "edge: $host (broker $bp, relay $rp, front door ${gp:-443}), CA ${#ca} hex chars"
 }
 
+# Both members check the peer's grant against the operator public key. The script knows it (operator.env on
+# a single machine, the pasted operator block on the member side) and hands it to every member it starts.
+need_operator_pub() {
+  case "${OPERATOR_PUB:-}" in
+    ""|*[!0-9a-f]*) die "the operator public key is unknown here, so the members could not check each other's grant. Single machine: run the operator step first ($WORK/operator.env). Several machines: paste the operator block first" ;;
+  esac
+  [ "${#OPERATOR_PUB}" -eq 64 ] || die "the operator public key must be 64 hex characters (got ${#OPERATOR_PUB})"
+}
+
 # run_side <side> <command...> -- the command runs with that member's keys, its grant and the edge settings
 run_side() {
   local side="$1"; shift
+  need_operator_pub
   ( set -a; . "$WORK/$side/member.env"; set +a
     export CT_CHANNEL_BROKER="$EDGE_BROKER" CT_CHANNEL_RELAY="$EDGE_RELAY" CT_CHANNEL_FRONT_DOOR="$EDGE_FRONT" \
       CT_CHANNEL_FRONT_DOOR_CERT="$EDGE_CA_HEX" CT_CHANNEL_FRONT_DOOR_ONLY=1 CT_CHANNEL_RELAY_ONLY=1 \
-      CT_CHANNEL_GRANT="$(tr -d ' \r\n' < "$WORK/grants/$side.grant")"
+      CT_CHANNEL_GRANT="$(tr -d ' \r\n' < "$WORK/grants/$side.grant")" CT_CHANNEL_OPERATOR_PUBKEY="$OPERATOR_PUB"
     exec "$@" )
 }
 
@@ -544,6 +554,7 @@ channel_single() {
 channel_run_single() {
   local msg="hello from B $(now)-$$" deadline apid=0 bpid=0 recv="$WORK/received.txt" waitfor="${CT_QS_WAIT:-90}"
   : > "$recv"
+  need_operator_pub
   stage "start member A (accept)" "see $WORK/logs/accept.log; 'refused the channel join' means the member add did not take effect"
   mkfifo "$WORK/run/accept.in" 2>/dev/null || true
   exec 7<>"$WORK/run/accept.in"     # keeps A's stdin open: at end-of-file A loses the data (#299)
@@ -578,6 +589,7 @@ channel_run_single() {
 
 ssh_channel_run_single() {
   local port="$CT_QS_LOCAL_PORT" tgt="$CT_QS_FORWARD_TARGET" waitfor="${CT_QS_WAIT:-90}" deadline pa pb banner="" user
+  need_operator_pub
   ask CT_QS_SSH_USER "Login name for ssh on the accepting machine" "$(id -un)"; user="$CT_QS_SSH_USER"
   pa="$(cat "$WORK/run/accept.pid" 2>/dev/null || true)"; pb="$(cat "$WORK/run/initiate.pid" 2>/dev/null || true)"
   stage "start member A (accept, serving, forward allowed to $tgt)" "see $WORK/logs/accept.log"
@@ -613,12 +625,16 @@ ssh_channel_run_single() {
   record_sig "$WORK/run/initiate.pid"
   ok "listener is up on 127.0.0.1:$port"
   stage "probe the forward" "make sure sshd listens on the target ($tgt) of the accepting side"
-  if port_open 127.0.0.1 "$port"; then
-    exec 4<>"/dev/tcp/127.0.0.1/$port" 2>/dev/null && { IFS= read -r -t 10 banner <&4 || true; exec 4>&- 2>/dev/null || true; }
+  # the redirect belongs to the probe only: a bare `exec ... 2>/dev/null` would silence the whole script
+  if port_open 127.0.0.1 "$port" && { exec 4<>"/dev/tcp/127.0.0.1/$port"; } 2>/dev/null; then
+    IFS= read -r -t 10 banner <&4 || true
+    exec 4>&-
   fi
   case "$banner" in
     SSH-*) ok "sshd answered through the channel: ${banner%$'\r'}" ;;
-    *)     warn "no ssh banner came back through the forward. Is sshd running on $tgt? (the channel itself is up)" ;;
+    *)
+      tail_log "$WORK/logs/accept.log"; tail_log "$WORK/logs/initiate.log"
+      die "the forward carried no data from the far side (no ssh banner). The local port being open is not enough: see the agent logs above, and check that sshd listens on $tgt of the accepting side" ;;
   esac
   DONE_MSG="the forward is up. Connect with:  ssh -p $port -o HostKeyAlias=ct-channel-$(sha8 "$CH") $user@127.0.0.1
   Stop it with:  $0 --clean   (the first ssh asks to confirm the host key of the accepting machine, not of this one)"
@@ -686,6 +702,7 @@ channel_member() {
 # join, retrying while the operator may not have finished adding the members
 member_start() {
   local side="$1" tries="${CT_QS_RETRIES:-6}" i=1 rc msg
+  need_operator_pub
   stage "start the $side side" "see $WORK/logs/$side.log; 'refused the channel join' means the operator has not added you yet or the grant expired"
   if [ "$side" = accept ]; then
     if [ "$FORWARD" -eq 1 ]; then
