@@ -1060,6 +1060,21 @@ mod tests {
     }
 
     #[test]
+    fn require_without_cp_url_fails_at_process_start_not_at_join() {
+        use super::super::check_revocation_config_from as check;
+        // accept side of a forward, strict mode, no CP URL: refused before any join
+        assert!(check(true, Some("accept"), None, Some("require")).unwrap_err().contains("CT_AGENT_CP_URL"));
+        assert!(check(true, Some(" Accept "), Some("  "), Some("require")).is_err(), "blank URL counts as missing");
+        // the default stays a warning, a URL satisfies it, the initiator and a non-forward run are unaffected
+        assert!(check(true, Some("accept"), None, None).is_ok());
+        assert!(check(true, Some("accept"), Some("https://cp"), Some("require")).is_ok());
+        assert!(check(true, Some("initiate"), None, Some("require")).is_ok());
+        assert!(check(false, Some("accept"), None, Some("require")).is_ok());
+        // a typo in the switch is an error at start, whatever else is configured
+        assert!(check(false, None, None, Some("yes")).is_err());
+    }
+
+    #[test]
     fn a_forward_forces_the_peer_grant_check() {
         let none = |_: &str| None;
         assert_eq!(PeerGrantPolicy::from_lookup_for(none, false).unwrap(), None);
