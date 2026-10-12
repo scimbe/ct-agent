@@ -266,6 +266,11 @@ where
         if let Ok(outcome @ ChannelJoinOutcome::Admitted { .. }) = result {
             return Ok(outcome);
         }
+        if let Err(e) = &result {
+            if is_revoked_grant_refusal(e) {
+                return result; // never valid again: stop at once, the error carries the operator hint
+            }
+        }
         let now = std::time::Instant::now();
         if now >= deadline {
             let reason = match &result {

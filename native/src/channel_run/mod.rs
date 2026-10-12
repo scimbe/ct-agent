@@ -412,6 +412,37 @@ pub(crate) fn revocation_required(v: Option<&str>) -> Result<bool, String> {
     }
 }
 
+/// Startup check of the revocation switch, run before any network is set up: an unknown
+/// `CT_CHANNEL_REVOCATION` value, or `require` on the accept side of a forward without
+/// `CT_AGENT_CP_URL`, fails the process start instead of the first join. [`gate_local`] keeps
+/// its own check for the paths that do not start here.
+pub fn check_revocation_config() -> Result<(), String> {
+    check_revocation_config_from(
+        forward_session_configured(),
+        std::env::var("CT_CHANNEL_ROLE").ok().as_deref(),
+        std::env::var("CT_AGENT_CP_URL").ok().as_deref(),
+        std::env::var(REVOCATION_ENV).ok().as_deref(),
+    )
+}
+
+pub(crate) fn check_revocation_config_from(
+    forward: bool,
+    role: Option<&str>,
+    cp_url: Option<&str>,
+    mode: Option<&str>,
+) -> Result<(), String> {
+    let required = revocation_required(mode)?;
+    let accept = matches!(
+        role.map(|r| r.trim().to_ascii_lowercase()).as_deref(),
+        Some("accept" | "responder" | "listen")
+    );
+    if forward && accept {
+        let cp = cp_url.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        resolve_cp(cp, required)?;
+    }
+    Ok(())
+}
+
 /// Whether this process runs a TCP forward session, on either side.
 fn forward_session_configured() -> bool {
     std::env::var(forward_stream::FORWARD_ENV).is_ok() || forward::forward_allow_configured()

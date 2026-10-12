@@ -6310,6 +6310,35 @@ async fn admit_one_shot_with_retry_gives_a_named_error_when_the_window_closes_95
     assert!(msg.contains(&hex_encode(&channel.0)), "must name the channel: {msg}");
 }
 
+/// A revoked grant is refused for good: the one-shot initiator must stop after the first
+/// refusal instead of re-asking the edge every 3 s for the whole window. Another definitive
+/// refusal (here `pairing`) keeps the bounded retry.
+#[tokio::test]
+async fn admit_one_shot_with_retry_stops_at_once_on_a_revoked_grant() {
+    use ct_common::channel::ChannelId;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let channel = ChannelId([0x33u8; 32]);
+    let calls = AtomicU32::new(0);
+    let admit = || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        async { Err::<ChannelJoinOutcome, BoxError>(AdmissionRefused::boxed_with_category("edge broker refused the channel join", Some("grant-revoked"))) }
+    };
+    let err = admit_one_shot_with_retry(std::time::Duration::from_secs(30), &channel, admit)
+        .await
+        .expect_err("a revoked grant is refused");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one attempt");
+    assert!(err.to_string().contains("[grant-revoked]"), "{err}");
+
+    let calls = AtomicU32::new(0);
+    let admit = || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        async { Err::<ChannelJoinOutcome, BoxError>(AdmissionRefused::boxed_with_category("edge broker refused the channel join", Some("pairing"))) }
+    };
+    let _ = admit_one_shot_with_retry(std::time::Duration::from_millis(50), &channel, admit).await;
+    assert!(calls.load(Ordering::SeqCst) >= 1);
+    assert!(!is_revoked_grant_refusal(&AdmissionRefused::boxed_with_category("x", Some("pairing"))));
+}
+
 #[test]
 fn accept_race_flag_is_opt_in_22() {
     // ct-agent#22 (b) (frozen): the race is OPT-IN until the edge advertises abandoned-park

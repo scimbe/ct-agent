@@ -95,6 +95,13 @@ pub(crate) fn is_definitive_admission_refusal(e: &BoxError) -> bool {
     e.to_string().contains("refused the channel join")
 }
 
+/// A refusal that names the `grant-revoked` category: this exact grant is on the revocation
+/// list and never becomes valid again, so retrying it only loads the edge. Other definitive
+/// refusals keep the one-shot initiator's bounded retry (a `pairing` refusal can clear).
+pub(crate) fn is_revoked_grant_refusal(e: &BoxError) -> bool {
+    e.downcast_ref::<AdmissionRefused>().is_some_and(|r| r.0.contains("[grant-revoked]"))
+}
+
 /// #20: typed marker for a DEFINITIVE broker/relay refusal -- the peer's wire `NO`. `Display`
 /// emits the exact historical strings (field-visible contract: operators grep these, docs quote
 /// them, the sort bridge's fault attribution matches on them), but in-process classification
