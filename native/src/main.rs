@@ -983,6 +983,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 std::process::exit(1);
             }
         }
+        // Configuration that can never work is refused here, before any network is set up.
+        if let Err(e) = ct_agent::channel_run::check_revocation_config() {
+            eprintln!("ct-agent channel: {e}");
+            std::process::exit(1);
+        }
         // Plane-brokered flow (#98/#103) when an edge rendezvous is configured: present
         // the grant, learn the peer via the broker (keys relayed), connect
         // direct-then-relay. Otherwise the direct-address path (CT_CHANNEL_ADDR).
