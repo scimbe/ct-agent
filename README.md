@@ -23,10 +23,34 @@ This repo is its own related project, extracted from the
 plane + edge) and published separately so it can be downloaded and installed without
 cloning the whole tunnel/edge/control-plane workspace. See that repo's docs (`docs/adr`,
 `docs/agent-onboarding.md`) for the full system design — and **[docs/channel.md](docs/channel.md)**
-for the `ct-agent channel` reference (modes incl. the v0.4.9 persistent call mode, transport
-ladders, the front-door-only pairing guidance, and what each failure message actually means).
+for the `ct-agent channel` reference (modes incl. the persistent call mode that is the default
+since v0.5.0, transport ladders, the front-door-only pairing guidance, the opt-in TCP forward, and
+what each failure message actually means). Step-by-step paths are in
+**[docs/quickstarts.md](docs/quickstarts.md)**.
 
-## Quick start (recommended)
+## Tunnel or channel?
+
+`ct-agent` does two different jobs. Pick by who has to reach whom.
+
+| | **Tunnel** | **Channel** |
+|---|---|---|
+| What it is | Publishes one service of yours under a public hostname | An end-to-end encrypted session between two members of an Agent-Fabric channel |
+| Who can reach it | Anyone who can reach the hostname (browser, `curl`, `ssh`) | Only the two paired members, admitted by an operator-signed grant |
+| Path | Agent dials out to the edge; the edge relays clients to it (QUIC first, TLS over TCP `:443` as fallback) | Both members dial out to the edge's broker and relay, which only see ciphertext (Noise_IK); QUIC first, then the `:443` front door |
+| Login / credentials | Routing token from the portal (bootstrap token for the first start); a certificate for Grün | Member keys and a grant; an OIDC login (`ct-agent login`) for the operator only |
+| Command | `ct-agent` (serve) | `ct-agent channel …` |
+| Use it for | Websites and services for the public or for your own users | Agent-to-agent calls, pipes, and private TCP access that must not be public |
+
+| | Over a tunnel | Over a channel |
+|---|---|---|
+| **SSH** | `ssh <hostname>`; `ct-agent ssh` is the ProxyCommand and speaks TLS to the edge on `:443`. The agent terminates TLS with the hostname's certificate and checks an owner key before sshd sees a byte. Needs tier Grün. | No `ssh` subcommand: the opt-in TCP forward (`CT_CHANNEL_FORWARD`) maps a loopback port on the client to `127.0.0.1:22` of the accepting member. Nothing is published; access is limited to the paired member. |
+
+Quickstarts: [Tunnel](docs/quickstarts.md#1-tunnel) ·
+[Channel](docs/quickstarts.md#2-channel) ·
+[SSH over a tunnel](docs/quickstarts.md#3-ssh-over-a-tunnel) ·
+[SSH over a channel](docs/quickstarts.md#4-ssh-over-a-channel)
+
+## Install and first tunnel (recommended)
 
 A guided setup script that checks your environment, walks you through a `.env`
 file, optionally grabs a starter site template, installs + onboards the agent
@@ -60,6 +84,28 @@ This is the one supported way to install `ct-agent` — it downloads the right
 OS/arch itself, so there's no separate manual-download path to keep in sync. If
 you're contributing to `ct-agent` itself, `cargo build --release` (Rust 1.85+) works
 as usual from a clone of this repo.
+
+Releases ship `ct-agent` and `ct-agent-supervisor` for Linux (x86_64, i686, aarch64), macOS
+(x86_64, aarch64) and Windows (x86_64, i686, aarch64). Binary activations of `ct-agent manifest`
+are refused on Windows (compose manifests and `manifest plan` work there).
+
+## Subcommands
+
+`ct-agent --help` is the reference; every subcommand is configured through `CT_*` environment
+variables, and a mistyped subcommand fails instead of starting the agent.
+
+| Group | Subcommands |
+|---|---|
+| Serve a tunnel | `ct-agent` (default), `onboard`, `rotate`, `certificate` (ACME DNS-01 renewal loop) |
+| Account | `login` (OIDC device grant), `signup <name>` (self-service tunnel creation) |
+| Operate | `status`, `update`, `doctor sandbox`, `local-auth set\|reset\|rotate\|link\|links\|link-revoke`, `relay-node` |
+| SSH | `ssh <hostname>`, `ssh-config <hostname>`, `ssh-owner show\|init` |
+| Channels | `channel` (join), `channel init`, `operator-init`, `member-material`, `join-pipeline-role`, `grant`, `invite`, `bind-topology`, `register [--rekey]`, `allowlist`, `agent-card`, `super-peer` |
+| Marketplace | `manifest create\|sign\|publish\|activate\|plan`, `harness run [--plan]` |
+
+`ct-agent update` replaces the binary in place and checks every download against the release's
+published checksum (and its signed manifest, once a release key is pinned in the build). `CT_AGENT_AUTO_UPDATE=1` does this in the background while
+serving; it only takes effect if something restarts the process (see `ct-agent-supervisor` below).
 
 ## `ct-agent-supervisor` (#331)
 

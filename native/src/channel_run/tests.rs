@@ -7933,6 +7933,10 @@ async fn forward_initiator_does_not_reconnect_after_the_grant_was_revoked() {
 /// bytes it got. An empty result is a clean refusal (the cap bit before a single echo byte came
 /// back); `expect_len` bytes is a full echo; anything in between is the truncation this test
 /// exists to catch, so it is left in the returned `Vec` rather than folded into an error.
+///
+/// A `ConnectionReset` before the first echo byte is the same refusal: on some platforms (macOS)
+/// the over-cap connection that the forward drops with unread data still queued surfaces as an RST
+/// rather than an EOF. A reset after any echo byte is NOT forgiven; it is returned as an error.
 async fn read_full_echo_or_clean_refusal(
     tcp: &mut tokio::net::TcpStream,
     expect_len: usize,
@@ -7940,9 +7944,11 @@ async fn read_full_echo_or_clean_refusal(
     let mut buf = vec![0u8; expect_len];
     let mut got = 0;
     while got < expect_len {
-        match tcp.read(&mut buf[got..]).await? {
-            0 => break,
-            n => got += n,
+        match tcp.read(&mut buf[got..]).await {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if got == 0 && e.kind() == io::ErrorKind::ConnectionReset => break,
+            Err(e) => return Err(e),
         }
     }
     buf.truncate(got);
@@ -8018,7 +8024,7 @@ async fn many_short_parallel_streams_body() {
                 .await
                 .expect("TCP connect to the local forward listener itself still succeeds");
             if tcp.write_all(&payload).await.is_err() {
-                return Ok(()); // refused before it took a single byte
+                return Ok(false); // refused before it took a single byte
             }
             let echoed = read_full_echo_or_clean_refusal(&mut tcp, PAYLOAD_LEN)
                 .await
@@ -8040,22 +8046,30 @@ async fn many_short_parallel_streams_body() {
                 let sock = socket2::SockRef::from(&tcp);
                 let _ = sock.set_linger(Some(Duration::ZERO));
             }
-            Ok(())
+            Ok(echoed.len() == PAYLOAD_LEN)
         }));
     }
 
     let mut failures = Vec::new();
+    let mut full_echoes = 0usize;
     for a in attempts {
-        if let Err(e) = a
+        match a
             .await
             .expect("the per-connection task itself does not panic")
         {
-            failures.push(e);
+            Ok(true) => full_echoes += 1,
+            Ok(false) => {}
+            Err(e) => failures.push(e),
         }
     }
     assert!(
         failures.is_empty(),
         "every within-cap connection must get its full echo, never a truncated one: {failures:?}"
+    );
+    // Refusals above the cap are tolerated, but they must not swallow the connections that fit.
+    assert!(
+        full_echoes >= forward_stream::DEFAULT_MAX_STREAMS,
+        "only {full_echoes} connections got a full echo; at least the cap's worth must"
     );
 
     // The actual acceptance: the channel session must still be alive after that load, proven by
