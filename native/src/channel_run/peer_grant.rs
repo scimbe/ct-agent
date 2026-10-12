@@ -32,7 +32,7 @@
 //! The check above is a *point-in-time* admission decision: it ran once, right after the Noise
 //! handshake. A session admitted at 10:00 with a grant that expires at 10:05 kept running at
 //! 11:00 -- and kept forwarding TCP streams (#255) -- for as long as both members stayed
-//! connected. INC-20260930-101: a revoked or expired grant has to end the session it authorized.
+//! connected. A revoked or expired grant has to end the session it authorized.
 //! [`GrantLifetime`] is that clock. It is armed with this member's OWN grant expiry when the gate
 //! is built, re-armed with the EARLIER of the two expiries as soon as the peer's grant verifies,
 //! and it also carries a [`GrantRevokeHandle`] for a revocation that reaches this member while
@@ -48,8 +48,7 @@
 //! whoever runs a session inside [`with_grant_end_record`] gets the [`GrantEndRecord`] that every
 //! gate built within that scope writes its end reason into, at the same moment it logs it.
 //
-// trace: AUF-20260930-005 (INC-20260930-101)
-// trace: AUF-20261004-022 (ct-agent#267)
+// See ct-agent#255 (forward) and ct-agent#267 (a session end is not the forward's end).
 
 use std::io;
 use std::pin::Pin;
@@ -76,7 +75,7 @@ const MAGIC: &[u8; 5] = b"CTPG1";
 pub(crate) const PRELUDE_LEN: usize = MAGIC.len() + SignedChannelGrant::WIRE_LEN;
 /// How long a peer has, after the Noise handshake, to present its grant.
 pub(crate) const PEER_GRANT_TIMEOUT: Duration = Duration::from_secs(10);
-/// The budget INC-20260930-101 gives a session whose grant ended: within it every forwarded
+/// The budget a session gets when its grant whose grant ended: within it every forwarded
 /// stream of that session is closed on BOTH members and no new one is opened. Nothing here ever
 /// waits this out -- [`GrantLifetime`] ends the session on the next poll of its plaintext side --
 /// it is the bound the tests assert against, named once so they and this doc cannot drift apart.
@@ -187,10 +186,9 @@ impl PeerGrantCheck {
     }
 }
 
-/// Ends one session from the outside when its member learns the peer's grant was revoked
-/// (AUF-20260930-005). Broker-side delivery of a revocation is `bridge/channel-revoke`, which is
-/// not built yet; this is the enforcement seam it drives when it is, and the seam the tests
-/// revoke through. Dropping the handle without revoking leaves the session alone -- the expiry
+/// Ends one session from the outside when its member learns the peer's grant was revoked. The
+/// re-check in `grant_watch` drives it (it asks the control plane about the peer's grant digest
+/// on an interval); the tests revoke through it directly. Dropping the handle without revoking leaves the session alone -- the expiry
 /// clock is then the only thing that ends it.
 pub struct GrantRevokeHandle(oneshot::Sender<String>);
 
@@ -341,7 +339,7 @@ impl GrantLifetime {
 /// then passes bytes on to the real `local`. A missing, late (past [`PEER_GRANT_TIMEOUT`]) or
 /// invalid grant fails both directions with `PermissionDenied`, ending the session.
 ///
-/// It is also where the session's grant *lifetime* is enforced (AUF-20260930-005): see
+/// It is also where the session's grant *lifetime* is enforced: see
 /// [`GrantLifetime`] and the module doc.
 pub struct PeerGrantGate<P> {
     inner: P,
@@ -426,7 +424,7 @@ impl Gate {
     }
 }
 
-// `AsyncWrite` as well as `AsyncRead` (AUF-20260930-005): when the grant ends, the read side
+// `AsyncWrite` as well as `AsyncRead`: when the grant ends, the read side
 // closes the local side itself rather than only reporting EOF upwards -- see `poll_read`.
 impl<P: AsyncRead + AsyncWrite + Unpin> AsyncRead for PeerGrantGate<P> {
     fn poll_read(
@@ -881,7 +879,7 @@ mod tests {
         assert!(a_failed, "the initiator's session ended with an error");
     }
 
-    /// AUF-20260930-005 (INC-20260930-101): the grant's expiry ends the session it authorized,
+    /// the grant's expiry ends the session it authorized,
     /// and closes the local side with it -- the mechanism the forward engines' teardown rests on
     /// (`channel_run::tests` proves the end-to-end effect on real forwarded TCP streams).
     #[tokio::test(start_paused = true)]
@@ -918,7 +916,7 @@ mod tests {
         assert!(gate.write_all(b"late").await.is_err());
     }
 
-    /// AUF-20260930-005: the same end, reached by a revocation instead of the clock.
+    /// the same end, reached by a revocation instead of the clock.
     #[tokio::test(start_paused = true)]
     async fn a_revoked_grant_ends_the_session() {
         let f = Fixture::new();

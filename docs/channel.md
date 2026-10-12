@@ -320,10 +320,35 @@ the two applications; neither the edge nor `ct-agent` terminates it.
 "allow everything" — it is the default, and it refuses every forward request the peer makes.
 There is no wildcard spelling. Turning the option on is two deliberate steps (the allowlist, and
 for anything that is not loopback a second grant), and both are on the **accepting** side, which is
-the side whose network is being reached into. The option is delivered in three slices; **until the
-grant-revocation slice lands, do not enable it in production** — revocation of a channel grant
-must end running forwarded streams ([#45](https://github.com/scimbe/ct-agent/issues/45)), and that
-is a security property, not a convenience.
+the side whose network is being reached into. The option is delivered in three slices. Revoking a channel grant must end running forwarded
+streams, and that is a security property, not a convenience. The mechanism is in place (below) but
+**do not enable the forward in production until it has passed a test on a real node**: the unit
+tests prove the re-check logic against a mock control plane, not the data path through a real edge,
+a direct upgrade or a hole-punched path. (The older [#45](https://github.com/scimbe/ct-agent/issues/45)
+concerns the direct-connect path `serve_direct`, not the forward.)
+
+### Revoking a grant
+
+- `ct-agent channel grant-revoke` (operator): puts one issued grant on the control plane's
+  revocation list. Name the grant with `CT_REVOKE_GRANT=<its hex>`, or give the `CT_GRANT_*` fields
+  it was issued with (signing is deterministic, so they reproduce it). Needs `CT_AGENT_CP_URL` and
+  `CT_CHANNEL_OPERATOR_KEY`; the request is signed with the operator key, no login required.
+  Revoking twice is not an error.
+- `bridge/channel-revoke` (bridge peer only): the same for this agent's own channel, authorized by
+  the owner session. Argument `{"grant": "<hex>"}`.
+- The edge refuses a revoked grant at admission and cuts live relays carrying it at its next
+  sweep (30 s). A forward session also **re-checks the peer's grant against the control plane**
+  on its accept side, so it ends even when no edge is in the data path (direct, upgraded,
+  hole-punched). Withdrawing a member ends their sessions the same way.
+- Because of that, a forward **requires** `CT_AGENT_CP_URL` and the end-to-end peer-grant exchange
+  (it behaves as if `CT_CHANNEL_REQUIRE_PEER_GRANT=1` and needs `CT_CHANNEL_OPERATOR_PUBKEY`), on
+  both members. A control plane that does not know the re-check endpoint (404/405) ends the
+  forward at the first check.
+
+| Variable | Meaning |
+|---|---|
+| `CT_CHANNEL_GRANT_RECHECK_SECS` | Re-check interval of a forward session (default 30, minimum 5) |
+| `CT_CHANNEL_GRANT_RECHECK_GRACE_SECS` | How long the control plane may stay unreadable before the session is ended, counted from the last valid answer (default 90, at least one interval). A `valid` answer never ends a session; a `revoked`/`not-member`/expired answer ends it at once |
 
 ### Accept side — the gate
 

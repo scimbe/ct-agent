@@ -10,7 +10,7 @@
 //! requested target may be dialed at all. It is deliberately the first slice, and it is
 //! pure policy — no listener, no stream, nothing that touches the transport core. The
 //! stream plumbing (slice 2) and the grant revocation that tears running streams down
-//! (slice 3, coupled to #45) land on top of it.
+//! (slice 3: re-check against the control plane's revocation list, see `grant_watch`) land on top of it.
 //!
 //! ## Default off, and off means off
 //!

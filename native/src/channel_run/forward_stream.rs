@@ -27,7 +27,7 @@
 //! for this slice is satisfied by whole-stream teardown, so that stays a documented follow-up
 //! rather than added here.
 //!
-//! ## The session's end is the streams' end (AUF-20260930-005, INC-20260930-101)
+//! ## The session's end is the streams' end
 //!
 //! Both engines treat "my end of the session duplex went EOF" as "every stream I own is over":
 //! the `JoinSet` is aborted on the spot, which closes each forwarded TCP connection, and the
@@ -36,7 +36,7 @@
 //! (`super::peer_grant`): an expiring or revoked grant closes this duplex, which is why the
 //! engine has to know nothing about grants.
 //!
-//! ## A session end is not the forward's end (ct-agent#267, AUF-20261004-022)
+//! ## A session end is not the forward's end (ct-agent#267)
 //!
 //! In 0.7.36 the initiate engine stayed alive after its session ended, refusing every new
 //! connection, and never closed its side of the duplex -- so the session never returned and the
@@ -49,8 +49,7 @@
 //! meantime wait in the listen backlog and are served by the next session. After a grant end the
 //! listener stays open but refuses every connection with a log line (#264), without reconnecting.
 //
-// trace: AUF-20260930-005 (INC-20260930-101)
-// trace: AUF-20261004-022 (ct-agent#267)
+// See ct-agent#255 and ct-agent#267.
 // trace: AUF-20261005-016 (DEC-0061)
 // trace: AUF-20261006-070 (DEC-0061)
 
@@ -1716,7 +1715,7 @@ async fn run_forward_accept_engine(
                             e.notify(msg).await;
                         }
                     }
-                    // AUF-20260930-005: the session ended -- every target socket this side dialed
+                    // The session ended -- every target socket this side dialed
                     // is closed with the JoinSet ("auf beiden Seiten binnen 5 s").
                     Err(e) => {
                         streams.abort_all();
@@ -2120,7 +2119,7 @@ mod tests {
         assert!(non_loopback.contains("loopback"), "{non_loopback}");
     }
 
-    // trace: AUF-20261004-022 (ct-agent#267)
+    // ct-agent#267
     #[test]
     fn reconnect_backoff_doubles_from_one_second_to_thirty_and_resets_after_a_healthy_session() {
         let short = Duration::from_millis(10);
@@ -2139,7 +2138,7 @@ mod tests {
         );
     }
 
-    // trace: AUF-20261004-022 (ct-agent#267)
+    // ct-agent#267
     #[test]
     fn only_a_recorded_grant_end_or_an_expired_own_grant_stops_the_reconnect() {
         assert_eq!(
