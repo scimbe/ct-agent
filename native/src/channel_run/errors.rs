@@ -161,6 +161,14 @@ pub(crate) fn refusal_category_hint(category: &str) -> Option<&'static str> {
             "the channel is unknown to this edge, or the holder is not currently a member — \
              check the channel id and whether this member was removed"
         }
+        "grant-revoked" => {
+            "this exact grant was revoked by the channel operator or owner — it will not work \
+             again; ask for a newly issued grant"
+        }
+        "grant-status" => {
+            "the edge could not read the channel's grant revocation list right now and refuses \
+             rather than guess — retry later; if it persists, check the control plane"
+        }
         "endpoint" => {
             "the advertised endpoint was rejected as unsafe/undialable — advertise a public \
              address or the relay-only sentinel"

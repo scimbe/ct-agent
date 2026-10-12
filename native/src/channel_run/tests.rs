@@ -3213,7 +3213,7 @@ fn refusal_category_messages_stay_definitive_and_keep_the_frozen_prefix_524() {
     );
 
     // Every closed-vocabulary token the edge can currently send has a real hint.
-    for cat in ["possession", "grant-verify", "not-member", "endpoint", "malformed", "len-oob", "pairing"] {
+    for cat in ["possession", "grant-verify", "not-member", "endpoint", "malformed", "len-oob", "pairing", "grant-revoked", "grant-status"] {
         assert!(
             refusal_category_hint(cat).is_some(),
             "closed-vocabulary token {cat:?} must map to an actionable hint"
