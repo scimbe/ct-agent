@@ -371,7 +371,10 @@ concerns the direct-connect path `serve_direct`, not the forward.)
   plane decided (`{"state":"asker-not-member"}`: this member was withdrawn); a bare `403` can come
   from a proxy in front of the control plane, so it is an unreadable answer and waits out the grace.
 - An initiator that is refused with `[grant-revoked]` stops at once instead of retrying for its
-  75 s window: a revoked grant never becomes valid again, so it needs a newly issued one.
+  75 s window: a revoked grant never becomes valid again, so it needs a newly issued one. A
+  forward initiator (`CT_CHANNEL_FORWARD`), which otherwise reconnects after a dropped session,
+  stops the same way: it prints the refusal and exits with a failure status instead of asking
+  again. Every other refusal keeps the reconnect with backoff.
 
 | Variable | Meaning |
 |---|---|

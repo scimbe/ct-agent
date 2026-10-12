@@ -48,6 +48,9 @@
 //! [`FORWARD_RECONNECT_MIN`] doubling up to [`FORWARD_RECONNECT_MAX`]; connections made in the
 //! meantime wait in the listen backlog and are served by the next session. After a grant end the
 //! listener stays open but refuses every connection with a log line (#264), without reconnecting.
+//! An admission that the edge refuses because the grant is on the revocation list is final too:
+//! the grant is fixed for the life of the process and never becomes valid again, so the loop
+//! returns that error and the process ends with a failure status, as a one-shot dial does.
 //
 // See ct-agent#255 and ct-agent#267.
 
@@ -302,18 +305,26 @@ async fn refuse_forward_connections(listener: &TcpListener, why: &str) {
 /// one fresh engine and one `admit` call per session, reconnecting with backoff until a grant
 /// end, after which it refuses connections for good. `admit` runs one whole session (admission
 /// included) over the duplex it is given and returns when that session ends; it is the seam the
-/// tests drive without a broker. Returns only if the listener's refusing loop ever could.
-pub(crate) async fn run_forward_initiate_reconnect_loop<A, Fut, E>(
+/// tests drive without a broker.
+///
+/// `is_final` names the admission errors that never clear on their own (a refusal because the
+/// grant is on the revocation list): the loop then stops and returns that error instead of
+/// asking again, so the process ends like a one-shot dial does. Otherwise it returns only if
+/// the listener's refusing loop ever could.
+pub(crate) async fn run_forward_initiate_reconnect_loop<A, Fut, E, F>(
     listener: Arc<TcpListener>,
     target: String,
     max_streams: usize,
     idle: Duration,
     own_expires_at: u64,
     mut admit: A,
-) where
+    is_final: F,
+) -> Result<(), E>
+where
     A: FnMut(LocalDuplex) -> Fut,
     Fut: std::future::Future<Output = Result<(), E>>,
     E: std::fmt::Display,
+    F: Fn(&E) -> bool,
 {
     let mut delay: Option<Duration> = None;
     loop {
@@ -330,7 +341,13 @@ pub(crate) async fn run_forward_initiate_reconnect_loop<A, Fut, E>(
                  the forward listener refuses every new connection (#264, #267)"
             );
             refuse_forward_connections(&listener, &why).await;
-            return;
+            return Ok(());
+        }
+        if let Err(e) = &outcome {
+            if is_final(e) {
+                eprintln!("ct-agent channel: forward session failed after {lasted:?}: {e} -- not reconnecting");
+                return outcome;
+            }
         }
         let wait = next_forward_reconnect_delay(delay, lasted);
         delay = Some(wait);

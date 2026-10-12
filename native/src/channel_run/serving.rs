@@ -553,9 +553,9 @@ pub(crate) async fn run_forward_initiate_sessions(
                 ChannelLocal::Forward(Ok(local)),
             )
         },
+        is_revoked_grant_refusal,
     )
-    .await;
-    Ok(())
+    .await
 }
 
 /// [`run_one_admission_session`]'s body, minus its own `channel_local()` call — `local` is supplied
