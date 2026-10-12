@@ -180,6 +180,13 @@ RE_TOKEN='^[A-Za-z0-9._~+/=-]+$'
 need() { # label value regex
   [[ "$2" =~ $3 ]] || die "$1 holds characters it should not (allowed pattern: $3) -- nothing was written"
 }
+check_cp() { # CP URL: shape, and a loud warning for clear-text http to a non-local host
+  need "CT_AGENT_CP_URL" "$1" "$RE_URL"
+  case "$1" in
+    http://127.0.0.1|http://127.0.0.1[:/]*|http://localhost|http://localhost[:/]*|"http://[::1]"*) ;;
+    http://*) warn "the control plane URL uses plain http:// to a non-local host -- tokens would travel in clear text. Use https://" ;;
+  esac
+}
 env_kv() { # NAME VALUE -> a line safe to source
   if [[ "$2" =~ ^[A-Za-z0-9._~:/+=@%,-]*$ ]]; then printf '%s=%s\n' "$1" "$2"
   else printf "%s='%s'\n" "$1" "${2//\'/\'\\\'\'}"; fi
@@ -441,7 +448,7 @@ block() { # title, then lines on stdin
 channel_common() {
   stage "settings" "set the variable named in the message and re-run"
   ask CT_AGENT_CP_URL "Control plane" "$DEFAULT_CP"
-  CP="${CT_AGENT_CP_URL%/}"; need "CT_AGENT_CP_URL" "$CP" "$RE_URL"
+  CP="${CT_AGENT_CP_URL%/}"; check_cp "$CP"
   CT_QS_GRANT_HOURS="${CT_QS_GRANT_HOURS:-24}"
   case "$CT_QS_GRANT_HOURS" in ""|*[!0-9]*) die "CT_QS_GRANT_HOURS must be a whole number of hours" ;; esac
   stage "install the CLI" "install curl, or put ct-agent on PATH, then re-run"
@@ -754,8 +761,8 @@ redeem() { # sets AGENT_JOIN_TOKEN / AGENT_TOKEN from CT_BOOTSTRAP
   AGENT_JOIN_TOKEN="$(printf '%s' "$bundle" | sed -n 's/.*CT_JOIN_TOKEN=\([^;"]*\).*/\1/p')"
   AGENT_TOKEN="$(printf '%s' "$bundle" | sed -n 's/.*CT_AGENT_TOKEN=\([^;"]*\).*/\1/p')"
   unset CT_BOOTSTRAP
-  [[ "$AGENT_JOIN_TOKEN" =~ $RE_TOKEN && "$AGENT_TOKEN" =~ $RE_TOKEN ]] || { AGENT_JOIN_TOKEN=""; AGENT_TOKEN=""; die "the control plane returned a token with unexpected characters -- nothing was written"; }
   [ -n "$AGENT_JOIN_TOKEN" ] && [ -n "$AGENT_TOKEN" ] || die "the control plane answered, but the answer holds no tokens"
+  [[ "$AGENT_JOIN_TOKEN" =~ $RE_TOKEN && "$AGENT_TOKEN" =~ $RE_TOKEN ]] || { AGENT_JOIN_TOKEN=""; AGENT_TOKEN=""; die "the control plane returned a token with unexpected characters -- nothing was written"; }
   ok "token redeemed"
 }
 
@@ -801,7 +808,7 @@ demo_origin() { # host:port
 
 tunnel_questions() {
   ask CT_AGENT_CP_URL "Control plane" "$DEFAULT_CP"
-  CP="${CT_AGENT_CP_URL%/}"; need "CT_AGENT_CP_URL" "$CP" "$RE_URL"
+  CP="${CT_AGENT_CP_URL%/}"; check_cp "$CP"
   if [ -f "$WORK/.env" ] && grep -q '^CT_AGENT_TOKEN=' "$WORK/.env"; then
     ok ".env found in $WORK -- reusing hostname and tokens"
     HOSTNAME_="$(envval CT_AGENT_HOSTNAME)"; AGENT_TOKEN="$(envval CT_AGENT_TOKEN)"; AGENT_JOIN_TOKEN="$(envval CT_AGENT_JOIN_TOKEN)"

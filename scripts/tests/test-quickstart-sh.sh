@@ -91,6 +91,9 @@ case "$url" in
   */network-info)     body='{"channel_broker_port": 7001, "channel_relay_port": 7002, "channel_relay_gate_port": 443}' ;;
   */pki/ca)           printf '\001\002\003' ;;
   */bootstrap/redeem) body="{\"secret\":\"CT_JOIN_TOKEN=joinsecret123;CT_AGENT_TOKEN=${STUB_EVIL_TOKEN:-agentsecret456}\"}" ;;
+esac
+case "$url" in
+  */bootstrap/redeem) [ -z "${STUB_EMPTY_SECRET:-}" ] || body='{"secret":""}' ;;
   */members)          code="${STUB_MEMBER_CODE:-201}" ;;
   https://*)          code=200 ;;
 esac
@@ -376,6 +379,26 @@ check "N: --workdir without a value fails and says so" [ "$rc" -ne 0 ] && grep -
 mkdir -p "$T/nops"; for t in mkdir ls touch cat sed dirname id date cd pwd; do p="$(command -v "$t" 2>/dev/null)"; case "$p" in /*) ln -sf "$p" "$T/nops/$t" ;; esac; done
 outO="$(env -i PATH="$T/nops" HOME="$T/home" CT_QS_WORKDIR="$T/wo" "$(command -v bash)" "$QS" --clean --yes 2>&1 </dev/null)"; rc=$?
 check "O: missing ps/pgrep stops with a clear message" [ "$rc" -ne 0 ] && grep -q 'ps and pgrep are required' <<<"$outO"
+
+# empty secret from the control plane: "holds no tokens", not "unexpected characters"
+reset
+E=(CT_AGENT_HOSTNAME=demo.example.test "CT_BOOTSTRAP=$SECRET_BOOT" CT_AGENT_ORIGIN=127.0.0.1:9 STUB_EMPTY_SECRET=1)
+outE="$(run_qs "$T/wq" tunnel --yes --no-demo-origin 2>&1)"; rc=$?
+check "an answer without tokens fails" [ "$rc" -ne 0 ]
+check "it says the answer holds no tokens" grep -q 'holds no tokens' <<<"$outE"
+check "it does not blame the characters" ! grep -q 'unexpected characters' <<<"$outE"
+# plain http:// to a non-local host warns loudly (no abort); to localhost it stays quiet
+reset
+E=(CT_AGENT_HOSTNAME=demo.example.test "CT_BOOTSTRAP=$SECRET_BOOT" CT_AGENT_ORIGIN=127.0.0.1:9 CT_AGENT_CP_URL=http://cp.example.test)
+outH="$(run_qs "$T/wu" tunnel --yes --no-demo-origin 2>&1)"; rc=$?
+check "http:// to a non-local host warns about clear text" grep -q 'plain http://' <<<"$outH"
+check "the warning is not an abort" [ "$rc" -eq 0 ]
+killrec
+reset
+E=(CT_AGENT_HOSTNAME=demo.example.test "CT_BOOTSTRAP=$SECRET_BOOT" CT_AGENT_ORIGIN=127.0.0.1:9 CT_AGENT_CP_URL=http://127.0.0.1:8080)
+outH2="$(run_qs "$T/wv" tunnel --yes --no-demo-origin 2>&1)"
+check "http:// to localhost does not warn" ! grep -q 'plain http://' <<<"$outH2"
+killrec
 
 # ---- 6. several machines: the pasted-block round trip -----------------------------------------------------------
 reset
