@@ -12,8 +12,10 @@ comparison table in the [README](../README.md#tunnel-or-channel) first.
 | 3 | `ssh <hostname>` to a machine behind NAT, through a tunnel | [SSH over a tunnel](#3-ssh-over-a-tunnel) |
 | 4 | `ssh` to a machine behind NAT, through a channel | [SSH over a channel](#4-ssh-over-a-channel) |
 
-Placeholders are written in angle brackets (`<name>.example.org`, `<edge-host>`). Secrets are never
-typed on a command line in these steps; they come from the environment or a `0600` file.
+Placeholders are written in angle brackets (`<name>.example.org`, `<edge-host>`). `<control-plane>` is
+the base URL of your CADS-Tunnel control plane, the value you give `ct-agent` as `CT_AGENT_CP_URL`
+(`https://bunsenbrenner.org` for the hosted deployment). Secrets are never typed on a command line in
+these steps; they come from the environment or a `0600` file.
 
 A note on QUIC: `ct-agent` speaks QUIC (UDP) where it can and falls back to TLS over TCP `:443`
 by itself. You do not choose it per path. A tunnel registers over QUIC first (the
@@ -25,11 +27,13 @@ relay first and then the `:443` front door ([transport ladders](channel.md#trans
 
 ## 1. Tunnel
 
+**Status:** commands checked against v0.7.39; not yet run end to end.
+
 **Result:** a service listening on `127.0.0.1:8080` of your machine answers under your tunnel's
 public hostname, although your machine only ever dials out.
 
-1. Create the tunnel in the portal of your CADS-Tunnel control plane (for the hosted deployment,
-   `https://bunsenbrenner.org/portal/tunnels`) and open its **Install** page. It shows a
+1. Create the tunnel in the portal of your control plane (`<control-plane>/portal/tunnels`) and open
+   its **Install** page. It shows a
    short-lived bootstrap token and the hostname of the tunnel.
 2. Start something to publish, here a throw-away web server on loopback:
 
@@ -80,6 +84,8 @@ recorded events), stop with `kill $(cat ct-agent.pid)`.
 
 ## 2. Channel
 
+**Status:** commands checked against v0.7.39; not yet run end to end.
+
 **Result:** bytes typed on member B appear on member A, end-to-end encrypted (Noise_IK). The
 edge brokers and relays the connection and sees only ciphertext.
 
@@ -109,28 +115,49 @@ initiates. One person can be all three.
    grep PUBKEY member.env
    ```
 
-4. Member B derives the channel id from the operator's public key and A's holder public key, and sends
-   `channel_id` and `noise_attestation` back to the operator:
+4. Each member computes its own material from the operator's public key and the *other* member's
+   holder public key, and sends `channel_id` and `noise_attestation` to the operator (both members
+   get the same `channel_id`):
 
    ```bash
    . ./member.env
-   CT_CHANNEL_OPERATOR_PUBKEY=<operator_pubkey> CT_CHANNEL_BRIDGE_HOLDER=<A's holder pubkey> \
+   CT_CHANNEL_OPERATOR_PUBKEY=<operator_pubkey> CT_CHANNEL_BRIDGE_HOLDER=<the other member's holder pubkey> \
      ct-agent channel member-material
    ```
 
-5. Operator: register the channel with the control plane, then sign one grant per member
-   (`CT_GRANT_DIRECTION` is `accept` for A and `initiate` for B; `CT_GRANT_EXPIRES` is Unix seconds):
+5. Operator: register the channel with the control plane, add both members, then sign one grant per
+   member (`CT_GRANT_DIRECTION` is `accept` for A and `initiate` for B; `CT_GRANT_EXPIRES` is Unix seconds).
 
    ```bash
-   CT_AGENT_CP_URL=https://bunsenbrenner.org CT_CHANNEL_ID=<channel_id> ct-agent channel register
+   CT_AGENT_CP_URL=<control-plane> CT_CHANNEL_ID=<channel_id> ct-agent channel register
+   ```
 
+   Adding a member is an HTTP call to the control plane, `POST /me/channels/<channel_id>/members`, as the
+   channel's owner (the same account you logged in with). It takes the member's `holder_pubkey`,
+   `noise_pubkey` and `noise_attestation`, and the control plane verifies the attestation. Put a bearer
+   token of that account into a file (`umask 077; ...  > token`, for example with
+   `scripts/channel-ops/mint-oidc-token.sh` from the CADS-Tunnel repository) and let curl read the header
+   from stdin so the token never appears in the process list. Repeat for both members; a `409` means the
+   member is already added:
+
+   ```bash
+   CP=<control-plane>; CH=<channel_id>
+   curl -sS -X POST "$CP/me/channels/$CH/members" -H 'content-type: application/json' \
+     --config - -d '{"holder":"<holder_pubkey>","noise_pubkey":"<noise_pubkey>","noise_attestation":"<noise_attestation>"}' <<EOF
+   header = "Authorization: Bearer $(cat token)"
+   EOF
+   ```
+
+   (`scripts/channel-ops/provision-link-channel.sh` in the CADS-Tunnel repository does register, member
+   add and grant signing for both sides in one run.) Then sign the grants:
+
+   ```bash
    CT_GRANT_CHANNEL=<channel_id> CT_GRANT_MEMBER_HOLDER=<member holder pubkey> \
    CT_GRANT_DIRECTION=initiate CT_GRANT_EXPIRES=$(( $(date +%s) + 86400 )) \
      ct-agent channel grant           # prints the member's CT_CHANNEL_GRANT
    ```
 
-   Then add both members to the channel at the control plane. This is not a `ct-agent`
-   subcommand; without it every join is refused with `edge broker refused the channel join`
+   Without the member add, every join is refused with `edge broker refused the channel join`
    (see the [note on admission](channel.md#modes)).
 
 6. Member A (accept) and member B (initiate) start with the same edge addresses. Both use the
@@ -161,6 +188,8 @@ without any broker) are in the [channel reference](channel.md#modes).
 ---
 
 ## 3. SSH over a tunnel
+
+**Status:** commands checked against v0.7.39; not yet run end to end.
 
 **Result:** `ssh <name>.example.org` reaches the sshd of a machine that has no open port. The
 tunnel's hostname is the SSH host; the client speaks SSH inside TLS to the edge on `:443`.
@@ -224,6 +253,8 @@ login still applies on top.
 
 ## 4. SSH over a channel
 
+**Status:** commands checked against v0.7.39; not yet run end to end.
+
 **Result:** `ssh -p 2222 <user>@127.0.0.1` on the client reaches the sshd of the accepting
 machine, which stays bound to its loopback and is never published. There is no `ssh`
 subcommand for channels; it is the generic **TCP forward** (`CT_CHANNEL_FORWARD`, off
@@ -258,5 +289,7 @@ by default) used with port 22.
    ssh -p 2222 <user>@127.0.0.1
    ```
 
-**You are done when** you get the shell prompt of member A's machine. The forward reconnects after
-a session end, and stops for good only when the grant expires or is revoked.
+**You are done when** you get the shell prompt of member A's machine. If the session drops (peer
+restart, network), the listener on B reconnects with backoff. Once B's own grant has expired, or the grant
+check has recorded the end of the session, it stays bound but closes every new connection and logs the
+reason. Do not rely on revoking a grant to stop a running forward (see the note at the top).
