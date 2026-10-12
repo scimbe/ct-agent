@@ -1,0 +1,52 @@
+name: public-hygiene
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  public-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Self-test
+        run: bash scripts/tests/test-public-hygiene.sh
+
+      # Only what the PR adds is checked (added lines, commit messages, author emails,
+      # PR title, body and branch name), so existing text never turns this red.
+      - name: Check the PR
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Optional, not in the repository; absent on fork PRs.
+          PUBLIC_HYGIENE_EXTRA_PATTERNS: ${{ secrets.PUBLIC_HYGIENE_EXTRA_PATTERNS }}
+          PUBLIC_HYGIENE_EXTRA_SHA256: ${{ secrets.PUBLIC_HYGIENE_EXTRA_SHA256 }}
+        # The PR cannot weaken its own check: when the base revision already has the script and
+        # its patterns, they are taken from there. (The three files are exempt from the diff scan
+        # because they must contain the shapes they look for; running the base copy is what
+        # keeps a PR from editing them to pass.) The self-test above still runs from the PR.
+        run: |
+          check=scripts/check-public-hygiene.sh
+          if git cat-file -e "$BASE_SHA:scripts/check-public-hygiene.sh" 2>/dev/null \
+             && git cat-file -e "$BASE_SHA:scripts/public-hygiene.patterns" 2>/dev/null; then
+            mkdir -p "$RUNNER_TEMP/hygiene"
+            git show "$BASE_SHA:scripts/check-public-hygiene.sh" > "$RUNNER_TEMP/hygiene/check-public-hygiene.sh"
+            git show "$BASE_SHA:scripts/public-hygiene.patterns" > "$RUNNER_TEMP/hygiene/public-hygiene.patterns"
+            check="$RUNNER_TEMP/hygiene/check-public-hygiene.sh"
+          fi
+          bash "$check" diff "$BASE_SHA" "$HEAD_SHA"
+
+      - name: Report on the whole tree (informational)
+        if: github.event_name == 'workflow_dispatch'
+        run: bash scripts/check-public-hygiene.sh scan
