@@ -27,7 +27,7 @@ relay first and then the `:443` front door ([transport ladders](channel.md#trans
 
 ## 1. Tunnel
 
-**Status:** commands checked against v0.7.39; not yet run end to end.
+**Status:** steps 2–3 run with v0.7.39; the portal steps not run.
 
 **Result:** a service listening on `127.0.0.1:8080` of your machine answers under your tunnel's
 public hostname, although your machine only ever dials out.
@@ -42,7 +42,8 @@ public hostname, although your machine only ever dials out.
    ```
 
 3. In a second terminal, in an empty directory, run the guided setup. On the first run it
-   writes `.env.example` and stops:
+   writes `.env.example` and stops. Without a terminal (a pipe, CI) the script cannot ask its
+   direct-host confirmation and aborts; pass `--yes` there (`bash setup.sh --yes`):
 
    ```bash
    curl -fsSL https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh -o setup.sh
@@ -63,8 +64,8 @@ public hostname, although your machine only ever dials out.
    ```
 
    Add `--docker` to run the agent as a container instead of directly on the host. The
-   direct-host path asks for confirmation (`--yes` skips it) because it should run on an isolated VM,
-   container or dedicated host.
+   direct-host path asks for confirmation (`--yes` skips it, and is required without a terminal)
+   because it should run on an isolated VM, container or dedicated host.
 
 5. **You are done when** the script ends with `done — current tier: …` and `ct-agent.log`
    shows the agent registered; then open `https://<name>.example.org/` in a browser or:
@@ -84,7 +85,7 @@ recorded events), stop with `kill $(cat ct-agent.pid)`.
 
 ## 2. Channel
 
-**Status:** commands checked against v0.7.39; not yet run end to end.
+**Status:** run end to end with v0.7.39 against a self-hosted edge and control plane (front door :443, relay).
 
 **Result:** bytes typed on member B appear on member A, end-to-end encrypted (Noise_IK). The
 edge brokers and relays the connection and sees only ciphertext.
@@ -163,7 +164,14 @@ initiates. One person can be all three.
 6. Member A (accept) and member B (initiate) start with the same edge addresses. Both use the
    `:443` front door only, which keeps both halves in the same pairer
    ([why](channel.md#pairing-reality-until-cads-tunnel495-lands)). Take the front-door address from
-   your operator; its certificate comes from `GET <control-plane>/pki/ca`:
+   your operator; its certificate is the control plane's CA, which `GET <control-plane>/pki/ca` returns as raw DER.
+   Convert it to hex once:
+
+   ```bash
+   curl -fsS <control-plane>/pki/ca | od -An -v -tx1 | tr -d ' \n'
+   ```
+
+   Then start both sides:
 
    ```bash
    . ./member.env
@@ -179,7 +187,8 @@ initiates. One person can be all three.
    echo "hello from B" | CT_CHANNEL_ROLE=initiate ct-agent channel
    ```
 
-7. **You are done when** `received.txt` on A contains `hello from B`. Without a service handler
+7. **You are done when** `received.txt` on A contains `hello from B` (after a few seconds). A does not
+   exit by itself after receiving; stop it with Ctrl-C. Without a service handler
    `ct-agent channel` is a raw pipe: stdin goes to the peer and the peer's bytes arrive on stdout.
 
 Other modes (a held service session with one JSON line per call, a persistent server, a call
@@ -189,7 +198,7 @@ without any broker) are in the [channel reference](channel.md#modes).
 
 ## 3. SSH over a tunnel
 
-**Status:** commands checked against v0.7.39; not yet run end to end.
+**Status:** `ssh-config` and `ssh-owner show` checked offline; not run end to end (needs tier Grün).
 
 **Result:** `ssh <name>.example.org` reaches the sshd of a machine that has no open port. The
 tunnel's hostname is the SSH host; the client speaks SSH inside TLS to the edge on `:443`.
@@ -219,8 +228,9 @@ terminate TLS with the hostname's own certificate (an sshd cannot).
 
    In terminate mode the agent terminates the client's TLS with the certificate pair from that
    directory, forwards the SSH bytes to sshd, and fails at startup if the pair cannot be loaded. It
-   also needs a state directory, because it generates an owner key there at its first start. Print the
-   key with:
+   also needs a state directory, because it generates an owner key there at its first start. Once the
+   agent has started, print the key (before that, `show` answers "no owner key yet"; `ct-agent ssh-owner init`
+   creates it right away):
 
    ```bash
    CT_AGENT_STATE_DIR=./.ct-agent-state ct-agent ssh-owner show
@@ -253,16 +263,19 @@ login still applies on top.
 
 ## 4. SSH over a channel
 
-**Status:** commands checked against v0.7.39; not yet run end to end.
+**Status:** run end to end with v0.7.39 against a self-hosted edge and control plane (front door :443, relay).
 
 **Result:** `ssh -p 2222 <user>@127.0.0.1` on the client reaches the sshd of the accepting
 machine, which stays bound to its loopback and is never published. There is no `ssh`
 subcommand for channels; it is the generic **TCP forward** (`CT_CHANNEL_FORWARD`, off
 by default) used with port 22.
 
-> The forward is opt-in. The reference says not to enable it in production until grant revocation
+> The forward is opt-in, and the reference says not to enable it in production until grant revocation
 > ends running forwarded streams ([#45](https://github.com/scimbe/ct-agent/issues/45)); see
 > [TCP forward over a paired channel](channel.md#tcp-forward-over-a-paired-channel-255--opt-in-default-off).
+> What was measured: on the relay path, removing the member at the control plane ended a running forwarded
+> SSH session within about 30 seconds (the edge's sweep) and new joins were refused. For peers that have
+> upgraded to a direct connection this was not measured. The warning stands.
 
 1. Set up the channel as in [section 2](#2-channel), steps 1 to 5. The machine with the sshd is
    member A (accept), the client is member B (initiate).
@@ -288,6 +301,10 @@ by default) used with port 22.
    ```bash
    ssh -p 2222 <user>@127.0.0.1
    ```
+
+   The first time, ssh asks you to confirm the host key of member A's machine under `127.0.0.1:2222`
+   (not of your own machine). To keep it apart from other things on that port, add
+   `-o HostKeyAlias=<name>`.
 
 **You are done when** you get the shell prompt of member A's machine. If the session drops (peer
 restart, network), the listener on B reconnects with backoff. Once B's own grant has expired, or the grant
