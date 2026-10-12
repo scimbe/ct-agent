@@ -1043,8 +1043,7 @@ mod tests {
         assert!(r.is_err(), "still open after twenty re-checks: {r:?}");
     }
 
-    /// A forward never runs without the peer's grant, whatever the opt-in says; without an
-    /// operator key it refuses to join rather than silently skipping the check.
+    /// No control-plane URL: the forward starts with a warning, and not at all when revocation is required.
     #[test]
     fn a_forward_without_a_control_plane_url_starts_with_a_warning_unless_revocation_is_required() {
         use super::super::{resolve_cp, revocation_required};
@@ -1072,6 +1071,8 @@ mod tests {
         assert!(check(false, None, None, Some("yes")).is_err());
     }
 
+    /// A forward never runs without the peer's grant, whatever the opt-in says; without an
+    /// operator key it refuses to join rather than silently skipping the check.
     #[test]
     fn a_forward_forces_the_peer_grant_check() {
         let none = |_: &str| None;
