@@ -1,0 +1,39 @@
+name: public-hygiene
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  public-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Self-test
+        run: bash scripts/tests/test-public-hygiene.sh
+
+      # Only what the PR adds is checked (added lines, commit messages, author emails,
+      # PR title, body and branch name), so existing text never turns this red.
+      - name: Check the PR
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Optional, not in the repository; absent on fork PRs.
+          PUBLIC_HYGIENE_EXTRA_PATTERNS: ${{ secrets.PUBLIC_HYGIENE_EXTRA_PATTERNS }}
+          PUBLIC_HYGIENE_EXTRA_SHA256: ${{ secrets.PUBLIC_HYGIENE_EXTRA_SHA256 }}
+        run: bash scripts/check-public-hygiene.sh diff "$BASE_SHA" "$HEAD_SHA"
+
+      - name: Report on the whole tree (informational)
+        if: github.event_name == 'workflow_dispatch'
+        run: bash scripts/check-public-hygiene.sh scan
