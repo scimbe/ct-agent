@@ -68,7 +68,7 @@ run_hashes() {
     h="$(printf '%s' "$tok" | sum | cut -d' ' -f1)"
     if printf '%s\n' "$PUBLIC_HYGIENE_EXTRA_SHA256" | tr -s ' \t' '\n\n' | grep -qxF "$h"; then
       while IFS= read -r loc; do report "$loc" "listed-token"; done \
-        < <(grep -iF -- "$tok" "$stream" | sed "s/${us}.*//")
+        < <(awk -v us="$us" -v t="$tok" '{ i = index($0, us); if (index(tolower(substr($0, i + 1)), t)) print substr($0, 1, i - 1) }' "$stream")
     fi
   done < <(sed "s/^[^${us}]*${us}//" "$stream" | grep -Eo '[A-Za-z0-9][A-Za-z0-9._-]{2,40}' | tr 'A-Z' 'a-z' | sort -u)
 }
