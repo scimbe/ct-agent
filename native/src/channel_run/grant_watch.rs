@@ -100,7 +100,9 @@ pub enum GrantState {
 /// Why no state could be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusError {
-    /// The control plane has no such endpoint (404/405): it can never answer.
+    /// The control plane answered 404 on the re-check path without naming a channel: it does
+    /// not have the endpoint (an older release). It answered, over the verified connection, so
+    /// the session runs on and says so once; revocation is just not available from this CP.
     Unsupported,
     /// A transient or unintelligible failure.
     Unreadable(String),
@@ -119,6 +121,14 @@ pub trait GrantStatusSource: Send + Sync {
 pub struct WatchSetup {
     pub source: Arc<dyn GrantStatusSource>,
     pub config: WatchConfig,
+    /// Where the one-per-session notices go (stderr in production).
+    pub notice: Arc<dyn Fn(String) + Send + Sync>,
+}
+
+impl WatchSetup {
+    pub fn new(source: Arc<dyn GrantStatusSource>, config: WatchConfig) -> Self {
+        Self { source, config, notice: Arc::new(|m| eprintln!("ct-agent channel: {m}")) }
+    }
 }
 
 impl std::fmt::Debug for WatchSetup {
@@ -190,28 +200,36 @@ impl CpStatusSource {
             .send()
             .await
             .map_err(|e| StatusError::Unreadable(format!("request failed: {e}")))?;
-        let code = resp.status();
-        if code == reqwest::StatusCode::NOT_FOUND || code == reqwest::StatusCode::METHOD_NOT_ALLOWED {
-            return Err(StatusError::Unsupported);
-        }
+        let code = resp.status().as_u16();
+        let body = resp.text().await.map_err(|e| StatusError::Unreadable(format!("unreadable answer: {e}")))?;
+        classify_answer(code, &body)
+    }
+}
+
+/// Turn the control plane's HTTP answer into a verdict. Pure.
+///
+/// A 404 is ambiguous on its own: a control plane that has the endpoint answers it for a channel
+/// it does not know (and says so in the body, `{"state":"unknown-channel"}`: the channel is gone,
+/// so the session ends), while one that lacks the endpoint answers an empty or foreign 404
+/// (unsupported). Everything else that is not a plain answer is unreadable and fails closed after
+/// the grace.
+pub fn classify_answer(code: u16, body: &str) -> Result<GrantState, StatusError> {
+    let state = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("state").and_then(|s| s.as_str()).map(str::to_string));
+    match code {
+        404 if state.as_deref() == Some("unknown-channel") => Ok(GrantState::NotMember),
+        404 => Err(StatusError::Unsupported),
         // 403 means the control plane no longer counts this member as one: nothing about the
         // peer can be asked, and nothing this member does on the channel is authorized.
-        if code == reqwest::StatusCode::FORBIDDEN {
-            return Ok(GrantState::NotMember);
-        }
-        if !code.is_success() {
-            return Err(StatusError::Unreadable(format!("control plane answered {code}")));
-        }
-        let v: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| StatusError::Unreadable(format!("unreadable answer: {e}")))?;
-        match v.get("state").and_then(|s| s.as_str()) {
+        403 => Ok(GrantState::NotMember),
+        200..=299 => match state.as_deref() {
             Some("valid") => Ok(GrantState::Valid),
             Some("revoked") => Ok(GrantState::Revoked),
             Some("not-member") => Ok(GrantState::NotMember),
             other => Err(StatusError::Unreadable(format!("unknown state {other:?}"))),
-        }
+        },
+        c => Err(StatusError::Unreadable(format!("control plane answered {c}"))),
     }
 }
 
@@ -225,6 +243,7 @@ impl GrantStatusSource for CpStatusSource {
 /// hearing about it; when its receiver is dropped (the session is over) the loop stops.
 pub async fn watch_peer_grant(setup: WatchSetup, mut end: oneshot::Sender<String>) {
     let mut last_valid = tokio::time::Instant::now();
+    let mut warned = false;
     loop {
         tokio::select! {
             _ = tokio::time::sleep(setup.config.interval) => {}
@@ -242,9 +261,17 @@ pub async fn watch_peer_grant(setup: WatchSetup, mut end: oneshot::Sender<String
             Ok(GrantState::Revoked) => "the peer's grant was revoked".to_string(),
             Ok(GrantState::NotMember) => "the peer is no longer a member of the channel".to_string(),
             Err(StatusError::Unsupported) => {
-                "the control plane cannot re-check grants (no /channel/grant-status); \
-                 refusing to keep a forward session nobody can revoke"
-                    .to_string()
+                // The control plane answered, so it is reachable: nothing to fail closed on.
+                last_valid = tokio::time::Instant::now();
+                if !warned {
+                    warned = true;
+                    (setup.notice)(
+                        "WARNING: this control plane has no /channel/grant-status; a revoked grant will NOT end \
+                         this forward session until it is upgraded (the session keeps running and asks again)"
+                            .to_string(),
+                    );
+                }
+                continue;
             }
             Err(StatusError::Unreadable(why)) => {
                 let silent = last_valid.elapsed();
@@ -330,10 +357,7 @@ mod tests {
     }
 
     fn setup(src: Arc<Script>) -> WatchSetup {
-        WatchSetup {
-            source: src,
-            config: WatchConfig { interval: Duration::from_secs(30), grace: Duration::from_secs(90) },
-        }
+        WatchSetup::new(src, WatchConfig { interval: Duration::from_secs(30), grace: Duration::from_secs(90) })
     }
 
     async fn run(src: Arc<Script>) -> (Option<String>, Duration) {
@@ -385,10 +409,58 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_control_plane_without_the_endpoint_ends_the_session_at_once() {
-        let (why, after) = run(Script::new(vec![Err(StatusError::Unsupported)])).await;
-        assert!(why.unwrap().contains("cannot re-check"));
-        assert_eq!(after, Duration::from_secs(30));
+    async fn a_control_plane_without_the_endpoint_keeps_the_session_and_warns_once() {
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let mut s = setup(Script::new(vec![
+            Err(StatusError::Unsupported),
+            Err(StatusError::Unsupported),
+            Err(StatusError::Unsupported),
+            Ok(GrantState::Revoked),
+        ]));
+        let n = notices.clone();
+        s.notice = Arc::new(move |m| n.lock().unwrap().push(m));
+        let (tx, rx) = oneshot::channel();
+        let started = tokio::time::Instant::now();
+        tokio::spawn(watch_peer_grant(s, tx));
+        let why = rx.await.unwrap();
+        assert!(why.contains("revoked"), "an upgraded control plane takes effect on a running session: {why}");
+        assert_eq!(started.elapsed(), Duration::from_secs(120), "three unsupported ticks did not end it");
+        let got = notices.lock().unwrap();
+        assert_eq!(got.len(), 1, "one warning per session, not one per tick: {got:?}");
+        assert!(got[0].contains("WARNING") && got[0].contains("grant-status"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsupported_answers_do_not_run_down_the_grace_but_unreadable_ones_do() {
+        // 100 ticks of "unsupported" (> grace), then the CP goes unreadable: the grace counts from
+        // the last answer, not from the session start.
+        let mut v: Vec<_> = (0..100).map(|_| Err(StatusError::Unsupported)).collect();
+        v.push(Err(StatusError::Unreadable("down".into())));
+        v.push(Err(StatusError::Unreadable("down".into())));
+        let (why, after) = run(Script::new(v)).await;
+        assert!(why.unwrap().contains("failing closed"));
+        assert_eq!(after, Duration::from_secs(30 * 100 + 30 * 3), "ends one grace after the last answer");
+    }
+
+    #[test]
+    fn answers_are_classified_so_that_only_a_clear_unknown_endpoint_is_unsupported() {
+        use GrantState::*;
+        assert_eq!(classify_answer(404, ""), Err(StatusError::Unsupported), "old CP: empty 404");
+        assert_eq!(classify_answer(404, "<html>nope</html>"), Err(StatusError::Unsupported));
+        assert_eq!(
+            classify_answer(404, r#"{"state":"unknown-channel"}"#),
+            Ok(NotMember),
+            "a CP that has the endpoint and no such channel: the channel is gone"
+        );
+        assert_eq!(classify_answer(403, ""), Ok(NotMember));
+        assert_eq!(classify_answer(200, r#"{"state":"valid","checked_at":1}"#), Ok(Valid));
+        assert_eq!(classify_answer(200, r#"{"state":"revoked"}"#), Ok(Revoked));
+        for (code, body) in [(405, ""), (500, ""), (502, "bad gateway"), (401, ""), (429, ""), (200, "{}"), (200, "garbage")] {
+            assert!(
+                matches!(classify_answer(code, body), Err(StatusError::Unreadable(_))),
+                "{code} {body:?} fails closed after the grace"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
