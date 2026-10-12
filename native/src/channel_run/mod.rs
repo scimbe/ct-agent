@@ -348,8 +348,9 @@ where
 /// A TCP forward session (`CT_CHANNEL_FORWARD` / `CT_CHANNEL_FORWARD_ALLOW`) always runs the check,
 /// and its accept side also re-checks the peer's grant against the control plane every
 /// `CT_CHANNEL_GRANT_RECHECK_SECS`, because only that can end a forward after the grant was
-/// revoked once the edge is out of the data path. It needs `CT_AGENT_CP_URL` for that and refuses
-/// to join without it.
+/// revoked once the edge is out of the data path. The control plane is `CT_AGENT_CP_URL` (the agent
+/// has no other source for it). Without it the forward starts as before, with a warning that the
+/// re-check is disabled; `CT_CHANNEL_REVOCATION=require` makes that an error instead.
 pub(crate) fn gate_local<P>(
     local: P,
     request: &ChannelJoinRequest,
@@ -359,11 +360,21 @@ pub(crate) fn gate_local<P>(
 ) -> Result<PeerGrantGate<P>, BoxError> {
     let forward = forward_session_configured();
     let watch = if forward && role == ChannelRole::Accept {
-        let cp_url = std::env::var("CT_AGENT_CP_URL").ok().filter(|s| !s.trim().is_empty()).ok_or(
-            "a forward session needs CT_AGENT_CP_URL to re-check the peer's grant while it runs -- refusing to join",
-        )?;
-        let config = grant_watch::WatchConfig::from_env()?;
-        Some(grant_watch::WatchPlan::control_plane(&cp_url, holder, &request.grant, config))
+        let cp_url = std::env::var("CT_AGENT_CP_URL").ok().filter(|s| !s.trim().is_empty());
+        let required = revocation_required(std::env::var(REVOCATION_ENV).ok().as_deref())?;
+        match resolve_cp(cp_url, required)? {
+            Some(cp_url) => {
+                let config = grant_watch::WatchConfig::from_env()?;
+                Some(grant_watch::WatchPlan::control_plane(&cp_url, holder, &request.grant, config))
+            }
+            None => {
+                eprintln!(
+                    "ct-agent channel: WARNING: revocation re-check disabled: no control-plane URL \
+                     (set CT_AGENT_CP_URL); a revoked grant will not end this forward session"
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -375,6 +386,30 @@ pub(crate) fn gate_local<P>(
         watch,
     });
     Ok(PeerGrantGate::new(local, check))
+}
+
+/// `CT_CHANNEL_REVOCATION=require` turns "no control-plane URL for the forward's grant re-check"
+/// from a warning into a refusal to join. Unset or `warn` is the default.
+pub(crate) const REVOCATION_ENV: &str = "CT_CHANNEL_REVOCATION";
+
+/// The control plane the re-check asks: the configured URL, or none (warn) / an error (require).
+pub(crate) fn resolve_cp(cp_url: Option<String>, required: bool) -> Result<Option<String>, String> {
+    match (cp_url, required) {
+        (Some(u), _) => Ok(Some(u)),
+        (None, true) => Err(format!(
+            "{REVOCATION_ENV}=require but no control-plane URL (CT_AGENT_CP_URL) is set: \
+             a revoked grant could not end this forward -- refusing to join"
+        )),
+        (None, false) => Ok(None),
+    }
+}
+
+pub(crate) fn revocation_required(v: Option<&str>) -> Result<bool, String> {
+    match v.map(str::trim) {
+        None | Some("") | Some("warn") => Ok(false),
+        Some("require") => Ok(true),
+        Some(o) => Err(format!("{REVOCATION_ENV}={o:?} is not understood (use `require` or `warn`)")),
+    }
 }
 
 /// Whether this process runs a TCP forward session, on either side.
