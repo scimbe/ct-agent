@@ -10,8 +10,10 @@
 #   scripts/quickstart.sh ssh-channel  [--yes] [--role operator|member] # 4. ssh via a channel (TCP forward)
 #   scripts/quickstart.sh --clean                                      # remove this script's own working directory
 #
-# Secrets are never put on a command line: tokens come from the environment or a hidden prompt,
-# files that hold secrets are mode 0600. Run it again after a failure: keys, the registration, the
+# This script never puts a secret on a command line it builds itself: tokens come from the environment
+# or a hidden prompt and go to curl through stdin; files that hold secrets are mode 0600. It cannot
+# vouch for other programs it starts (setup.sh, ct-agent). Known: the agent writes the ssh owner key to
+# ct-agent.log on its first terminate-mode start, so treat that file as secret. Run it again after a failure: keys, the registration, the
 # member entries and the grants that already exist are reused. It overwrites only files it created
 # itself. With --yes it accepts defaults only: overwriting a different ssh owner key, appending to
 # ~/.ssh/config and turning on the TCP forward each need their own switch (see --help).
@@ -85,14 +87,17 @@ CMD=""; ROLE="${CT_QS_ROLE:-}"; ASSUME_YES=0; DO_CLEAN=0; DOCKER=0; DEMO_ORIGIN=
 INBOX_FILE="${CT_QS_INBOX_FILE:-}"
 WORK="${CT_QS_WORKDIR:-./ct-quickstart}"
 CT_QS_SIDE="${CT_QS_SIDE:-}"
+optval() { # an option that takes a value must have one (not missing, not another option)
+  { [ $# -ge 2 ] && [ -n "$2" ] && [ "${2#-}" = "$2" ]; } || die "$1 needs a value (try --help)"
+}
 while [ $# -gt 0 ]; do
   case "$1" in
     tunnel|channel|ssh-tunnel|ssh-channel) CMD="$1" ;;
     --yes|-y)         ASSUME_YES=1 ;;
-    --role)           shift; ROLE="${1:-}" ;;
-    --side)           shift; CT_QS_SIDE="${1:-}" ;;
-    --workdir)        shift; WORK="${1:-}" ;;
-    --inbox)          shift; INBOX_FILE="${1:-}" ;;
+    --role)           optval "$@"; shift; ROLE="$1" ;;
+    --side)           optval "$@"; shift; CT_QS_SIDE="$1" ;;
+    --workdir)        optval "$@"; shift; WORK="$1" ;;
+    --inbox)          optval "$@"; shift; INBOX_FILE="$1" ;;
     --docker)         DOCKER=1 ;;
     --no-demo-origin) DEMO_ORIGIN=0 ;;
     --rekey)          REKEY=1 ;;
@@ -180,6 +185,11 @@ env_kv() { # NAME VALUE -> a line safe to source
   else printf "%s='%s'\n" "$1" "${2//\'/\'\\\'\'}"; fi
 }
 
+# ours PIDFILE -- alive AND matching the signature recorded at start
+ours() {
+  local p; p="$(cat "$1" 2>/dev/null || true)"
+  pid_alive "$p" && [ -s "$(sigfile_of "$1")" ] && [ "$(proc_sig "$p")" = "$(cat "$(sigfile_of "$1")")" ]
+}
 # A process is "ours" only if its start time and command line equal what was recorded right after the start
 # (a recycled pid or someone else's ct-agent never matches). No record: never killed.
 proc_sig() { ps -p "$1" -o lstart=,command= 2>/dev/null | sed 's/  */ /g'; }
@@ -194,8 +204,13 @@ kill_tree() {
   for c in $(pgrep -P "$p" 2>/dev/null || true); do kill_tree "$c"; done
   kill "$p" 2>/dev/null || true
 }
-# Show the last lines of a log, redacted of nothing secret (ct-agent logs carry no keys).
-tail_log() { [ -s "$1" ] && { echo "  --- last lines of $1" >&2; tail -n "${2:-8}" "$1" | sed 's/^/  | /' >&2; } || true; }
+# Show the last lines of a log. Logs can hold keys (the agent prints the ssh owner key to its log on the first
+# terminate-mode start), so long hex runs are masked before anything is shown.
+tail_log() {
+  [ -s "$1" ] || return 0
+  echo "  --- last lines of $1" >&2
+  tail -n "${2:-8}" "$1" | sed -E 's/[0-9A-Fa-f]{32,}/<hex-redacted>/g; s/^/  | /' >&2
+}
 
 # Copy `bash`'s stdin to stdout, hiding every occurrence of the given secrets.
 redact() {
@@ -246,12 +261,17 @@ ensure_login() {
 }
 # The bearer token goes to curl through stdin only; this prints it for that single use.
 bearer() {
-  local f
-  if [ -n "${CT_OIDC_TOKEN:-}" ]; then printf '%s' "$CT_OIDC_TOKEN"; return; fi
-  if [ -n "${CT_OIDC_TOKEN_FILE:-}" ] && [ -s "$CT_OIDC_TOKEN_FILE" ]; then tr -d ' \r\n' < "$CT_OIDC_TOKEN_FILE"; return; fi
-  f="$(token_file)"
-  [ -s "$f" ] || return 1
-  tr -d '\n' < "$f" | sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p'
+  local f t=""
+  if [ -n "${CT_OIDC_TOKEN:-}" ]; then t="$CT_OIDC_TOKEN"
+  elif [ -n "${CT_OIDC_TOKEN_FILE:-}" ] && [ -s "$CT_OIDC_TOKEN_FILE" ]; then t="$(tr -d ' \r\n' < "$CT_OIDC_TOKEN_FILE")"
+  else
+    f="$(token_file)"
+    [ -s "$f" ] || return 1
+    t="$(tr -d '\n' < "$f" | sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p')"
+  fi
+  # the value goes into a curl config line: no quote, space or line break may get in
+  [[ "$t" =~ $RE_TOKEN ]] || { echo "the bearer token holds characters a token never has (quote, space, line break)" >&2; return 1; }
+  printf '%s' "$t"
 }
 
 # --- key material ---------------------------------------------------------------------
@@ -554,7 +574,14 @@ ssh_channel_run_single() {
   ask CT_QS_SSH_USER "Login name for ssh on the accepting machine" "$(id -un)"; user="$CT_QS_SSH_USER"
   pa="$(cat "$WORK/run/accept.pid" 2>/dev/null || true)"; pb="$(cat "$WORK/run/initiate.pid" 2>/dev/null || true)"
   stage "start member A (accept, serving, forward allowed to $tgt)" "see $WORK/logs/accept.log"
-  if pid_alive "$pa"; then ok "member A already running (pid $pa)"; else
+  local cfg="$WORK/run/forward.cfg" want="$tgt $port"
+  if [ -f "$cfg" ] && [ "$(cat "$cfg")" != "$want" ]; then
+    warn "the forward target or port changed ($(cat "$cfg") -> $want) -- restarting both members"
+    stop_pidfile "$WORK/run/accept.pid"; stop_pidfile "$WORK/run/initiate.pid"; pa=""; pb=""
+  fi
+  printf '%s\n' "$want" > "$cfg"
+  if ours "$WORK/run/accept.pid"; then ok "member A already running (pid $pa)"; else
+    pid_alive "$pa" && warn "pid $pa in accept.pid is not this script's process -- starting a new member A"
     run_side accept env CT_CHANNEL_ROLE=accept CT_CHANNEL_SERVE=1 CT_CHANNEL_FORWARD_ALLOW="$tgt" "$CTA" channel \
       </dev/null >"$WORK/logs/accept.out" 2>"$WORK/logs/accept.log" &
     pa=$!; echo "$pa" > "$WORK/run/accept.pid"; disown "$pa" 2>/dev/null || true
@@ -563,7 +590,8 @@ ssh_channel_run_single() {
     record_sig "$WORK/run/accept.pid"
   fi
   stage "start member B (initiate, listener on 127.0.0.1:$port)" "see $WORK/logs/initiate.log; stop everything with: $0 --clean"
-  if pid_alive "$pb"; then ok "member B already running (pid $pb)"; else
+  if ours "$WORK/run/initiate.pid"; then ok "member B already running (pid $pb)"; else
+    pid_alive "$pb" && warn "pid $pb in initiate.pid is not this script's process -- starting a new member B"
     : > "$WORK/logs/initiate.out"
     run_side initiate env CT_CHANNEL_ROLE=initiate CT_CHANNEL_FORWARD="127.0.0.1:$port=$tgt" "$CTA" channel \
       </dev/null >"$WORK/logs/initiate.out" 2>"$WORK/logs/initiate.log" &
@@ -720,8 +748,8 @@ cmd_channel() {
 redeem() { # sets AGENT_JOIN_TOKEN / AGENT_TOKEN from CT_BOOTSTRAP
   local resp bundle
   case "$CT_BOOTSTRAP" in *[!A-Za-z0-9._~-]*) die "the bootstrap token holds characters a token never has -- copy it again from the Install page" ;; esac
-  resp="$(printf '{"token":"%s"}' "$CT_BOOTSTRAP" | curl -fsSL -X POST -H 'content-type: application/json' \
-          --data-binary @- "$CP/bootstrap/redeem")" || die "redeeming the token failed -- it may be expired or already used; create a new one on the Install page"
+  resp="$(printf '{"token":"%s"}' "$CT_BOOTSTRAP" | curl -fsS --max-redirs 0 -X POST -H 'content-type: application/json' \
+          --data-binary @- "$CP/bootstrap/redeem")" || die "redeeming the token failed -- it may be expired or already used; create a new one on the Install page (a redirect is treated as an error: the token is not sent anywhere else)"
   bundle="$(printf '%s' "$resp" | sed -n 's/.*"secret":"\([^"]*\)".*/\1/p')"
   AGENT_JOIN_TOKEN="$(printf '%s' "$bundle" | sed -n 's/.*CT_JOIN_TOKEN=\([^;"]*\).*/\1/p')"
   AGENT_TOKEN="$(printf '%s' "$bundle" | sed -n 's/.*CT_AGENT_TOKEN=\([^;"]*\).*/\1/p')"
@@ -921,7 +949,7 @@ cmd_ssh_tunnel() {
       done
       ok "certificate pair written to $cdir (ct-agent certificate keeps running and renews it)"
     fi
-    stage "switch the agent to ssh" "see $WORK/ct-agent.log; the previous .env is in $WORK/.env.bak"
+    stage "switch the agent to ssh" "see $WORK/ct-agent.log (it may hold the owner key: do not share it); the previous .env is in $WORK/.env.bak"
     stop_pidfile "$WORK/ct-agent.pid"; sleep 1
     write_tunnel_env "127.0.0.1:22" CT_AGENT_MODE=browser CT_AGENT_ORIGIN_TLS=terminate "CT_ACME_CERT_OUT_DIR=$cdir"
     ok ".env switched to 127.0.0.1:22 / terminate (old one kept as .env.bak)"
@@ -932,7 +960,8 @@ cmd_ssh_tunnel() {
   (cd "$WORK" && CT_AGENT_STATE_DIR=./.ct-agent-state "$CTA" ssh-owner init > ssh-owner.key.new 2>"$WORK/logs/ssh-owner.log") \
     || { tail_log "$WORK/logs/ssh-owner.log"; die "ssh-owner init failed"; }
   chmod 600 "$WORK/ssh-owner.key.new"; mv -f "$WORK/ssh-owner.key.new" "$WORK/ssh-owner.key"
-  ok "owner key saved to $WORK/ssh-owner.key (mode 0600; it is not printed)"
+  ok "owner key saved to $WORK/ssh-owner.key (mode 0600; this script does not print it)"
+  warn "the agent also wrote the owner key to $WORK/ct-agent.log on its first start -- treat that file as secret and do not share it"
   DONE_MSG="the agent host is ready for ssh at $HOSTNAME_.
   On the client: copy $WORK/ssh-owner.key there (scp), then run
     CT_AGENT_HOSTNAME=$HOSTNAME_ CT_QS_OWNER_KEY_FILE=./ssh-owner.key $0 ssh-tunnel --role client
@@ -941,6 +970,10 @@ cmd_ssh_tunnel() {
 
 # --- main ----------------------------------------------------------------------------------
 main() {
+  command -v ps >/dev/null 2>&1 && command -v pgrep >/dev/null 2>&1 \
+    || die "ps and pgrep are required to stop only the processes this script started -- install procps (or run on macOS/Linux)"
+  ps -p $$ -o lstart=,command= >/dev/null 2>&1 \
+    || die "this system's ps does not support 'ps -p PID -o lstart=,command=' -- the script cannot tell its own processes apart, so it will not run"
   if [ "$DO_CLEAN" -eq 1 ]; then do_clean; return; fi
   case "$CMD" in
     tunnel)      cmd_tunnel ;;

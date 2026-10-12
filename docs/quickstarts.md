@@ -14,8 +14,11 @@ comparison table in the [README](../README.md#tunnel-or-channel) first.
 
 Placeholders are written in angle brackets (`<name>.example.org`, `<edge-host>`). `<control-plane>` is
 the base URL of your CADS-Tunnel control plane, the value you give `ct-agent` as `CT_AGENT_CP_URL`
-(`https://bunsenbrenner.org` for the hosted deployment). Secrets are never typed on a command line in
-these steps; they come from the environment or a `0600` file.
+(`https://bunsenbrenner.org` for the hosted deployment). In these steps secrets come from the environment
+or a `0600` file instead of a typed argument; `scripts/quickstart.sh` also keeps them off the command
+lines it builds. That covers only the script itself: other programs it starts can still expose a value
+(for example `setup.sh` puts a routing token into a URL), and the agent writes the ssh owner key to
+`ct-agent.log` on its first terminate-mode start, so treat that log as secret.
 
 A note on QUIC: `ct-agent` speaks QUIC (UDP) where it can and falls back to TLS over TCP `:443`
 by itself. You do not choose it per path. A tunnel registers over QUIC first (the

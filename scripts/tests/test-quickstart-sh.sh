@@ -342,6 +342,41 @@ env -i PATH=/usr/bin:/bin HOME="$T/home" STUB_LOG="$T/stub.log" CT_QS_WORKDIR="$
 check "E: client run without ct-agent on PATH succeeds" [ "$rc" -eq 0 ]
 check "E: the stanza calls the CLI by absolute path" grep -q "ProxyCommand $T/we/ct-agent " "$T/home/.ssh/config"
 
+# J: the host path warns that the agent log can hold the owner key; log excerpts mask long hex runs
+check "J: the finished host run says the owner key is not printed by the script and warns about ct-agent.log" grep -q 'do not share it' <<<"$outR"
+( set -e; cd "$T"; CT_QS_WORKDIR="$T/wj" . "$QS" tunnel >/dev/null 2>&1 || true
+  printf 'owner key %s\n' "$(printf 'ab%.0s' $(seq 1 32))" > "$T/j.log"
+  tail_log "$T/j.log" 2>&1 | grep -q 'hex-redacted' && ! tail_log "$T/j.log" 2>&1 | grep -q 'abababababababab' )
+check "J: tail_log masks a 64-character hex key" [ "$?" -eq 0 ]
+# K: the redeem POST does not follow redirects
+reset
+E=(CT_AGENT_HOSTNAME=demo.example.test "CT_BOOTSTRAP=$SECRET_BOOT" CT_AGENT_ORIGIN=127.0.0.1:9)
+run_qs "$T/wk" tunnel --yes --no-demo-origin >/dev/null 2>&1; killrec
+check "K: the redeem call has no -L and caps redirects" grep -q 'curl -fsS --max-redirs 0 -X POST' "$T/stub.log"
+# L: a bearer token with a quote is refused before it reaches a curl config
+reset
+E=(CT_OIDC_TOKEN='abc"def' CT_QS_WAIT=5)
+outL="$(run_qs "$T/wl" channel --yes 2>&1)"; rc=$?
+check "L: a bearer token with a quote is refused" [ "$rc" -ne 0 ]
+check "L: the bad token never reached curl's stdin" ! grep -q 'abc"def' "$T/curl.stdin"
+# M: a changed forward target restarts the members instead of keeping the old FORWARD_ALLOW
+reset
+mkdir -p "$T/home/.ct-agent"; echo "{\"access_token\":\"$SECRET_TOKEN\"}" > "$T/home/.ct-agent/oidc-token.json"
+E=(CT_QS_SSH_USER=tester)
+run_qs "$T/wm" ssh-channel --yes --enable-forward >/dev/null 2>&1
+E=(CT_QS_SSH_USER=tester CT_QS_FORWARD_TARGET=127.0.0.1:2200)
+outM="$(run_qs "$T/wm" ssh-channel --yes --enable-forward 2>&1)"
+check "M: the changed target is announced as a restart" grep -q 'restarting both members' <<<"$outM"
+check "M: member A was started again with the new allow list" grep -q 'run role=accept serve=1 allow=127.0.0.1:2200' "$T/stub.log"
+killrec
+# N: an option without its value ends with a clear message
+outN="$(run_qs "$T/wn" tunnel --workdir 2>&1)"; rc=$?
+check "N: --workdir without a value fails and says so" [ "$rc" -ne 0 ] && grep -q -- '--workdir needs a value' <<<"$outN"
+# O: without pgrep the script stops with a clear message
+mkdir -p "$T/nops"; for t in mkdir ls touch cat sed dirname id date cd pwd; do p="$(command -v "$t" 2>/dev/null)"; case "$p" in /*) ln -sf "$p" "$T/nops/$t" ;; esac; done
+outO="$(env -i PATH="$T/nops" HOME="$T/home" CT_QS_WORKDIR="$T/wo" "$(command -v bash)" "$QS" --clean --yes 2>&1 </dev/null)"; rc=$?
+check "O: missing ps/pgrep stops with a clear message" [ "$rc" -ne 0 ] && grep -q 'ps and pgrep are required' <<<"$outO"
+
 # ---- 6. several machines: the pasted-block round trip -----------------------------------------------------------
 reset
 mkdir -p "$T/home/.ct-agent"; echo "{\"access_token\":\"$SECRET_TOKEN\"}" > "$T/home/.ct-agent/oidc-token.json"
