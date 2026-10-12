@@ -340,15 +340,25 @@ concerns the direct-connect path `serve_direct`, not the forward.)
   sweep (30 s). A forward session also **re-checks the peer's grant against the control plane**
   on its accept side, so it ends even when no edge is in the data path (direct, upgraded,
   hole-punched). Withdrawing a member ends their sessions the same way.
-- Because of that, a forward **requires** `CT_AGENT_CP_URL` and the end-to-end peer-grant exchange
-  (it behaves as if `CT_CHANNEL_REQUIRE_PEER_GRANT=1` and needs `CT_CHANNEL_OPERATOR_PUBKEY`), on
-  both members. A control plane that does not know the re-check endpoint (404/405) ends the
-  forward at the first check.
+- The re-check needs the end-to-end peer-grant exchange (a forward behaves as if
+  `CT_CHANNEL_REQUIRE_PEER_GRANT=1` and needs `CT_CHANNEL_OPERATOR_PUBKEY`) and the control plane's
+  address, `CT_AGENT_CP_URL`, on the accepting member. **The agent does not derive the address from
+  anything else, so a forward without `CT_AGENT_CP_URL` still starts as before**, with one warning
+  line: `revocation re-check disabled: no control-plane URL`. A revoked grant then does not end the
+  session (the edge still cuts a relayed leg). Set `CT_CHANNEL_REVOCATION=require` to make the
+  missing address a startup error instead; unset or `warn` is the default.
+- **Old control plane.** A control plane without the re-check endpoint answers a bare `404`
+  (empty or non-JSON body) over the verified TLS connection. That means "revocation not supported
+  by this control plane": the session keeps running, with one warning line per session, and the
+  agent keeps polling in case the control plane is upgraded. Every other failure -- timeout, `5xx`,
+  `405`, TLS error, an unreadable answer -- is fail-closed: the session ends when the grace has
+  passed. A `404` whose JSON body is `{"state":"unknown-channel"}` means the channel is gone and
+  ends the session at once.
 
 | Variable | Meaning |
 |---|---|
 | `CT_CHANNEL_GRANT_RECHECK_SECS` | Re-check interval of a forward session (default 30, minimum 5) |
-| `CT_CHANNEL_GRANT_RECHECK_GRACE_SECS` | How long the control plane may stay unreadable before the session is ended, counted from the last valid answer (default 90, at least one interval). A `valid` answer never ends a session; a `revoked`/`not-member`/expired answer ends it at once |
+| `CT_CHANNEL_GRANT_RECHECK_GRACE_SECS` | How long the control plane may stay unreadable before the session is ended, counted from the last valid answer (default 90, at least one interval). A `valid` answer never ends a session; a `revoked`/`not-member` answer ends it at once |
 
 ### Accept side — the gate
 
