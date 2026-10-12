@@ -7,9 +7,10 @@
 //! peer's grant (identified by the SHA-256 of its signed bytes) is still good, and ends the
 //! session when the answer is `revoked` or `not-member`.
 //!
-//! Fail-closed: an answer that cannot be read does not end the session at once, but if no
-//! `valid` answer has arrived for `grace` the session ends. A control plane that does not know
-//! the endpoint at all (404/405) ends it immediately, because then nothing would ever check.
+//! Fail-closed: an answer that cannot be read (timeout, 5xx, 405, TLS error, garbage) does not end
+//! the session at once, but if no `valid` answer has arrived for `grace` the session ends. A bare
+//! 404 means the control plane does not have the endpoint (an old one): the session keeps running
+//! with one warning and the polling goes on. A definite `revoked`/`not-member` ends it at once.
 //!
 //! The digest and the signed bytes are computed here, not taken from `ct-common`: this crate
 //! pins `ct-common` by release tag, and the helpers do not exist in a tag yet. The golden
