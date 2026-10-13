@@ -1,4 +1,3 @@
-<!-- trace: AUF-20260929-020 -->
 # `ct-agent channel` — reference
 
 The Agent-Fabric channel subsystem: end-to-end encrypted (Noise_IK) sessions between two
@@ -320,10 +319,67 @@ the two applications; neither the edge nor `ct-agent` terminates it.
 "allow everything" — it is the default, and it refuses every forward request the peer makes.
 There is no wildcard spelling. Turning the option on is two deliberate steps (the allowlist, and
 for anything that is not loopback a second grant), and both are on the **accepting** side, which is
-the side whose network is being reached into. The option is delivered in three slices; **until the
-grant-revocation slice lands, do not enable it in production** — revocation of a channel grant
-must end running forwarded streams ([#45](https://github.com/scimbe/ct-agent/issues/45)), and that
-is a security property, not a convenience.
+the side whose network is being reached into. The option is delivered in three slices. Revoking a channel grant must end running forwarded
+streams, and that is a security property, not a convenience. The mechanism is in place (below) but
+**do not enable the forward in production until it has passed a test on a real node**: the unit
+tests prove the re-check logic against a mock control plane, not the data path through a real edge,
+a direct upgrade or a hole-punched path. (The older [#45](https://github.com/scimbe/ct-agent/issues/45)
+concerns the direct-connect path `serve_direct`, not the forward.)
+
+### Revoking a grant
+
+- `ct-agent channel grant-revoke` (operator): puts one issued grant on the control plane's
+  revocation list. Name the grant with `CT_REVOKE_GRANT=<its hex>`, or give the `CT_GRANT_*` fields
+  it was issued with (signing is deterministic, so they reproduce it). Needs `CT_AGENT_CP_URL` and
+  `CT_CHANNEL_OPERATOR_KEY`; the request is signed with the operator key, no login required.
+  A grant that this operator key did not sign is refused before anything is sent. On success the
+  command prints the grant's digest, channel, holder and expiry. Revoking twice is not an error.
+- `bridge/channel-revoke` (bridge peer only): the same for this agent's own channel, authorized by
+  the owner session. Argument `{"grant": "<hex>"}`.
+- The edge refuses a revoked grant at admission and cuts live relays carrying it at its next
+  sweep (30 s). A forward session also **re-checks the peer's grant against the control plane**
+  on its accept side, so it ends even when no edge is in the data path (direct, upgraded,
+  hole-punched). Withdrawing a member ends their sessions the same way.
+- **Upgrade note.** A forward now enforces the peer-grant check on **both** sides: each member
+  presents its grant and verifies the other's. Update both members before relying on a forward
+  between them; an updated member refuses a peer that does not present a grant. Every forward
+  member therefore **needs `CT_CHANNEL_OPERATOR_PUBKEY`** (64 hex): without it the member refuses
+  to join, whatever `CT_CHANNEL_REQUIRE_PEER_GRANT` says.
+- The re-check runs on the accepting member and needs the control plane's address,
+  `CT_AGENT_CP_URL`, which must be `https` (plain `http` is accepted only to a loopback host). The
+  agent does not derive the address from anything else. **With `CT_CHANNEL_OPERATOR_PUBKEY` set, a
+  forward without `CT_AGENT_CP_URL` still starts**, with one warning line:
+  `revocation re-check disabled: no control-plane URL`. A revoked grant then does not end the
+  session (the edge still cuts a relayed leg). Set `CT_CHANNEL_REVOCATION=require` to make the
+  missing address an error instead, and to treat a control plane without the re-check endpoint as
+  unreadable (below). In the `ct-agent channel` entry with the accept role, a missing address under
+  `require`, a non-`https` address, a value of `CT_CHANNEL_REVOCATION` other than `require`/`warn`
+  and a malformed `CT_CHANNEL_GRANT_RECHECK_*` value are all refused at process start, before any
+  connection is made (exit code 1); other entry points report the same errors when the session is
+  built. Unset or `warn` is the default.
+- The first status question is asked as soon as the session is admitted, then every interval. If
+  the re-check task itself dies, the session ends rather than running unwatched.
+- **Old control plane.** A control plane without the re-check endpoint answers a `404` that does
+  not carry `{"state":"unknown-channel"}` (any other body, including an empty or non-JSON one)
+  over the verified TLS connection. That means "revocation not supported by this control plane":
+  the session keeps running, with one warning line per session, and the agent keeps polling in
+  case the control plane is upgraded. **Under `CT_CHANNEL_REVOCATION=require` this answer is
+  treated as unreadable**, so the session ends once the grace has passed. Every other failure -- timeout, `5xx`,
+  `405`, TLS error, an unreadable answer -- is fail-closed: the session ends when the grace has
+  passed since the last valid answer (or the last "not supported" one). A `404` whose JSON body is `{"state":"unknown-channel"}` means the channel is gone and
+  ends the session at once. A `403` ends it at once only when its JSON body says what the control
+  plane decided (`{"state":"asker-not-member"}`: this member was withdrawn); a bare `403` can come
+  from a proxy in front of the control plane, so it is an unreadable answer and waits out the grace.
+- An initiator that is refused with `[grant-revoked]` stops at once instead of retrying for its
+  75 s window: a revoked grant never becomes valid again, so it needs a newly issued one. A
+  forward initiator (`CT_CHANNEL_FORWARD`), which otherwise reconnects after a dropped session,
+  stops the same way: it prints the refusal and exits with a failure status instead of asking
+  again. Every other refusal keeps the reconnect with backoff.
+
+| Variable | Meaning |
+|---|---|
+| `CT_CHANNEL_GRANT_RECHECK_SECS` | Re-check interval of a forward session (default 30, minimum 5) |
+| `CT_CHANNEL_GRANT_RECHECK_GRACE_SECS` | The grace for an answer that **cannot be read** (timeout, `5xx`, `405`, TLS error, garbage): the session ends when no valid answer has come for this long (default 90, at least one interval). It does not apply to a definite answer: `revoked` or `not-member` ends the session at once, `valid` resets the clock |
 
 ### Accept side — the gate
 
@@ -345,8 +401,6 @@ moment later, between the check and the dial.
 
 ### Flow control on a forward session -- control messages and the session window
 
-<!-- trace: AUF-20261007-005, AUF-20261007-012 -->
-
 Control messages travel as `Data` on the reserved stream id `0`; real streams start at `1`. An
 agent that does not know a message ignores `Data` for an unknown id, so mixed versions keep
 working. All integers are big-endian.
@@ -361,7 +415,7 @@ working. All integers are big-endian.
 
 **Why a second window.** Credit per stream bounds what one stream may queue, not what all streams
 together put ahead of a new one. With 16 uploads over a 62 500 B/s path, 3.8 MiB waited ahead of
-a new stream's `Open` and its first bytes arrived after 64 s (measured, AUF-20261006-078/-081).
+a new stream's `Open` and its first bytes arrived after 64 s (measured).
 The session window bounds that queue for the whole session.
 
 **Rules.**
@@ -397,7 +451,6 @@ The session window bounds that queue for the whole session.
 5. *What it does not do.* The window bounds bytes on their way to the peer's engine. It does not
    bound what the peer's engine holds per stream (credit per stream: 256 KiB each) and it does
    not shape bandwidth between streams.
-<!-- trace: AUF-20261007-005, AUF-20261007-012 (slice ii: rules 6 to 8) -->
 
 6. *Both directions.* Each member is sender under the window the peer announced and receiver
    under its own; the two windows are independent. The accept side takes the peer's window only

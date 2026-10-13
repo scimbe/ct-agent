@@ -47,6 +47,8 @@
 //! grant ran out or was revoked. So the end is recorded as state, not inferred from log text:
 //! whoever runs a session inside [`with_grant_end_record`] gets the [`GrantEndRecord`] that every
 //! gate built within that scope writes its end reason into, at the same moment it logs it.
+//
+// See ct-agent#255 (forward) and ct-agent#267 (a session end is not the forward's end).
 
 use std::io;
 use std::pin::Pin;
@@ -184,10 +186,12 @@ impl PeerGrantCheck {
     }
 }
 
-/// Ends one session from the outside when its member learns the peer's grant was revoked.
-/// Broker-side delivery of a revocation is `bridge/channel-revoke`, which is
-/// not built yet; this is the enforcement seam it drives when it is, and the seam the tests
-/// revoke through. Dropping the handle without revoking leaves the session alone -- the expiry
+/// Ends one session from the outside when its member learns the peer's grant was revoked. It is
+/// a seam, not a production path: the control-plane re-check in `grant_watch` ends a session
+/// through its own channel (`GrantLifetime::watch`), and nothing outside the tests takes this
+/// handle yet. It stays for a broker-side delivery of a revocation (`bridge/channel-revoke` acts
+/// at the control plane, not on a running session) and for the tests, which revoke through it.
+/// Dropping the handle without revoking leaves the session alone -- the expiry
 /// clock is then the only thing that ends it.
 pub struct GrantRevokeHandle(oneshot::Sender<String>);
 

@@ -3213,7 +3213,7 @@ fn refusal_category_messages_stay_definitive_and_keep_the_frozen_prefix_524() {
     );
 
     // Every closed-vocabulary token the edge can currently send has a real hint.
-    for cat in ["possession", "grant-verify", "not-member", "endpoint", "malformed", "len-oob", "pairing"] {
+    for cat in ["possession", "grant-verify", "not-member", "endpoint", "malformed", "len-oob", "pairing", "grant-revoked", "grant-status"] {
         assert!(
             refusal_category_hint(cat).is_some(),
             "closed-vocabulary token {cat:?} must map to an actionable hint"
@@ -7747,7 +7747,7 @@ fn forward_grant_checks(expires_at: u64) -> (PeerGrantCheck, PeerGrantCheck) {
 /// accept member and runs the initiate member's real session against it.
 struct ReconnectingForward {
     bound: SocketAddr,
-    looping: tokio::task::JoinHandle<()>,
+    looping: tokio::task::JoinHandle<io::Result<()>>,
     admissions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Per admission: the accept member's session task (aborting it = the peer restarts).
     accept_sides: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
@@ -7809,6 +7809,7 @@ fn spawn_reconnecting_forward(target: String, expires_at: u64) -> ReconnectingFo
         idle,
         expires_at,
         admit,
+        |_: &io::Error| false,
     ));
     ReconnectingForward {
         bound,
@@ -7927,6 +7928,64 @@ async fn forward_initiator_does_not_reconnect_after_the_grant_was_revoked() {
     assert!(forward_connection_is_refused(fwd.bound).await);
     assert!(!fwd.looping.is_finished());
     fwd.looping.abort();
+}
+
+/// A bound forward listener and a stub admission that the edge refuses with `category` every
+/// time, counting its calls. The loop runs with the production classifier.
+fn spawn_forward_loop_over_refusals(
+    category: &'static str,
+) -> (
+    tokio::task::JoinHandle<Result<(), BoxError>>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (listener, _bound) =
+        bind_forward_listener("127.0.0.1:0".parse().unwrap()).expect("the loopback listener binds");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    let looping = tokio::spawn(run_forward_initiate_reconnect_loop(
+        listener,
+        "127.0.0.1:9".to_string(),
+        forward_stream::DEFAULT_MAX_STREAMS,
+        Duration::from_secs(forward_stream::DEFAULT_IDLE_SECS),
+        crate::codec::now_unix() + 3600,
+        move |_local: LocalDuplex| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                Err::<(), BoxError>(AdmissionRefused::boxed_with_category(
+                    "edge broker refused the channel join",
+                    Some(category),
+                ))
+            }
+        },
+        is_revoked_grant_refusal,
+    ));
+    (looping, calls)
+}
+
+#[tokio::test]
+async fn forward_initiator_ends_with_an_error_when_the_edge_refuses_a_revoked_grant() {
+    // A grant on the revocation list never becomes valid again and the process holds exactly one
+    // grant, so asking again only loads the edge: the loop stops after the first refusal and hands
+    // the refusal to the caller, which is what ends the process with a failure status.
+    let (looping, calls) = spawn_forward_loop_over_refusals("grant-revoked");
+    let ended = tokio::time::timeout(Duration::from_secs(5), looping)
+        .await
+        .expect("the loop ends by itself")
+        .expect("the loop task does not panic");
+    let err = ended.expect_err("the refusal is returned, not swallowed");
+    assert!(is_revoked_grant_refusal(&err), "{err}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "no second admission");
+}
+
+#[tokio::test]
+async fn forward_initiator_keeps_retrying_a_refusal_that_can_still_clear() {
+    // Any other refusal (here `pairing`: the peer has not parked yet) can clear on its own, so the
+    // reconnect with backoff stays.
+    let (looping, calls) = spawn_forward_loop_over_refusals("pairing");
+    tokio::time::sleep(FORWARD_RECONNECT_MIN * 3).await;
+    assert!(!looping.is_finished(), "a refusal that can clear does not end the forward");
+    assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2, "it asked again");
+    looping.abort();
 }
 
 /// Reads until `tcp` either delivers exactly `expect_len` bytes or EOFs, returning exactly the
