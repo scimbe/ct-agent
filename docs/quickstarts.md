@@ -14,8 +14,10 @@ comparison table in the [README](../README.md#tunnel-or-channel) first.
 
 Placeholders are written in angle brackets (`<name>.example.org`, `<edge-host>`). `<control-plane>` is
 the base URL of your CADS-Tunnel control plane, the value you give `ct-agent` as `CT_AGENT_CP_URL`
-(`https://bunsenbrenner.org` for the hosted deployment). Secrets are never typed on a command line in
-these steps; they come from the environment or a `0600` file.
+(`https://bunsenbrenner.org` for the hosted deployment). In these steps secrets come from the environment
+or a `0600` file instead of a typed argument; `scripts/quickstart.sh` also keeps them off the command
+lines it builds. That promise covers only the script itself. The agent writes the ssh owner key to
+`ct-agent.log` on its first terminate-mode start, so treat that log as secret.
 
 A note on QUIC: `ct-agent` speaks QUIC (UDP) where it can and falls back to TLS over TCP `:443`
 by itself. You do not choose it per path. A tunnel registers over QUIC first (the
@@ -28,6 +30,10 @@ relay first and then the `:443` front door ([transport ladders](channel.md#trans
 ## 1. Tunnel
 
 **Status:** steps 2–3 run with v0.7.39; the portal steps not run.
+
+**Short path:** `scripts/quickstart.sh tunnel` asks for the hostname and the token of the Install page (hidden), writes the `.env`, runs `setup.sh` and checks the public URL. The steps below are the manual reference.
+
+**Script status:** tested with stubs (no network); not yet run against a real service.
 
 **Result:** a service listening on `127.0.0.1:8080` of your machine answers under your tunnel's
 public hostname, although your machine only ever dials out.
@@ -86,6 +92,10 @@ recorded events), stop with `kill $(cat ct-agent.pid)`.
 ## 2. Channel
 
 **Status:** run end to end with v0.7.39 against a self-hosted edge and control plane (front door :443, relay).
+
+**Short path:** `scripts/quickstart.sh channel` runs the whole path on one machine (you are the operator and both members), sends a test line and reports success or the first failed stage. For several machines use `--role operator` and `--role member`; they exchange a few pasted text blocks (public values and the grant only; three rounds). The steps below are the manual reference.
+
+**Script status:** tested with stubs (no network); not yet run against a real service.
 
 **Result:** bytes typed on member B appear on member A, end-to-end encrypted (Noise_IK). The
 edge brokers and relays the connection and sees only ciphertext.
@@ -210,6 +220,10 @@ without any broker) are in the [channel reference](channel.md#modes).
 
 **Status:** `ssh-config` and `ssh-owner show` checked offline; not run end to end (needs tier Grün).
 
+**Short path:** `scripts/quickstart.sh ssh-tunnel` on the agent host (it prints what tier Grün needs first), then `scripts/quickstart.sh ssh-tunnel --role client` on the client. `--yes` accepts defaults only: replacing a different `~/.ssh/ct-agent-<host>.owner` needs `--allow-ssh-key-overwrite`, and adding the stanza to `~/.ssh/config` needs `--append-ssh-config` (without it the stanza is printed for you to add). The steps below are the manual reference.
+
+**Script status:** tested with stubs (no network); not yet run against a real service. The tier-Grün path has not been run end to end by anyone.
+
 **Result:** `ssh <name>.example.org` reaches the sshd of a machine that has no open port. The
 tunnel's hostname is the SSH host; the client speaks SSH inside TLS to the edge on `:443`.
 
@@ -274,6 +288,10 @@ login still applies on top.
 ## 4. SSH over a channel
 
 **Status:** run end to end with v0.7.39 against the hosted edge (front door :443, relay): login, scp of 50 MiB in both directions, 5 parallel sessions, restart of the accepting side. Measured: login median 0.78 s, about 1.9 MiB/s over the relay.
+
+**Short path:** `scripts/quickstart.sh ssh-channel` does section 2 plus the forward and prints the finished `ssh` line; `--role operator|member` for several machines. The forward is opt-in even with `--yes`: add `--enable-forward` to turn it on without a question. The forward warning below applies and the script repeats it. The steps below are the manual reference.
+
+**Script status:** tested with stubs (no network); not yet run against a real service.
 
 **Result:** `ssh -p 2222 <user>@127.0.0.1` on the client reaches the sshd of the accepting
 machine, which stays bound to its loopback and is never published. There is no `ssh`
