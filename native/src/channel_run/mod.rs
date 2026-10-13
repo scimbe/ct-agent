@@ -966,6 +966,10 @@ pub use peer_grant::*;
 // Control-plane re-check of the peer's grant while a forward session runs.
 pub(crate) mod grant_watch;
 
+// Revoking one issued grant at the control plane (CLI and bridge tool).
+mod grant_revoke;
+pub use grant_revoke::*;
+
 mod errors;
 pub(crate) use errors::*;
 

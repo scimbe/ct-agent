@@ -1452,6 +1452,7 @@ fn bridge_manifest_tools_refuse_every_caller_that_is_not_the_configured_bridge_p
     for (name, arguments) in [
         ("bridge/config", serde_json::json!({})),
         ("bridge/channel-members", serde_json::json!({})),
+        ("bridge/channel-revoke", serde_json::json!({ "grant": "00" })),
         ("bridge/allowlist-list", serde_json::json!({})),
         ("bridge/allowlist-add", serde_json::json!({ "email": "someone@example.com" })),
         ("bridge/allowlist-remove", serde_json::json!({ "email": "someone@example.com" })),
