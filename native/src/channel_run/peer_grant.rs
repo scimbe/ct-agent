@@ -32,7 +32,7 @@
 //! The check above is a *point-in-time* admission decision: it ran once, right after the Noise
 //! handshake. A session admitted at 10:00 with a grant that expires at 10:05 kept running at
 //! 11:00 -- and kept forwarding TCP streams (#255) -- for as long as both members stayed
-//! connected. INC-20260930-101: a revoked or expired grant has to end the session it authorized.
+//! connected. A revoked or expired grant has to end the session it authorized.
 //! [`GrantLifetime`] is that clock. It is armed with this member's OWN grant expiry when the gate
 //! is built, re-armed with the EARLIER of the two expiries as soon as the peer's grant verifies,
 //! and it also carries a [`GrantRevokeHandle`] for a revocation that reaches this member while
@@ -47,9 +47,6 @@
 //! grant ran out or was revoked. So the end is recorded as state, not inferred from log text:
 //! whoever runs a session inside [`with_grant_end_record`] gets the [`GrantEndRecord`] that every
 //! gate built within that scope writes its end reason into, at the same moment it logs it.
-//
-// trace: AUF-20260930-005 (INC-20260930-101)
-// trace: AUF-20261004-022 (ct-agent#267)
 
 use std::io;
 use std::pin::Pin;
@@ -61,6 +58,7 @@ use ct_common::channel::{Direction, SignedChannelGrant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::oneshot;
 
+use super::grant_watch::{watch_peer_grant, WatchPlan, WatchSetup};
 use super::ChannelRole;
 
 /// Switch for the peer-grant check (off by default; see the module doc for the rollout).
@@ -75,7 +73,7 @@ const MAGIC: &[u8; 5] = b"CTPG1";
 pub(crate) const PRELUDE_LEN: usize = MAGIC.len() + SignedChannelGrant::WIRE_LEN;
 /// How long a peer has, after the Noise handshake, to present its grant.
 pub(crate) const PEER_GRANT_TIMEOUT: Duration = Duration::from_secs(10);
-/// The budget INC-20260930-101 gives a session whose grant ended: within it every forwarded
+/// The budget a session gets once its grant has ended: within it every forwarded
 /// stream of that session is closed on BOTH members and no new one is opened. Nothing here ever
 /// waits this out -- [`GrantLifetime`] ends the session on the next poll of its plaintext side --
 /// it is the bound the tests assert against, named once so they and this doc cannot drift apart.
@@ -96,18 +94,32 @@ impl PeerGrantPolicy {
 
     /// [`from_env`](Self::from_env) over a variable lookup (the testable seam).
     pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, String> {
-        if !crate::envflag::flag_named(
-            REQUIRE_PEER_GRANT_ENV,
-            f(REQUIRE_PEER_GRANT_ENV).as_deref(),
-            false,
-        ) {
+        Self::from_lookup_for(f, false)
+    }
+
+    /// [`from_env`](Self::from_env) for a session that may be a TCP forward: a forward is
+    /// never admitted without the peer's grant, whatever [`REQUIRE_PEER_GRANT_ENV`] says,
+    /// because the grant is what lets the control plane end the session later.
+    pub fn from_env_for(forward: bool) -> Result<Option<Self>, String> {
+        Self::from_lookup_for(|k| std::env::var(k).ok(), forward)
+    }
+
+    /// The testable seam of the two above.
+    pub fn from_lookup_for(f: impl Fn(&str) -> Option<String>, forward: bool) -> Result<Option<Self>, String> {
+        if !forward
+            && !crate::envflag::flag_named(
+                REQUIRE_PEER_GRANT_ENV,
+                f(REQUIRE_PEER_GRANT_ENV).as_deref(),
+                false,
+            )
+        {
             return Ok(None);
         }
         let raw = f(OPERATOR_PUBKEY_ENV).unwrap_or_default();
         let operator = crate::codec::hex_decode::<32>(raw.trim()).ok_or_else(|| {
             format!(
-                "{REQUIRE_PEER_GRANT_ENV} is on but {OPERATOR_PUBKEY_ENV} is not a 64-hex operator public key \
-                 -- the peer's grant cannot be checked, refusing to join"
+                "the peer's grant must be checked ({REQUIRE_PEER_GRANT_ENV} is on, or this is a forward) but \
+                 {OPERATOR_PUBKEY_ENV} is not a 64-hex operator public key -- refusing to join"
             )
         })?;
         Ok(Some(Self { operator }))
@@ -123,6 +135,9 @@ pub struct PeerGrantCheck {
     pub own_grant: SignedChannelGrant,
     pub peer_holder: [u8; 32],
     pub role: ChannelRole,
+    /// Re-check the verified peer grant against the control plane while the session runs
+    /// (the accept side of a forward). `None`: only expiry and an explicit revoke end it.
+    pub watch: Option<WatchPlan>,
 }
 
 impl PeerGrantCheck {
@@ -169,8 +184,8 @@ impl PeerGrantCheck {
     }
 }
 
-/// Ends one session from the outside when its member learns the peer's grant was revoked
-/// (AUF-20260930-005). Broker-side delivery of a revocation is `bridge/channel-revoke`, which is
+/// Ends one session from the outside when its member learns the peer's grant was revoked.
+/// Broker-side delivery of a revocation is `bridge/channel-revoke`, which is
 /// not built yet; this is the enforcement seam it drives when it is, and the seam the tests
 /// revoke through. Dropping the handle without revoking leaves the session alone -- the expiry
 /// clock is then the only thing that ends it.
@@ -233,6 +248,9 @@ struct GrantLifetime {
     /// The revocation channel; `None` once nobody can revoke any more (the handle was dropped
     /// without being used, or the session has ended).
     revoke: Option<oneshot::Receiver<String>>,
+    /// The control-plane re-check of the peer's grant (see `grant_watch`); `None` when this
+    /// session does not run one or it has ended. Its reason arrives already worded.
+    watch: Option<oneshot::Receiver<String>>,
     /// Set exactly once, the operator-facing reason the session ended.
     ended: Option<String>,
     /// ct-agent#267: the caller's record of that end, when the session runs inside
@@ -263,6 +281,19 @@ impl GrantLifetime {
         if expired {
             return self.end("the channel grant expired".to_string());
         }
+        let watched = match self.watch.as_mut() {
+            Some(rx) => std::future::Future::poll(Pin::new(rx), cx),
+            None => Poll::Pending,
+        };
+        match watched {
+            Poll::Ready(Ok(why)) => return self.end(why),
+            // The task that asks the control plane is gone without having answered: the revocation
+            // check no longer runs, and a session must not go on unwatched. Fail closed, loudly.
+            Poll::Ready(Err(_)) => {
+                return self.end("the peer-grant re-check stopped unexpectedly; failing closed".to_string());
+            }
+            Poll::Pending => {}
+        }
         let revoked = match self.revoke.as_mut() {
             Some(rx) => std::future::Future::poll(Pin::new(rx), cx),
             None => Poll::Pending,
@@ -288,6 +319,7 @@ impl GrantLifetime {
         );
         self.expiry = None;
         self.revoke = None;
+        self.watch = None;
         if let Some(record) = &self.record {
             record.set(&why);
         }
@@ -310,7 +342,7 @@ impl GrantLifetime {
 /// then passes bytes on to the real `local`. A missing, late (past [`PEER_GRANT_TIMEOUT`]) or
 /// invalid grant fails both directions with `PermissionDenied`, ending the session.
 ///
-/// It is also where the session's grant *lifetime* is enforced (AUF-20260930-005): see
+/// It is also where the session's grant *lifetime* is enforced: see
 /// [`GrantLifetime`] and the module doc.
 pub struct PeerGrantGate<P> {
     inner: P,
@@ -354,6 +386,7 @@ impl<P> PeerGrantGate<P> {
             life: GrantLifetime {
                 expiry,
                 revoke: Some(revoke),
+                watch: None,
                 ended: None,
                 record: GRANT_END_RECORD.try_with(GrantEndRecord::clone).ok(),
             },
@@ -394,7 +427,7 @@ impl Gate {
     }
 }
 
-// `AsyncWrite` as well as `AsyncRead` (AUF-20260930-005): when the grant ends, the read side
+// `AsyncWrite` as well as `AsyncRead`: when the grant ends, the read side
 // closes the local side itself rather than only reporting EOF upwards -- see `poll_read`.
 impl<P: AsyncRead + AsyncWrite + Unpin> AsyncRead for PeerGrantGate<P> {
     fn poll_read(
@@ -473,6 +506,12 @@ impl<P: AsyncWrite + Unpin> AsyncWrite for PeerGrantGate<P> {
                                 .expires_at
                                 .min(peer.grant.expires_at);
                             this.life.expiry = Some(GrantLifetime::timer(ends_at));
+                            if let Some(plan) = &g.check.watch {
+                                let (tx, rx) = oneshot::channel();
+                                this.life.watch = Some(rx);
+                                let setup = WatchSetup::new((plan.factory)(&peer), plan.config);
+                                tokio::spawn(watch_peer_grant(setup, tx));
+                            }
                             if let Some(w) = g.reader.take() {
                                 w.wake();
                             }
@@ -580,6 +619,7 @@ mod tests {
                 ),
                 peer_holder: peer,
                 role,
+                watch: None,
             }
         }
     }
@@ -839,7 +879,7 @@ mod tests {
         assert!(a_failed, "the initiator's session ended with an error");
     }
 
-    /// AUF-20260930-005 (INC-20260930-101): the grant's expiry ends the session it authorized,
+    /// The grant's expiry ends the session it authorized,
     /// and closes the local side with it -- the mechanism the forward engines' teardown rests on
     /// (`channel_run::tests` proves the end-to-end effect on real forwarded TCP streams).
     #[tokio::test(start_paused = true)]
@@ -876,7 +916,7 @@ mod tests {
         assert!(gate.write_all(b"late").await.is_err());
     }
 
-    /// AUF-20260930-005: the same end, reached by a revocation instead of the clock.
+    /// The same end, reached by a revocation instead of the clock.
     #[tokio::test(start_paused = true)]
     async fn a_revoked_grant_ends_the_session() {
         let f = Fixture::new();
@@ -939,5 +979,150 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// A scripted control plane for the re-check: the listed states, then `Valid` forever.
+    struct Seq(Mutex<std::collections::VecDeque<crate::channel_run::grant_watch::GrantState>>);
+    impl crate::channel_run::grant_watch::GrantStatusSource for Seq {
+        fn status(&self) -> crate::channel_run::grant_watch::StatusFuture<'_> {
+            let next = self.0.lock().unwrap().pop_front();
+            Box::pin(async move { Ok(next.unwrap_or(crate::channel_run::grant_watch::GrantState::Valid)) })
+        }
+    }
+
+    fn watched_accept_gate(
+        f: &Fixture,
+        states: Vec<crate::channel_run::grant_watch::GrantState>,
+    ) -> (tokio::io::DuplexStream, PeerGrantGate<tokio::io::DuplexStream>) {
+        let mut check = f.check(ChannelRole::Accept);
+        let src: Arc<dyn crate::channel_run::grant_watch::GrantStatusSource> = Arc::new(Seq(Mutex::new(states.into())));
+        check.watch = Some(WatchPlan {
+            factory: Arc::new(move |_peer| src.clone()),
+            config: crate::channel_run::grant_watch::WatchConfig {
+                interval: Duration::from_secs(30),
+                grace: Duration::from_secs(90),
+                require: false,
+            },
+        });
+        let (app, local) = tokio::io::duplex(4096);
+        (app, PeerGrantGate::new(local, Some(check)))
+    }
+
+    async fn present_initiator_grant(f: &Fixture, gate: &mut PeerGrantGate<tokio::io::DuplexStream>) {
+        let mut prelude = vec![0u8; PRELUDE_LEN];
+        gate.read_exact(&mut prelude).await.unwrap();
+        let peer = grant(&f.operator, CHANNEL, f.initiator, Direction::Initiate, crate::codec::now_unix() + 3600);
+        gate.write_all(&prelude_of(&peer)).await.unwrap();
+    }
+
+    /// K1: the accept side asks the control plane about the verified peer grant, and a
+    /// `revoked` answer ends the session within one interval and closes the local side -- with
+    /// no help from the edge, the peer or the clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_revoked_peer_grant_found_by_the_recheck_ends_the_session() {
+        use crate::channel_run::grant_watch::GrantState::*;
+        let f = Fixture::new();
+        let (mut app, mut gate) = watched_accept_gate(&f, vec![Valid, Revoked]);
+        present_initiator_grant(&f, &mut gate).await;
+
+        let mut more = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(120), gate.read(&mut more))
+            .await
+            .expect("the revoked answer at the second tick ends the session")
+            .expect("as an EOF");
+        assert_eq!(n, 0);
+        let mut rest = Vec::new();
+        app.read_to_end(&mut rest).await.unwrap();
+        assert!(gate.write_all(b"late").await.is_err(), "nothing reaches the local side afterwards");
+    }
+
+    /// And the other direction: valid answers never end a session that is otherwise healthy.
+    #[tokio::test(start_paused = true)]
+    async fn valid_answers_leave_the_session_running() {
+        let f = Fixture::new();
+        let (_app, mut gate) = watched_accept_gate(&f, vec![]);
+        present_initiator_grant(&f, &mut gate).await;
+        let mut more = [0u8; 1];
+        let r = tokio::time::timeout(Duration::from_secs(600), gate.read(&mut more)).await;
+        assert!(r.is_err(), "still open after twenty re-checks: {r:?}");
+    }
+
+    /// No control-plane URL: the forward starts with a warning, and not at all when revocation is required.
+    #[test]
+    fn a_forward_without_a_control_plane_url_starts_with_a_warning_unless_revocation_is_required() {
+        use super::super::{resolve_cp, revocation_required};
+        assert_eq!(resolve_cp(None, false), Ok(None), "as before: no silent break of existing setups");
+        assert!(resolve_cp(None, true).unwrap_err().contains("CT_CHANNEL_REVOCATION=require"));
+        assert_eq!(resolve_cp(Some("https://cp".into()), true), Ok(Some("https://cp".into())));
+        assert_eq!(revocation_required(None), Ok(false));
+        assert_eq!(revocation_required(Some("warn")), Ok(false));
+        assert_eq!(revocation_required(Some(" require ")), Ok(true));
+        assert!(revocation_required(Some("yes")).is_err(), "a typo must not silently disable the switch");
+    }
+
+    #[test]
+    fn require_without_cp_url_fails_at_process_start_not_at_join() {
+        use super::super::check_revocation_config_from;
+        let check = |forward, role, cp, mode| check_revocation_config_from(forward, role, cp, mode, &|_: &str| None);
+        // accept side of a forward, strict mode, no CP URL: refused before any join
+        assert!(check(true, Some("accept"), None, Some("require")).unwrap_err().contains("CT_AGENT_CP_URL"));
+        assert!(check(true, Some(" Accept "), Some("  "), Some("require")).is_err(), "blank URL counts as missing");
+        // the default stays a warning, a URL satisfies it, the initiator and a non-forward run are unaffected
+        assert!(check(true, Some("accept"), None, None).is_ok());
+        assert!(check(true, Some("accept"), Some("https://cp"), Some("require")).is_ok());
+        assert!(check(true, Some("initiate"), None, Some("require")).is_ok());
+        assert!(check(false, Some("accept"), None, Some("require")).is_ok());
+        // a typo in the switch is an error at start, whatever else is configured
+        assert!(check(false, None, None, Some("yes")).is_err());
+    }
+
+    /// A malformed re-check interval or grace fails the process start (accept side of a forward),
+    /// not the first join.
+    #[test]
+    fn a_malformed_recheck_value_fails_at_process_start() {
+        use super::super::check_revocation_config_from as check;
+        let bad = |k: &str| (k == "CT_CHANNEL_GRANT_RECHECK_SECS").then(|| "soon".to_string());
+        let err = check(true, Some("accept"), Some("https://cp"), None, &bad).unwrap_err();
+        assert!(err.contains("CT_CHANNEL_GRANT_RECHECK_SECS"), "{err}");
+        assert!(check(true, Some("initiate"), None, None, &bad).is_ok(), "only the watching side reads it");
+        assert!(check(false, Some("accept"), None, None, &bad).is_ok());
+    }
+
+    /// The control plane is believed, so a plain-http URL is refused unless it is loopback.
+    #[test]
+    fn the_control_plane_url_must_be_https_or_loopback() {
+        use super::super::{check_cp_url, resolve_cp};
+        for ok in ["https://cp.example", "https://cp.example:8443/base", "http://127.0.0.1:8090", "http://localhost:8090", "http://[::1]:8090"] {
+            assert!(check_cp_url(ok).is_ok(), "{ok}");
+        }
+        for bad in ["http://cp.example", "http://10.0.0.5:8090", "ftp://cp.example", "cp.example", ""] {
+            assert!(check_cp_url(bad).unwrap_err().contains("CT_AGENT_CP_URL"), "{bad}");
+        }
+        assert!(resolve_cp(Some("http://cp.example".into()), false).is_err(), "refused whatever the mode");
+    }
+
+    /// If the re-check task dies without an answer, the session ends instead of running unwatched.
+    #[tokio::test]
+    async fn a_dead_watch_task_ends_the_session_loudly() {
+        let (tx, rx) = oneshot::channel::<String>();
+        let mut life = GrantLifetime { expiry: None, revoke: None, watch: Some(rx), ended: None, record: None };
+        drop(tx);
+        let ended = std::future::poll_fn(|cx| Poll::Ready(life.poll_ended(cx))).await;
+        assert!(ended);
+        assert!(life.reason().contains("re-check stopped") && life.reason().contains("failing closed"), "{}", life.reason());
+    }
+
+    /// A forward never runs without the peer's grant, whatever the opt-in says; without an
+    /// operator key it refuses to join rather than silently skipping the check.
+    #[test]
+    fn a_forward_forces_the_peer_grant_check() {
+        let none = |_: &str| None;
+        assert_eq!(PeerGrantPolicy::from_lookup_for(none, false).unwrap(), None);
+        assert!(PeerGrantPolicy::from_lookup_for(none, true).unwrap_err().contains(OPERATOR_PUBKEY_ENV));
+        let keyed = |k: &str| (k == OPERATOR_PUBKEY_ENV).then(|| "07".repeat(32));
+        assert_eq!(
+            PeerGrantPolicy::from_lookup_for(keyed, true).unwrap(),
+            Some(PeerGrantPolicy { operator: [7; 32] })
+        );
     }
 }

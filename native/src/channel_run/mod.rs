@@ -169,7 +169,7 @@ where
     };
     // The attestation binds the Noise key to `peer_holder` only; the peer's operator-signed grant
     // binds `peer_holder` to this channel (checked inside the session when enabled).
-    let local = gate_local(local, request, role, peer_holder)?;
+    let local = gate_local(local, request, role, peer_holder, holder)?;
     // #104: built once, moved into whichever single relay-fallback call site below
     // actually fires (they're mutually exclusive). `None` whenever direct_upgrade is off
     // (the default) or the edge reported no reflexive address for this admission.
@@ -344,19 +344,129 @@ where
 /// `local` behind the peer-grant check when [`REQUIRE_PEER_GRANT_ENV`] is on (see `peer_grant`),
 /// a pass-through otherwise. `peer_holder` is the holder admission attested the pinned Noise key
 /// with. Fails when the check is on but cannot run (no operator key configured).
+///
+/// A TCP forward session (`CT_CHANNEL_FORWARD` / `CT_CHANNEL_FORWARD_ALLOW`) always runs the check,
+/// and its accept side also re-checks the peer's grant against the control plane every
+/// `CT_CHANNEL_GRANT_RECHECK_SECS`, because only that can end a forward after the grant was
+/// revoked once the edge is out of the data path. The control plane is `CT_AGENT_CP_URL` (the agent
+/// has no other source for it). Without it the forward starts as before, with a warning that the
+/// re-check is disabled; `CT_CHANNEL_REVOCATION=require` makes that an error instead.
 pub(crate) fn gate_local<P>(
     local: P,
     request: &ChannelJoinRequest,
     role: ChannelRole,
     peer_holder: [u8; 32],
+    holder: &SigningKey,
 ) -> Result<PeerGrantGate<P>, BoxError> {
-    let check = PeerGrantPolicy::from_env()?.map(|policy| PeerGrantCheck {
+    let forward = forward_session_configured();
+    let watch = if forward && role == ChannelRole::Accept {
+        let cp_url = std::env::var("CT_AGENT_CP_URL").ok().filter(|s| !s.trim().is_empty());
+        let required = revocation_required(std::env::var(REVOCATION_ENV).ok().as_deref())?;
+        match resolve_cp(cp_url, required)? {
+            Some(cp_url) => {
+                let config = grant_watch::WatchConfig::from_env()?.requiring(required);
+                Some(grant_watch::WatchPlan::control_plane(&cp_url, holder, &request.grant, config))
+            }
+            None => {
+                eprintln!(
+                    "ct-agent channel: WARNING: revocation re-check disabled: no control-plane URL \
+                     (set CT_AGENT_CP_URL); a revoked grant will not end this forward session"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let check = PeerGrantPolicy::from_env_for(forward)?.map(|policy| PeerGrantCheck {
         policy,
         own_grant: request.grant.clone(),
         peer_holder,
         role,
+        watch,
     });
     Ok(PeerGrantGate::new(local, check))
+}
+
+/// `CT_CHANNEL_REVOCATION=require` turns "no control-plane URL for the forward's grant re-check"
+/// from a warning into a refusal to join. Unset or `warn` is the default.
+pub(crate) const REVOCATION_ENV: &str = "CT_CHANNEL_REVOCATION";
+
+/// The control plane the re-check asks: the configured URL, or none (warn) / an error (require).
+pub(crate) fn resolve_cp(cp_url: Option<String>, required: bool) -> Result<Option<String>, String> {
+    match (cp_url, required) {
+        (Some(u), _) => check_cp_url(&u).map(|()| Some(u)),
+        (None, true) => Err(format!(
+            "{REVOCATION_ENV}=require but no control-plane URL (CT_AGENT_CP_URL) is set: \
+             a revoked grant could not end this forward -- refusing to join"
+        )),
+        (None, false) => Ok(None),
+    }
+}
+
+/// The re-check sends a signed question to this URL and believes the answer, so it has to be
+/// https; plain http is accepted only to a loopback host (a local control plane, a test).
+pub(crate) fn check_cp_url(url: &str) -> Result<(), String> {
+    let bad = |why: &str| format!("CT_AGENT_CP_URL {url:?} {why} (the grant re-check needs https, or http to a loopback host)");
+    let parsed = reqwest::Url::parse(url.trim()).map_err(|_| bad("is not a URL"))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let host = parsed.host_str().unwrap_or("").trim_matches(['[', ']']);
+            let loopback = host.eq_ignore_ascii_case("localhost")
+                || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+            if loopback { Ok(()) } else { Err(bad("is plain http to a non-loopback host")) }
+        }
+        _ => Err(bad("is not an http(s) URL")),
+    }
+}
+
+pub(crate) fn revocation_required(v: Option<&str>) -> Result<bool, String> {
+    match v.map(str::trim) {
+        None | Some("") | Some("warn") => Ok(false),
+        Some("require") => Ok(true),
+        Some(o) => Err(format!("{REVOCATION_ENV}={o:?} is not understood (use `require` or `warn`)")),
+    }
+}
+
+/// Startup check of the revocation switch, run before any network is set up: an unknown
+/// `CT_CHANNEL_REVOCATION` value, or `require` on the accept side of a forward without
+/// `CT_AGENT_CP_URL`, a control-plane URL that is not https (or loopback), or a malformed
+/// `CT_CHANNEL_GRANT_RECHECK_*` value fails the process start instead of the first join.
+/// [`gate_local`] keeps its own check for the paths that do not start here.
+pub fn check_revocation_config() -> Result<(), String> {
+    check_revocation_config_from(
+        forward_session_configured(),
+        std::env::var("CT_CHANNEL_ROLE").ok().as_deref(),
+        std::env::var("CT_AGENT_CP_URL").ok().as_deref(),
+        std::env::var(REVOCATION_ENV).ok().as_deref(),
+        &|k: &str| std::env::var(k).ok(),
+    )
+}
+
+pub(crate) fn check_revocation_config_from(
+    forward: bool,
+    role: Option<&str>,
+    cp_url: Option<&str>,
+    mode: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    let required = revocation_required(mode)?;
+    let accept = matches!(
+        role.map(|r| r.trim().to_ascii_lowercase()).as_deref(),
+        Some("accept" | "responder" | "listen")
+    );
+    if forward && accept {
+        let cp = cp_url.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        resolve_cp(cp, required)?;
+        grant_watch::WatchConfig::from_lookup(env)?;
+    }
+    Ok(())
+}
+
+/// Whether this process runs a TCP forward session, on either side.
+fn forward_session_configured() -> bool {
+    std::env::var(forward_stream::FORWARD_ENV).is_ok() || forward::forward_allow_configured()
 }
 
 /// The peer's attested Noise key and the holder that attested it.
@@ -414,7 +524,7 @@ where
             return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
         }
     };
-    let local = gate_local(local, request, role, peer_holder)?;
+    let local = gate_local(local, request, role, peer_holder, holder)?;
     // The DCUtR session runs the Noise_IK over the relay bi-stream as its base leg, punching to
     // direct in the background. Initiator opens the bi-stream; acceptor accepts the edge-opened one.
     let (relay_send, relay_recv) = open_relay_channel_streams(relay_conn, role).await?;
@@ -665,10 +775,9 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                 .await;
             }
         }
-        // ct-agent#267 (AUF-20261004-022): a forward must survive a peer restart or a relay
+        // ct-agent#267: a forward must survive a peer restart or a relay
         // drop, so with CT_CHANNEL_FORWARD set (the same env-only selection `channel_local` makes)
         // the one session becomes a reconnecting session loop over one listener.
-        // trace: AUF-20261004-022 (ct-agent#267)
         if let Ok(raw) = std::env::var(forward_stream::FORWARD_ENV) {
             return run_forward_initiate_sessions(&raw, &cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert)
                 .await;
@@ -696,7 +805,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
         }
         _ => None,
     };
-    // AUF-20261006-069: built in `ServeSessionCtx::from_cfg` (serving.rs), which also starts
+    // Built in `ServeSessionCtx::from_cfg` (serving.rs), which also starts
     // the background refresher for the join names.
     let serve_ctx = ServeSessionCtx::from_cfg(&cfg, request.clone(), shared_listener);
     let ctx = std::sync::Arc::new(serve_ctx);
@@ -854,6 +963,9 @@ pub use session::*;
 mod peer_grant;
 pub use peer_grant::*;
 
+// Control-plane re-check of the peer's grant while a forward session runs.
+pub(crate) mod grant_watch;
+
 mod errors;
 pub(crate) use errors::*;
 
@@ -883,7 +995,7 @@ pub use join_config::*;
 mod forward;
 pub use forward::*;
 
-// scimbe/ct-agent#255 slice 2 (AUF-20260929-029): the wire framing and the stream engine that
+// scimbe/ct-agent#255 slice 2: the wire framing and the stream engine that
 // actually run a channel TCP forward -- the initiate side's local listener and the byte-
 // transparent per-connection pump on both sides, built on `forward`'s policy gate above.
 mod forward_stream;

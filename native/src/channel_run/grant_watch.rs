@@ -1,0 +1,579 @@
+//! Re-checking the peer's grant while a forward session runs.
+//!
+//! A channel grant is verified once, when the session starts, and is stateless: nothing in it
+//! says it was withdrawn. Once a session is on a direct path (direct upgrade, DCUtR, fallback)
+//! the edge is no longer in the data path either, so the member itself has to ask. The accept
+//! side of a forward session therefore asks the control plane every `interval` whether the
+//! peer's grant (identified by the SHA-256 of its signed bytes) is still good, and ends the
+//! session when the answer is `revoked` or `not-member`. The first question is asked at once,
+//! when the watch starts, so a peer whose grant was revoked before the join does not run for a
+//! whole interval.
+//!
+//! Fail-closed: an answer that cannot be read (timeout, 5xx, 405, TLS error, garbage) does not end
+//! the session at once, but if no `valid` answer has arrived for `grace` the session ends. A bare
+//! 404 means the control plane does not have the endpoint (an old one): the session keeps running
+//! with one warning and the polling goes on, unless `CT_CHANNEL_REVOCATION=require` is set: then
+//! such an answer is as good as unreadable (a misrouted 404 or a rolled-back control plane must not
+//! keep a revoked session open for ever). A definite `revoked`/`not-member` ends it at once.
+//!
+//! The digest and the signed bytes are computed here, not taken from `ct-common`: this crate
+//! pins `ct-common` by release tag, and the helpers do not exist in a tag yet. The golden
+//! vectors in the tests are the same ones the control plane pins, so a drift on either side
+//! fails a test rather than a revocation.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ct_common::channel::SignedChannelGrant;
+use ed25519_dalek::{Signer as _, SigningKey};
+use sha2::{Digest as _, Sha256};
+use tokio::sync::oneshot;
+
+/// Seconds between two re-checks (default 30, floor 5).
+pub const RECHECK_SECS_ENV: &str = "CT_CHANNEL_GRANT_RECHECK_SECS";
+/// Seconds without a `valid` answer after which the session ends (default 90).
+pub const RECHECK_GRACE_SECS_ENV: &str = "CT_CHANNEL_GRANT_RECHECK_GRACE_SECS";
+
+const DEFAULT_INTERVAL_SECS: u64 = 30;
+const MIN_INTERVAL_SECS: u64 = 5;
+const DEFAULT_GRACE_SECS: u64 = 90;
+/// Bound on one status request, so a stalled control plane counts as unreadable.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often to ask, and how long an unreadable answer is tolerated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchConfig {
+    pub interval: Duration,
+    pub grace: Duration,
+    /// `CT_CHANNEL_REVOCATION=require`: a control plane without the endpoint counts as unreadable.
+    pub require: bool,
+}
+
+impl WatchConfig {
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// A malformed value is an error (the operator asked for something we cannot honour);
+    /// an interval below the floor is raised to it, a grace shorter than one interval is
+    /// raised to one interval (it could not otherwise ever see a second attempt).
+    pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let read = |key: &str, default: u64| -> Result<u64, String> {
+            match f(key).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                None => Ok(default),
+                Some(s) => s
+                    .parse::<u64>()
+                    .map_err(|_| format!("{key} must be a whole number of seconds, got {s:?}")),
+            }
+        };
+        let interval = read(RECHECK_SECS_ENV, DEFAULT_INTERVAL_SECS)?.max(MIN_INTERVAL_SECS);
+        let grace = read(RECHECK_GRACE_SECS_ENV, DEFAULT_GRACE_SECS)?.max(interval);
+        Ok(Self {
+            interval: Duration::from_secs(interval),
+            grace: Duration::from_secs(grace),
+            require: false,
+        })
+    }
+
+    /// The same timing with the strict mode switched on or off.
+    pub fn requiring(mut self, require: bool) -> Self {
+        self.require = require;
+        self
+    }
+}
+
+/// SHA-256 of the grant's signed wire form: the key of the control plane's revocation list.
+pub fn grant_digest(grant: &SignedChannelGrant) -> [u8; 32] {
+    Sha256::digest(grant.encode()).into()
+}
+
+/// The bytes a member signs to ask about `peer`'s grant. Mirror of
+/// `ct_common::channel::grant_status_signing_bytes`.
+pub fn status_signing_bytes(channel: &[u8; 32], peer: &[u8; 32], digest: &[u8; 32], ts: u64) -> Vec<u8> {
+    let mut out = b"ct-grant-status:v1|".to_vec();
+    out.extend_from_slice(channel);
+    out.push(b'|');
+    out.extend_from_slice(peer);
+    out.push(b'|');
+    out.extend_from_slice(digest);
+    out.push(b'|');
+    out.extend_from_slice(&ts.to_le_bytes());
+    out
+}
+
+/// What the control plane says about the peer's grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantState {
+    Valid,
+    Revoked,
+    NotMember,
+}
+
+/// Why no state could be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusError {
+    /// The control plane answered 404 on the re-check path without naming a channel: it does
+    /// not have the endpoint (an older release). It answered, over the verified connection, so
+    /// the session runs on and says so once; revocation is just not available from this CP.
+    Unsupported,
+    /// A transient or unintelligible failure.
+    Unreadable(String),
+}
+
+pub type StatusFuture<'a> = Pin<Box<dyn Future<Output = Result<GrantState, StatusError>> + Send + 'a>>;
+
+/// Where the answers come from (the control plane in production, a script in tests).
+pub trait GrantStatusSource: Send + Sync {
+    fn status(&self) -> StatusFuture<'_>;
+}
+
+/// The peer whose grant is watched, plus the source and timing: everything the gate needs to
+/// start a watch once the peer's grant has verified.
+#[derive(Clone)]
+pub struct WatchSetup {
+    pub source: Arc<dyn GrantStatusSource>,
+    pub config: WatchConfig,
+    /// Where the one-per-session notices go (stderr in production).
+    pub notice: Arc<dyn Fn(String) + Send + Sync>,
+}
+
+impl WatchSetup {
+    pub fn new(source: Arc<dyn GrantStatusSource>, config: WatchConfig) -> Self {
+        Self { source, config, notice: Arc::new(|m| eprintln!("ct-agent channel: {m}")) }
+    }
+}
+
+impl std::fmt::Debug for WatchSetup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatchSetup").field("config", &self.config).finish_non_exhaustive()
+    }
+}
+
+/// Builds the status source for a verified peer grant. The grant is only known once the peer has
+/// verified, so a session starts its watch then.
+pub type SourceFactory = Arc<dyn Fn(&SignedChannelGrant) -> Arc<dyn GrantStatusSource> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct WatchPlan {
+    pub factory: SourceFactory,
+    pub config: WatchConfig,
+}
+
+impl std::fmt::Debug for WatchPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatchPlan").field("config", &self.config).finish_non_exhaustive()
+    }
+}
+
+impl WatchPlan {
+    /// The production plan: ask the control plane at `cp_url`, signing as `holder`.
+    pub fn control_plane(cp_url: &str, holder: &SigningKey, own: &SignedChannelGrant, config: WatchConfig) -> Self {
+        let (cp_url, holder, channel) = (cp_url.to_string(), holder.clone(), own.grant.channel.0);
+        Self {
+            factory: Arc::new(move |peer: &SignedChannelGrant| {
+                Arc::new(CpStatusSource::new(&cp_url, holder.clone(), channel, peer.grant.holder, grant_digest(peer)))
+                    as Arc<dyn GrantStatusSource>
+            }),
+            config,
+        }
+    }
+}
+
+/// Ask the control plane's `POST /channel/grant-status`.
+pub struct CpStatusSource {
+    base: String,
+    holder: SigningKey,
+    channel: [u8; 32],
+    peer: [u8; 32],
+    digest: [u8; 32],
+}
+
+impl CpStatusSource {
+    pub fn new(base: &str, holder: SigningKey, channel: [u8; 32], peer: [u8; 32], digest: [u8; 32]) -> Self {
+        Self { base: base.trim_end_matches('/').to_string(), holder, channel, peer, digest }
+    }
+
+    async fn ask(&self) -> Result<GrantState, StatusError> {
+        let ts = crate::codec::now_unix();
+        let sig = self.holder.sign(&status_signing_bytes(&self.channel, &self.peer, &self.digest, ts));
+        let body = serde_json::json!({
+            "channel": crate::codec::hex_encode(&self.channel),
+            "asker": crate::codec::hex_encode(&self.holder.verifying_key().to_bytes()),
+            "peer": crate::codec::hex_encode(&self.peer),
+            "grant_digest": crate::codec::hex_encode(&self.digest),
+            "ts": ts,
+            "sig": crate::codec::hex_encode(&sig.to_bytes()),
+        });
+        let resp = crate::http::shared()
+            .post(format!("{}/channel/grant-status", self.base))
+            .timeout(REQUEST_TIMEOUT)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| StatusError::Unreadable(format!("request failed: {e}")))?;
+        let code = resp.status().as_u16();
+        let body = resp.text().await.map_err(|e| StatusError::Unreadable(format!("unreadable answer: {e}")))?;
+        classify_answer(code, &body)
+    }
+}
+
+/// Turn the control plane's HTTP answer into a verdict. Pure.
+///
+/// A 404 is ambiguous on its own: a control plane that has the endpoint answers it for a channel
+/// it does not know (and says so in the body, `{"state":"unknown-channel"}`: the channel is gone,
+/// so the session ends), while one that lacks the endpoint answers an empty or foreign 404
+/// (unsupported). A 403 is the same kind of ambiguous: only one that says in its body what the
+/// control plane itself decided (`{"state":"asker-not-member"}`) ends the session at once, since a
+/// proxy in front of the control plane can answer a bare 403 and that would otherwise end every
+/// forward session together. Everything else that is not a plain answer is unreadable and fails
+/// closed after the grace.
+pub fn classify_answer(code: u16, body: &str) -> Result<GrantState, StatusError> {
+    let state = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("state").and_then(|s| s.as_str()).map(str::to_string));
+    match code {
+        404 if state.as_deref() == Some("unknown-channel") => Ok(GrantState::NotMember),
+        404 => Err(StatusError::Unsupported),
+        // The control plane no longer counts this member as one: nothing about the peer can be
+        // asked, and nothing this member does on the channel is authorized. Only when the control
+        // plane said so itself; a bare 403 is unreadable (see above).
+        403 if state.as_deref() == Some("asker-not-member") => Ok(GrantState::NotMember),
+        200..=299 => match state.as_deref() {
+            Some("valid") => Ok(GrantState::Valid),
+            Some("revoked") => Ok(GrantState::Revoked),
+            Some("not-member") => Ok(GrantState::NotMember),
+            other => Err(StatusError::Unreadable(format!("unknown state {other:?}"))),
+        },
+        c => Err(StatusError::Unreadable(format!("control plane answered {c}"))),
+    }
+}
+
+impl GrantStatusSource for CpStatusSource {
+    fn status(&self) -> StatusFuture<'_> {
+        Box::pin(self.ask())
+    }
+}
+
+/// Run the watch until the grant ends or the session does. `end` is the session's way of
+/// hearing about it; when its receiver is dropped (the session is over) the loop stops.
+pub async fn watch_peer_grant(setup: WatchSetup, mut end: oneshot::Sender<String>) {
+    let mut last_valid = tokio::time::Instant::now();
+    let mut warned = false;
+    let mut first = true;
+    loop {
+        // The first question is asked at once; only the later ones wait out the interval.
+        if !std::mem::take(&mut first) {
+            tokio::select! {
+                _ = tokio::time::sleep(setup.config.interval) => {}
+                _ = end.closed() => return,
+            }
+        }
+        let verdict = tokio::select! {
+            v = setup.source.status() => v,
+            _ = end.closed() => return,
+        };
+        let verdict = match verdict {
+            Err(StatusError::Unsupported) if setup.config.require => {
+                Err(StatusError::Unreadable("the control plane has no /channel/grant-status".to_string()))
+            }
+            v => v,
+        };
+        let reason = match verdict {
+            Ok(GrantState::Valid) => {
+                last_valid = tokio::time::Instant::now();
+                continue;
+            }
+            Ok(GrantState::Revoked) => "the peer's grant was revoked".to_string(),
+            Ok(GrantState::NotMember) => "the peer is no longer a member of the channel".to_string(),
+            Err(StatusError::Unsupported) => {
+                // The control plane answered, so it is reachable: nothing to fail closed on.
+                last_valid = tokio::time::Instant::now();
+                if !warned {
+                    warned = true;
+                    (setup.notice)(
+                        "WARNING: this control plane has no /channel/grant-status; a revoked grant will NOT end \
+                         this forward session until it is upgraded (the session keeps running and asks again)"
+                            .to_string(),
+                    );
+                }
+                continue;
+            }
+            Err(StatusError::Unreadable(why)) => {
+                let silent = last_valid.elapsed();
+                if silent < setup.config.grace {
+                    eprintln!(
+                        "ct-agent channel: grant re-check unreadable for {}s (limit {}s): {why}",
+                        silent.as_secs(),
+                        setup.config.grace.as_secs()
+                    );
+                    continue;
+                }
+                format!(
+                    "the peer's grant could not be re-checked for {}s ({why}); failing closed",
+                    silent.as_secs()
+                )
+            }
+        };
+        let _ = end.send(reason);
+        return;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    #[test]
+    fn digest_and_status_bytes_match_the_control_plane_vectors() {
+        // Same vector the control plane pins (the control plane's
+        // ct-common test grant_digest_and_revoke_bytes_are_pinned_for_cross_repo_use).
+        let signed = SignedChannelGrant {
+            grant: ChannelGrant {
+                channel: ChannelId([0x11; 32]),
+                holder: [0x22; 32],
+                direction: Direction::Both,
+                rights: Rights::Read,
+                delegable: false,
+                expires_at: 2000,
+            },
+            signature: [0xaa; 64],
+        };
+        assert_eq!(
+            crate::codec::hex_encode(&grant_digest(&signed)),
+            "76e43324c486202745e98926f6362b6966ee3935f24aa72a784f77deb103d662"
+        );
+        let b = status_signing_bytes(&[0x11; 32], &[2; 32], &[1; 32], 5);
+        assert!(b.starts_with(b"ct-grant-status:v1|"));
+        assert_eq!(b.len(), 19 + 32 + 1 + 32 + 1 + 32 + 1 + 8);
+        assert_eq!(&b[b.len() - 8..], &5u64.to_le_bytes());
+    }
+
+    #[test]
+    fn config_defaults_floors_and_rejects_garbage() {
+        let none = |_: &str| None;
+        let d = WatchConfig::from_lookup(none).unwrap();
+        assert_eq!((d.interval.as_secs(), d.grace.as_secs()), (30, 90));
+        let f = |k: &str| match k {
+            RECHECK_SECS_ENV => Some("1".to_string()),
+            RECHECK_GRACE_SECS_ENV => Some("2".to_string()),
+            _ => None,
+        };
+        let c = WatchConfig::from_lookup(f).unwrap();
+        assert_eq!((c.interval.as_secs(), c.grace.as_secs()), (5, 5), "floor, and grace >= interval");
+        let bad = |k: &str| (k == RECHECK_SECS_ENV).then(|| "soon".to_string());
+        assert!(WatchConfig::from_lookup(bad).unwrap_err().contains(RECHECK_SECS_ENV));
+    }
+
+    struct Script(Mutex<VecDeque<Result<GrantState, StatusError>>>);
+    impl Script {
+        fn new(v: Vec<Result<GrantState, StatusError>>) -> Arc<Self> {
+            Arc::new(Self(Mutex::new(v.into())))
+        }
+    }
+    impl GrantStatusSource for Script {
+        fn status(&self) -> StatusFuture<'_> {
+            // Once the script runs out the control plane stays unreachable.
+            let next = self.0.lock().unwrap().pop_front();
+            Box::pin(async move { next.unwrap_or(Err(StatusError::Unreadable("down".into()))) })
+        }
+    }
+
+    fn setup(src: Arc<Script>) -> WatchSetup {
+        WatchSetup::new(src, WatchConfig { interval: Duration::from_secs(30), grace: Duration::from_secs(90), require: false })
+    }
+
+    async fn run(src: Arc<Script>) -> (Option<String>, Duration) {
+        let (tx, rx) = oneshot::channel();
+        let started = tokio::time::Instant::now();
+        let h = tokio::spawn(watch_peer_grant(setup(src), tx));
+        let got = rx.await.ok();
+        let _ = h.await;
+        (got, started.elapsed())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_revoked_answer_ends_the_session_at_the_next_tick_and_valid_ones_do_not() {
+        let (why, after) = run(Script::new(vec![
+            Ok(GrantState::Valid),
+            Ok(GrantState::Valid),
+            Ok(GrantState::Revoked),
+        ]))
+        .await;
+        assert!(why.unwrap().contains("revoked"));
+        assert_eq!(after, Duration::from_secs(60), "third check (the first is at once), not before");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removal_from_the_channel_ends_the_session() {
+        let (why, _) = run(Script::new(vec![Ok(GrantState::NotMember)])).await;
+        assert!(why.unwrap().contains("no longer a member"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_state_is_tolerated_for_the_grace_and_then_fails_closed() {
+        // Valid at 0 s, then the control plane goes away: the session survives until 90 s
+        // after the last valid answer, and not a tick longer.
+        let (why, after) = run(Script::new(vec![Ok(GrantState::Valid)])).await;
+        assert!(why.unwrap().contains("failing closed"));
+        assert_eq!(after, Duration::from_secs(90));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_recovered_control_plane_resets_the_grace() {
+        let (why, after) = run(Script::new(vec![
+            Err(StatusError::Unreadable("blip".into())),
+            Err(StatusError::Unreadable("blip".into())),
+            Ok(GrantState::Valid), // at 60 s
+        ]))
+        .await;
+        assert!(why.unwrap().contains("failing closed"));
+        assert_eq!(after, Duration::from_secs(150), "the clock restarted at the valid answer");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_control_plane_without_the_endpoint_keeps_the_session_and_warns_once() {
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let mut s = setup(Script::new(vec![
+            Err(StatusError::Unsupported),
+            Err(StatusError::Unsupported),
+            Err(StatusError::Unsupported),
+            Ok(GrantState::Revoked),
+        ]));
+        let n = notices.clone();
+        s.notice = Arc::new(move |m| n.lock().unwrap().push(m));
+        let (tx, rx) = oneshot::channel();
+        let started = tokio::time::Instant::now();
+        tokio::spawn(watch_peer_grant(s, tx));
+        let why = rx.await.unwrap();
+        assert!(why.contains("revoked"), "an upgraded control plane takes effect on a running session: {why}");
+        assert_eq!(started.elapsed(), Duration::from_secs(90), "three unsupported checks did not end it");
+        let got = notices.lock().unwrap();
+        assert_eq!(got.len(), 1, "one warning per session, not one per tick: {got:?}");
+        assert!(got[0].contains("WARNING") && got[0].contains("grant-status"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsupported_answers_do_not_run_down_the_grace_but_unreadable_ones_do() {
+        // 100 ticks of "unsupported" (> grace), then the CP goes unreadable: the grace counts from
+        // the last answer, not from the session start.
+        let mut v: Vec<_> = (0..100).map(|_| Err(StatusError::Unsupported)).collect();
+        v.push(Err(StatusError::Unreadable("down".into())));
+        v.push(Err(StatusError::Unreadable("down".into())));
+        let (why, after) = run(Script::new(v)).await;
+        assert!(why.unwrap().contains("failing closed"));
+        assert_eq!(after, Duration::from_secs(30 * 99 + 30 * 3), "ends one grace after the last answer");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn under_require_a_control_plane_without_the_endpoint_fails_closed_after_the_grace() {
+        let mut s = setup(Script::new((0..10).map(|_| Err(StatusError::Unsupported)).collect()));
+        s.config.require = true;
+        let (tx, rx) = oneshot::channel();
+        let started = tokio::time::Instant::now();
+        tokio::spawn(watch_peer_grant(s, tx));
+        let why = rx.await.unwrap();
+        assert!(why.contains("failing closed") && why.contains("grant-status"), "{why}");
+        assert_eq!(started.elapsed(), Duration::from_secs(90), "one grace after the watch started");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_question_is_asked_at_once() {
+        let (why, after) = run(Script::new(vec![Ok(GrantState::Revoked)])).await;
+        assert!(why.unwrap().contains("revoked"));
+        assert_eq!(after, Duration::ZERO, "a grant revoked before the join does not run for an interval");
+    }
+
+    /// `ask` against a loopback server: the path, the JSON fields and a signature that verifies
+    /// over the signed bytes on the wire.
+    #[tokio::test]
+    async fn the_control_plane_request_has_the_path_the_fields_and_a_valid_signature() {
+        use ed25519_dalek::Verifier as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (got_tx, got_rx) = oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = l.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let want = head
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                        .unwrap_or(0);
+                    if body.len() >= want {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let body = r#"{"state":"valid","checked_at":1}"#;
+            let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            let _ = got_tx.send(String::from_utf8_lossy(&raw).to_string());
+        });
+        let holder = SigningKey::from_bytes(&[0x31; 32]);
+        let (channel, peer, digest) = ([0x11u8; 32], [0x22u8; 32], [0x33u8; 32]);
+        let src = CpStatusSource::new(&format!("http://{addr}/"), holder.clone(), channel, peer, digest);
+        assert_eq!(src.status().await, Ok(GrantState::Valid));
+        let raw = got_rx.await.unwrap();
+        assert!(raw.starts_with("POST /channel/grant-status HTTP/1.1"), "{raw}");
+        let body: serde_json::Value = serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let hex = |b: &[u8]| crate::codec::hex_encode(b);
+        assert_eq!(body["channel"], hex(&channel));
+        assert_eq!(body["asker"], hex(&holder.verifying_key().to_bytes()));
+        assert_eq!(body["peer"], hex(&peer));
+        assert_eq!(body["grant_digest"], hex(&digest));
+        let ts = body["ts"].as_u64().unwrap();
+        let sig = ed25519_dalek::Signature::from_bytes(&crate::codec::hex_decode::<64>(body["sig"].as_str().unwrap()).unwrap());
+        holder
+            .verifying_key()
+            .verify(&status_signing_bytes(&channel, &peer, &digest, ts), &sig)
+            .expect("the signature on the wire covers the signed bytes");
+    }
+
+    #[test]
+    fn answers_are_classified_so_that_only_a_clear_unknown_endpoint_is_unsupported() {
+        use GrantState::*;
+        assert_eq!(classify_answer(404, ""), Err(StatusError::Unsupported), "old CP: empty 404");
+        assert_eq!(classify_answer(404, "<html>nope</html>"), Err(StatusError::Unsupported));
+        assert_eq!(
+            classify_answer(404, r#"{"state":"unknown-channel"}"#),
+            Ok(NotMember),
+            "a CP that has the endpoint and no such channel: the channel is gone"
+        );
+        assert_eq!(
+            classify_answer(403, r#"{"state":"asker-not-member"}"#),
+            Ok(NotMember),
+            "the control plane itself says the asker is no longer a member"
+        );
+        assert_eq!(classify_answer(200, r#"{"state":"valid","checked_at":1}"#), Ok(Valid));
+        assert_eq!(classify_answer(200, r#"{"state":"revoked"}"#), Ok(Revoked));
+        for (code, body) in [(405, ""), (500, ""), (502, "bad gateway"), (401, ""), (429, ""), (200, "{}"), (200, "garbage"),
+            (403, ""), (403, "<html>forbidden</html>"), (403, r#"{"error":"denied"}"#)] {
+            assert!(
+                matches!(classify_answer(code, body), Err(StatusError::Unreadable(_))),
+                "{code} {body:?} fails closed after the grace"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_watch_stops_when_the_session_is_gone() {
+        let (tx, rx) = oneshot::channel::<String>();
+        let h = tokio::spawn(watch_peer_grant(setup(Script::new(vec![])), tx));
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(1), h).await.expect("watch must stop").unwrap();
+    }
+}

@@ -6310,6 +6310,132 @@ async fn admit_one_shot_with_retry_gives_a_named_error_when_the_window_closes_95
     assert!(msg.contains(&hex_encode(&channel.0)), "must name the channel: {msg}");
 }
 
+/// A revoked grant is refused for good: the one-shot initiator must stop after the first
+/// refusal instead of re-asking the edge every 3 s for the whole window. Another definitive
+/// refusal (here `pairing`) keeps the bounded retry.
+#[tokio::test(start_paused = true)]
+async fn admit_one_shot_with_retry_stops_at_once_on_a_revoked_grant() {
+    // Paused time: the 3 s retry interval and the window pass instantly and exactly.
+    use ct_common::channel::ChannelId;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let channel = ChannelId([0x33u8; 32]);
+    let calls = AtomicU32::new(0);
+    let admit = || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        async { Err::<ChannelJoinOutcome, BoxError>(AdmissionRefused::boxed_with_category("edge broker refused the channel join", Some("grant-revoked"))) }
+    };
+    let err = admit_one_shot_with_retry(std::time::Duration::from_secs(10), &channel, admit)
+        .await
+        .expect_err("a revoked grant is refused");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one attempt");
+    assert!(err.to_string().contains("[grant-revoked]"), "{err}");
+
+    let calls = AtomicU32::new(0);
+    let admit = || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        async { Err::<ChannelJoinOutcome, BoxError>(AdmissionRefused::boxed_with_category("edge broker refused the channel join", Some("pairing"))) }
+    };
+    // Same window, a refusal that can still clear up: tried at 0, 3, 6, 9 s and once more at the
+    // deadline, then the named timeout error.
+    let err = admit_one_shot_with_retry(std::time::Duration::from_secs(10), &channel, admit)
+        .await
+        .expect_err("the window closes without an acceptor");
+    assert_eq!(calls.load(Ordering::SeqCst), 5, "a pairing refusal is retried until the window closes");
+    assert!(err.to_string().contains("no acceptor for channel"), "{err}");
+    assert!(!is_revoked_grant_refusal(&AdmissionRefused::boxed_with_category("x", Some("pairing"))));
+}
+
+/// The refusal as it really reaches the initiator: an edge that answers the join with
+/// `NO grant-revoked`, walked through the dial ladder (which wraps it in `ChannelDialError`), then
+/// through the one-shot retry. The initiator must give up at once, not re-ask every 3 s.
+#[tokio::test]
+async fn a_revoked_grant_refused_over_the_dial_path_is_final() {
+    use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+    use ct_edge::channel_broker::admit_channel_join_on_duplex;
+    use ct_edge::transport::build_tcp_tls_listener_at;
+    use ed25519_dalek::Signer;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
+
+    let op = SigningKey::from_bytes(&[8u8; 32]);
+    let op_pub = op.verifying_key().to_bytes();
+    let channel = [0x0Au8; 32];
+    let holder = SigningKey::from_bytes(&[0x13u8; 32]);
+    let g = ChannelGrant {
+        channel: ChannelId(channel),
+        holder: holder.verifying_key().to_bytes(),
+        direction: Direction::Initiate,
+        rights: Rights::ReadWrite,
+        delegable: false,
+        expires_at: 1_000,
+    };
+    let grant = SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() };
+    let request = ChannelJoinRequest { grant, endpoint: "203.0.113.8:7008".to_string() };
+
+    let (listener, acceptor, edge_cert) =
+        build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap()).await.expect("tls listener");
+    let fd_addr = listener.local_addr().expect("front-door addr");
+    let joins = Arc::new(AtomicU32::new(0));
+    let edge_joins = joins.clone();
+    let edge = tokio::spawn(async move {
+        loop {
+            let (tcp, peer) = listener.accept().await.expect("accept tcp");
+            edge_joins.fetch_add(1, Ordering::SeqCst);
+            let tls = acceptor.accept(tcp).await.expect("tls accept");
+            let (mut stream, ..) = admit_channel_join_on_duplex(
+                tls,
+                peer,
+                500u64,
+                std::time::Duration::from_secs(5),
+                &move |c: ChannelId, _h: [u8; 32]| {
+                    let ok = c.0 == channel;
+                    async move { ok.then_some((op_pub, None, None)) }
+                },
+            )
+            .await
+            .expect("the join is admitted up to the verdict");
+            // `NO | len | category`, as `encode_channel_refusal` frames it (the category is not in
+            // the vocabulary of the pinned dev-dependency edge, so it is framed by hand).
+            let mut frame = b"NO".to_vec();
+            frame.push(GRANT_REVOKED_CATEGORY.len() as u8);
+            frame.extend_from_slice(GRANT_REVOKED_CATEGORY.as_bytes());
+            stream.write_all(&frame).await.expect("refusal");
+            stream.shutdown().await.ok();
+        }
+    });
+    let rungs = vec![ChannelDialRung { endpoint: fd_addr, kind: ChannelDialKind::FrontDoor }];
+    let join = || {
+        present_channel_join_via_ladder(
+            &rungs,
+            &request,
+            &holder,
+            edge_cert.clone(),
+            std::time::Duration::from_millis(400),
+        )
+    };
+
+    // The shape that really arrives: not an AdmissionRefused itself, but one inside the dial error.
+    let err = join().await.expect_err("the revoked grant is refused");
+    assert!(err.downcast_ref::<AdmissionRefused>().is_none(), "arrives wrapped: {err:?}");
+    assert!(err.downcast_ref::<ChannelDialError>().is_some(), "arrives wrapped: {err:?}");
+    assert!(is_revoked_grant_refusal(&err), "recognized as final through the wrapper: {err}");
+    assert!(is_definitive_admission_refusal(&err));
+
+    // The one-shot initiator stops after that one refusal; a retry would wait out its 3 s interval.
+    let before = joins.load(Ordering::SeqCst);
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        admit_one_shot_with_retry(std::time::Duration::from_secs(30), &ChannelId(channel), join),
+    )
+    .await
+    .expect("returns at once instead of retrying every 3 s")
+    .expect_err("refused");
+    assert!(err.to_string().contains("[grant-revoked]"), "{err}");
+    assert_eq!(joins.load(Ordering::SeqCst) - before, 1, "exactly one join attempt");
+    edge.abort();
+}
+
 #[test]
 fn accept_race_flag_is_opt_in_22() {
     // ct-agent#22 (b) (frozen): the race is OPT-IN until the edge advertises abandoned-park
@@ -6906,9 +7032,9 @@ async fn a_successful_dial_resets_the_dial_failure_streak() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// scimbe/ct-agent#255 slice 2 (AUF-20260929-029): the channel TCP forward end to end -- two
+// scimbe/ct-agent#255 slice 2: the channel TCP forward end to end -- two
 // members in ONE process (Initiate + Accept), the way #255 acceptance 2's "local" clause asks
-// for (the real labor-com -> labor-de leg is a later slice, DEC-0045 B1). Both members' Noise
+// for (the real two-node leg is a later slice). Both members' Noise
 // session runs over a plain in-process duplex, exactly the [`run_channel_session_on_stream`]
 // pattern `run_channel_session_on_stream_forms_the_noise_tunnel_over_a_plain_duplex` above
 // already established -- the forward engines are just each side's `local`.
@@ -7035,7 +7161,7 @@ fn spawn_forward_pair(
 #[tokio::test]
 async fn channel_forward_carries_a_full_mtls_connection_byte_transparent_to_the_accept_sides_target(
 ) {
-    // #255 acceptance 1 (AUF-20260929-029): a TCP connection on the INITIATE side's local
+    // #255 acceptance 1: a TCP connection on the INITIATE side's local
     // listener reaches an mTLS test server behind the ACCEPT member; the server sees the
     // client's certificate unchanged -- proof the forward is byte-transparent end to end,
     // including a real TLS handshake (mTLS runs end-to-end, this member never touches it).
@@ -7155,7 +7281,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
 
 #[tokio::test]
 async fn channel_forward_max_streams_refuses_a_connection_over_the_cap() {
-    // #255 acceptance 3 (AUF-20260929-029): CT_CHANNEL_FORWARD_MAX_STREAMS actually bites. A
+    // #255 acceptance 3: CT_CHANNEL_FORWARD_MAX_STREAMS actually bites. A
     // plain TCP echo target (no TLS needed for this one) held open by its first client so the
     // stream count stays at the cap while a second connection is attempted.
     let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7220,7 +7346,7 @@ async fn channel_forward_max_streams_refuses_a_connection_over_the_cap() {
 
 #[tokio::test]
 async fn channel_forward_idle_timeout_closes_a_silent_stream() {
-    // #255 acceptance 3 (AUF-20260929-029): CT_CHANNEL_FORWARD_IDLE_SECS (here driven directly
+    // #255 acceptance 3: CT_CHANNEL_FORWARD_IDLE_SECS (here driven directly
     // via the Duration parameter every real env value ultimately becomes) closes a forwarded
     // stream that moves no bytes in EITHER direction for that long.
     let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7258,7 +7384,7 @@ async fn channel_forward_idle_timeout_closes_a_silent_stream() {
     // Wait for the accept side's own teardown instead of sleeping a fixed 50ms at it: that side
     // only starts its OWN idle countdown when this side's Close arrives, so its forward_close is
     // up to a full idle window behind the EOF above -- a fixed sleep passed only while some other
-    // concurrently-running test happened to bump the same counter inside it (AUF-20260930-005:
+    // concurrently-running test happened to bump the same counter inside it (
     // the three gated-forward tests at the end of this file made that coincidence stop holding).
     // `>` rather than `== +1` for that same reason: EVENT_COUNTS is one process-wide static
     // shared with every other test in this binary (the tolerance the mTLS test above and
@@ -7278,12 +7404,11 @@ async fn channel_forward_idle_timeout_closes_a_silent_stream() {
     b_task.abort();
 }
 
-// --- AUF-20260930-005 (INC-20260930-101): a grant that ends, ends the forward ------------------
+// --- a grant that ends, ends the forward ------------------
 //
-// trace: AUF-20260930-005 (INC-20260930-101)
 //
 // Until now `PeerGrantGate` decided once, at session setup, whether the peer's grant allowed the
-// session at all. INC-20260930-101: a grant that expires or is revoked while the session runs has
+// session at all. A grant that expires or is revoked while the session runs has
 // to end it -- and with it every CT_CHANNEL_FORWARD stream it carries, on BOTH members, within
 // `GRANT_TEARDOWN_BUDGET`, after which the initiate side's listener refuses new connections. The
 // three tests below drive real TCP through a real Noise session for each half of that sentence:
@@ -7370,12 +7495,14 @@ fn spawn_gated_forward_pair(target: String, expires_at: u64) -> GatedForwardPair
         own_grant: sign(a_holder, ct_common::channel::Direction::Initiate),
         peer_holder: b_holder,
         role: ChannelRole::Initiate,
+        watch: None,
     };
     let b_check = PeerGrantCheck {
         policy,
         own_grant: sign(b_holder, ct_common::channel::Direction::Accept),
         peer_holder: a_holder,
         role: ChannelRole::Accept,
+        watch: None,
     };
 
     let a = generate_static_keypair();
@@ -7445,7 +7572,7 @@ async fn open_forwarded_stream(bound: SocketAddr, byte: u8) -> tokio::net::TcpSt
 /// Whether an already-open forwarded stream is gone within [`GRANT_TEARDOWN_BUDGET`]: a clean EOF
 /// or a reset -- both are the teardown, which one arrives depends on whether the peer's FIN or
 /// the local engine's abort wins the race. `false` means it was still open when the budget ran
-/// out, which is exactly the failure INC-20260930-101 reported.
+/// out, which is exactly the failure that was reported.
 async fn forwarded_stream_is_closed(tcp: &mut tokio::net::TcpStream) -> bool {
     let mut buf = [0u8; 1];
     matches!(
@@ -7471,7 +7598,7 @@ async fn forward_connection_is_refused(bound: SocketAddr) -> bool {
 
 #[tokio::test]
 async fn channel_forward_streams_end_when_the_grant_expires_and_the_listener_then_refuses() {
-    // AUF-20260930-005 criterion 1: the grant expires while a forwarded stream is open. Within
+    // Criterion 1: the grant expires while a forwarded stream is open. Within
     // GRANT_TEARDOWN_BUDGET that stream is closed on BOTH sides -- the initiate side's client
     // socket and the accept side's dialed target socket -- and a new connect is refused.
     let grant_secs = 2;
@@ -7503,7 +7630,7 @@ async fn channel_forward_streams_end_when_the_grant_expires_and_the_listener_the
 
 #[tokio::test]
 async fn channel_forward_streams_end_when_the_grant_is_revoked() {
-    // AUF-20260930-005: the same end, reached by a revocation instead of the clock. Both members
+    // : the same end, reached by a revocation instead of the clock. Both members
     // are told, which is what the broker's channel-revoke path does when it reaches them; either
     // one alone would do, since the other's engine sees its end of the session duplex go EOF.
     let (target_addr, target) = spawn_echo_target(1).await;
@@ -7535,7 +7662,7 @@ async fn channel_forward_streams_end_when_the_grant_is_revoked() {
 
 #[tokio::test]
 async fn channel_forward_streams_stay_open_while_the_grant_is_valid() {
-    // AUF-20260930-005 criterion 2, the regression guard: the same gated pair with a grant that
+    // Criterion 2, the regression guard: the same gated pair with a grant that
     // is NOT about to expire keeps its stream open well past the teardown budget, and its
     // listener keeps opening new ones. Without this the incident's fix could "pass" by closing
     // every forward.
@@ -7560,9 +7687,8 @@ async fn channel_forward_streams_stay_open_while_the_grant_is_valid() {
     pair.initiate.abort();
     pair.accept.abort();
 }
-// --- AUF-20261004-022 (ct-agent#267): a session end that is not a grant end reconnects -------
+// --- ct-agent#267: a session end that is not a grant end reconnects -------
 //
-// trace: AUF-20261004-022 (ct-agent#267)
 //
 // 0.7.36 kept the initiate engine alive after ANY session end, refusing connections and never
 // closing its side of the duplex, so the process hung with a dead forward after a peer restart.
@@ -7604,12 +7730,14 @@ fn forward_grant_checks(expires_at: u64) -> (PeerGrantCheck, PeerGrantCheck) {
             own_grant: sign(a_holder, ct_common::channel::Direction::Initiate),
             peer_holder: b_holder,
             role: ChannelRole::Initiate,
+            watch: None,
         },
         PeerGrantCheck {
             policy,
             own_grant: sign(b_holder, ct_common::channel::Direction::Accept),
             peer_holder: a_holder,
             role: ChannelRole::Accept,
+            watch: None,
         },
     )
 }
@@ -7826,7 +7954,6 @@ async fn read_full_echo_or_clean_refusal(
     Ok(buf)
 }
 
-// trace: AUF-20261005-016 (DEC-0061)
 #[tokio::test]
 async fn channel_forward_many_short_parallel_streams_do_not_end_the_session() {
     // A stuck engine (the deadlock this guards against) must fail the test, never hang it.
@@ -7836,7 +7963,7 @@ async fn channel_forward_many_short_parallel_streams_do_not_end_the_session() {
 }
 
 async fn many_short_parallel_streams_body() {
-    // DEC-0061 / AUF-20261005-016: #255's own stream tests (above) each drive ONE forwarded
+    // #255's own stream tests (above) each drive ONE forwarded
     // connection at a time. Here, 40 short-lived connections race each other through a forward
     // whose CT_CHANNEL_FORWARD_MAX_STREAMS is the shipped default of 16, and some of the
     // within-cap ones are torn down with a hard reset (SO_LINGER 0) instead of a clean FIN --
@@ -7972,9 +8099,9 @@ async fn many_short_parallel_streams_body() {
     b_task.abort();
 }
 
-// --- DEC-0061 (2026-10-05): a dead local socket resets the stream, a clean EOF half-closes ------
+// --- a dead local socket resets the stream, a clean EOF half-closes ------
 //
-// Measured on labor-com/labor-de: a client that aborted a large Docker image export left the
+// Measured on two nodes: a client that aborted a large Docker image export left the
 // accept side relaying the rest (~2 GB) into a connection nobody read; the channel stayed
 // saturated for minutes. A clean EOF must stay a half-close (the reply still arrives); a failed
 // local socket must reset the stream so the peer closes its target.
@@ -8075,8 +8202,7 @@ async fn channel_forward_aborted_client_stops_the_target_and_frees_the_channel()
     .expect("test hung for 60 s");
 }
 
-// --- DEC-0061 (2026-10-05): flow control per stream (spec: REP-20261005-entwurf-flusskontrolle-
-// forward, section 5). Measured on labor-com/labor-de: one slow receiver stalled every other stream
+// --- flow control per stream (see the design of the forward, section 5). Measured on two nodes: one slow receiver stalled every other stream
 // of the same forward (50/50 fast requests timed out while a 64 KiB/s export ran).
 
 /// Target for the flow-control tests: the first byte of each connection picks its role.
@@ -8649,15 +8775,14 @@ async fn channel_forward_bidirectional_bulk_over_a_slow_edge_like_relay_without_
     eprintln!("bidirectional bulk over a slow edge-like relay (flow control off): {took:?}");
 }
 
-// trace: REQ-0006, AUF-20261006-060 (DEC-0061)
-// Part A of the follow-the-move preparation (REQ-0006): `join_addr_for_attempt`/`join_addr_now`
-// have no caller outside these tests yet -- Part B (AUF-20261006-061) wires them into the
+// Part A of the follow-the-move preparation: `join_addr_for_attempt`/`join_addr_now`
+// have no caller outside these tests yet -- Part B wires them into the
 // broker/relay dial loops. These tests need no network and no DNS: the resolver is a closure
 // (tests 1-3) or, for `join_addr_now`, a plain `fn` with a static counter (tests 5-6), since the
 // field/parameter type is a `fn` pointer, not a boxed closure.
 
 #[test]
-fn join_addr_for_attempt_folgt_dem_aufloeser_auf_20261006_060() {
+fn join_addr_for_attempt_folgt_dem_aufloeser() {
     use std::cell::Cell;
     use std::net::SocketAddr;
     let a: SocketAddr = "203.0.113.10:1".parse().unwrap();
@@ -8679,7 +8804,7 @@ fn join_addr_for_attempt_folgt_dem_aufloeser_auf_20261006_060() {
 }
 
 #[test]
-fn join_addr_for_attempt_faellt_auf_die_letzte_adresse_zurueck_auf_20261006_060() {
+fn join_addr_for_attempt_faellt_auf_die_letzte_adresse_zurueck() {
     use std::net::SocketAddr;
     let last: SocketAddr = "203.0.113.1:1".parse().unwrap();
     let resolve = |_raw: &str| -> Result<SocketAddr, String> { Err("lookup failed".to_string()) };
@@ -8691,7 +8816,7 @@ fn join_addr_for_attempt_faellt_auf_die_letzte_adresse_zurueck_auf_20261006_060(
 }
 
 #[test]
-fn join_addr_for_attempt_ip_literal_ruft_den_aufloeser_nie_auf_20261006_060() {
+fn join_addr_for_attempt_ip_literal_ruft_den_aufloeser_nie() {
     use std::cell::Cell;
     use std::net::SocketAddr;
     let calls = Cell::new(0);
@@ -8711,7 +8836,7 @@ fn join_addr_for_attempt_ip_literal_ruft_den_aufloeser_nie_auf_20261006_060() {
 }
 
 #[test]
-fn from_lookup_bewahrt_die_rohen_werte_auf_20261006_060() {
+fn from_lookup_bewahrt_die_rohen_werte() {
     use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
     use ed25519_dalek::Signer;
     use std::net::SocketAddr;
@@ -8772,7 +8897,7 @@ fn from_lookup_bewahrt_die_rohen_werte_auf_20261006_060() {
 }
 
 #[tokio::test]
-async fn join_addr_now_ip_literal_auf_20261006_060() {
+async fn join_addr_now_ip_literal() {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -8792,7 +8917,7 @@ async fn join_addr_now_ip_literal_auf_20261006_060() {
 }
 
 #[tokio::test]
-async fn join_addr_now_folgt_dem_aufloeser_auf_20261006_060() {
+async fn join_addr_now_folgt_dem_aufloeser() {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -8821,9 +8946,8 @@ async fn join_addr_now_folgt_dem_aufloeser_auf_20261006_060() {
     );
 }
 
-// trace: REQ-0006, AUF-20261006-069 (DEC-0061) -- Pflicht aus dem Merge-Review von Teil A (#277)
 #[tokio::test]
-async fn join_addr_now_timeout_faellt_auf_last_auf_20261006_069() {
+async fn join_addr_now_timeout_faellt_auf_last() {
     use std::net::SocketAddr;
     fn resolver(_raw: &str) -> Result<SocketAddr, String> {
         std::thread::sleep(std::time::Duration::from_secs(7));
@@ -8845,10 +8969,10 @@ async fn join_addr_now_timeout_faellt_auf_last_auf_20261006_069() {
 }
 
 #[tokio::test]
-async fn join_addr_now_panic_faellt_auf_last_auf_20261006_069() {
+async fn join_addr_now_panic_faellt_auf_last() {
     use std::net::SocketAddr;
     fn resolver(_raw: &str) -> Result<SocketAddr, String> {
-        panic!("kuenstlich: der Aufloeser bricht ab (AUF-20261006-069)");
+        panic!("kuenstlich: der Aufloeser bricht ab");
     }
     let last: SocketAddr = "203.0.113.1:1".parse().unwrap();
     let result = join_addr_now("t-panic-069.invalid:443", last, resolver).await;
@@ -8856,7 +8980,7 @@ async fn join_addr_now_panic_faellt_auf_last_auf_20261006_069() {
 }
 
 #[tokio::test]
-async fn join_addr_now_haelt_den_reaktor_nicht_an_auf_20261006_069() {
+async fn join_addr_now_haelt_den_reaktor_nicht_an() {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
     static FERTIG: AtomicBool = AtomicBool::new(false);
@@ -8868,8 +8992,7 @@ async fn join_addr_now_haelt_den_reaktor_nicht_an_auf_20261006_069() {
     let last: SocketAddr = "203.0.113.1:1".parse().unwrap();
     let t = std::time::Instant::now();
     // current_thread runtime: a resolver running ON the reactor would keep the ticker from
-    // running until the resolver is done. The check is load-independent (AUF-20261006-069,
-    // Haertung): when the ticker is through, the resolver must still be in its 800 ms -- no
+    // running until the resolver is done. The check is load-independent (hardening): when the ticker is through, the resolver must still be in its 800 ms -- no
     // wall-clock budget for the ten 20 ms sleeps of the ticker.
     let (result, (ticker_fertig, aufloeser_war_fertig)) = tokio::join!(
         join_addr_now("t-reaktor-069.invalid:443", last, resolver),
@@ -8892,7 +9015,7 @@ async fn join_addr_now_haelt_den_reaktor_nicht_an_auf_20261006_069() {
 }
 
 #[test]
-fn from_lookup_setzt_den_echten_aufloeser_auf_20261006_069() {
+fn from_lookup_setzt_den_echten_aufloeser() {
     use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
     use ed25519_dalek::Signer;
     use std::net::SocketAddr;
@@ -8943,10 +9066,9 @@ fn from_lookup_setzt_den_echten_aufloeser_auf_20261006_069() {
     let lokal = (cfg.join_resolve)("localhost:4433").expect("localhost resolves without DNS");
     assert!(lokal.ip().is_loopback() && lokal.port() == 4433, "{lokal}");
 }
-// trace: REQ-0006, AUF-20261006-069 (DEC-0061) -- the data path only READS the remembered
 // address; one background task refreshes it. Every test uses its OWN raw names: the memory
 // (`JOIN_LAST_GOOD`) is process-wide.
-fn cfg_auf_20261006_069(
+fn serve_cfg(
     front_door: Option<std::net::SocketAddr>,
     cert_hex: Option<String>,
     front_door_only: bool,
@@ -9000,7 +9122,7 @@ fn cfg_auf_20261006_069(
 
 /// A plain TCP listener standing in for a front door: counts accepted connections and closes
 /// them (the TLS handshake of the rung fails, the rung is over at once).
-async fn zaehl_lauscher_auf_20261006_069() -> (
+async fn zaehl_lauscher() -> (
     std::net::SocketAddr,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
     crate::task_guard::TaskGuard<()>,
@@ -9021,10 +9143,10 @@ async fn zaehl_lauscher_auf_20261006_069() -> (
     (addr, count, task)
 }
 
-/// AUF-20261006-069 (Haertung nach dem Gate-Lauf): the limit is REAL time, also under
+/// Hardening after the gate run: the limit is REAL time, also under
 /// `start_paused` -- a blocking resolver runs on an OS thread, and the virtual clock knows
 /// nothing about its progress, so a virtual limit can expire before that thread ever ran.
-async fn warte_bis_auf_20261006_069(frist: std::time::Duration, f: impl Fn() -> bool) -> bool {
+async fn warte_bis(frist: std::time::Duration, f: impl Fn() -> bool) -> bool {
     let t = std::time::Instant::now();
     while !f() {
         if t.elapsed() >= frist {
@@ -9035,9 +9157,9 @@ async fn warte_bis_auf_20261006_069(frist: std::time::Duration, f: impl Fn() -> 
     true
 }
 
-/// Like [`warte_bis_auf_20261006_069`], but it never lets the clock move on (it only yields):
+/// Like [`warte_bis`], but it never lets the clock move on (it only yields):
 /// for assertions that count the refresh rounds inside ONE `JOIN_REFRESH_MIN_GAP`.
-async fn warte_echt_auf_20261006_069(frist: std::time::Duration, f: impl Fn() -> bool) -> bool {
+async fn warte_echt(frist: std::time::Duration, f: impl Fn() -> bool) -> bool {
     let t = std::time::Instant::now();
     while !f() {
         if t.elapsed() >= frist {
@@ -9048,7 +9170,7 @@ async fn warte_echt_auf_20261006_069(frist: std::time::Duration, f: impl Fn() ->
     true
 }
 
-async fn test_zertifikat_hex_auf_20261006_069() -> String {
+async fn test_zertifikat_hex() -> String {
     let (_l, _a, cert) =
         ct_edge::transport::build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap())
             .await
@@ -9057,7 +9179,7 @@ async fn test_zertifikat_hex_auf_20261006_069() -> String {
 }
 
 #[tokio::test]
-async fn join_addr_refresh_merkt_a_b_und_haelt_b_bei_fehler_auf_20261006_069() {
+async fn join_addr_refresh_merkt_a_b_und_haelt_b_bei_fehler() {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static RUFE: AtomicUsize = AtomicUsize::new(0);
@@ -9108,7 +9230,7 @@ async fn join_addr_refresh_merkt_a_b_und_haelt_b_bei_fehler_auf_20261006_069() {
 }
 
 #[tokio::test]
-async fn hoechstens_eine_laufende_aufloesung_je_name_auf_20261006_069() {
+async fn hoechstens_eine_laufende_aufloesung_je_name() {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     static RUFE: AtomicUsize = AtomicUsize::new(0);
@@ -9142,7 +9264,7 @@ async fn hoechstens_eine_laufende_aufloesung_je_name_auf_20261006_069() {
     let _loslassen = Loslassen;
     let langsam = tokio::spawn(join_addr_refresh(raw, s, resolver));
     assert!(
-        warte_bis_auf_20261006_069(std::time::Duration::from_secs(5), || RUFE
+        warte_bis(std::time::Duration::from_secs(5), || RUFE
             .load(Ordering::SeqCst)
             == 1)
         .await,
@@ -9187,7 +9309,7 @@ async fn hoechstens_eine_laufende_aufloesung_je_name_auf_20261006_069() {
 }
 
 #[tokio::test]
-async fn ladder_known_setzt_nur_die_endpunkte_auf_20261006_069() {
+async fn ladder_known_setzt_nur_die_endpunkte() {
     use std::net::SocketAddr;
     fn resolver(raw: &str) -> Result<SocketAddr, String> {
         match raw {
@@ -9245,20 +9367,20 @@ async fn ladder_known_setzt_nur_die_endpunkte_auf_20261006_069() {
 }
 
 #[tokio::test]
-async fn from_cfg_startet_den_auffrischer_nur_mit_zertifikat_und_namen_auf_20261006_069() {
+async fn from_cfg_startet_den_auffrischer_nur_mit_zertifikat_und_namen() {
     use std::net::SocketAddr;
     fn resolver(_raw: &str) -> Result<SocketAddr, String> {
         Err("kuenstlich".to_string())
     }
     let a: SocketAddr = "127.0.0.1:9".parse().unwrap();
-    let cert = test_zertifikat_hex_auf_20261006_069().await;
+    let cert = test_zertifikat_hex().await;
     let req = |cfg: &ChannelJoinCliConfig| ChannelJoinRequest {
         grant: cfg.grant.clone(),
         endpoint: "203.0.113.7:7007".to_string(),
     };
 
     // from_lookup keeps the raw front-door value, trimmed; unset -> None.
-    let mut cfg = cfg_auf_20261006_069(Some(a), Some(cert.clone()), true);
+    let mut cfg = serve_cfg(Some(a), Some(cert.clone()), true);
     assert_eq!(cfg.front_door_raw.as_deref(), Some("127.0.0.1:9"));
     // All values are IP literals: nothing to refresh, no task.
     let ctx = ServeSessionCtx::from_cfg(&cfg, req(&cfg), None);
@@ -9280,7 +9402,7 @@ async fn from_cfg_startet_den_auffrischer_nur_mit_zertifikat_und_namen_auf_20261
     );
 
     // The same names WITHOUT a certificate: that path dials no ladder -> no refresher.
-    let mut ohne = cfg_auf_20261006_069(Some(a), None, false);
+    let mut ohne = serve_cfg(Some(a), None, false);
     ohne.front_door_raw = Some("t-ctx-069.invalid:443".to_string());
     ohne.broker_raw = "t-ctx-broker-069.invalid:4433".to_string();
     ohne.join_resolve = resolver;
@@ -9291,7 +9413,7 @@ async fn from_cfg_startet_den_auffrischer_nur_mit_zertifikat_und_namen_auf_20261
     );
 
     // front_door_raw = None with a certificate and a broker NAME: only the direct names.
-    let mut direkt = cfg_auf_20261006_069(Some(a), Some(cert), false);
+    let mut direkt = serve_cfg(Some(a), Some(cert), false);
     direkt.front_door_raw = None;
     direkt.broker_raw = "t-ctx-broker-069.invalid:4433".to_string();
     direkt.join_resolve = resolver;
@@ -9307,7 +9429,7 @@ async fn from_cfg_startet_den_auffrischer_nur_mit_zertifikat_und_namen_auf_20261
     );
 
     // CT_CHANNEL_FRONT_DOOR unset: no raw value, and nothing to refresh for IP literals.
-    let unset = cfg_auf_20261006_069(None, None, false);
+    let unset = serve_cfg(None, None, false);
     assert_eq!(unset.front_door_raw, None);
     assert!(ServeSessionCtx::from_cfg(&unset, req(&unset), None)
         .join_refresh
@@ -9315,7 +9437,7 @@ async fn from_cfg_startet_den_auffrischer_nur_mit_zertifikat_und_namen_auf_20261
 }
 
 #[tokio::test]
-async fn serve_ctx_folgt_der_front_door_zwischen_den_aufnahmen_auf_20261006_069() {
+async fn serve_ctx_folgt_der_front_door_zwischen_den_aufnahmen() {
     use ct_common::sync::MutexExt;
     use std::net::SocketAddr;
     use std::sync::atomic::Ordering;
@@ -9324,11 +9446,11 @@ async fn serve_ctx_folgt_der_front_door_zwischen_den_aufnahmen_auf_20261006_069(
         (*ZIEL.lock_safe()).ok_or_else(|| "kuenstlich: keine Antwort".to_string())
     }
     let name = "t-beleg-069.invalid:443";
-    let (a, zahl_a, _la) = zaehl_lauscher_auf_20261006_069().await;
-    let (b, zahl_b, _lb) = zaehl_lauscher_auf_20261006_069().await;
-    let mut cfg = cfg_auf_20261006_069(
+    let (a, zahl_a, _la) = zaehl_lauscher().await;
+    let (b, zahl_b, _lb) = zaehl_lauscher().await;
+    let mut cfg = serve_cfg(
         Some(a),
-        Some(test_zertifikat_hex_auf_20261006_069().await),
+        Some(test_zertifikat_hex().await),
         true,
     );
     cfg.front_door_raw = Some(name.to_string());
@@ -9353,13 +9475,13 @@ async fn serve_ctx_folgt_der_front_door_zwischen_den_aufnahmen_auf_20261006_069(
 
     aufnahme().await; // 1: nothing refreshed yet -> start address A (two rungs = two dials)
     assert!(
-        warte_bis_auf_20261006_069(zwei, || stand() == (2, 0)).await,
+        warte_bis(zwei, || stand() == (2, 0)).await,
         "{:?}",
         stand()
     );
     ctx.join_refresh.as_ref().expect("a name: refresher").kick();
     assert!(
-        warte_bis_auf_20261006_069(frist, || join_addr_known(name, a) == b).await,
+        warte_bis(frist, || join_addr_known(name, a) == b).await,
         "the refresher must learn B"
     );
     aufnahme().await; // 2: B
@@ -9368,14 +9490,14 @@ async fn serve_ctx_folgt_der_front_door_zwischen_den_aufnahmen_auf_20261006_069(
     tokio::time::sleep(JOIN_REFRESH_MIN_GAP + std::time::Duration::from_millis(500)).await;
     aufnahme().await; // 3: the lookup failed in between -> still B
     assert!(
-        warte_bis_auf_20261006_069(zwei, || stand() == (2, 4)).await,
+        warte_bis(zwei, || stand() == (2, 4)).await,
         "admissions 2 and 3 must reach the moved front door B (A, B) = {:?}, want (2, 4)",
         stand()
     );
 }
 
 #[tokio::test]
-async fn gescheiterte_aufnahme_stoesst_die_auffrischung_an_auf_20261006_069() {
+async fn gescheiterte_aufnahme_stoesst_die_auffrischung_an() {
     use ct_common::sync::MutexExt;
     use std::net::SocketAddr;
     static ZIEL: std::sync::Mutex<Option<SocketAddr>> = std::sync::Mutex::new(None);
@@ -9383,11 +9505,11 @@ async fn gescheiterte_aufnahme_stoesst_die_auffrischung_an_auf_20261006_069() {
         (*ZIEL.lock_safe()).ok_or_else(|| "kuenstlich: keine Antwort".to_string())
     }
     let name = "t-anstoss-069.invalid:443";
-    let (a, _zahl_a, _la) = zaehl_lauscher_auf_20261006_069().await;
+    let (a, _zahl_a, _la) = zaehl_lauscher().await;
     let b: SocketAddr = "203.0.113.42:443".parse().unwrap();
-    let mut cfg = cfg_auf_20261006_069(
+    let mut cfg = serve_cfg(
         Some(a),
-        Some(test_zertifikat_hex_auf_20261006_069().await),
+        Some(test_zertifikat_hex().await),
         true,
     );
     cfg.front_door_raw = Some(name.to_string());
@@ -9409,7 +9531,7 @@ async fn gescheiterte_aufnahme_stoesst_die_auffrischung_an_auf_20261006_069() {
     // No kick from the test and far below JOIN_REFRESH_INTERVAL: only the failed join can
     // have asked for this refresh.
     assert!(
-        warte_bis_auf_20261006_069(std::time::Duration::from_secs(5), || join_addr_known(
+        warte_bis(std::time::Duration::from_secs(5), || join_addr_known(
             name, a
         ) == b)
         .await,
@@ -9418,7 +9540,7 @@ async fn gescheiterte_aufnahme_stoesst_die_auffrischung_an_auf_20261006_069() {
 }
 
 #[tokio::test]
-async fn haengender_aufloeser_haelt_die_aufnahme_nicht_auf_auf_20261006_069() {
+async fn haengender_aufloeser_haelt_die_aufnahme_nicht_auf() {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     static RUFE: AtomicUsize = AtomicUsize::new(0);
@@ -9427,7 +9549,7 @@ async fn haengender_aufloeser_haelt_die_aufnahme_nicht_auf_auf_20261006_069() {
     fn resolver(_raw: &str) -> Result<SocketAddr, String> {
         use ct_common::sync::MutexExt;
         if RUFE.fetch_add(1, Ordering::SeqCst) > 0 {
-            // AUF-20261006-069 (Haertung): every lookup after the first one hangs until the
+            // Hardening: every lookup after the first one hangs until the
             // test lets it go -- much longer than JOIN_RESOLVE_TIMEOUT (5 s), and independent
             // of how loaded the machine is.
             while !FREI.load(Ordering::SeqCst) {
@@ -9448,11 +9570,11 @@ async fn haengender_aufloeser_haelt_die_aufnahme_nicht_auf_auf_20261006_069() {
     }
     let _loslassen = Loslassen;
     let name = "t-haengt-069.invalid:443";
-    let (a, zahl_a, _la) = zaehl_lauscher_auf_20261006_069().await;
-    let (b, zahl_b, _lb) = zaehl_lauscher_auf_20261006_069().await;
-    let mut cfg = cfg_auf_20261006_069(
+    let (a, zahl_a, _la) = zaehl_lauscher().await;
+    let (b, zahl_b, _lb) = zaehl_lauscher().await;
+    let mut cfg = serve_cfg(
         Some(a),
-        Some(test_zertifikat_hex_auf_20261006_069().await),
+        Some(test_zertifikat_hex().await),
         true,
     );
     cfg.front_door_raw = Some(name.to_string());
@@ -9467,10 +9589,10 @@ async fn haengender_aufloeser_haelt_die_aufnahme_nicht_auf_auf_20261006_069() {
     let frist = std::time::Duration::from_secs(10);
 
     refresh.kick(); // lookup 1 answers B at once
-    assert!(warte_bis_auf_20261006_069(frist, || join_addr_known(name, a) == b).await);
+    assert!(warte_bis(frist, || join_addr_known(name, a) == b).await);
     refresh.kick(); // lookup 2 hangs for 7 s
     assert!(
-        warte_bis_auf_20261006_069(frist, || RUFE.load(Ordering::SeqCst) == 2).await,
+        warte_bis(frist, || RUFE.load(Ordering::SeqCst) == 2).await,
         "the hanging lookup must be under way"
     );
     let haengt_seit = std::time::Instant::now();
@@ -9485,14 +9607,14 @@ async fn haengender_aufloeser_haelt_die_aufnahme_nicht_auf_auf_20261006_069() {
         "admit_one_peer must not wait for the hanging resolver (5 s): {dauer:?}"
     );
     assert!(
-        warte_bis_auf_20261006_069(std::time::Duration::from_secs(2), || {
+        warte_bis(std::time::Duration::from_secs(2), || {
             (zahl_a.load(Ordering::SeqCst), zahl_b.load(Ordering::SeqCst)) == (0, 2)
         })
         .await,
         "the admission must dial the remembered B while the resolver hangs: (A, B) = {:?}",
         (zahl_a.load(Ordering::SeqCst), zahl_b.load(Ordering::SeqCst))
     );
-    eprintln!("AUF-20261006-069: admit_one_peer bei haengendem Aufloeser: {dauer:?}");
+    eprintln!("admit_one_peer bei haengendem Aufloeser: {dauer:?}");
 
     // The waiting side gives up after JOIN_RESOLVE_TIMEOUT (5 s), the lookup thread hangs
     // until this test lets it go. A kick in between must NOT start a third lookup: the name
@@ -9509,7 +9631,7 @@ async fn haengender_aufloeser_haelt_die_aufnahme_nicht_auf_auf_20261006_069() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn anstoesse_loesen_hoechstens_eine_runde_je_abstand_aus_auf_20261006_069() {
+async fn anstoesse_loesen_hoechstens_eine_runde_je_abstand_aus() {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static RUFE: AtomicUsize = AtomicUsize::new(0);
@@ -9532,7 +9654,7 @@ async fn anstoesse_loesen_hoechstens_eine_runde_je_abstand_aus_auf_20261006_069(
     // The lookup runs on an OS thread: the 600 ms above are virtual and cost no real time,
     // so the thread gets its real time here (without moving the paused clock on).
     assert!(
-        warte_echt_auf_20261006_069(std::time::Duration::from_secs(5), || RUFE
+        warte_echt(std::time::Duration::from_secs(5), || RUFE
             .load(Ordering::SeqCst)
             >= 1)
         .await,
@@ -9544,7 +9666,7 @@ async fn anstoesse_loesen_hoechstens_eine_runde_je_abstand_aus_auf_20261006_069(
         "30 kicks inside JOIN_REFRESH_MIN_GAP must reach the resolver exactly once"
     );
     assert!(
-        warte_bis_auf_20261006_069(std::time::Duration::from_secs(3), || RUFE
+        warte_bis(std::time::Duration::from_secs(3), || RUFE
             .load(Ordering::SeqCst)
             == 2)
         .await,
@@ -9563,11 +9685,10 @@ async fn anstoesse_loesen_hoechstens_eine_runde_je_abstand_aus_auf_20261006_069(
     );
 }
 
-// trace: REQ-0006, AUF-20261006-069 (DEC-0061) -- Planpruefung: je ein Test fuer die
 // ueberlebenden Mutanten (Auffrischer nach Drop, Intervall, Port im Schluessel, Rueckzug auf
 // die Startadresse, Anstoss nur bei Fehlschlag, alle Namen, Relay-Pfad).
 #[tokio::test(start_paused = true)]
-async fn auffrischer_endet_mit_seinem_besitzer_auf_20261006_069() {
+async fn auffrischer_endet_mit_seinem_besitzer() {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static RUFE: AtomicUsize = AtomicUsize::new(0);
@@ -9580,7 +9701,7 @@ async fn auffrischer_endet_mit_seinem_besitzer_auf_20261006_069() {
         .expect("a name: refresher");
     refresh.kick();
     assert!(
-        warte_bis_auf_20261006_069(std::time::Duration::from_secs(5), || RUFE
+        warte_bis(std::time::Duration::from_secs(5), || RUFE
             .load(Ordering::SeqCst)
             == 1)
         .await,
@@ -9598,7 +9719,7 @@ async fn auffrischer_endet_mit_seinem_besitzer_auf_20261006_069() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn intervall_loest_ohne_anstoss_aus_auf_20261006_069() {
+async fn intervall_loest_ohne_anstoss_aus() {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static RUFE: AtomicUsize = AtomicUsize::new(0);
@@ -9619,12 +9740,12 @@ async fn intervall_loest_ohne_anstoss_aus_auf_20261006_069() {
         "nobody asked: no lookup before JOIN_REFRESH_INTERVAL"
     );
     assert!(
-        warte_bis_auf_20261006_069(sekunde * 3, || join_addr_known(name, s) == b).await,
+        warte_bis(sekunde * 3, || join_addr_known(name, s) == b).await,
         "the interval alone (no kick) must refresh the name"
     );
     assert_eq!(RUFE.load(Ordering::SeqCst), 1);
     assert!(
-        warte_bis_auf_20261006_069(JOIN_REFRESH_INTERVAL + sekunde * 3, || RUFE
+        warte_bis(JOIN_REFRESH_INTERVAL + sekunde * 3, || RUFE
             .load(Ordering::SeqCst)
             == 2)
         .await,
@@ -9633,7 +9754,7 @@ async fn intervall_loest_ohne_anstoss_aus_auf_20261006_069() {
 }
 
 #[tokio::test]
-async fn merker_traegt_den_port_und_folgt_dem_rueckzug_auf_den_start_auf_20261006_069() {
+async fn merker_traegt_den_port_und_folgt_dem_rueckzug_auf_den_start() {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static RUFE: AtomicUsize = AtomicUsize::new(0);
@@ -9666,7 +9787,7 @@ async fn merker_traegt_den_port_und_folgt_dem_rueckzug_auf_den_start_auf_2026100
 }
 
 #[tokio::test]
-async fn auffrischer_loest_jeden_namen_auf_auf_20261006_069() {
+async fn auffrischer_loest_jeden_namen_auf() {
     use std::net::SocketAddr;
     const EINS: &str = "t-zwei-namen-1-069.invalid:443";
     const ZWEI: &str = "t-zwei-namen-2-069.invalid:7443";
@@ -9685,7 +9806,7 @@ async fn auffrischer_loest_jeden_namen_auf_auf_20261006_069() {
             .expect("two names: refresher");
     refresh.kick();
     assert!(
-        warte_bis_auf_20261006_069(std::time::Duration::from_secs(5), || {
+        warte_bis(std::time::Duration::from_secs(5), || {
             join_addr_known(EINS, s) == e1 && join_addr_known(ZWEI, s) == e2
         })
         .await,
@@ -9696,7 +9817,7 @@ async fn auffrischer_loest_jeden_namen_auf_auf_20261006_069() {
 }
 
 #[tokio::test]
-async fn erfolgreiche_aufnahme_stoesst_nichts_an_auf_20261006_069() {
+async fn erfolgreiche_aufnahme_stoesst_nichts_an() {
     use ct_common::channel::ChannelId;
     use ct_edge::channel_broker::admit_channel_join_on_duplex;
     use ct_edge::transport::build_tcp_tls_listener_at;
@@ -9738,7 +9859,7 @@ async fn erfolgreiche_aufnahme_stoesst_nichts_an_auf_20261006_069() {
         stream.shutdown().await.expect("shutdown");
         // The listener is dropped here: every later dial is refused.
     });
-    let mut cfg = cfg_auf_20261006_069(Some(fd_addr), Some(hex_encode(edge_cert.as_ref())), true);
+    let mut cfg = serve_cfg(Some(fd_addr), Some(hex_encode(edge_cert.as_ref())), true);
     cfg.front_door_raw = Some("t-erfolg-069.invalid:443".to_string());
     cfg.join_resolve = resolver;
     let request = ChannelJoinRequest {
@@ -9770,7 +9891,7 @@ async fn erfolgreiche_aufnahme_stoesst_nichts_an_auf_20261006_069() {
         .expect("admit_one_peer must return against a closed port");
     assert!(zweite.is_err(), "nothing listens any more: the join fails");
     assert!(
-        warte_bis_auf_20261006_069(std::time::Duration::from_secs(5), || RUFE
+        warte_bis(std::time::Duration::from_secs(5), || RUFE
             .load(Ordering::SeqCst)
             == 1)
         .await,
@@ -9779,7 +9900,7 @@ async fn erfolgreiche_aufnahme_stoesst_nichts_an_auf_20261006_069() {
 }
 
 #[tokio::test]
-async fn relay_pfad_folgt_dem_merker_auf_20261006_069() {
+async fn relay_pfad_folgt_dem_merker() {
     use ct_common::channel::ChannelId;
     use ct_common::sync::MutexExt;
     use ed25519_dalek::Signer;
@@ -9790,11 +9911,11 @@ async fn relay_pfad_folgt_dem_merker_auf_20261006_069() {
         (*ZIEL.lock_safe()).ok_or_else(|| "kuenstlich: keine Antwort".to_string())
     }
     let name = "t-relay-069.invalid:443";
-    let (a, zahl_a, _la) = zaehl_lauscher_auf_20261006_069().await;
-    let (b, zahl_b, _lb) = zaehl_lauscher_auf_20261006_069().await;
-    let mut cfg = cfg_auf_20261006_069(
+    let (a, zahl_a, _la) = zaehl_lauscher().await;
+    let (b, zahl_b, _lb) = zaehl_lauscher().await;
+    let mut cfg = serve_cfg(
         Some(a),
-        Some(test_zertifikat_hex_auf_20261006_069().await),
+        Some(test_zertifikat_hex().await),
         true,
     );
     cfg.front_door_raw = Some(name.to_string());
@@ -9808,7 +9929,7 @@ async fn relay_pfad_folgt_dem_merker_auf_20261006_069() {
     let frist = std::time::Duration::from_secs(10);
     ctx.join_refresh.as_ref().expect("a name: refresher").kick();
     assert!(
-        warte_bis_auf_20261006_069(frist, || join_addr_known(name, a) == b).await,
+        warte_bis(frist, || join_addr_known(name, a) == b).await,
         "the refresher must learn B"
     );
     // A pre-computed admission with a valid attestation: the session goes straight to the
@@ -9839,7 +9960,7 @@ async fn relay_pfad_folgt_dem_merker_auf_20261006_069() {
     assert!(ergebnis.is_err(), "the listeners only count and close");
     let stand = || (zahl_a.load(Ordering::SeqCst), zahl_b.load(Ordering::SeqCst));
     assert!(
-        warte_bis_auf_20261006_069(std::time::Duration::from_secs(2), || stand().1 >= 1).await,
+        warte_bis(std::time::Duration::from_secs(2), || stand().1 >= 1).await,
         "the relay rungs must dial the remembered B: (A, B) = {:?}",
         stand()
     );
@@ -9851,10 +9972,9 @@ async fn relay_pfad_folgt_dem_merker_auf_20261006_069() {
     );
 }
 
-// trace: REQ-0006, AUF-20261006-069 (DEC-0061) -- the lookup remembers its own answer: an
 // answer after JOIN_RESOLVE_TIMEOUT is used, and a name is freed however its lookup ends.
 #[tokio::test]
-async fn panik_im_aufloeser_gibt_den_namen_frei_auf_20261006_069() {
+async fn panik_im_aufloeser_gibt_den_namen_frei() {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static RUFE: AtomicUsize = AtomicUsize::new(0);
@@ -9881,7 +10001,7 @@ async fn panik_im_aufloeser_gibt_den_namen_frei_auf_20261006_069() {
 }
 
 #[tokio::test]
-async fn antwort_nach_der_frist_wird_genutzt_auf_20261006_069() {
+async fn antwort_nach_der_frist_wird_genutzt() {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     static RUFE: AtomicUsize = AtomicUsize::new(0);
@@ -9917,7 +10037,7 @@ async fn antwort_nach_der_frist_wird_genutzt_auf_20261006_069() {
     assert_eq!(join_addr_known(raw, s), s);
     FREI.store(true, Ordering::SeqCst);
     assert!(
-        warte_bis_auf_20261006_069(std::time::Duration::from_secs(5), || join_addr_known(
+        warte_bis(std::time::Duration::from_secs(5), || join_addr_known(
             raw, s
         ) == b)
         .await,
@@ -9932,7 +10052,7 @@ async fn antwort_nach_der_frist_wird_genutzt_auf_20261006_069() {
 }
 
 #[tokio::test]
-async fn abbruch_des_wartenden_gibt_den_namen_frei_auf_20261006_069() {
+async fn abbruch_des_wartenden_gibt_den_namen_frei() {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     static RUFE: AtomicUsize = AtomicUsize::new(0);
@@ -9960,7 +10080,7 @@ async fn abbruch_des_wartenden_gibt_den_namen_frei_auf_20261006_069() {
     let frist = std::time::Duration::from_secs(5);
     let wartender = tokio::spawn(join_addr_refresh(raw, s, resolver));
     assert!(
-        warte_bis_auf_20261006_069(frist, || RUFE.load(Ordering::SeqCst) == 1).await,
+        warte_bis(frist, || RUFE.load(Ordering::SeqCst) == 1).await,
         "the lookup must be under way first"
     );
     // The waiting side goes away (as when the refresher ends with its owner).
@@ -9974,7 +10094,7 @@ async fn abbruch_des_wartenden_gibt_den_namen_frei_auf_20261006_069() {
     assert_eq!(RUFE.load(Ordering::SeqCst), 1);
     FREI.store(true, Ordering::SeqCst);
     assert!(
-        warte_bis_auf_20261006_069(frist, || join_addr_known(raw, s) == b).await,
+        warte_bis(frist, || join_addr_known(raw, s) == b).await,
         "the answer of the abandoned lookup must still be remembered"
     );
     let mut jetzt = s;
@@ -9993,7 +10113,7 @@ async fn abbruch_des_wartenden_gibt_den_namen_frei_auf_20261006_069() {
 }
 
 #[tokio::test]
-async fn direkte_sprossen_folgen_je_ihrem_eigenen_namen_auf_20261006_069() {
+async fn direkte_sprossen_folgen_je_ihrem_eigenen_namen() {
     use std::net::SocketAddr;
     const BROKER: &str = "t-direkt-broker-069.invalid:4433";
     const RELAY: &str = "t-direkt-relay-069.invalid:4434";
@@ -10010,9 +10130,9 @@ async fn direkte_sprossen_folgen_je_ihrem_eigenen_namen_auf_20261006_069() {
     let nr: SocketAddr = "203.0.113.102:4434".parse().unwrap();
     let nt: SocketAddr = "203.0.113.103:443".parse().unwrap();
     let start_tuer: SocketAddr = "203.0.113.5:443".parse().unwrap();
-    let mut cfg = cfg_auf_20261006_069(
+    let mut cfg = serve_cfg(
         Some(start_tuer),
-        Some(test_zertifikat_hex_auf_20261006_069().await),
+        Some(test_zertifikat_hex().await),
         false,
     );
     cfg.broker_raw = BROKER.to_string();
@@ -10054,7 +10174,7 @@ async fn direkte_sprossen_folgen_je_ihrem_eigenen_namen_auf_20261006_069() {
         )
     };
     assert!(
-        warte_bis_auf_20261006_069(std::time::Duration::from_secs(5), || {
+        warte_bis(std::time::Duration::from_secs(5), || {
             let (b, r) = stand();
             direkt(&b).iter().all(|a| *a == nb) && direkt(&r).iter().all(|a| *a == nr)
         })
@@ -10071,7 +10191,7 @@ async fn direkte_sprossen_folgen_je_ihrem_eigenen_namen_auf_20261006_069() {
 }
 
 #[tokio::test]
-async fn haengender_erster_name_haelt_den_zweiten_nur_eine_frist_auf_auf_20261006_069() {
+async fn haengender_erster_name_haelt_den_zweiten_nur_eine_frist_auf() {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     const EINS: &str = "t-haengt-1-069.invalid:443";
@@ -10109,7 +10229,7 @@ async fn haengender_erster_name_haelt_den_zweiten_nur_eine_frist_auf_auf_2026100
     refresh.kick();
     // Round 1 waits one JOIN_RESOLVE_TIMEOUT for the hanging first name, then asks the second.
     assert!(
-        warte_bis_auf_20261006_069(std::time::Duration::from_secs(9), || join_addr_known(
+        warte_bis(std::time::Duration::from_secs(9), || join_addr_known(
             ZWEI, s
         ) == z1)
         .await,
@@ -10119,7 +10239,7 @@ async fn haengender_erster_name_haelt_den_zweiten_nur_eine_frist_auf_auf_2026100
     let t = std::time::Instant::now();
     refresh.kick();
     assert!(
-        warte_bis_auf_20261006_069(std::time::Duration::from_secs(4), || join_addr_known(
+        warte_bis(std::time::Duration::from_secs(4), || join_addr_known(
             ZWEI, s
         ) == z2)
         .await,
@@ -10134,7 +10254,7 @@ async fn haengender_erster_name_haelt_den_zweiten_nur_eine_frist_auf_auf_2026100
     assert_eq!(join_addr_known(EINS, s), s);
     FREI.store(true, Ordering::SeqCst);
     assert!(
-        warte_bis_auf_20261006_069(std::time::Duration::from_secs(5), || join_addr_known(
+        warte_bis(std::time::Duration::from_secs(5), || join_addr_known(
             EINS, s
         ) == e1)
         .await,
@@ -10142,11 +10262,10 @@ async fn haengender_erster_name_haelt_den_zweiten_nur_eine_frist_auf_auf_2026100
     );
 }
 
-// trace: REQ-0006, AUF-20261006-069 (DEC-0061) -- Planpruefung: die zwei Aufrufstellen in
 // serving.rs muessen die direkte Sprosse unter dem EIGENEN Namen ihrer Leiter nachschlagen.
 /// A UDP socket standing in for a direct (QUIC) broker or relay: counts datagrams, never
 /// answers (the first QUIC Initial of a direct rung is enough to see where it went).
-async fn udp_senke_auf_20261006_069() -> (
+async fn udp_senke() -> (
     std::net::SocketAddr,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
     crate::task_guard::TaskGuard<()>,
@@ -10168,7 +10287,7 @@ async fn udp_senke_auf_20261006_069() -> (
 }
 
 #[tokio::test]
-async fn aufnahme_waehlt_die_direkte_sprosse_unter_dem_broker_namen_auf_20261006_069() {
+async fn aufnahme_waehlt_die_direkte_sprosse_unter_dem_broker_namen() {
     use ct_common::sync::MutexExt;
     use std::net::SocketAddr;
     use std::sync::atomic::Ordering;
@@ -10183,13 +10302,13 @@ async fn aufnahme_waehlt_die_direkte_sprosse_unter_dem_broker_namen_auf_20261006
             other => Err(format!("unerwartet: {other}")),
         }
     }
-    let (nb, zahl_b, _sb) = udp_senke_auf_20261006_069().await;
-    let (nr, zahl_r, _sr) = udp_senke_auf_20261006_069().await;
-    let (tuer, _zahl_t, _lt) = zaehl_lauscher_auf_20261006_069().await;
+    let (nb, zahl_b, _sb) = udp_senke().await;
+    let (nr, zahl_r, _sr) = udp_senke().await;
+    let (tuer, _zahl_t, _lt) = zaehl_lauscher().await;
     *ZIELE.lock_safe() = Some((nb, nr));
-    let mut cfg = cfg_auf_20261006_069(
+    let mut cfg = serve_cfg(
         Some(tuer),
-        Some(test_zertifikat_hex_auf_20261006_069().await),
+        Some(test_zertifikat_hex().await),
         false,
     );
     cfg.broker_raw = BROKER.to_string();
@@ -10206,7 +10325,7 @@ async fn aufnahme_waehlt_die_direkte_sprosse_unter_dem_broker_namen_auf_20261006
         .kick();
     let frist = std::time::Duration::from_secs(5);
     assert!(
-        warte_bis_auf_20261006_069(frist, || {
+        warte_bis(frist, || {
             join_addr_known(BROKER, cfg.broker_addr) == nb
                 && join_addr_known(RELAY, cfg.relay_addr) == nr
         })
@@ -10218,7 +10337,7 @@ async fn aufnahme_waehlt_die_direkte_sprosse_unter_dem_broker_namen_auf_20261006
     // that never comes: its first datagram shows where it went, the rest is not awaited.
     tokio::select! {
         _ = admit_one_peer(&ctx) => {}
-        _ = warte_bis_auf_20261006_069(frist, || stand() != (0, 0)) => {}
+        _ = warte_bis(frist, || stand() != (0, 0)) => {}
     }
     assert!(
         stand().0 >= 1 && stand().1 == 0,
@@ -10228,7 +10347,7 @@ async fn aufnahme_waehlt_die_direkte_sprosse_unter_dem_broker_namen_auf_20261006
 }
 
 #[tokio::test]
-async fn sitzung_waehlt_die_direkte_sprosse_unter_dem_relay_namen_auf_20261006_069() {
+async fn sitzung_waehlt_die_direkte_sprosse_unter_dem_relay_namen() {
     use ct_common::channel::ChannelId;
     use ct_common::sync::MutexExt;
     use ed25519_dalek::Signer;
@@ -10245,13 +10364,13 @@ async fn sitzung_waehlt_die_direkte_sprosse_unter_dem_relay_namen_auf_20261006_0
             other => Err(format!("unerwartet: {other}")),
         }
     }
-    let (nb, zahl_b, _sb) = udp_senke_auf_20261006_069().await;
-    let (nr, zahl_r, _sr) = udp_senke_auf_20261006_069().await;
-    let (tuer, _zahl_t, _lt) = zaehl_lauscher_auf_20261006_069().await;
+    let (nb, zahl_b, _sb) = udp_senke().await;
+    let (nr, zahl_r, _sr) = udp_senke().await;
+    let (tuer, _zahl_t, _lt) = zaehl_lauscher().await;
     *ZIELE.lock_safe() = Some((nb, nr));
-    let mut cfg = cfg_auf_20261006_069(
+    let mut cfg = serve_cfg(
         Some(tuer),
-        Some(test_zertifikat_hex_auf_20261006_069().await),
+        Some(test_zertifikat_hex().await),
         false,
     );
     cfg.broker_raw = BROKER.to_string();
@@ -10268,7 +10387,7 @@ async fn sitzung_waehlt_die_direkte_sprosse_unter_dem_relay_namen_auf_20261006_0
         .kick();
     let frist = std::time::Duration::from_secs(5);
     assert!(
-        warte_bis_auf_20261006_069(frist, || {
+        warte_bis(frist, || {
             join_addr_known(BROKER, cfg.broker_addr) == nb
                 && join_addr_known(RELAY, cfg.relay_addr) == nr
         })
@@ -10297,7 +10416,7 @@ async fn sitzung_waehlt_die_direkte_sprosse_unter_dem_relay_namen_auf_20261006_0
     let stand = || (zahl_b.load(Ordering::SeqCst), zahl_r.load(Ordering::SeqCst));
     tokio::select! {
         _ = serve_admitted_session(std::sync::Arc::new(ctx), admission) => {}
-        _ = warte_bis_auf_20261006_069(frist, || stand() != (0, 0)) => {}
+        _ = warte_bis(frist, || stand() != (0, 0)) => {}
     }
     assert!(
         stand().1 >= 1 && stand().0 == 0,
@@ -10310,7 +10429,7 @@ async fn sitzung_waehlt_die_direkte_sprosse_unter_dem_relay_namen_auf_20261006_0
 // Planpruefung: the in-flight claim is per raw name WITH port (broker and relay usually
 // share the host and differ only in the port).
 #[tokio::test]
-async fn belegter_name_haelt_denselben_host_mit_anderem_port_nicht_auf_auf_20261006_069() {
+async fn belegter_name_haelt_denselben_host_mit_anderem_port_nicht_auf() {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     static RUFE: AtomicUsize = AtomicUsize::new(0);
@@ -10338,7 +10457,7 @@ async fn belegter_name_haelt_denselben_host_mit_anderem_port_nicht_auf_auf_20261
     let zwei: SocketAddr = "203.0.113.97:4434".parse().unwrap();
     let haengt = tokio::spawn(join_addr_refresh(EINS, s, resolver));
     assert!(
-        warte_bis_auf_20261006_069(std::time::Duration::from_secs(5), || RUFE
+        warte_bis(std::time::Duration::from_secs(5), || RUFE
             .load(Ordering::SeqCst)
             == 1)
         .await,
@@ -10353,7 +10472,7 @@ async fn belegter_name_haelt_denselben_host_mit_anderem_port_nicht_auf_auf_20261
     let _ = haengt.await;
 }
 
-// AUF-20261007-005 (replaces -078/-081): with the session window a new connection is answered
+// With the session window a new connection is answered
 // while sixteen uploads keep a slow relay full. Measured on the base of this change (PR #276):
 // 64 s for the same request, 3.8 MiB of stream data ahead of its Open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

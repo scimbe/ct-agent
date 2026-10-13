@@ -89,10 +89,35 @@ pub(crate) fn is_definitive_admission_refusal(e: &BoxError) -> bool {
     // crossed a stringifying boundary (e.g. a subprocess's stderr re-parsed into a fresh
     // error), costs one frozen operator-visible string, and fails safe (worst case: a
     // refusal-shaped transient backs off too long, never the reverse).
-    if e.downcast_ref::<AdmissionRefused>().is_some() {
+    if admission_refusal(e).is_some() {
         return true;
     }
     e.to_string().contains("refused the channel join")
+}
+
+/// The edge's refusal category for a grant on the revocation list.
+pub(crate) const GRANT_REVOKED_CATEGORY: &str = "grant-revoked";
+
+/// The [`AdmissionRefused`] an error is or wraps. A refusal reaches the caller inside
+/// [`super::dialing::ChannelDialError`] when it came through the dial ladder, so a plain downcast
+/// of the outer error misses it; this walks the `source()` chain, the one place that looks.
+pub(crate) fn admission_refusal(e: &BoxError) -> Option<&AdmissionRefused> {
+    let first: &(dyn std::error::Error + 'static) = &**e;
+    let mut cur = Some(first);
+    while let Some(err) = cur {
+        if let Some(refusal) = err.downcast_ref::<AdmissionRefused>() {
+            return Some(refusal);
+        }
+        cur = err.source();
+    }
+    None
+}
+
+/// A refusal that names the `grant-revoked` category: this exact grant is on the revocation
+/// list and never becomes valid again, so retrying it only loads the edge. Other definitive
+/// refusals keep the one-shot initiator's bounded retry (a `pairing` refusal can clear).
+pub(crate) fn is_revoked_grant_refusal(e: &BoxError) -> bool {
+    admission_refusal(e).is_some_and(|r| r.category.as_deref() == Some(GRANT_REVOKED_CATEGORY))
 }
 
 /// #20: typed marker for a DEFINITIVE broker/relay refusal -- the peer's wire `NO`. `Display`
@@ -101,11 +126,15 @@ pub(crate) fn is_definitive_admission_refusal(e: &BoxError) -> bool {
 /// ([`is_definitive_admission_refusal`]) is a downcast, not a substring search. The client-side
 /// sibling of the edge's `DefinitiveJoinRefusal` (CADS-Tunnel, same day, same class of fix).
 #[derive(Debug)]
-pub(crate) struct AdmissionRefused(pub(crate) std::borrow::Cow<'static, str>);
+pub(crate) struct AdmissionRefused {
+    text: std::borrow::Cow<'static, str>,
+    /// The edge's refusal category token, when the wire carried one.
+    pub(crate) category: Option<String>,
+}
 
 impl std::fmt::Display for AdmissionRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.text)
     }
 }
 
@@ -115,7 +144,7 @@ impl AdmissionRefused {
     /// The category-less constructor -- boxed, ready to return. Emits the exact
     /// historical string, for the sites (and old edges) with no category to add.
     pub(crate) fn boxed(text: &'static str) -> BoxError {
-        Box::new(AdmissionRefused(text.into()))
+        Box::new(AdmissionRefused { text: text.into(), category: None })
     }
 
     /// #524: the category-aware constructor every wire-refusal site uses. `base` is the
@@ -136,7 +165,7 @@ impl AdmissionRefused {
                  the edge's own log has the detail)"
             ),
         };
-        Box::new(AdmissionRefused(text.into()))
+        Box::new(AdmissionRefused { text: text.into(), category: Some(cat.to_string()) })
     }
 }
 

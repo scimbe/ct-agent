@@ -130,7 +130,7 @@ where
             return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
         }
     };
-    let local = gate_local(local, request, role, peer_holder)?;
+    let local = gate_local(local, request, role, peer_holder, holder)?;
     let (relay_send, relay_recv) = open_relay_channel_streams(relay_conn, role).await?;
     let (gate_stream, relay_peer) =
         dial_relay_gate_over_443(relay_gate_addr, relay_gate_cert, own_grant, holder).await?;
