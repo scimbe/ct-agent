@@ -35,6 +35,7 @@ pub mod events;
 pub mod harness_run;
 pub mod http;
 pub mod ladder;
+pub mod limits;
 pub mod local_auth;
 pub mod login;
 pub mod masque;
