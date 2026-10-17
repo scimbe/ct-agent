@@ -142,7 +142,15 @@ pub async fn serve_stream_to_origin(
     origin: impl Into<DialTarget>,
     terminator: Option<Arc<OriginTerminator>>,
 ) -> Result<(), BoxError> {
-    serve_duplex_to_origin(join(quic_recv, quic_send), origin, terminator).await
+    // A QUIC stream is opened by the Edge when a Client arrives, so (unlike a parked TCP
+    // registration) the Client's first byte is due promptly: bound it.
+    relay_duplex_to_origin(
+        join(quic_recv, quic_send),
+        origin.into(),
+        terminator,
+        Some(crate::limits::relay_first_byte_timeout()),
+    )
+    .await
 }
 
 /// How often [`OriginTerminator::acceptor`] is willing to stat the certificate and key
@@ -418,7 +426,7 @@ where
         }
     }
     let mut tcp = connect_origin(origin).await?;
-    copy_bidirectional(&mut tls, &mut tcp).await?;
+    copy_bidirectional_idle(&mut tls, &mut tcp, crate::limits::relay_idle_timeout()).await?;
     Ok(())
 }
 
@@ -449,16 +457,37 @@ where
 /// as without a terminator -- unless the terminator requires SSH owner auth (#214), in which
 /// case it is refused; `None` never inspects the bytes beyond the read it always did.
 pub async fn serve_duplex_to_origin<T>(
-    mut client: T,
+    client: T,
     origin: impl Into<DialTarget>,
     terminator: Option<Arc<OriginTerminator>>,
 ) -> Result<(), BoxError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let origin = origin.into();
+    // No first-byte bound here: the TLS-TCP fallback parks this call until the Edge delivers a
+    // Client, which may take arbitrarily long. Callers whose stream only exists once a Client
+    // is there use `relay_duplex_to_origin` with a bound.
+    relay_duplex_to_origin(client, origin.into(), terminator, None).await
+}
+
+/// [`serve_duplex_to_origin`] with an optional bound on the wait for the Client's first byte
+/// (`TimedOut` when it passes), and the configurable idle bound on the established relay.
+pub(crate) async fn relay_duplex_to_origin<T>(
+    mut client: T,
+    origin: DialTarget,
+    terminator: Option<Arc<OriginTerminator>>,
+    first_byte_timeout: Option<Duration>,
+) -> Result<(), BoxError>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     let mut first = [0u8; 4096];
-    let n = client.read(&mut first).await?;
+    let n = match first_byte_timeout {
+        Some(limit) => tokio::time::timeout(limit, client.read(&mut first))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "relayed stream sent no data in time"))??,
+        None => client.read(&mut first).await?,
+    };
     if n == 0 {
         return Ok(()); // Client closed before ever sending anything -- nothing to relay.
     }
@@ -482,8 +511,76 @@ where
     }
     let mut tcp = connect_origin(&origin).await?;
     tcp.write_all(&first[..n]).await?;
-    copy_bidirectional(&mut client, &mut tcp).await?;
+    copy_bidirectional_idle(&mut client, &mut tcp, crate::limits::relay_idle_timeout()).await?;
     Ok(())
+}
+
+/// Counts every successful read or write through it, so an idle watchdog can tell a quiet
+/// relay from a busy one without touching the copy loop.
+struct Activity<T> {
+    inner: T,
+    ticks: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<T> Activity<T> {
+    fn bump(&self) {
+        self.ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Activity<T> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let r = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(r, Poll::Ready(Ok(()))) {
+            self.bump();
+        }
+        r
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Activity<T> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let r = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(r, Poll::Ready(Ok(n)) if n > 0) {
+            self.bump();
+        }
+        r
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// `copy_bidirectional`, closed with `TimedOut` after `idle` without a byte moving in either
+/// direction. `None` is plain `copy_bidirectional`.
+pub(crate) async fn copy_bidirectional_idle<A, B>(a: &mut A, b: &mut B, idle: Option<Duration>) -> io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some(idle) = idle else {
+        return copy_bidirectional(a, b).await.map(|_| ());
+    };
+    let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut a = Activity { inner: a, ticks: Arc::clone(&ticks) };
+    let copy = copy_bidirectional(&mut a, b);
+    tokio::pin!(copy);
+    let mut seen = 0u64;
+    loop {
+        tokio::select! {
+            r = &mut copy => return r.map(|_| ()),
+            _ = tokio::time::sleep(idle) => {
+                let now = ticks.load(std::sync::atomic::Ordering::Relaxed);
+                if now == seen {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "relayed stream idle too long"));
+                }
+                seen = now;
+            }
+        }
+    }
 }
 
 
@@ -1544,7 +1641,8 @@ where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    serve_noise_stream_with_policy(send, recv, origin, origin_keys, metrics, gate, None, None).await
+    let deadline = tokio::time::Instant::now() + crate::limits::relay_setup_timeout();
+    serve_noise_stream_with_policy(send, recv, origin, origin_keys, metrics, gate, None, Some(deadline)).await
 }
 
 /// A stream half that fails with `TimedOut` once `deadline` has passed, until [`PreAuth::lift`]
@@ -1732,7 +1830,8 @@ where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    serve_noise_udp_with_policy(send, recv, origin, origin_keys, None, None).await
+    let deadline = tokio::time::Instant::now() + crate::limits::relay_setup_timeout();
+    serve_noise_udp_with_policy(send, recv, origin, origin_keys, None, Some(deadline)).await
 }
 
 /// [`serve_noise_udp`] with the direct-connect routing-token check (ct-agent#45
@@ -3552,6 +3651,80 @@ async fn tcp_connect_register_serve(
 
 #[cfg(test)]
 mod tests {
+
+    // ---- configurable limits on relayed streams ----
+
+    /// A relayed Noise stream whose client never sends message 1 times out at the setup bound
+    /// instead of holding its slot.
+    #[tokio::test(start_paused = true)]
+    async fn relayed_noise_stream_without_msg1_times_out() {
+        let (_client_end, agent_end) = tokio::io::duplex(1024);
+        let (a_read, a_write) = tokio::io::split(agent_end);
+        let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+        let metrics = Arc::new(TunnelMetrics::default());
+        let origin: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, 9).into();
+        let started = tokio::time::Instant::now();
+        let err = serve_noise_stream(a_write, a_read, origin, &[[7u8; 32]], metrics, &gate)
+            .await
+            .expect_err("must not wait forever");
+        let io = err.downcast_ref::<io::Error>().expect("io error");
+        assert_eq!(io.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), crate::limits::relay_setup_timeout());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relayed_udp_noise_stream_without_msg1_times_out() {
+        let (_client_end, agent_end) = tokio::io::duplex(1024);
+        let (a_read, a_write) = tokio::io::split(agent_end);
+        let origin: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, 9).into();
+        let err = serve_noise_udp(a_write, a_read, origin, &[[7u8; 32]]).await.expect_err("timeout");
+        assert_eq!(err.downcast_ref::<io::Error>().expect("io error").kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relayed_raw_stream_without_first_byte_times_out_but_parked_path_waits() {
+        let origin: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, 9).into();
+        let (_c, agent_end) = tokio::io::duplex(1024);
+        let err = relay_duplex_to_origin(agent_end, origin.into(), None, Some(Duration::from_secs(5)))
+            .await
+            .expect_err("timeout");
+        assert_eq!(err.downcast_ref::<io::Error>().expect("io error").kind(), io::ErrorKind::TimedOut);
+
+        // The unbounded entry point (parked TCP fallback) is still waiting a day later.
+        let (_c2, agent_end2) = tokio::io::duplex(1024);
+        let parked = tokio::spawn(async move { serve_duplex_to_origin(agent_end2, origin, None).await });
+        tokio::time::sleep(Duration::from_secs(86_400)).await;
+        assert!(!parked.is_finished(), "a parked registration must not be cut by the first-byte bound");
+        parked.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_bound_closes_a_silent_relay_but_not_a_busy_one() {
+        let (mut a_far, mut a) = tokio::io::duplex(1024);
+        let (mut b, mut b_far) = tokio::io::duplex(1024);
+        let relay = tokio::spawn(async move { copy_bidirectional_idle(&mut a, &mut b, Some(Duration::from_secs(10))).await });
+        // Traffic every 6 s keeps it alive well past one idle window.
+        for _ in 0..5 {
+            a_far.write_all(b"ping").await.unwrap();
+            let mut got = [0u8; 4];
+            b_far.read_exact(&mut got).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(6)).await;
+        }
+        assert!(!relay.is_finished(), "active relay survives");
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        let r = relay.await.unwrap();
+        assert_eq!(r.expect_err("idle").kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_idle_bound_means_a_silent_relay_stays_open() {
+        let (_a_far, mut a) = tokio::io::duplex(1024);
+        let (mut b, _b_far) = tokio::io::duplex(1024);
+        let relay = tokio::spawn(async move { copy_bidirectional_idle(&mut a, &mut b, None).await });
+        tokio::time::sleep(Duration::from_secs(86_400)).await;
+        assert!(!relay.is_finished());
+        relay.abort();
+    }
     use super::*;
     use crate::transport::dial_quic;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

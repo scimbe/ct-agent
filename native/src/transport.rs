@@ -37,9 +37,20 @@ fn self_signed() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), Bo
 pub fn build_direct_listener_at(
     addr: SocketAddr,
 ) -> Result<(Endpoint, CertificateDer<'static>), BoxError> {
+    build_direct_listener_with(addr, crate::limits::QuicLimits::from_env())
+}
+
+/// [`build_direct_listener_at`] with explicit transport limits (the test seam).
+pub(crate) fn build_direct_listener_with(
+    addr: SocketAddr,
+    limits: crate::limits::QuicLimits,
+) -> Result<(Endpoint, CertificateDer<'static>), BoxError> {
     install_crypto_provider();
     let (cert, key) = self_signed()?;
-    let server_config = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key)?;
+    let mut server_config = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key)?;
+    let mut transport = quinn::TransportConfig::default();
+    limits.apply(&mut transport);
+    server_config.transport_config(Arc::new(transport));
     let endpoint = Endpoint::server(server_config, addr)?;
     Ok((endpoint, cert))
 }
@@ -161,6 +172,7 @@ pub(crate) fn quic_client_config(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
     let mut transport = quinn::TransportConfig::default();
+    crate::limits::QuicLimits::from_env().apply(&mut transport);
     transport.keep_alive_interval(keep_alive);
     transport.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(max_idle).map_err(|_| "agent max_idle_timeout out of range")?,
