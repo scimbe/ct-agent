@@ -708,9 +708,10 @@ pub fn validate_front_door_sni(raw: &str) -> Result<String, String> {
     }
 }
 
-/// The SNI every non-fallback TLS-TCP dial presents. The client pins the edge's raw
-/// certificate (`roots.add(edge_cert)`) instead of doing hostname-based CA validation, so
-/// this value is never checked against the certificate — it is pure ClientHello metadata.
+/// The SNI every non-fallback TLS-TCP dial presents. The client pins the edge's certificate
+/// as its only trust anchor (`roots.add(edge_cert)`), but rustls still checks this name
+/// against the SAN of the leaf the edge presents. It works because the edge issues its
+/// leaves for "localhost"; any other SNI (`CT_CHANNEL_FRONT_DOOR_SNI`) needs a matching SAN.
 const DEFAULT_SNI: &str = "localhost";
 
 /// The synthetic SNI hostname of the DPI-resistant `:443` fallback route (#106
