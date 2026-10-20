@@ -80,7 +80,7 @@ stops verifying`), and you must then re-issue every member's `CT_CHANNEL_GRANT` 
 Broker and relay each get a ladder: **direct QUIC** (`CT_CHANNEL_BROKER` :4435 / `CT_CHANNEL_RELAY`
 :4436, UDP) first, then — when `CT_CHANNEL_FRONT_DOOR` (+ `_CERT`, hex DER of the edge CA from
 `GET <cp>/pki/ca`) is set — the `:443` TLS-TCP front door, then the DPI-resistant boring-ALPN
-`:443` rung.
+`:443` rung (skipped when `CT_CHANNEL_FRONT_DOOR_SNI` is set).
 
 - **`CT_CHANNEL_FRONT_DOOR_ONLY=1`** (v0.4.8, [#16]) drops the direct QUIC rung entirely.
   Refused at parse time without a configured front door.
@@ -276,6 +276,7 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_CHANNEL_LISTEN` / `CT_CHANNEL_ADVERTISE` | direct-path bind / advertised address (see the README's opt-in warning) |
 | `CT_CHANNEL_RELAY_ONLY=1` | no dialable address; relay-only member (auto-detected from a non-global advertise address) |
 | `CT_CHANNEL_FRONT_DOOR` / `_CERT` / `_ONLY` | `:443` TLS-TCP fallback rungs; `_ONLY=1` skips direct QUIC (v0.4.8) |
+| `CT_CHANNEL_FRONT_DOOR_SNI` | optional DNS hostname presented as SNI on every `:443` TLS-TCP dial (channel, relay) instead of `localhost`; for an edge behind an SNI-routing ingress (ssl-passthrough). The edge classifies by ALPN, so these legs are unaffected. **The boring h2 rung is dropped** when set (it is routed by its fixed SNI `edge-cdn.invalid`). The pinned edge certificate must carry this name as SAN. Invalid value = error at start |
 | `CT_CHANNEL_RELAY_GATE` / `_CERT` | #330 Circuit-Relay gate (admission still needs QUIC — see above) |
 | `CT_CHANNEL_CALL_SERVICE` / `CT_CHANNEL_CALL_PERSISTENT` | service-call modes (see table above) |
 | `CT_CHANNEL_CALL_RECONNECT` | persistent call mode only, default **on** (v0.6.0, [#47]) — internal redial on a mid-run session death, with #250-style exponential backoff on repeated near-instant failures. `0`/`false`/`no` restores the pre-#47 contract (`exit(1)` on death, no internal retry) — set this if your integration already owns process-level respawn+backoff itself and would rather not have two retry layers stacked |

@@ -4086,6 +4086,28 @@ fn channel_join_cli_config_parses_the_plane_one_liner() {
     bad_fd.push(("CT_CHANNEL_FRONT_DOOR", "not-an-addr".into()));
     assert!(lookup(&bad_fd).is_err(), "malformed CT_CHANNEL_FRONT_DOOR rejected");
 
+    // CT_CHANNEL_FRONT_DOOR_SNI: unset -> None and the full ladder; set -> validated, kept,
+    // and the boring (h2 + edge-cdn.invalid) rung is dropped from both ladders; invalid ->
+    // a clear error at config load.
+    assert_eq!(lookup(&with_fd).unwrap().front_door_sni, None, "unset by default");
+    let mut with_sni = with_fd.clone();
+    with_sni.push(("CT_CHANNEL_FRONT_DOOR_SNI", " core.cads.inf.haw-hamburg.de ".into()));
+    let cfg = lookup(&with_sni).expect("a DNS hostname SNI parses");
+    assert_eq!(cfg.front_door_sni.as_deref(), Some("core.cads.inf.haw-hamburg.de"));
+    for ladder in [cfg.broker_ladder(), cfg.relay_ladder()] {
+        assert_eq!(
+            ladder.iter().map(|r| r.kind).collect::<Vec<_>>(),
+            vec![ChannelDialKind::Direct, ChannelDialKind::FrontDoor],
+            "custom SNI: the h2 boring rung cannot reach the broker and is skipped"
+        );
+    }
+    for bad in ["192.0.2.1", "bad host", "a..b", "-x.example"] {
+        let mut v = with_fd.clone();
+        v.push(("CT_CHANNEL_FRONT_DOOR_SNI", bad.into()));
+        let err = lookup(&v).err().unwrap_or_else(|| panic!("{bad:?} must be rejected"));
+        assert!(err.contains("CT_CHANNEL_FRONT_DOOR_SNI"), "error names the variable: {err}");
+    }
+
     // A host:port hostname resolves, exactly like CT_CHANNEL_BROKER/CT_CHANNEL_RELAY
     // already do (#214) -- a real regression: this used to be a bare SocketAddr parse
     // with no resolver, so a compose-network service name like "edge:443" failed with

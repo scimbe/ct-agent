@@ -567,7 +567,7 @@ pub async fn dial_relay_gate_over_443(
     // real hole-punch failures.
     let dbg = debug_timing_enabled();
     let t0 = std::time::Instant::now();
-    let mut stream = crate::transport::tcp_tls_connect_with_alpn(addr, edge_cert, b"ct-edge-relay").await
+    let mut stream = crate::transport::tcp_tls_connect_relay(addr, edge_cert).await
         .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate tcp+tls connect to {addr} failed after {:?}: {e}", t0.elapsed()); } e })?;
     if dbg { eprintln!("ct-agent channel: debug relay-gate tcp+tls connect to {addr} ok in {:?}", t0.elapsed()); }
     let t1 = std::time::Instant::now();
@@ -631,6 +631,8 @@ pub async fn dial_relay_gate_over_443(
 pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), BoxError> {
     // Capture what the broker/relay ladders need before `cfg.grant` is moved into
     // `request` (a partial move would forbid the `cfg.broker_ladder()` `&self` call).
+    // CT_CHANNEL_FRONT_DOOR_SNI: install before any front-door dial (None = unchanged).
+    crate::transport::set_front_door_sni(cfg.front_door_sni.clone());
     let broker_ladder = cfg.broker_ladder();
     let relay_ladder = cfg.relay_ladder();
     let front_door_cert = cfg.front_door_cert.clone();
