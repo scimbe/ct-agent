@@ -99,7 +99,9 @@ Broker and relay each get a ladder: **direct QUIC** (`CT_CHANNEL_BROKER` :4435 /
   limits (2 min, 128 KiB) then cut the session mid-transfer. Between two members on the
   CADS-Tunnel v0.4.20 pin the upgrade never happened anyway: the responder refuses the circuit
   address before probing it (ct-common's offer guard, CADS-Tunnel#480: it is not one socket
-  address). The start-up log says which mode a member runs
+  address). Switching it on also brings back the original [#296] failure: the DCUtR punch
+  candidate is still learned on a throwaway socket (fixed only for `CT_CHANNEL_DIRECT_UPGRADE`),
+  so the hole punch itself is expected to time out. The start-up log says which mode a member runs
   (`relay-only edge-relay (DCUtR off, #296) …` vs. `relay-only DCUtR-upgradable …`).
 
 ### Pairing reality (until CADS-Tunnel#495 lands)
@@ -293,7 +295,7 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_CHANNEL_ADDR` | direct-address mode: the peer's `host:port`. Selects the no-broker path above |
 | `CT_CHANNEL_PEER_NOISE_KEY` / `CT_CHANNEL_PEER_CERT` | the peer's Noise public key (64 hex) and, for the initiator, its transport cert (hex DER) — direct-address mode only |
 | `CT_CHANNEL_CIRCUIT_RELAY` | libp2p Circuit-Relay v2 multiaddr for the DCUtR upgrade path (#136). Absent: no hole-punch is attempted at all. The upgrade itself also needs `CT_CHANNEL_EXPERIMENTAL_DCUTR=1` |
-| `CT_CHANNEL_EXPERIMENTAL_DCUTR=1` | (#296, default **off**) lets a relay-only member with `CT_CHANNEL_RELAY_GATE` or `CT_CHANNEL_CIRCUIT_RELAY` run the libp2p DCUtR upgrade. Off, the member joins exactly as before but keeps every session on the edge relay — an "upgraded" session would ride the relay-node's circuit (2 min / 128 KiB). See [Transport selection](#transport-selection-the-dial-ladders) |
+| `CT_CHANNEL_EXPERIMENTAL_DCUTR=1` | (#296, default **off**) lets a relay-only member with `CT_CHANNEL_RELAY_GATE` or `CT_CHANNEL_CIRCUIT_RELAY` run the libp2p DCUtR upgrade. Off, the member joins exactly as before but keeps every session on the edge relay — an "upgraded" session would ride the relay-node's circuit (2 min / 128 KiB). On, the punch candidate still comes from a throwaway socket (#296 is fixed only for `CT_CHANNEL_DIRECT_UPGRADE`), so expect the hole punch to time out. See [Transport selection](#transport-selection-the-dial-ladders) |
 | `CT_CHANNEL_RELAY_DIRECT` | dial the relay at this `host:port` instead of the one the grant names — an operator override, not a fallback |
 | `CT_CHANNEL_SERVE` / `CT_CHANNEL_SERVE_CONCURRENCY` | accept-side persistent serve, session cap (default 8) |
 | `CT_CHANNEL_DIRECT_UPGRADE=1` | opt-in in-band relay→direct upgrade (#104), on a QUIC relay leg only. Since #296 the initiator offers the address the edge's `'W'` echo reports for its **listening** socket (one socket dials the query and accepts the direct dial), asked right before the offer; before, it offered the admission's `r=`, a different socket, so the port never matched. No `'W'` answer (UDP to the echo blocked) → no offer, the session stays on the relay. The responder dials without coordination, so this only goes direct when the initiator is public, port-forwarded or behind a NAT that lets any host in on an existing mapping |

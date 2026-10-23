@@ -551,11 +551,53 @@ where
 }
 
 /// #296: the start-up line of a relay-only member whose DCUtR knob (`CT_CHANNEL_RELAY_GATE` or
-/// `CT_CHANNEL_CIRCUIT_RELAY`) is set without `CT_CHANNEL_EXPERIMENTAL_DCUTR`.
+/// `CT_CHANNEL_CIRCUIT_RELAY`) is set without `CT_CHANNEL_EXPERIMENTAL_DCUTR`. It also says what
+/// switching it on brings back: this release fixes the candidate socket only for the
+/// `CT_CHANNEL_DIRECT_UPGRADE` path, the DCUtR swarm is still seeded from a throwaway socket.
 pub(crate) const DCUTR_FENCED_NOTICE: &str = "ct-agent channel: the libp2p DCUtR upgrade is experimental and OFF \
      (#296): an upgraded session opens its stream on the relayed libp2p connection, which the \
      relay-node cuts at 2 min / 128 KiB. This member joins on the same relay port as before and \
-     keeps every session on the edge relay; set CT_CHANNEL_EXPERIMENTAL_DCUTR=1 to try the upgrade.";
+     keeps every session on the edge relay; set CT_CHANNEL_EXPERIMENTAL_DCUTR=1 to try the upgrade \
+     -- its punch candidate is still learned on a throwaway socket (#296, not fixed on this path), \
+     so expect the hole punch itself to time out.";
+
+/// #296: what a relay-only member's DCUtR knob decides -- which join loop runs (the relay-gate one
+/// wins over the circuit-relay one) and whether that loop runs the libp2p upgrade (`upgrade`,
+/// `CT_CHANNEL_EXPERIMENTAL_DCUTR`) or the same relay-port join without it
+/// ([`join_via_relay_without_dcutr`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DcutrKnob {
+    /// `CT_CHANNEL_RELAY_GATE` set.
+    RelayGate { upgrade: bool },
+    /// `CT_CHANNEL_CIRCUIT_RELAY` set (and no relay-gate).
+    CircuitRelay { upgrade: bool },
+}
+
+impl DcutrKnob {
+    /// Whether the libp2p DCUtR upgrade runs.
+    pub(crate) fn upgrade(self) -> bool {
+        match self {
+            Self::RelayGate { upgrade } | Self::CircuitRelay { upgrade } => upgrade,
+        }
+    }
+}
+
+/// #296: the fence as one pure decision, so the table is tested rather than only the two joins it
+/// chooses between. `None`: not relay-only, or neither knob set -- the member takes the broker
+/// path of [`run_channel_join_command`].
+pub(crate) fn dcutr_knob(relay_only: bool, relay_gate: bool, circuit_relay: bool, experimental_dcutr: bool) -> Option<DcutrKnob> {
+    if !relay_only {
+        return None;
+    }
+    let upgrade = experimental_dcutr;
+    if relay_gate {
+        Some(DcutrKnob::RelayGate { upgrade })
+    } else if circuit_relay {
+        Some(DcutrKnob::CircuitRelay { upgrade })
+    } else {
+        None
+    }
+}
 
 /// #296 (finding D3): the relay-only join of a member with `CT_CHANNEL_RELAY_GATE` or
 /// `CT_CHANNEL_CIRCUIT_RELAY` set but without `CT_CHANNEL_EXPERIMENTAL_DCUTR`. Admission is the one
@@ -792,18 +834,21 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // a2a-demo's plain "bob" scenario (previously thought stable, now exercising this same
     // path): the persistent --serve side eventually gets past a stall by retrying forever,
     // while the one-shot side had zero tolerance and failed the whole call on one hiccup.
-    if cfg.relay_only {
-        // #296: without CT_CHANNEL_EXPERIMENTAL_DCUTR both branches below keep their admission
-        // (relay port, same pairer, same session framing) but skip the libp2p upgrade.
-        let dcutr = cfg.experimental_dcutr;
-        if !dcutr && (cfg.relay_gate_addr.is_some() || cfg.circuit_relay.is_some()) {
+    // #296: the knob picks the join loop below ([`dcutr_knob`]); without
+    // CT_CHANNEL_EXPERIMENTAL_DCUTR both loops keep their admission (relay port, same pairer,
+    // same session framing) but skip the libp2p upgrade.
+    if let Some(knob) =
+        dcutr_knob(cfg.relay_only, cfg.relay_gate_addr.is_some(), cfg.circuit_relay.is_some(), cfg.experimental_dcutr)
+    {
+        let dcutr = knob.upgrade();
+        if !dcutr {
             eprintln!("{DCUTR_FENCED_NOTICE}");
         }
         let upgrade_label = if dcutr { "DCUtR-upgradable" } else { "edge-relay (DCUtR off, #296)" };
         // The real gated relay-gate leg (no new public port, grant+possession pre-auth) takes
         // priority when configured — `circuit_relay` (a directly-dialable relay multiaddr) is
         // kept for the nat-lab test rig, not the deployed path.
-        if let Some(relay_gate_addr) = cfg.relay_gate_addr {
+        if let (DcutrKnob::RelayGate { .. }, Some(relay_gate_addr)) = (knob, cfg.relay_gate_addr) {
             let relay_gate_cert = cfg
                 .relay_gate_cert
                 .clone()
@@ -847,7 +892,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             })
             .await;
         }
-        if let Some(circuit) = cfg.circuit_relay.clone() {
+        if let (DcutrKnob::CircuitRelay { .. }, Some(circuit)) = (knob, cfg.circuit_relay.clone()) {
             eprintln!(
                 "ct-agent channel: relay-only {upgrade_label} {:?} (relay {}, circuit {}){}",
                 cfg.role, cfg.relay_addr, circuit,

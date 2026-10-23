@@ -45,22 +45,58 @@ impl DirectUpgrade {
 
     /// #296: this endpoint's own reflexive address, asked THROUGH it at the edge's `'W'` echo
     /// next to `relay` (the relay leg's remote address). Unfiltered, so a loopback test can see
-    /// it; [`Self::offer`] applies the global-unicast filter.
+    /// it; [`Self::offer`] applies the global-unicast filter. `timeout` bounds the whole answer,
+    /// the name lookup of a `host:port` override included.
     pub(crate) async fn own_reflexive(&self, relay: SocketAddr, timeout: std::time::Duration) -> Option<SocketAddr> {
-        let edge_w = match reflexive_query_addr(relay, self.reflexive_edge.as_deref()) {
-            Ok(a) => a,
-            Err(e) => {
+        let started = tokio::time::Instant::now();
+        let edge_w = match tokio::time::timeout(timeout, self.query_target(relay)).await {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => {
                 eprintln!("ct-agent channel: #104 upgrade — CT_CHANNEL_REFLEXIVE_EDGE unusable ({e}) — nothing to offer, staying on relay (#296)");
                 return None;
             }
+            Err(_) => {
+                eprintln!(
+                    "ct-agent channel: #104 upgrade — CT_CHANNEL_REFLEXIVE_EDGE did not resolve within {timeout:?} — nothing to offer, staying on relay (#296)"
+                );
+                return None;
+            }
         };
-        let found = whoami_via(&self.endpoint, edge_w, timeout).await;
+        let found = whoami_via(&self.endpoint, edge_w, timeout.saturating_sub(started.elapsed())).await;
         if found.is_none() {
             eprintln!(
                 "ct-agent channel: #104 upgrade — no 'W' answer from {edge_w} within {timeout:?} — nothing to offer, staying on relay (#296)"
             );
         }
         found
+    }
+
+    /// #296: where to ask. `CT_CHANNEL_REFLEXIVE_EDGE` as an `ip:port` is taken as it is; a
+    /// `host:port` is looked up on tokio's blocking pool, not with std's lookup: this runs while
+    /// the relay session pumps, in the same task, and a slow resolver would otherwise hold this
+    /// worker thread and that pump for as long as it takes. Of the answers it takes one of the
+    /// endpoint's own family -- the shared endpoint is bound on `0.0.0.0` and cannot send to an
+    /// IPv6 address, and resolvers commonly list `::1`/AAAA first. Unset: the relay leg's host on
+    /// the `'W'` port ([`reflexive_query_addr`], no lookup).
+    async fn query_target(&self, relay: SocketAddr) -> Result<SocketAddr, String> {
+        let raw = match self.reflexive_edge.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => s,
+            _ => return reflexive_query_addr(relay, None),
+        };
+        if let Ok(literal) = raw.parse::<SocketAddr>() {
+            return Ok(literal);
+        }
+        let v4 = self.endpoint.local_addr().map(|a| a.is_ipv4()).unwrap_or(true);
+        let found: Vec<SocketAddr> = tokio::net::lookup_host(raw)
+            .await
+            .map_err(|e| format!("{raw:?} is not an IP:port and did not resolve as host:port: {e}"))?
+            .collect();
+        found
+            .iter()
+            .find(|a| a.is_ipv4() == v4)
+            .or_else(|| found.first())
+            .copied()
+            .ok_or_else(|| format!("{raw:?} resolved to no addresses"))
     }
 
     /// #296: the Offer: [`Self::own_reflexive`] as ONE `ip:port`, only when global-unicast

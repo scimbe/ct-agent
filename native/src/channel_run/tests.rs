@@ -6572,6 +6572,124 @@ async fn relay_only_members_without_dcutr_pair_on_the_relay_port_and_stay_on_the
     relay_task.abort();
 }
 
+#[tokio::test]
+async fn own_reflexive_looks_up_a_host_name_override_in_the_endpoints_family_296() {
+    // #296 review: CT_CHANNEL_REFLEXIVE_EDGE may be a host name. It is looked up while the relay
+    // session pumps, so on tokio's pool instead of with std's blocking lookup, and of its answers
+    // the one the shared endpoint can reach: that endpoint is bound on 0.0.0.0, and resolvers
+    // commonly list ::1 / AAAA first. "localhost" names both families; the 'W' echo listens on
+    // 127.0.0.1 only.
+    let (edge, _) = build_server_endpoint_with_cert().expect("whoami edge");
+    let edge_port = edge.local_addr().unwrap().port();
+    let edge_task = tokio::spawn(serve_one_whoami_echo(edge));
+    let upgrade =
+        build_upgrade_candidate(Some("203.0.113.7:4433".parse().unwrap()), Some(format!("localhost:{edge_port}")))
+            .expect("takes part");
+    let relay: SocketAddr = "203.0.113.1:4436".parse().unwrap(); // unused: the override names the echo
+    let seen = upgrade.own_reflexive(relay, Duration::from_secs(3)).await;
+    assert_eq!(
+        seen.map(|a| a.port()),
+        Some(upgrade.listener().local_addr().unwrap().port()),
+        "the host name led to the IPv4 echo, which reported the listening socket's own port"
+    );
+    edge_task.await.unwrap();
+}
+
+#[test]
+fn the_dcutr_knob_runs_the_upgrade_only_with_the_switch_296() {
+    // #296 review: the fence as a table. Not relay-only, or no knob: the broker path (None). A knob
+    // picks the join loop -- the relay-gate wins over the circuit relay -- and only
+    // CT_CHANNEL_EXPERIMENTAL_DCUTR turns the libp2p upgrade in that loop on.
+    for gate in [false, true] {
+        for circuit in [false, true] {
+            for switch in [false, true] {
+                assert_eq!(dcutr_knob(false, gate, circuit, switch), None, "not relay-only: the broker path");
+            }
+        }
+    }
+    for switch in [false, true] {
+        assert_eq!(dcutr_knob(true, false, false, switch), None, "relay-only without a knob: the broker path");
+        assert_eq!(dcutr_knob(true, true, false, switch), Some(DcutrKnob::RelayGate { upgrade: switch }));
+        assert_eq!(
+            dcutr_knob(true, true, true, switch),
+            Some(DcutrKnob::RelayGate { upgrade: switch }),
+            "the relay-gate wins over the circuit relay"
+        );
+        assert_eq!(dcutr_knob(true, false, true, switch), Some(DcutrKnob::CircuitRelay { upgrade: switch }));
+    }
+    assert!(!DcutrKnob::RelayGate { upgrade: false }.upgrade(), "a knob alone never runs the upgrade");
+    assert!(DcutrKnob::CircuitRelay { upgrade: true }.upgrade());
+}
+
+#[tokio::test]
+async fn a_quic_relay_leg_offers_exactly_the_whoami_answer_of_its_listener_296() {
+    // #296 review: the wiring the DirectUpgrade unit tests do not reach. A QUIC relay leg with an
+    // upgrade (ParkedRelayLeg::run_session, what every relay fallback runs) asks the 'W' echo when
+    // its coordinator is about to offer, and the peer's probe sees exactly that answer -- not the
+    // admission's r=, no LAN half. The echo answers a fixed global address, as only a real edge can.
+    use ct_common::upgrade::{run_upgradable_session_responder_verified, Role, UpgradeCoordinator};
+
+    let a = generate_static_keypair(); // the member under test, initiating
+    let b = generate_static_keypair(); // the peer behind the relay
+    let (w, _) = build_server_endpoint_with_cert().expect("whoami edge");
+    let w_addr = w.local_addr().unwrap();
+    let w_task = tokio::spawn(serve_one_fixed_whoami_answer(w, "203.0.113.7:40001"));
+
+    // The relay leg is one QUIC connection; its far end runs the peer's upgradable responder.
+    let (relay_ep, relay_cert) = build_server_endpoint_with_cert().expect("relay ep");
+    let relay_addr = relay_ep.local_addr().unwrap();
+    let offered = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let seen = offered.clone();
+    let (b_priv, a_pub) = (b.private, a.public);
+    let peer = tokio::spawn(async move {
+        let conn = relay_ep.accept().await.expect("incoming").await.expect("relay leg");
+        let (send, recv) = open_channel_streams(&conn, ChannelRole::Accept, Duration::from_secs(5)).await.expect("streams");
+        let (b_app, _b_test) = tokio::io::duplex(1 << 16);
+        run_upgradable_session_responder_verified(
+            send,
+            recv,
+            b_app,
+            &b_priv,
+            &a_pub,
+            UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100),
+            1,
+            move |ep: String| async move {
+                *seen.lock().unwrap() = Some(ep);
+                false
+            },
+            |_ep: String, _peer: [u8; 32]| async {
+                None::<(snow::TransportState, tokio::io::DuplexStream, tokio::io::DuplexStream)>
+            },
+        )
+        .await
+    });
+    let conn = build_client_endpoint(relay_cert)
+        .expect("client ep")
+        .connect(relay_addr, "localhost")
+        .expect("cfg")
+        .await
+        .expect("relay leg");
+    let upgrade = build_upgrade_candidate(Some("203.0.113.7:4433".parse().unwrap()), Some(w_addr.to_string()))
+        .expect("takes part");
+    let (a_app, _a_test) = tokio::io::duplex(1 << 16);
+    let (a_priv, b_pub) = (a.private, b.public);
+    let member = tokio::spawn(async move {
+        ParkedRelayLeg::Quic(conn).run_session(ChannelRole::Initiate, &a_priv, &b_pub, a_app, Some(upgrade)).await
+    });
+    assert!(
+        warte_bis(Duration::from_secs(10), || offered.lock().unwrap().is_some()).await,
+        "the member made an offer over its relay leg"
+    );
+    assert_eq!(
+        offered.lock().unwrap().as_deref(),
+        Some("203.0.113.7:40001"),
+        "the peer's probe saw exactly the endpoint's own 'W' answer"
+    );
+    w_task.await.unwrap();
+    member.abort();
+    peer.abort();
+}
+
 #[test]
 fn der_certificate_shape_catches_the_transcription_damage_agent26() {
     use crate::channel_run::der_certificate_shape;
