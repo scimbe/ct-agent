@@ -206,7 +206,10 @@ initiates. One person can be all three.
    ```
 
 7. **You are done when** `received.txt` on A contains `hello from B` (after a few seconds). With stdin
-   on a terminal, A does not exit by itself after receiving; stop it with Ctrl-C. A started without a
+   on a terminal, A does not exit by itself after receiving: end A's input with Ctrl-D, and both
+   members exit with status 0. Stopping A with Ctrl-C instead makes B report `ok=false` and exit
+   non-zero once both members run a ct-agent with delivery confirmation, because A's direction never
+   ended ([why](channel.md#delivery-confirmation-protocol-v2-299)). A started without a
    terminal (`nohup`, `</dev/null`, a service unit) has its stdin at end-of-file from the start. That
    works when both members run a ct-agent with [delivery confirmation](channel.md#delivery-confirmation-protocol-v2-299)
    (`delivery=ack` in the `channel_session` events), whatever the edge: A still receives, A exits once

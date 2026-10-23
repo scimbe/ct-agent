@@ -512,8 +512,10 @@ where
     if let (Err(e), true, false) = (&pumped, v2, gave_up) {
         eprintln!("ct-agent channel: {e} (#299)");
     }
-    // A failed v2 session has nothing left to deliver; only its abort record still has to leave
-    // before the process may exit, which a short drain covers -- as after giving up (#314).
+    // A failed v2 session is over: the transport ended, the peer ended it, or the peer made no
+    // progress on our bytes for FIN_ACK_IDLE. Only an abort record may still have to leave before
+    // the process may exit, which a short drain covers (see FAILED_DELIVERY_DRAIN) -- as after
+    // giving up on the peer above (LOCAL_FAILURE_DRAIN, #314/#308).
     let drain = if gave_up {
         LOCAL_FAILURE_DRAIN
     } else if pumped.is_err() && v2 {

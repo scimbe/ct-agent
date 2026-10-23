@@ -409,7 +409,7 @@ impl GrantLifetime {
     /// expiries the timer was armed from, not from the clock at firing time: the timer runs on
     /// tokio's monotonic clock, which a wall-clock step does not move, and a firing delayed by a
     /// busy runtime may already be past the later expiry too. A tie is this member's own end --
-    /// its grant is over either way.
+    /// its grant is over either way. Its scope is also the FIN reason of a v2 session (#299).
     fn expired_grant(&self) -> GrantEnd {
         match (self.own_expires_at, self.peer_expires_at) {
             (Some(own), Some(peer)) if peer < own => {
@@ -1128,6 +1128,38 @@ mod tests {
             "{b_err}"
         );
         assert!(a_res.is_err(), "the refusing side ends with an error too");
+    }
+
+    #[tokio::test]
+    async fn the_earlier_of_the_two_expiries_names_whose_grant_ran_out_299() {
+        // #299 review: the FIN reason of an expiry follows the two expiries the timer was armed
+        // from, not the clock when it fires. The first case is the reviewer's counterexample: the
+        // peer's grant ends a second before ours, and "now + 1 >= own expiry" called that ours.
+        use super::super::delivery::{with_session_end_cause, SessionEndCause};
+        let now = crate::codec::now_unix();
+        for (own, peer, want) in [
+            (now + 1, Some(now), FinReason::PeerGrantEnded),
+            (now, Some(now + 1), FinReason::OwnGrantExpired),
+            (now, Some(now), FinReason::OwnGrantExpired), // a tie is ours: over either way
+            (now, None, FinReason::OwnGrantExpired),      // the peer's grant not verified yet
+        ] {
+            let mut life = GrantLifetime {
+                expiry: Some(Box::pin(tokio::time::sleep(Duration::ZERO))),
+                revoke: None,
+                watch: None,
+                ended: None,
+                record: None,
+                own_expires_at: Some(own),
+                peer_expires_at: peer,
+            };
+            let cause = SessionEndCause::default();
+            with_session_end_cause(
+                cause.clone(),
+                std::future::poll_fn(|cx| if life.poll_ended(cx) { Poll::Ready(()) } else { Poll::Pending }),
+            )
+            .await;
+            assert_eq!(cause.get(), Some(want), "own {own}, peer {peer:?}");
+        }
     }
 
     /// The grant's expiry ends the session it authorized,
