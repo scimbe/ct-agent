@@ -84,6 +84,19 @@ Broker and relay each get a ladder: **direct QUIC** (`CT_CHANNEL_BROKER` :4435 /
 
 - **`CT_CHANNEL_FRONT_DOOR_ONLY=1`** (v0.4.8, [#16]) drops the direct QUIC rung entirely.
   Refused at parse time without a configured front door.
+- **TLS session resumption** ([#290]): the `:443` rungs keep one TLS client configuration per
+  edge CA (`_CERT`) and ALPN offer (process-wide, at most 64; the least recently used one goes
+  first), so a re-park can resume the TLS 1.3 session instead of repeating the full handshake
+  while the edge still holds the ticket (no certificate exchange; the key exchange is still
+  fresh; 0-RTT stays off; TLS 1.2 sessions are never kept). An edge restart or a ticket the
+  edge has already evicted falls back to a full handshake. The tunnel's TLS-TCP fallback, its
+  QUIC dials and the MASQUE front door do the same. A ClientHello that offers a session
+  carries the `pre_shared_key` extension, so the edge's JA4 counter shows a second fingerprint
+  for the same build; that counts offers, not resumptions. Whether the edge resumed shows on
+  the agent: the log reports `ct-agent: N TLS-TCP handshakes to the edge so far, M of them
+  resumed (#290)` at 16, 32, 64, … handshakes; a tunnel agent also exports
+  `ct_agent_tls_handshakes_total{kind}` on `/metrics`. `CT_TLS_RESUMPTION=0` switches it off
+  (table below).
 - **`CT_CHANNEL_RELAY_GATE` (+`_CERT`) — read this before using it** ([#330]): the gate is a
   `:443`-multiplexed **Circuit-Relay v2** path for the NAT-to-NAT hole punch. **Its
   channel-join admission still runs over plain QUIC to the relay port** — the `:443` gate leg
@@ -277,6 +290,7 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_CHANNEL_RELAY_ONLY=1` | no dialable address; relay-only member (auto-detected from a non-global advertise address) |
 | `CT_CHANNEL_FRONT_DOOR` / `_CERT` / `_ONLY` | `:443` TLS-TCP fallback rungs; `_ONLY=1` skips direct QUIC (v0.4.8) |
 | `CT_CHANNEL_FRONT_DOOR_SNI` | optional DNS hostname presented as SNI on every `:443` TLS-TCP dial (channel, relay) instead of `localhost`; for an edge behind an SNI-routing ingress (ssl-passthrough). The edge classifies by ALPN, so these legs are unaffected. **The boring h2 rung is dropped** when set (it is routed by its fixed SNI `edge-cdn.invalid`). The pinned edge certificate must carry this name as SAN. Invalid value = error at start |
+| `CT_TLS_RESUMPTION` | TLS session resumption on the dials to the edge and to the MASQUE front door ([#290]), default **on**; it applies to the tunnel agent too. `0`/`false`/`no`/`off` builds a fresh TLS configuration per dial again: every ClientHello is the pre-#290 one (no `pre_shared_key`) and every dial is a full handshake. The opt-out for a network path that mishandles a resumed hello. Read once per process; reported once on stderr when off |
 | `CT_CHANNEL_RELAY_GATE` / `_CERT` | #330 Circuit-Relay gate (admission still needs QUIC — see above) |
 | `CT_CHANNEL_CALL_SERVICE` / `CT_CHANNEL_CALL_PERSISTENT` | service-call modes (see table above) |
 | `CT_CHANNEL_CALL_RECONNECT` | persistent call mode only, default **on** (v0.6.0, [#47]) — internal redial on a mid-run session death, with #250-style exponential backoff on repeated near-instant failures. `0`/`false`/`no` restores the pre-#47 contract (`exit(1)` on death, no internal retry) — set this if your integration already owns process-level respawn+backoff itself and would rather not have two retry layers stacked |
@@ -536,5 +550,6 @@ needed exactly once, at `sign`, so an operator can review the unsigned skeleton 
 [CADS-Tunnel#799]: https://github.com/scimbe/CADS-Tunnel/issues/799
 [#231]: https://github.com/scimbe/ct-agent/issues/15
 [#250]: https://github.com/scimbe/ct-agent/issues/15
+[#290]: https://github.com/scimbe/ct-agent/issues/290
 [#330]: https://github.com/scimbe/ct-agent/issues/16
 [#47]: https://github.com/scimbe/ct-agent/issues/47

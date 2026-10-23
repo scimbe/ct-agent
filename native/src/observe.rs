@@ -133,13 +133,15 @@ fn render_text(metrics: &TunnelMetrics) -> String {
 }
 
 /// The full `/metrics` body: ct_common's tunnel counters, then ct-agent's own
-/// series. Order: status gauges, event counters, MASQUE drops, live tasks -- the
-/// last two keep their pre-#178 tail position (a test pins it).
+/// series. Order: status gauges, event counters, direct refusals, TLS handshakes
+/// (#290), MASQUE drops, live tasks -- the last two keep their pre-#178 tail
+/// position (a test pins it).
 fn render_text_with(metrics: &TunnelMetrics, status: &AgentStatus, events: &EventCounters) -> String {
     let mut text = metrics.render_prometheus();
     text.push_str(&status.render_prometheus());
     text.push_str(&events.render_prometheus());
     text.push_str(&crate::serve::render_direct_refused_prometheus());
+    text.push_str(&crate::transport::render_tls_handshakes_prometheus());
     text.push_str(&crate::masque::render_dropped_datagrams_prometheus());
     text.push_str(&crate::task_guard::render_prometheus());
     text
@@ -327,6 +329,10 @@ mod tests {
         assert!(text.contains("# TYPE ct_agent_events_total counter\n"));
         assert!(text.contains("\nct_agent_events_total{kind=\"registered\"} "));
         assert!(text.contains("\nct_agent_events_total{kind=\"credential_degraded\"} "));
+        // #290: TLS-TCP handshakes by kind. Process-wide statics too, so shape only.
+        assert!(text.contains("# TYPE ct_agent_tls_handshakes_total counter\n"), "tls handshake counter header");
+        assert!(text.contains("\nct_agent_tls_handshakes_total{kind=\"full\"} "));
+        assert!(text.contains("\nct_agent_tls_handshakes_total{kind=\"resumed\"} "));
     }
 
     #[test]
