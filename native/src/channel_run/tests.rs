@@ -3681,6 +3681,116 @@ async fn serve_loop_stops_when_its_own_grant_is_revoked_or_expired_308() {
     assert!(still_running.is_err(), "a pairing refusal is no reason to stop: {still_running:?}");
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_stopping_serve_loop_lets_sessions_end_through_their_gates_and_drops_the_rest_308() {
+    // #308: the process exits right after the loop returns its own grant end, and
+    // `std::process::exit` runs no destructor -- a session still alive then left its stream
+    // handler's process group behind (#183: only the session's Drop kills it).
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let now = crate::codec::now_unix();
+
+    // (a) Own expiry: a running session's own gate (R1) fires a little after the loop's timer and
+    // ends it the regular way. The loop waits for that (bounded) before it returns.
+    let finished = Arc::new(AtomicBool::new(false));
+    let admits = Arc::new(AtomicUsize::new(0));
+    let counted = admits.clone();
+    let first_then_parked = move || {
+        let n = counted.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if n == 0 {
+                Ok::<(), BoxError>(())
+            } else {
+                std::future::pending().await
+            }
+        }
+    };
+    let done = finished.clone();
+    let ends_through_its_gate = move |_w: ()| {
+        let done = done.clone();
+        async move {
+            tokio::time::sleep(Duration::from_secs(5) + Duration::from_millis(500)).await;
+            done.store(true, Ordering::SeqCst);
+            Ok::<(), BoxError>(())
+        }
+    };
+    let ended = tokio::time::timeout(
+        Duration::from_secs(600),
+        serve_loop_concurrent(4, Duration::from_millis(10), Some(now + 5), first_then_parked, ends_through_its_gate),
+    )
+    .await
+    .expect("the loop stops at the own expiry");
+    assert!(is_own_grant_end(ended.expect_err("an own grant end").as_ref()));
+    assert!(finished.load(Ordering::SeqCst), "the running session ended through its gate first");
+
+    // (b) `[grant-revoked]`: no session gate learns about it. The running session is dropped --
+    // which kills a stream handler's process group -- before the loop returns.
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let dropped = Arc::new(AtomicBool::new(false));
+    let admits = Arc::new(AtomicUsize::new(0));
+    let counted = admits.clone();
+    let first_then_revoked = move || {
+        let n = counted.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if n == 0 {
+                Ok::<(), BoxError>(())
+            } else {
+                Err(AdmissionRefused::boxed_with_category("edge broker refused the channel join", Some("grant-revoked")))
+            }
+        }
+    };
+    let flag = dropped.clone();
+    let runs_until_dropped = move |_w: ()| {
+        let guard = DropFlag(flag.clone());
+        async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+            Ok::<(), BoxError>(())
+        }
+    };
+    let ended = tokio::time::timeout(
+        Duration::from_secs(600),
+        serve_loop_concurrent(4, Duration::from_millis(10), Some(now + 3600), first_then_revoked, runs_until_dropped),
+    )
+    .await
+    .expect("the loop stops on the revoked grant");
+    assert!(is_own_grant_end(ended.expect_err("an own grant end").as_ref()));
+    assert!(dropped.load(Ordering::SeqCst), "the running session was dropped before the loop returned");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_one_shot_session_cut_short_by_a_grant_end_is_an_error_not_a_clean_end_308() {
+    // R1 ends an ungated pipe session at this member's own expiry with a clean EOF, and the
+    // session returns Ok: a transfer cut at the expiry was reported like a complete one (exit 0).
+    let cut = one_shot_session(async {
+        let (mut app, local) = tokio::io::duplex(4096);
+        let mut gate = PeerGrantGate::with_own_expiry(local, None, crate::codec::now_unix() + 2);
+        app.write_all(b"the first part of a transfer").await?;
+        let mut got = Vec::new();
+        gate.read_to_end(&mut got).await?; // the pump's view: EOF at the expiry
+        assert_eq!(got, b"the first part of a transfer");
+        Ok::<(), BoxError>(())
+    })
+    .await;
+    let err = cut.expect_err("a session a grant end cut short is not a success");
+    assert_eq!(
+        err.downcast_ref::<io::Error>().map(io::Error::kind),
+        Some(io::ErrorKind::PermissionDenied),
+        "{err}"
+    );
+    assert!(err.to_string().contains("cut short") && err.to_string().contains("expired"), "{err}");
+    assert!(!is_own_grant_end(err.as_ref()), "one-shot modes keep exit status 1");
+    // Without a grant end the session's own result passes through.
+    assert!(one_shot_session(async { Ok::<(), BoxError>(()) }).await.is_ok());
+    let failed = one_shot_session(async { Err::<(), BoxError>("the relay dropped".into()) }).await;
+    assert!(failed.expect_err("kept").to_string().contains("the relay dropped"));
+}
+
 #[test]
 fn only_a_revoked_or_expired_own_grant_refusal_ends_the_member_308() {
     let refusal = |category: &str| -> BoxError {
@@ -6628,6 +6738,7 @@ async fn persistent_call_reconnect_survives_a_session_death_without_losing_a_que
     let loop_fut = run_persistent_call_reconnect_loop_over(
         "text_generation".to_string(),
         true,
+        None,
         admit,
         &mut rx,
         out_write,
@@ -6685,12 +6796,68 @@ async fn persistent_call_reconnect_off_fails_instead_of_redialing_47() {
 
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        run_persistent_call_reconnect_loop_over("text_generation".to_string(), false, admit, &mut rx, out_write),
+        run_persistent_call_reconnect_loop_over("text_generation".to_string(), false, None, admit, &mut rx, out_write),
     )
     .await
     .expect("must not hang");
     assert!(outcome.is_err(), "CT_CHANNEL_CALL_RECONNECT=0 must fail rather than redial on a session death");
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1, "no second attempt without reconnect enabled");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_persistent_call_loop_stops_with_its_own_grant_end_308() {
+    // #308 with R1: every session ends at this member's own expiry, and the redial loop then asked
+    // the edge again for ever with a grant that never works again, while stdin calls queued up
+    // unanswered. It now ends with the own grant end (exit status 77).
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let now = crate::codec::now_unix();
+    let (_lines, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+
+    // (a) The own grant expires while a session runs (or waits for its admission).
+    let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = attempts.clone();
+    let parked = move |_local: ChannelLocal| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        std::future::pending::<Result<(), BoxError>>()
+    };
+    let started = tokio::time::Instant::now();
+    let ended = tokio::time::timeout(
+        Duration::from_secs(600),
+        run_persistent_call_reconnect_loop_over(
+            "text_generation".to_string(),
+            true,
+            Some(now + 5),
+            parked,
+            &mut rx,
+            tokio::io::sink(),
+        ),
+    )
+    .await
+    .expect("the loop ends at the own expiry");
+    assert!(is_own_grant_end(ended.expect_err("an own grant end").as_ref()));
+    assert!(started.elapsed() <= Duration::from_secs(5) + GRANT_TEARDOWN_BUDGET + Duration::from_millis(100));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "no redial after the expiry");
+
+    // (b) The edge refuses the admission: this member's grant is revoked.
+    let revoked = |_local: ChannelLocal| async {
+        Err::<(), BoxError>(AdmissionRefused::boxed_with_category("edge broker refused the channel join", Some("grant-revoked")))
+    };
+    let ended = tokio::time::timeout(
+        Duration::from_secs(600),
+        run_persistent_call_reconnect_loop_over(
+            "text_generation".to_string(),
+            true,
+            Some(now + 3600),
+            revoked,
+            &mut rx,
+            tokio::io::sink(),
+        ),
+    )
+    .await
+    .expect("the loop stops on the revoked grant");
+    let err = ended.expect_err("an own grant end");
+    assert!(is_own_grant_end(err.as_ref()), "{err}");
+    assert!(err.to_string().contains("[grant-revoked]"), "{err}");
 }
 
 #[test]
@@ -7401,7 +7568,7 @@ async fn a_serve_member_retries_a_dial_failure_instead_of_exiting() {
     let calls = std::sync::Arc::new(AtomicU32::new(0));
     let c = calls.clone();
     let serve = tokio::spawn(async move {
-        run_dcutr_join_loop::<(), _, _>("test", true, || {
+        run_dcutr_join_loop::<(), _, _>("test", true, None, || {
             let c = c.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -7418,7 +7585,7 @@ async fn a_serve_member_retries_a_dial_failure_instead_of_exiting() {
     assert!(!serve.is_finished(), "and did not end the serve process");
     serve.abort();
 
-    let one_shot = run_dcutr_join_loop::<(), _, _>("test", false, || async {
+    let one_shot = run_dcutr_join_loop::<(), _, _>("test", false, None, || async {
         Err::<Result<(), BoxError>, BoxError>("edge unreachable".into())
     })
     .await;
@@ -7444,7 +7611,7 @@ async fn a_serve_member_ends_after_a_dial_failure_that_never_clears() {
     let c = calls.clone();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(3600),
-        run_dcutr_join_loop::<(), _, _>("test", true, || {
+        run_dcutr_join_loop::<(), _, _>("test", true, None, || {
             let c = c.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -7461,6 +7628,66 @@ async fn a_serve_member_ends_after_a_dial_failure_that_never_clears() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_dcutr_serve_member_stops_with_its_own_grant_end_308() {
+    // #308: the relay-gate / circuit-relay serve loop is a persistent serve loop too. Its own
+    // grant end stops it with exit status 77 instead of a retry for ever.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let now = crate::codec::now_unix();
+    let revoked = || -> BoxError {
+        AdmissionRefused::boxed_with_category("edge relay refused the channel join", Some("grant-revoked"))
+    };
+
+    // (a) The edge refuses the admission: this member's grant is revoked.
+    let calls = std::sync::Arc::new(AtomicU32::new(0));
+    let c = calls.clone();
+    let ended = tokio::time::timeout(
+        Duration::from_secs(600),
+        run_dcutr_join_loop::<(), _, _>("test", true, Some(now + 3600), || {
+            c.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(Err(revoked())) }
+        }),
+    )
+    .await
+    .expect("the loop stops on the revoked grant");
+    let err = ended.expect_err("an own grant end");
+    assert!(is_own_grant_end(err.as_ref()), "{err}");
+    assert!(err.to_string().contains("[grant-revoked]"), "{err}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no second admission");
+
+    // (b) The own grant runs out while the member is parked at the relay.
+    let started = tokio::time::Instant::now();
+    let ended = tokio::time::timeout(
+        Duration::from_secs(600),
+        run_dcutr_join_loop::<(), _, _>("test", true, Some(now + 5), || async {
+            std::future::pending::<Result<Result<(), BoxError>, BoxError>>().await
+        }),
+    )
+    .await
+    .expect("the loop stops at the own expiry");
+    assert!(is_own_grant_end(ended.expect_err("an own grant end").as_ref()));
+    assert!(started.elapsed() <= Duration::from_secs(5) + GRANT_TEARDOWN_BUDGET + Duration::from_millis(100));
+
+    // (c) A one-shot join keeps its error (exit status 1), as every one-shot mode does.
+    let one_shot = run_dcutr_join_loop::<(), _, _>("test", false, None, || async { Ok(Err(revoked())) }).await;
+    assert!(!is_own_grant_end(one_shot.expect_err("refused").as_ref()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dcutr_serve_backoff_ends_at_the_own_expiry_308() {
+    // The DCUtR serve loop backs a refusal or a dial failure off for up to 30 s. The own expiry
+    // cuts such a wait short: the loop ends then, not when the wait is over.
+    let now = crate::codec::now_unix();
+    let started = tokio::time::Instant::now();
+    let cut = backoff_within_grant("test", Duration::from_secs(30), Some(now + 5)).await;
+    assert!(is_own_grant_end(cut.expect_err("the own grant expired first").as_ref()));
+    assert!(started.elapsed() <= Duration::from_secs(5), "{:?}", started.elapsed());
+    let started = tokio::time::Instant::now();
+    backoff_within_grant("test", Duration::from_secs(1), Some(now + 5)).await.expect("a wait within the grant");
+    backoff_within_grant("test", Duration::from_secs(1), None).await.expect("no grant watched");
+    assert_eq!(started.elapsed(), Duration::from_secs(2), "both waits ran in full");
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_successful_dial_resets_the_dial_failure_streak() {
     // Intermittent dial failures between served sessions never add up to the cap: each dial
     // that reaches admission starts the streak over.
@@ -7469,7 +7696,7 @@ async fn a_successful_dial_resets_the_dial_failure_streak() {
     let served = std::sync::Arc::new(AtomicU32::new(0));
     let (c, s) = (calls.clone(), served.clone());
     let serve = tokio::spawn(async move {
-        run_dcutr_join_loop::<(), _, _>("test", true, || {
+        run_dcutr_join_loop::<(), _, _>("test", true, None, || {
             let (c, s) = (c.clone(), s.clone());
             async move {
                 if c.fetch_add(1, Ordering::SeqCst) % 10 == 9 {
@@ -8559,6 +8786,236 @@ async fn forward_initiator_keeps_retrying_a_refusal_that_can_still_clear() {
     assert!(!looping.is_finished(), "a refusal that can clear does not end the forward");
     assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2, "it asked again");
     looping.abort();
+}
+
+/// A forward loop whose admissions never return -- the member waits at the edge for a peer that
+/// does not come -- counting them (ct-agent#308).
+fn spawn_parked_forward_loop(
+    own_expires_at: u64,
+    on_own_end: OnOwnGrantEnd,
+) -> (
+    tokio::task::JoinHandle<io::Result<()>>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    SocketAddr,
+) {
+    let (listener, bound) =
+        bind_forward_listener("127.0.0.1:0".parse().unwrap()).expect("the loopback listener binds");
+    let admissions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = admissions.clone();
+    let looping = tokio::spawn(run_forward_initiate_reconnect_loop(
+        listener,
+        "127.0.0.1:9".to_string(),
+        forward_stream::DEFAULT_MAX_STREAMS,
+        Duration::from_secs(forward_stream::DEFAULT_IDLE_SECS),
+        own_expires_at,
+        on_own_end,
+        move |_local: LocalDuplex| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<io::Result<()>>()
+        },
+        |_: &io::Error| false,
+    ));
+    (looping, admissions, bound)
+}
+
+#[tokio::test(start_paused = true)]
+async fn forward_initiator_ends_when_its_own_grant_expires_while_it_waits_at_the_edge_308() {
+    // A park lasts as long as the edge allows, so the own grant can run out while the member
+    // waits there for a peer. The forward ends at the expiry -- not at a session end that never
+    // comes -- and releases its port.
+    let grant_secs = 5;
+    let (looping, admissions, bound) =
+        spawn_parked_forward_loop(crate::codec::now_unix() + grant_secs, OnOwnGrantEnd::Exit);
+    let started = tokio::time::Instant::now();
+    let ended = tokio::time::timeout(Duration::from_secs(600), looping)
+        .await
+        .expect("the loop ends at the own expiry")
+        .expect("the loop task does not panic");
+    let err = ended.expect_err("an own grant end");
+    assert!(is_own_grant_end(&err), "{err}");
+    let after = started.elapsed();
+    assert!(
+        after <= Duration::from_secs(grant_secs) + GRANT_TEARDOWN_BUDGET + Duration::from_millis(100),
+        "ended after {after:?}: the expiry plus at most the teardown budget"
+    );
+    assert_eq!(admissions.load(std::sync::atomic::Ordering::SeqCst), 1, "no admission after the expiry");
+    tokio::time::resume();
+    assert!(forward_listener_is_released(bound, GRANT_TEARDOWN_BUDGET).await, "the port is free again");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_parked_forward_initiator_asked_to_refuse_keeps_its_port_at_the_own_expiry_308() {
+    // The same under CT_CHANNEL_FORWARD_ON_GRANT_END=refuse: the process keeps the port and refuses
+    // every connection, without another admission.
+    let grant_secs = 5;
+    let (looping, admissions, bound) =
+        spawn_parked_forward_loop(crate::codec::now_unix() + grant_secs, OnOwnGrantEnd::Refuse);
+    tokio::time::sleep(Duration::from_secs(grant_secs) + GRANT_TEARDOWN_BUDGET + Duration::from_secs(1)).await;
+    assert!(!looping.is_finished(), "the forward keeps running and its port");
+    assert_eq!(admissions.load(std::sync::atomic::Ordering::SeqCst), 1, "no admission after the expiry");
+    tokio::time::resume();
+    assert!(forward_connection_is_refused(bound).await, "and refuses every connection");
+    looping.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn forward_initiator_lets_its_session_end_through_its_own_gate_at_the_own_expiry_308() {
+    // At the own expiry the loop's timer and the session gate's (R1) fire within a second of each
+    // other. The loop gives the session the teardown budget to end through its gate -- forwarded
+    // streams closed, close event emitted -- instead of dropping it mid-teardown.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let grant_secs = 5u64;
+    let ended_by_its_gate = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = ended_by_its_gate.clone();
+    let (listener, _bound) =
+        bind_forward_listener("127.0.0.1:0".parse().unwrap()).expect("the loopback listener binds");
+    let looping = tokio::spawn(run_forward_initiate_reconnect_loop(
+        listener,
+        "127.0.0.1:9".to_string(),
+        forward_stream::DEFAULT_MAX_STREAMS,
+        Duration::from_secs(forward_stream::DEFAULT_IDLE_SECS),
+        crate::codec::now_unix() + grant_secs,
+        OnOwnGrantEnd::Exit,
+        move |_local: LocalDuplex| {
+            let flag = flag.clone();
+            async move {
+                // The session's gate fires a little after the loop's timer.
+                tokio::time::sleep(Duration::from_secs(grant_secs) + Duration::from_millis(500)).await;
+                flag.store(true, Ordering::SeqCst);
+                Ok::<(), io::Error>(())
+            }
+        },
+        |_: &io::Error| false,
+    ));
+    let ended = tokio::time::timeout(Duration::from_secs(600), looping)
+        .await
+        .expect("the loop ends")
+        .expect("the loop task does not panic");
+    assert!(is_own_grant_end(&ended.expect_err("an own grant end")));
+    assert!(
+        ended_by_its_gate.load(Ordering::SeqCst),
+        "the session ended through its own gate before the loop let go of it"
+    );
+}
+
+#[tokio::test]
+async fn forward_initiator_ends_during_its_backoff_when_its_own_grant_expires_308() {
+    // The backoff after a failed session lasts up to 30 s. An own grant that runs out during it
+    // ends the forward at the expiry, not when the wait is over, and is not presented again.
+    // Real time: the expiry is a wall-clock instant, and a paused test clock would move it along.
+    // The second session fails just before the expiry, so the 2 s step's wait -- 1 to 2 s -- spans
+    // it by at least 0.8 s.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let own_expires_at = crate::codec::now_unix() + 3;
+    let until_expiry = (std::time::UNIX_EPOCH + Duration::from_secs(own_expires_at))
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or_default();
+    let expiry = tokio::time::Instant::now() + until_expiry;
+    let (listener, _bound) =
+        bind_forward_listener("127.0.0.1:0".parse().unwrap()).expect("the loopback listener binds");
+    let admissions = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = admissions.clone();
+    let looping = tokio::spawn(run_forward_initiate_reconnect_loop(
+        listener,
+        "127.0.0.1:9".to_string(),
+        forward_stream::DEFAULT_MAX_STREAMS,
+        Duration::from_secs(forward_stream::DEFAULT_IDLE_SECS),
+        own_expires_at,
+        OnOwnGrantEnd::Exit,
+        move |_local: LocalDuplex| {
+            let n = counted.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 1 {
+                    tokio::time::sleep_until(expiry - Duration::from_millis(200)).await;
+                }
+                Err::<(), io::Error>(io::Error::other("the edge is restarting"))
+            }
+        },
+        |_: &io::Error| false,
+    ));
+    let ended = tokio::time::timeout(Duration::from_secs(30), looping)
+        .await
+        .expect("the loop ends at the own expiry")
+        .expect("the loop task does not panic");
+    let ended_at = tokio::time::Instant::now();
+    assert!(is_own_grant_end(&ended.expect_err("an own grant end")));
+    assert!(ended_at + Duration::from_millis(50) >= expiry, "not before the expiry");
+    assert!(
+        ended_at <= expiry + Duration::from_millis(500),
+        "{:?} after the expiry: the backoff was waited out",
+        ended_at - expiry
+    );
+    assert_eq!(admissions.load(Ordering::SeqCst), 2, "no admission after the own expiry");
+}
+
+/// A peer that completes the Noise handshake, presents `prelude` (its grant) and then stays
+/// silent: no other byte, and no close -- not even after this member's FIN.
+async fn silent_after_its_grant_noise_peer(transport: tokio::io::DuplexStream, own_private: [u8; 32], prelude: Vec<u8>) {
+    let (mut r, mut w) = tokio::io::split(transport);
+    let Ok(session) = ct_common::a2a::a2a_respond(&mut w, &mut r, &own_private).await else {
+        return;
+    };
+    let (_never_written, never) = tokio::io::duplex(64);
+    let plain = tokio::io::join(std::io::Cursor::new(prelude).chain(never), tokio::io::sink());
+    let _ = ct_common::noise::noise_pump(session, r.unsplit(w), plain).await;
+    std::future::pending::<()>().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn forward_initiator_reconnects_after_the_peers_grant_end_even_if_the_peer_never_closes_308() {
+    // The peer's grant runs out first: the gate ends the session with a clean EOF, the pump FINs
+    // the peer and waits for its close. A peer that never closes held the session -- and with it
+    // the reconnect that a peer's grant end now calls for. The runner stops waiting after the
+    // grace, as it does after a local failure (#314).
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (listener, _bound) =
+        bind_forward_listener("127.0.0.1:0".parse().unwrap()).expect("the loopback listener binds");
+    let admissions = std::sync::Arc::new(AtomicUsize::new(0));
+    let peers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (counted, spawned) = (admissions.clone(), peers.clone());
+    let admit = move |local: LocalDuplex| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        let now = crate::codec::now_unix();
+        let (initiate_check, accept_check) = forward_grant_checks_apart(now + 3600, now + 2);
+        let mut prelude = b"CTPG1".to_vec();
+        prelude.extend_from_slice(&accept_check.own_grant.encode());
+        let (a, b) = (generate_static_keypair(), generate_static_keypair());
+        let (a_priv, b_priv, b_pub) = (a.private, b.private, b.public);
+        let (a_transport, b_transport) = tokio::io::duplex(1 << 16);
+        spawned
+            .lock()
+            .unwrap()
+            .push(tokio::spawn(silent_after_its_grant_noise_peer(b_transport, b_priv, prelude)).abort_handle());
+        async move {
+            let gate = PeerGrantGate::new(local, Some(initiate_check));
+            let (ar, aw) = tokio::io::split(a_transport);
+            run_channel_session_on_stream(aw, ar, ChannelRole::Initiate, &a_priv, &b_pub, gate).await
+        }
+    };
+    let looping = tokio::spawn(run_forward_initiate_reconnect_loop(
+        listener,
+        "127.0.0.1:9".to_string(),
+        forward_stream::DEFAULT_MAX_STREAMS,
+        Duration::from_secs(forward_stream::DEFAULT_IDLE_SECS),
+        crate::codec::now_unix() + 3600,
+        OnOwnGrantEnd::Exit,
+        admit,
+        |_: &io::Error| false,
+    ));
+    let bound = Duration::from_secs(2) + LOCAL_FAILURE_GRACE + LOCAL_FAILURE_DRAIN + FORWARD_RECONNECT_MIN;
+    let deadline = tokio::time::Instant::now() + bound + Duration::from_secs(1);
+    while admissions.load(Ordering::SeqCst) < 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        admissions.load(Ordering::SeqCst) >= 2,
+        "only the peer's grant ended: this member admits again, silent peer or not"
+    );
+    assert!(!looping.is_finished(), "and keeps its forward");
+    looping.abort();
+    for peer in peers.lock().unwrap().iter() {
+        peer.abort();
+    }
 }
 
 // --- ct-agent#314: a session whose own side failed ends, even if the peer stays silent ---------

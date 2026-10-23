@@ -80,9 +80,11 @@ pub(crate) const PRELUDE_LEN: usize = MAGIC.len() + SignedChannelGrant::WIRE_LEN
 /// session pump's first touch of the gate, which comes right after the handshake (ct-agent#314).
 pub(crate) const PEER_GRANT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The budget a session gets once its grant has ended: within it every forwarded
-/// stream of that session is closed on BOTH members and no new one is opened. Nothing here ever
+/// stream of that session is closed on BOTH members and no new one is opened. The gate never
 /// waits this out -- [`GrantLifetime`] ends the session on the next poll of its plaintext side --
 /// it is the bound the tests assert against, named once so they and this doc cannot drift apart.
+/// The long-running loops that stop on this member's own grant end give their running sessions
+/// this long to end that way before they drop them (ct-agent#308).
 pub const GRANT_TEARDOWN_BUDGET: Duration = Duration::from_secs(5);
 
 /// The configuration of the check: on, with the operator key to verify against.
@@ -236,21 +238,41 @@ impl GrantEnd {
 
 /// Where a session's grant end is recorded for its caller (ct-agent#267, see the module doc):
 /// `Some(end)` once a [`PeerGrantGate`] built inside [`with_grant_end_record`] saw a grant
-/// expire or get revoked, `None` for every other way a session can end.
+/// expire or get revoked, `None` for every other way a session can end. Recording it also wakes
+/// [`Self::wait`] -- the session runner's bound on how long it still waits for the peer to close
+/// after a grant end (ct-agent#308).
 #[derive(Clone, Default)]
-pub(crate) struct GrantEndRecord(Arc<Mutex<Option<GrantEnd>>>);
+pub(crate) struct GrantEndRecord {
+    end: Arc<Mutex<Option<GrantEnd>>>,
+    recorded: Arc<tokio::sync::Notify>,
+}
 
 impl GrantEndRecord {
     fn set(&self, end: &GrantEnd) {
-        if let Ok(mut slot) = self.0.lock() {
+        if let Ok(mut slot) = self.end.lock() {
             slot.get_or_insert_with(|| end.clone());
         }
+        // One waiter at most (the session runner); without one, the permit is kept for it.
+        self.recorded.notify_one();
     }
 
     /// The recorded grant end, if any. Reading does not clear it.
     pub(crate) fn ended(&self) -> Option<GrantEnd> {
-        self.0.lock().ok().and_then(|slot| slot.clone())
+        self.end.lock().ok().and_then(|slot| slot.clone())
     }
+
+    /// Resolves once a grant end is recorded -- at once when it already is.
+    pub(crate) async fn wait(&self) {
+        while self.ended().is_none() {
+            self.recorded.notified().await;
+        }
+    }
+}
+
+/// The record of the session running in this task, when it runs inside
+/// [`with_grant_end_record`] (ct-agent#308: the session runner reads and waits on it).
+pub(crate) fn current_grant_end_record() -> Option<GrantEndRecord> {
+    GRANT_END_RECORD.try_with(GrantEndRecord::clone).ok()
 }
 
 /// A timer that fires when a grant that expires at `expires_at` (unix seconds) has run out, on the
@@ -297,7 +319,7 @@ struct GrantLifetime {
     revoke: Option<oneshot::Receiver<String>>,
     /// The control-plane re-check of the peer's grant (see `grant_watch`); `None` when this
     /// session does not run one or it has ended. Its reason arrives already worded.
-    watch: Option<oneshot::Receiver<String>>,
+    watch: Option<oneshot::Receiver<GrantEnd>>,
     /// Set exactly once, the operator-facing reason the session ended.
     ended: Option<String>,
     /// ct-agent#267: the caller's record of that end, when the session runs inside
@@ -307,12 +329,15 @@ struct GrantLifetime {
 
 impl GrantLifetime {
     /// A timer for a grant that expires at `expires_at` (unix seconds, the clock the grants
-    /// themselves are written in). `now_unix()` truncates to the second, so the timer can fire
-    /// up to a second EARLY and never late -- the safe direction for an authorization that has
-    /// run out.
+    /// themselves are written in). It fires at the expiry itself -- the moment `now_unix() >=
+    /// expires_at` starts to hold, the rule `verify_stateless` applies. ct-agent#308: computed
+    /// from `now_unix()`, which truncates to the second, it fired up to a second LATE, and every
+    /// session (R1) and both long-running loops outlived their grant by that fraction.
     fn timer(expires_at: u64) -> Pin<Box<tokio::time::Sleep>> {
-        let left = expires_at.saturating_sub(crate::codec::now_unix());
-        Box::pin(tokio::time::sleep(Duration::from_secs(left)))
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        Box::pin(tokio::time::sleep(Duration::from_secs(expires_at).saturating_sub(now)))
     }
 
     /// Whether this session is over, registering `cx` on whichever of the two ends can still
@@ -328,13 +353,14 @@ impl GrantLifetime {
         if expired {
             return self.end(self.expired_grant());
         }
-        // The re-check and the revoke handle are about the PEER's grant (see their docs).
+        // The re-check says whose standing ended (the peer's grant, or -- `asker-not-member` --
+        // this member's own); the revoke handle is about the PEER's grant (see its doc).
         let watched = match self.watch.as_mut() {
             Some(rx) => std::future::Future::poll(Pin::new(rx), cx),
             None => Poll::Pending,
         };
         match watched {
-            Poll::Ready(Ok(why)) => return self.end(GrantEnd::peer(why)),
+            Poll::Ready(Ok(end)) => return self.end(end),
             // The task that asks the control plane is gone without having answered: the revocation
             // check no longer runs, and a session must not go on unwatched. Fail closed, loudly.
             Poll::Ready(Err(_)) => {
@@ -358,8 +384,10 @@ impl GrantLifetime {
     }
 
     /// Which grant ran out when the expiry timer fired (ct-agent#308). Decided from the two
-    /// expiries the timer was armed from, not from the clock at firing time: the timer may fire
-    /// up to a second early. A tie is this member's own end -- its grant is over either way.
+    /// expiries the timer was armed from, not from the clock at firing time: the timer runs on
+    /// tokio's monotonic clock, which a wall-clock step does not move, and a firing delayed by a
+    /// busy runtime may already be past the later expiry too. A tie is this member's own end --
+    /// its grant is over either way.
     fn expired_grant(&self) -> GrantEnd {
         match (self.own_expires_at, self.peer_expires_at) {
             (Some(own), Some(peer)) if peer < own => {
@@ -474,7 +502,7 @@ impl<P> PeerGrantGate<P> {
                 revoke: Some(revoke),
                 watch: None,
                 ended: None,
-                record: GRANT_END_RECORD.try_with(GrantEndRecord::clone).ok(),
+                record: current_grant_end_record(),
             },
             revoker: Some(GrantRevokeHandle(revoker)),
         }
@@ -1180,6 +1208,24 @@ mod tests {
         assert_eq!(end.scope, GrantEndScope::Own, "{end:?}");
     }
 
+    /// ct-agent#308: the expiry timer fires at the expiry -- not up to a second later, as one
+    /// computed from a whole-second clock reading did. Every session (R1) and both long-running
+    /// loops end on it.
+    #[tokio::test(start_paused = true)]
+    async fn the_expiry_timer_fires_at_the_expiry_not_up_to_a_second_later_308() {
+        let expires_at = crate::codec::now_unix() + 2;
+        let timer = grant_expiry_timer(expires_at);
+        let armed = tokio::time::Instant::now();
+        let left = (std::time::UNIX_EPOCH + Duration::from_secs(expires_at))
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or_default();
+        timer.await;
+        let waited = armed.elapsed();
+        // The timer wheel rounds a sleep up to the next millisecond.
+        assert!(waited >= left, "fired {waited:?} after arming, before the expiry {left:?} away");
+        assert!(waited <= left + Duration::from_millis(2), "fired {waited:?} after arming, the expiry was {left:?} away");
+    }
+
     /// ct-agent#308: the session timer runs to the EARLIER of the two expiries; the record says
     /// whose grant that was. Until v0.7.40 it only said "the channel grant expired", and a forward
     /// initiator whose peer's grant ran out first stopped for good.
@@ -1338,7 +1384,7 @@ mod tests {
     /// If the re-check task dies without an answer, the session ends instead of running unwatched.
     #[tokio::test]
     async fn a_dead_watch_task_ends_the_session_loudly() {
-        let (tx, rx) = oneshot::channel::<String>();
+        let (tx, rx) = oneshot::channel::<GrantEnd>();
         let mut life = GrantLifetime {
             expiry: None,
             own_expires_at: None,

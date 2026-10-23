@@ -80,7 +80,9 @@ use tokio::task::JoinSet;
 use super::errors::{OwnGrantEnded, OWN_GRANT_ENDED_EXIT};
 use super::forward::accept_forward_request_with;
 use super::forward_wire::Frame;
-use super::peer_grant::{grant_expiry_timer, with_grant_end_record, GrantEnd, GrantEndRecord, GrantEndScope};
+use super::peer_grant::{
+    grant_expiry_timer, with_grant_end_record, GrantEnd, GrantEndRecord, GrantEndScope, GRANT_TEARDOWN_BUDGET,
+};
 use super::service_calls::LocalDuplex;
 use crate::events;
 use crate::task_guard::TaskGuard;
@@ -407,7 +409,15 @@ where
     F: Fn(&E) -> bool,
 {
     let mut delay: Option<Duration> = None;
+    let mut lasted = Duration::ZERO;
+    let expired = || format!("this member's channel grant expired (expires_at {own_expires_at})");
     loop {
+        // ct-agent#308: an own grant that is already over by this member's clock ends the forward
+        // here -- before a fresh engine could take a connection from the listen backlog, and
+        // before the expired grant is presented to the edge once more.
+        if crate::codec::now_unix() >= own_expires_at {
+            return end_forward_for_own_grant(&listener, on_own_end, lasted, expired()).await;
+        }
         let record = GrantEndRecord::default();
         let local = forward_initiate_on(listener.clone(), target.clone(), max_streams, idle);
         let started = std::time::Instant::now();
@@ -420,13 +430,19 @@ where
             tokio::select! {
                 biased;
                 outcome = &mut session => Some(outcome),
-                () = grant_expiry_timer(own_expires_at) => None,
+                () = grant_expiry_timer(own_expires_at) => {
+                    // A running session's gate holds the same expiry (R1) and fires within a
+                    // second of this timer: it ends the session the regular way, streams closed
+                    // within the teardown budget and its close event emitted. Only a session
+                    // still parked at the edge after that budget is dropped here.
+                    let _ = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, &mut session).await;
+                    None
+                }
             }
         };
-        let lasted = started.elapsed();
+        lasted = started.elapsed();
         let Some(outcome) = outcome else {
-            let reason = format!("this member's channel grant expired (expires_at {own_expires_at})");
-            return end_forward_for_own_grant(&listener, on_own_end, lasted, reason).await;
+            return end_forward_for_own_grant(&listener, on_own_end, lasted, expired()).await;
         };
         let end = forward_grant_end(record.ended(), own_expires_at, crate::codec::now_unix()).or_else(|| {
             match &outcome {
@@ -462,7 +478,15 @@ where
                  in {wait:?} (#267)"
             ),
         }
-        tokio::time::sleep(wait).await;
+        // ct-agent#308: the own grant can also run out during the backoff (up to 30 s); the
+        // forward ends then, with its listener, not when the wait is over.
+        tokio::select! {
+            biased;
+            () = grant_expiry_timer(own_expires_at) => {
+                return end_forward_for_own_grant(&listener, on_own_end, lasted, expired()).await;
+            }
+            () = tokio::time::sleep(wait) => {}
+        }
     }
 }
 
