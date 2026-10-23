@@ -152,7 +152,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
     }
 }
 
-/// ct-agent#314: the session's `local` side, reporting its first error through a oneshot.
+/// ct-agent#314: the session's `local` side, reporting its first READ error through a oneshot.
 /// `noise_pump` hands a local read error back from its outbound direction without closing the
 /// cipher side, and its `join!` then waits for the inbound direction -- which ends only when the
 /// PEER sends a byte or closes. A peer that completed the Noise handshake and then stays silent
@@ -160,16 +160,24 @@ impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
 /// gate giving up after `PEER_GRANT_TIMEOUT`) for ever, and with it a forward initiator's
 /// reconnect loop or a serve slot. [`run_channel_session_on_stream`] watches this signal and stops
 /// waiting for such a peer after [`LOCAL_FAILURE_GRACE`].
+///
+/// Only the read side reports. A gate that refuses the peer on the write side (a grant that does
+/// not verify) fails both directions, so its next read reports it. A plain local write error --
+/// a stream handler that closed its stdin, a closed stdout -- ends only the inbound direction,
+/// while the outbound one may still be delivering what the local side produces; cutting that after
+/// the grace would truncate a response the peer is still receiving.
 struct LocalFailSignal<P> {
     inner: P,
-    /// Taken on the first error; the session runner holds the receiver.
+    /// Taken on the first read error; the session runner holds the receiver.
     failed: Option<tokio::sync::oneshot::Sender<io::Error>>,
 }
 
-impl<P> LocalFailSignal<P> {
-    fn report<T>(&mut self, polled: Poll<io::Result<T>>) -> Poll<io::Result<T>> {
+impl<P: AsyncRead + Unpin> AsyncRead for LocalFailSignal<P> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
         if let Poll::Ready(Err(e)) = &polled {
-            if let Some(tx) = self.failed.take() {
+            if let Some(tx) = this.failed.take() {
                 let _ = tx.send(io::Error::new(e.kind(), e.to_string()));
             }
         }
@@ -177,27 +185,14 @@ impl<P> LocalFailSignal<P> {
     }
 }
 
-impl<P: AsyncRead + Unpin> AsyncRead for LocalFailSignal<P> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        let this = &mut *self;
-        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
-        this.report(polled)
-    }
-}
-
+// Writes pass through unreported (see the type's doc).
 impl<P: AsyncWrite + Unpin> AsyncWrite for LocalFailSignal<P> {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        let this = &mut *self;
-        let polled = Pin::new(&mut this.inner).poll_write(cx, buf);
-        this.report(polled)
+        Pin::new(&mut self.inner).poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = &mut *self;
-        let polled = Pin::new(&mut this.inner).poll_flush(cx);
-        this.report(polled)
+        Pin::new(&mut self.inner).poll_flush(cx)
     }
-    // Not reported: the pump shuts the local side down only once the peer's direction has
-    // ended, and ignores the result.
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
@@ -320,9 +315,9 @@ where
 /// port is also blocked (a truly `:443`-only network) relays over `:443` unchanged; the
 /// Noise_IK session stays end-to-end and the edge only forwards ciphertext.
 ///
-/// When `local` fails (an error from reading or writing it, e.g. the peer-grant gate refusing
-/// the peer), the session ends with that error within [`LOCAL_FAILURE_GRACE`], whether or not the
-/// peer ever sends another byte (ct-agent#314).
+/// When reading `local` fails (e.g. the peer-grant gate refusing the peer), the session ends with
+/// that error within [`LOCAL_FAILURE_GRACE`] plus [`LOCAL_FAILURE_DRAIN`], whether or not the peer
+/// ever sends another byte (ct-agent#314).
 pub async fn run_channel_session_on_stream<W, R, P>(
     send: W,
     recv: R,

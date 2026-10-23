@@ -230,10 +230,13 @@ picture first.
   from the peer. The 10 s count from the start of the session, right after the Noise handshake.
   Through v0.7.40 they counted from admission, so a slow pairing (direct dial 5 s, accept window
   8 s, a relay rung, the handshake) could use them up before the peer could answer: the refusal
-  then came milliseconds after `state=open`. When this side of a session fails like that, the
-  session ends within 2 s even if the peer never sends another byte; before, a peer that had
+  then came milliseconds after `state=open`. When this side of a session fails like that (an
+  error reading its local side), the session ends within about 4 s (the peer gets 2 s to close it,
+  then at most 2 s of drain) even if the peer never sends another byte; before, a peer that had
   finished the handshake and then stayed silent held the session for ever — a forward initiator
-  never reconnected and an accept member lost a serve slot. A refusal is **not a grant end**: a
+  never reconnected and an accept member lost a serve slot. A local *write* error (a stream
+  handler that closed its stdin, a closed stdout) does not trigger this: the other direction keeps
+  delivering until the local side ends, as before. A refusal is **not a grant end**: a
   forward initiator reconnects with backoff (1 s doubling up to 30 s, each wait jittered into the
   upper half of its step), the serve loop parks again. A peer that never presents its grant is
   usually not a forward member of this channel at all: a second process with the same identity

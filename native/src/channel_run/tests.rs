@@ -8085,6 +8085,90 @@ async fn a_peer_grant_timeout_ends_the_session_even_if_the_peer_stays_silent_314
     }
 }
 
+/// A session's local side whose writes fail -- a stream handler that closed its stdin after
+/// reading its request -- while its reads keep delivering whatever the test feeds in.
+struct WriteFailsLocal(tokio::io::DuplexStream);
+
+impl tokio::io::AsyncRead for WriteFailsLocal {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for WriteFailsLocal {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::task::Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "the handler closed its stdin")))
+    }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_local_write_error_does_not_cut_a_still_producing_read_side_314() {
+    // The #314 bound is for a session whose own side can no longer produce anything. A local
+    // WRITE error ends only the inbound direction: a stream handler that closed its stdin can
+    // still be streaming its answer. The peer then sends one more byte (a trailing newline), the
+    // write fails -- and everything the handler produces afterwards, for longer than the grace and
+    // the drain together, must still reach the peer, as it did in v0.7.40.
+    let (a, b) = (generate_static_keypair(), generate_static_keypair());
+    let (a_priv, a_pub, b_priv, b_pub) = (a.private, a.public, b.private, b.public);
+    let (a_transport, b_transport) = tokio::io::duplex(1 << 16);
+    let (mut handler_out, handler_side) = tokio::io::duplex(4096);
+    let member = tokio::spawn(async move {
+        let (r, w) = tokio::io::split(a_transport);
+        run_channel_session_on_stream(w, r, ChannelRole::Initiate, &a_priv, &b_pub, WriteFailsLocal(handler_side)).await
+    });
+    let (mut peer_app, peer_local) = tokio::io::duplex(4096);
+    let peer = tokio::spawn(async move {
+        let (r, w) = tokio::io::split(b_transport);
+        run_channel_session_on_stream(w, r, ChannelRole::Accept, &b_priv, &a_pub, peer_local).await
+    });
+    peer_app.write_all(b"\n").await.unwrap();
+    let chunks = 6u8;
+    let producing = tokio::spawn(async move {
+        for i in 0..chunks {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            handler_out.write_all(&[b'a' + i; 100]).await.unwrap();
+        }
+        // Dropping `handler_out` is the handler's EOF.
+    });
+    assert!(
+        Duration::from_secs(u64::from(chunks)) > LOCAL_FAILURE_GRACE + LOCAL_FAILURE_DRAIN,
+        "the handler must keep producing past the bound"
+    );
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(60), peer_app.read_to_end(&mut got))
+        .await
+        .expect("the peer sees the end of the answer")
+        .unwrap();
+    let want: Vec<u8> = (0..chunks).flat_map(|i| [b'a' + i; 100]).collect();
+    assert_eq!(got.len(), want.len(), "the whole answer arrives, not the part produced within the grace");
+    assert_eq!(got, want);
+    producing.await.unwrap();
+    drop(peer_app);
+    let ended = tokio::time::timeout(Duration::from_secs(60), member)
+        .await
+        .expect("the session ends once the handler is done")
+        .unwrap();
+    assert_eq!(
+        ended.expect_err("the failed write is still reported").kind(),
+        io::ErrorKind::BrokenPipe,
+    );
+    peer.abort();
+}
+
 #[tokio::test(start_paused = true)]
 async fn forward_initiator_reconnects_after_a_silent_peer_never_presents_its_grant_314() {
     // The #314 shape end to end over the reconnect loop: every admission pairs with a peer that
@@ -8181,12 +8265,15 @@ async fn forward_reconnect_waits_are_jittered_so_a_fleet_does_not_reconnect_in_l
 }
 
 #[tokio::test]
-async fn a_persistent_serve_forward_accept_presents_its_grant_without_the_opt_in_314() {
-    // The issue's own hypothesis, pinned as refuted: a persistent-serve accept member of a forward
-    // (CT_CHANNEL_SERVE=1 + CT_CHANNEL_FORWARD_ALLOW) never ran the gate, and
-    // CT_CHANNEL_REQUIRE_PEER_GRANT=1 was the fix. Every plane session -- the serve loop's
-    // included -- builds its gate in `gate_local`, and a forward forces the check there whatever
-    // the opt-in says: the accept side's first bytes towards the peer are its own grant.
+async fn a_forward_accept_gate_presents_its_grant_without_the_opt_in_314() {
+    // The issue's own hypothesis was that a persistent-serve accept member of a forward
+    // (CT_CHANNEL_SERVE=1 + CT_CHANNEL_FORWARD_ALLOW) never ran the gate, and that
+    // CT_CHANNEL_REQUIRE_PEER_GRANT=1 was the fix. This pins the rule that refutes it: a forward
+    // accept member's gate forces the check whatever the opt-in says, so the accept side's first
+    // bytes towards the peer are its own grant. That the serve loop's sessions get their gate
+    // here is read from the code, not driven by this test: `serve_admitted_session` ->
+    // `run_channel_join_with_admission` -> `gate_local` -> `gate_local_from`, the same call every
+    // plane session makes (driving it would need process-wide env, which these tests avoid).
     use ed25519_dalek::Signer as _;
     let operator = ed25519_dalek::SigningKey::from_bytes(&[0x41u8; 32]);
     let holder = ed25519_dalek::SigningKey::from_bytes(&[0x03u8; 32]);
@@ -8203,15 +8290,14 @@ async fn a_persistent_serve_forward_accept_presents_its_grant_without_the_opt_in
         endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
     };
     let operator_hex = crate::codec::hex_encode(&operator.verifying_key().to_bytes());
-    let serve_forward_accept = |k: &str| match k {
-        "CT_CHANNEL_ROLE" => Some("accept".to_string()),
-        "CT_CHANNEL_SERVE" => Some("1".to_string()),
+    // What the gate reads of a forward accept member's configuration; the role is the argument.
+    let forward_accept = |k: &str| match k {
         forward::FORWARD_ALLOW_ENV => Some("127.0.0.1:5432".to_string()),
         OPERATOR_PUBKEY_ENV => Some(operator_hex.clone()),
         _ => None, // no CT_CHANNEL_REQUIRE_PEER_GRANT
     };
     let (_app, local) = tokio::io::duplex(4096);
-    let mut gate = gate_local_from(local, &request, ChannelRole::Accept, [0x02u8; 32], &holder, &serve_forward_accept)
+    let mut gate = gate_local_from(local, &request, ChannelRole::Accept, [0x02u8; 32], &holder, &forward_accept)
         .expect("a forward accept member with an operator key builds its gate");
     let mut first = [0u8; 5];
     tokio::time::timeout(Duration::from_secs(5), gate.read_exact(&mut first))
