@@ -14,7 +14,7 @@ linked — those threads carry the full evidence.
 | One-shot service call (opt-out) | `CT_CHANNEL_CALL_SERVICE=<slug>` **+** `CT_CHANNEL_CALL_PERSISTENT=0` | The pre-v0.5.0 default: join → pair → Noise → **one** `service/<slug>` call (stdin = input, stdout = **bare** output) → exit. The historical crew-bridge `CREW_*_CMD` contract — **a caller still expecting bare one-shot output must set `=0` when upgrading to v0.5.0** (migration note in the release; only explicit `0`/`false`/`no` opts out). |
 | One-shot raw MCP call | `CT_CHANNEL_CALL=<method>` (+ `CT_CHANNEL_CALL_PARAMS`) | One JSON-RPC request/response, prints the whole envelope, exits. |
 | Persistent serve | `CT_CHANNEL_ROLE=accept` + `CT_CHANNEL_SERVE=1` | Parks at the broker, serves each paired peer's session **concurrently** (up to `CT_CHANNEL_SERVE_CONCURRENCY`, default 8, [#200]) — a JSON-RPC request loop per session, any number of calls per session. `CT_AGENT_SERVICE_HANDLER_CMD` spawns a fresh handler per request (the handler stays stateless even under a held session). |
-| Raw pipe | neither | stdin/stdout spliced over the channel. stdin end-of-file is a **half-close**: it ends only the direction towards the peer, the peer's bytes keep arriving on stdout until the peer ends too. On the `:443` front door that needs an edge with CADS-Tunnel v0.5.0 or later; an older edge drops the receive direction as well ([#299]). **`ok=true` in the `channel_session` close event, and exit status 0, mean "the transport closed cleanly", not "the peer received everything"**: a relay that cuts the stream can produce the same clean close, and there is no end-to-end delivery acknowledgement. Check delivery in the application (a reply, a checksum) when it matters. |
+| Raw pipe | neither | stdin/stdout spliced over the channel. stdin end-of-file is a **half-close**: it ends only the direction towards the peer, the peer's bytes keep arriving on stdout until the peer ends too. **What `ok=true` (and exit status 0) means depends on the peer** ([#299]): when both members run a version with [delivery confirmation](#delivery-confirmation-protocol-v2-299) (the `channel_session` events say `delivery=ack`), it means the peer confirmed every byte this side sent and this side confirmed every byte it received; anything less ends with `ok=false` and a non-zero exit, naming what is missing. With an older peer (`delivery=legacy`) it only means "the transport closed cleanly": a relay that cuts the stream produces the same clean close, and on the `:443` front door an edge older than CADS-Tunnel v0.5.0 even drops the receive direction on a half-close. Check delivery in the application (a reply, a checksum) when it matters and a legacy peer is possible. |
 | **Direct address (no broker at all)** | `CT_CHANNEL_ADDR` + `CT_CHANNEL_PEER_NOISE_KEY` (+ `CT_CHANNEL_PEER_CERT` when initiating) | Dials the peer **directly**; the edge is not involved in pairing. This is the `first-channel` tutorial's path. Every other row in this table goes through the broker — this one is the reason not to read "channel" as "always via the edge". |
 
 **Every row above except Direct address needs the control plane, not just a valid grant.** Source-verified
@@ -226,6 +226,56 @@ picture first.
   ≥500 ms resets the streak (real arena rounds run ~85 ms *inside* an already-held session; a
   fresh session that does real work runs well past 500 ms).
 
+### Delivery confirmation (protocol v2, [#299])
+
+Every session that runs the plain Noise pump (pipe, forward, serve and the call modes, direct or
+relayed) offers protocol v2 inside the Noise handshake. Two members that both speak it use it;
+with an older peer the session stays legacy, byte for byte, so members can be updated one at a
+time. `CT_CHANNEL_DELIVERY_ACK=0` turns it off. The `channel_session` events carry
+`delivery=ack` or `delivery=legacy`.
+
+- The end of a member's input travels as an in-band FIN record with the byte count, not as a
+  transport half-close. The peer delivers everything into its local side, closes it and confirms
+  with a FIN_ACK. The transport closes only after both directions are confirmed, so v2 does not
+  depend on how a relay treats a half-close (an edge older than CADS-Tunnel v0.5.0 dropped both
+  directions on one).
+- `ok=true` and exit status 0 then mean that both directions were confirmed with matching byte
+  counts, and the close event carries `confirmed_sent`/`confirmed_received`. Anything less ends
+  with `ok=false`, a non-zero exit in pipe mode, and a line `ct-agent channel: ... (#299)` that
+  names what is missing: `delivery not confirmed: ...` (this side's bytes lack the peer's
+  confirmation), `the peer's stream is incomplete: ...; our N bytes were confirmed` (the peer's
+  direction never ended), `session cut: ...` (the transport ended while a direction was still
+  open), or `the peer ended the session early: ...`. A forward or serve session that ends this
+  way is retried like any other failed session.
+- **Transport loss is now visible.** A session whose transport ends while a direction is still
+  open -- a forward or serve session cut by a peer restart, an edge restart or a network drop, or
+  a member stopped with Ctrl-C -- ends with `ok=false` (`session cut: ...`) where a legacy session
+  said `ok=true`. That is the normal end of a forward session; nothing was necessarily lost, v2
+  just cannot confirm a direction that never ended. A member that only receives should end its
+  input (`</dev/null`, or Ctrl-D on a terminal) instead of being stopped: then both members end
+  with `ok=true` and exit status 0.
+- **Exit status in pipe mode** (release note): a peer that is stopped or cut before its input
+  ends, a peer that confirms nothing within the bound below, and a relay that cuts the stream now
+  give exit status 1, where a legacy session gave 0.
+- The wait for the peer's confirmation is bounded by progress: it fails after 60 s without a
+  single record from the peer after this side's FIN. A peer that is still delivering this side's
+  bytes into a slow consumer reports its progress (every 15 s while it grows), so only a consumer
+  that stops taking data -- or takes less than one 16 KiB record in about 45 s -- ends the session
+  with `ok=false`. What it had not taken is reported as unconfirmed, not necessarily lost.
+- When the peer-grant check ends a session, the FIN says why, and the peer reports it, e.g. "the
+  peer ended the session early: the peer's own channel grant expired". The reason is the peer's
+  own word: it is logged, and no authorization or exit decision rests on it.
+- A persistent `--call-service` client lets its session end with that FIN after stdin's
+  end-of-file (at most 10 s) instead of dropping it, so the serving member records a clean end.
+- The records travel inside the end-to-end Noise session; the edge learns no content from them.
+  It can tell a v2 session by size, though (the handshake is 6 bytes longer, and the end records
+  are small fixed-size frames).
+- Confirmed means "written and flushed into the peer agent's local side" (its stdout, the
+  forward engine), not "processed by the application behind it". Only the application protocol
+  can confirm that.
+- The relay→direct upgrade (`CT_CHANNEL_DIRECT_UPGRADE`, #104) and the DCUtR sessions keep their
+  own pumps and stay legacy.
+
 ## Registration (the Browser-Plane/mesh tunnel, not channels — but same binary)
 
 Since v0.4.7 ([#16]) a **mid-life** UDP failure falls back to TLS-TCP (pool, [#229]) and probes
@@ -286,6 +336,7 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_CHANNEL_RELAY_DIRECT` | dial the relay at this `host:port` instead of the one the grant names — an operator override, not a fallback |
 | `CT_CHANNEL_SERVE` / `CT_CHANNEL_SERVE_CONCURRENCY` | accept-side persistent serve, session cap (default 8) |
 | `CT_CHANNEL_DIRECT_UPGRADE=1` | opt-in in-band relay→direct upgrade (#104) |
+| `CT_CHANNEL_DELIVERY_ACK` | default **on** ([#299]): offer and accept [delivery confirmation](#delivery-confirmation-protocol-v2-299) in every session. `0`/`false`/`no`/`off` runs only the legacy session (and so answers no offer); meant as a way back, not as a tuning knob |
 | `CT_CHANNEL_REQUIRE_PEER_GRANT` / `CT_CHANNEL_OPERATOR_PUBKEY` | **Opt-in end-to-end check of the peer's grant** (default off). Admission attests the peer's Noise key with the peer's holder key, but all of that comes from the broker; nothing binds the holder to an operator-signed grant, so a compromised broker could present an identity it minted itself. With `CT_CHANNEL_REQUIRE_PEER_GRANT=1` both members send their own grant as the first bytes inside the Noise session, and each checks the other's before any application byte flows: the signature against `CT_CHANNEL_OPERATOR_PUBKEY` (64 hex, required when on), expiry, same channel, holder = the attested peer holder, and the complementary direction. **Switch it on for every member of a channel together**: a member that sends the grant to one that does not expect it breaks that session. On but without an operator key, the join fails. |
 | `CT_AGENT_SERVICE_HANDLER_CMD` / `CT_AGENT_SERVICES` | the handler command + offered service slugs on the serve side |
 | `CT_SERVICE_TYPE` | not read by `ct-agent` itself — set **in the handler child's own environment** by `CT_AGENT_SERVICE_HANDLER_CMD` (#149-A.1) so one handler script can branch on which of several registered `service/<slug>` calls was actually invoked |

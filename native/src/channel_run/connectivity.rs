@@ -244,9 +244,18 @@ where
             let (listener, endpoint) = match (direct_listener, own_direct_endpoint) {
                 (Some(l), Some(e)) => (l, e),
                 // Relay-only initiator (no dialable direct address): run the plain relay session.
+                // #299: legacy on purpose, to leave the opt-in #104 path exactly as it was. An
+                // offer would be safe (an upgradable responder answers none, a plain acceptor
+                // would answer v2), but no v2 test covers this path yet.
                 _ => {
-                    return run_channel_session_on_stream(
-                        relay_send, relay_recv, ChannelRole::Initiate, &relay_priv, &relay_peer, local,
+                    return run_channel_session_on_stream_with(
+                        relay_send,
+                        relay_recv,
+                        ChannelRole::Initiate,
+                        &relay_priv,
+                        &relay_peer,
+                        local,
+                        ct_common::delivery::SessionCaps::NONE,
                     )
                     .await
                     .map_err(Into::into)
