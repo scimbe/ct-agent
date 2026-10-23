@@ -6299,7 +6299,7 @@ async fn admit_one_shot_with_retry_succeeds_after_park_expired_within_the_window
 
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        admit_one_shot_with_retry(std::time::Duration::from_secs(30), &channel, admit),
+        admit_one_shot_with_retry(std::time::Duration::from_secs(30), &channel, InitiateWait::OneShot, admit),
     )
     .await
     .expect("must not hang waiting out the whole window when a later attempt succeeds")
@@ -6321,7 +6321,7 @@ async fn admit_one_shot_with_retry_gives_a_named_error_when_the_window_closes_95
 
     let err = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        admit_one_shot_with_retry(std::time::Duration::from_millis(50), &channel, admit),
+        admit_one_shot_with_retry(std::time::Duration::from_millis(50), &channel, InitiateWait::OneShot, admit),
     )
     .await
     .expect("must not hang past the window")
@@ -6347,7 +6347,7 @@ async fn admit_one_shot_with_retry_stops_at_once_on_a_revoked_grant() {
         calls.fetch_add(1, Ordering::SeqCst);
         async { Err::<ChannelJoinOutcome, BoxError>(AdmissionRefused::boxed_with_category("edge broker refused the channel join", Some("grant-revoked"))) }
     };
-    let err = admit_one_shot_with_retry(std::time::Duration::from_secs(10), &channel, admit)
+    let err = admit_one_shot_with_retry(std::time::Duration::from_secs(10), &channel, InitiateWait::OneShot, admit)
         .await
         .expect_err("a revoked grant is refused");
     assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one attempt");
@@ -6360,12 +6360,74 @@ async fn admit_one_shot_with_retry_stops_at_once_on_a_revoked_grant() {
     };
     // Same window, a refusal that can still clear up: tried at 0, 3, 6, 9 s and once more at the
     // deadline, then the named timeout error.
-    let err = admit_one_shot_with_retry(std::time::Duration::from_secs(10), &channel, admit)
+    let err = admit_one_shot_with_retry(std::time::Duration::from_secs(10), &channel, InitiateWait::OneShot, admit)
         .await
         .expect_err("the window closes without an acceptor");
     assert_eq!(calls.load(Ordering::SeqCst), 5, "a pairing refusal is retried until the window closes");
     assert!(err.to_string().contains("no acceptor for channel"), "{err}");
     assert!(!is_revoked_grant_refusal(&AdmissionRefused::boxed_with_category("x", Some("pairing"))));
+}
+
+/// ct-agent#95: the window used to be checked only BETWEEN attempts, and a keepalive `:443`
+/// attempt waits as long as the edge parks it -- with a raised keepalive park TTL (600 s) a
+/// one-shot call to an absent acceptor failed after ~10 min instead of its 75 s. The attempt is
+/// now cut at the window itself, and dropped (its leg with it).
+#[tokio::test(start_paused = true)]
+async fn admit_one_shot_with_retry_cuts_a_single_long_park_at_the_window_95() {
+    use ct_common::channel::ChannelId;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    // Set when the parked attempt's future is dropped -- the stand-in for its TLS leg.
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let dropped = Arc::new(AtomicBool::new(false));
+    let flag = dropped.clone();
+    let admit = move || {
+        let guard = DropFlag(flag.clone());
+        async move {
+            let _guard = guard;
+            // One park the edge holds for 600 s, then ends with EX.
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            Ok::<_, BoxError>(ChannelJoinOutcome::ParkExpired)
+        }
+    };
+    let started = tokio::time::Instant::now();
+    let err = admit_one_shot_with_retry(Duration::from_secs(75), &ChannelId([0x44u8; 32]), InitiateWait::OneShot, admit)
+        .await
+        .expect_err("no acceptor arrived within the window");
+    let took = started.elapsed();
+    assert!(took <= Duration::from_secs(75) + Duration::from_millis(1), "cut at the window, not at the park's end: {took:?}");
+    let msg = err.to_string();
+    assert!(msg.contains("ct-agent#95"), "the window's named error: {msg}");
+    assert!(msg.contains("still parked"), "says the attempt was cut while parked: {msg}");
+    assert!(dropped.load(Ordering::SeqCst), "the cut attempt was dropped, and its leg with it");
+}
+
+/// ct-agent#95: forward and persistent CALL initiators WANT a long park -- they are paired the
+/// moment the acceptor parks -- so their attempt is not cut at the window.
+#[tokio::test(start_paused = true)]
+async fn persistent_initiators_keep_an_unbounded_park_attempt_95() {
+    use ct_common::channel::ChannelId;
+    let admit = || async {
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        Ok::<_, BoxError>(ChannelJoinOutcome::Admitted {
+            peer_endpoint: "127.0.0.1:1".to_string(),
+            peer_noise_pubkey: None,
+            peer_holder: None,
+            peer_attestation: None,
+            observed_reflexive: None,
+        })
+    };
+    let started = tokio::time::Instant::now();
+    let outcome = admit_one_shot_with_retry(Duration::from_secs(75), &ChannelId([0x45u8; 32]), InitiateWait::Persistent, admit)
+        .await
+        .expect("the long park ends in an admission");
+    assert!(matches!(outcome, ChannelJoinOutcome::Admitted { .. }), "the admission is returned");
+    assert!(started.elapsed() >= Duration::from_secs(600), "the attempt was waited out, not cut at the window");
 }
 
 /// The refusal as it really reaches the initiator: an edge that answers the join with
@@ -6449,7 +6511,7 @@ async fn a_revoked_grant_refused_over_the_dial_path_is_final() {
     let before = joins.load(Ordering::SeqCst);
     let err = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        admit_one_shot_with_retry(std::time::Duration::from_secs(30), &ChannelId(channel), join),
+        admit_one_shot_with_retry(std::time::Duration::from_secs(30), &ChannelId(channel), InitiateWait::OneShot, join),
     )
     .await
     .expect("returns at once instead of retrying every 3 s")

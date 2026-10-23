@@ -223,6 +223,21 @@ pub(crate) const DEFAULT_INITIATE_RETRY_SECS: u64 = 75;
 /// How long between retry attempts within the window above.
 const INITIATE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// ct-agent#95: how long ONE admission attempt of an initiator may stay parked. The window above
+/// is checked only between attempts, and a keepalive `:443` attempt has no total bound of its own
+/// (35 s per read, refreshed by the edge's ticks): it waits until the edge ends the park -- 30 s
+/// by default, up to the edge's keepalive park TTL where an operator raised it (CADS-Tunnel#506),
+/// so a one-shot call could wait about 115 s, or that TTL, instead of its window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitiateWait {
+    /// Pipe and `--call` callers were promised the window: an attempt still parked when it
+    /// closes is dropped, and the window's named error follows.
+    OneShot,
+    /// Forward (#267) and persistent CALL (#47) initiators: a long park is what they want (they
+    /// are paired the moment the acceptor parks), so an attempt waits as long as the edge holds it.
+    Persistent,
+}
+
 /// Parse `CT_CHANNEL_INITIATE_RETRY_SECS` into the retry window: a positive integer overrides the
 /// default; anything absent/blank/zero/malformed falls back to [`DEFAULT_INITIATE_RETRY_SECS`].
 /// Pure, same shape as [`serve_concurrency_from_env`] below.
@@ -247,9 +262,13 @@ pub(crate) fn initiate_retry_window_from_env(value: Option<&str>) -> std::time::
 /// named timeout error (naming the channel, the window, and the attempt count) instead of
 /// whatever the last raw outcome/error happened to be -- the whole point being an actionable,
 /// distinguishable message instead of the prior silent-stall/silent-exit nondeterminism.
+///
+/// `wait` (see [`InitiateWait`]): a `OneShot` attempt is cut at the window itself, so a caller
+/// never waits past it however long the edge parks it.
 pub(crate) async fn admit_one_shot_with_retry<A, Fut>(
     window: std::time::Duration,
     channel: &ct_common::channel::ChannelId,
+    wait: InitiateWait,
     mut admit: A,
 ) -> Result<ChannelJoinOutcome, BoxError>
 where
@@ -260,7 +279,16 @@ where
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        let result = admit().await;
+        // ct-agent#95: dropping a cut attempt drops its TLS stream; the edge's park pump reads
+        // that as the death of a keepalive park at once, so no stale park is left for a partner.
+        // The deadline check below then returns the named error.
+        let result = match wait {
+            InitiateWait::OneShot => match tokio::time::timeout_at(deadline, admit()).await {
+                Ok(r) => r,
+                Err(_) => Err("the attempt was still parked when the one-shot window closed".into()),
+            },
+            InitiateWait::Persistent => admit().await,
+        };
         if let Ok(outcome @ ChannelJoinOutcome::Admitted { .. }) = result {
             return Ok(outcome);
         }
@@ -510,7 +538,7 @@ pub(crate) async fn run_one_admission_session(
     // `run_one_admission_session_with_local` below, after this `channel_local()` call --
     // the peer's Noise key isn't known yet at this call site.
     let local = channel_local(None);
-    run_one_admission_session_with_local(cfg, request, broker_ladder, relay_ladder, front_door_cert, local).await
+    run_one_admission_session_with_local(cfg, request, broker_ladder, relay_ladder, front_door_cert, local, InitiateWait::OneShot).await
 }
 
 /// ct-agent#267: the plane-brokered one-shot path with `CT_CHANNEL_FORWARD`
@@ -551,6 +579,7 @@ pub(crate) async fn run_forward_initiate_sessions(
                 relay_ladder,
                 front_door_cert,
                 ChannelLocal::Forward(Ok(local)),
+                InitiateWait::Persistent,
             )
         },
         is_revoked_grant_refusal,
@@ -562,7 +591,7 @@ pub(crate) async fn run_forward_initiate_sessions(
 /// by the caller instead. Exists so a caller that must control the local app stream's lifecycle
 /// itself (ct-agent#47: redialing this admission cycle repeatedly while reusing ONE stdin feed
 /// across attempts) can drive the identical admission/relay/session logic without re-entering
-/// `channel_local()`.
+/// `channel_local()`. `wait` is how long one initiator attempt may stay parked ([`InitiateWait`]).
 pub(crate) async fn run_one_admission_session_with_local<L>(
     cfg: &ChannelJoinCliConfig,
     request: &ChannelJoinRequest,
@@ -570,6 +599,7 @@ pub(crate) async fn run_one_admission_session_with_local<L>(
     relay_ladder: &[ChannelDialRung],
     front_door_cert: &Option<CertificateDer<'static>>,
     local: L,
+    wait: InitiateWait,
 ) -> Result<(), BoxError>
 where
     L: AsyncRead + AsyncWrite + Unpin,
@@ -597,6 +627,7 @@ where
         admit_one_shot_with_retry(
             initiate_retry_window_from_env(std::env::var("CT_CHANNEL_INITIATE_RETRY_SECS").ok().as_deref()),
             &request.grant.grant.channel,
+            wait,
             admit_once,
         )
         .await?
