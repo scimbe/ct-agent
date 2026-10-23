@@ -88,7 +88,9 @@ where
         accept_timeout,
         local,
         false, // #104: this entry point predates the option and stays opt-out by default
-        false, // ct-agent#22 (b): same -- the accept-vs-relay race is opt-in (CT_CHANNEL_ACCEPT_RACE)
+        // ct-agent#22 (b): same -- this entry point keeps the serial order; its pre-dialed QUIC
+        // relay is a leg the adaptive race (#295) would not race anyway.
+        AcceptRaceMode::Off,
     )
     .await
 }
@@ -104,9 +106,10 @@ where
 /// direct-dial failure: [`RelayFallback::Quic`] (a pre-dialed QUIC relay connection) or —
 /// for a member whose relay port is also blocked — [`RelayFallback::Ladder`], which walks
 /// the relay ladder (direct QUIC → the `:443` front door) via [`join_via_relay_ladder`].
-/// `accept_race` (ct-agent#22 (b), opt-in) makes an `Accept` member with a bound listener
-/// race its accept window against the relay leg (`race_accept_against_relay`) instead of
-/// serialising the two; off, the accept-then-relay order is byte-for-byte unchanged.
+/// `accept_race` (ct-agent#22 (b), adaptive by default since #295, see [`AcceptRaceMode`]) makes
+/// an `Accept` member with a bound listener race its accept window against the relay leg
+/// (`race_accept_against_relay`) instead of serialising the two; where it does not race, the
+/// accept-then-relay order is byte-for-byte unchanged.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_channel_join_with_admission<P>(
     admission: ChannelJoinOutcome,
@@ -123,15 +126,18 @@ pub async fn run_channel_join_with_admission<P>(
     // whether to attempt the in-band relay->direct upgrade if/when this session ends up
     // on the relay leg.
     direct_upgrade: bool,
-    // ct-agent#22 (b), opt-in via CT_CHANNEL_ACCEPT_RACE (default false -> unchanged
-    // behavior): whether an Accept member with a bound listener RACES its accept window
-    // against the relay leg ([`race_accept_against_relay`]) instead of waiting the full
-    // `accept_timeout` before it even dials the relay.
-    accept_race: bool,
+    // ct-agent#22 (b) / #295, CT_CHANNEL_ACCEPT_RACE: whether an Accept member with a bound
+    // listener RACES its accept window against the relay leg ([`race_accept_against_relay`])
+    // instead of waiting the full `accept_timeout` before it even dials the relay -- off,
+    // adaptive (the default: only a keepalive-monitored `:443` leg parks during the race), or on.
+    // `impl Into` (#295 review): a caller still passing the former `bool` keeps compiling --
+    // `false` is the serial order, `true` the #22 opt-in, exactly as before.
+    accept_race: impl Into<AcceptRaceMode>,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
 {
+    let accept_race: AcceptRaceMode = accept_race.into();
     let (peer_endpoint, peer_noise, observed_reflexive, peer_holder) = match admission {
         ChannelJoinOutcome::Admitted { peer_endpoint, peer_noise_pubkey, peer_holder, peer_attestation, observed_reflexive } => {
             let noise = peer_noise_pubkey
@@ -229,11 +235,11 @@ where
                 }
                 // ct-agent#22 (b): race the accept window against the relay leg instead of
                 // serialising them -- the 8 s vanish from the critical path for EVERY
-                // acceptor, not just a misconfigured one (part (a) above). Opt-in for now:
-                // the edge must detect an abandoned park on both transports before this can
-                // be the default (issue Befund 2, Vorschlag B).
-                // TODO(#22): auto-enable on the ack's cl=1 tag
-                if accept_race {
+                // acceptor, not just a misconfigured one (part (a) above). #295: by default
+                // only where the edge sees an abandoned park -- a keepalive-negotiated `:443`
+                // leg (the `cl=1` tag #22 waited for was never built; the leg's own ALPN is the
+                // signal) -- and the direct arm only wins on a verified Noise_IK peer.
+                if let Some((park, claim)) = accept_race_for(accept_race, &relay, request) {
                     race_accept_against_relay(
                         ep,
                         accept_timeout,
@@ -244,6 +250,8 @@ where
                         &peer_noise,
                         local,
                         upgrade,
+                        park,
+                        claim,
                     )
                     .await?;
                     return Ok(());
@@ -755,6 +763,19 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
         cfg.relay_addr,
         if serve_loop { " — persistent serve: concurrent sessions (#200)" } else { "" }
     );
+    // ct-agent#295: the race default moved from off to adaptive -- name once what this
+    // acceptor does, from the same relay shape every session will build.
+    if cfg.role == ChannelRole::Accept && !cfg.relay_only {
+        let relay_shape = match &front_door_cert {
+            Some(edge_cert) => RelayFallback::Ladder {
+                rungs: &relay_ladder,
+                edge_cert: edge_cert.clone(),
+                direct_timeout: DIRECT_DIAL_TIMEOUT,
+            },
+            None => RelayFallback::QuicLazy(cfg.relay_addr),
+        };
+        eprintln!("ct-agent channel: accept-vs-relay race: {} (#295)", cfg.accept_race.startup_note(&relay_shape));
+    }
     if !serve_loop {
         // ct-agent#47: a persistent --call-service session (the default under
         // CT_CHANNEL_CALL_PERSISTENT) gets its own internal redial loop unless the operator
