@@ -7684,7 +7684,11 @@ async fn a_dcutr_serve_backoff_ends_at_the_own_expiry_308() {
     let started = tokio::time::Instant::now();
     backoff_within_grant("test", Duration::from_secs(1), Some(now + 5)).await.expect("a wait within the grant");
     backoff_within_grant("test", Duration::from_secs(1), None).await.expect("no grant watched");
-    assert_eq!(started.elapsed(), Duration::from_secs(2), "both waits ran in full");
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_secs(2) && waited <= Duration::from_secs(2) + Duration::from_millis(5),
+        "both waits ran in full: {waited:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]

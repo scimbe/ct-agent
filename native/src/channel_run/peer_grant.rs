@@ -1214,16 +1214,25 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_expiry_timer_fires_at_the_expiry_not_up_to_a_second_later_308() {
         let expires_at = crate::codec::now_unix() + 2;
-        let timer = grant_expiry_timer(expires_at);
+        let until_expiry = || {
+            (std::time::UNIX_EPOCH + Duration::from_secs(expires_at))
+                .duration_since(std::time::SystemTime::now())
+                .unwrap_or_default()
+        };
+        // The timer reads the wall clock between these two readings (the paused test clock does
+        // not move meanwhile, the wall clock does), so its sleep lies between them.
+        let before = until_expiry();
         let armed = tokio::time::Instant::now();
-        let left = (std::time::UNIX_EPOCH + Duration::from_secs(expires_at))
-            .duration_since(std::time::SystemTime::now())
-            .unwrap_or_default();
+        let timer = grant_expiry_timer(expires_at);
+        let after = until_expiry();
         timer.await;
         let waited = armed.elapsed();
+        assert!(waited >= after, "fired {waited:?} after arming, before the expiry ({after:?} away)");
         // The timer wheel rounds a sleep up to the next millisecond.
-        assert!(waited >= left, "fired {waited:?} after arming, before the expiry {left:?} away");
-        assert!(waited <= left + Duration::from_millis(2), "fired {waited:?} after arming, the expiry was {left:?} away");
+        assert!(
+            waited <= before + Duration::from_millis(2),
+            "fired {waited:?} after arming, the expiry was at most {before:?} away"
+        );
     }
 
     /// ct-agent#308: the session timer runs to the EARLIER of the two expiries; the record says
