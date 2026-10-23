@@ -6,8 +6,8 @@
 //! are the wire-outcome vocabulary the serve loop routes on; the backoff constants and
 //! pure functions are the policy for HOW each class retries. Keeping them in one module
 //! makes the contract reviewable at a glance: refusals back off exponentially, park
-//! expiries re-park immediately, flaps back off on a shorter cap, transients retry fast
-//! once and then back off on the same shorter cap.
+//! expiries re-park after a short jittered pause, flaps back off on a shorter cap,
+//! transients retry fast once and then back off on the same shorter cap.
 
 use super::BoxError;
 
@@ -334,6 +334,15 @@ pub(crate) fn is_park_expired(e: &BoxError) -> bool {
         return true;
     }
     crate::channel::error_names_park_expiry(e.as_ref())
+}
+
+/// #21: the pause before re-parking after a park expiry, uniformly in `[base/2, 2.5 * base]`
+/// -- 100-500 ms for the production 200 ms `retry_backoff`. It was a flat `base`, so the parks
+/// one reaper sweep ended (all of a fleet's after an edge restart) came back in the same
+/// instant, every time; the spread de-phases them. The floor stays a tight-loop guard against an
+/// edge that reaps at once. Pure: the caller supplies `rand01`, as for [`equal_jitter`].
+pub(crate) fn ex_repark_delay(base: std::time::Duration, rand01: f64) -> std::time::Duration {
+    base / 2 + base.mul_f64(2.0 * rand01.clamp(0.0, 1.0))
 }
 
 /// #22: a `:443` relay leg that found no partner within its own bound

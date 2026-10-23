@@ -163,6 +163,14 @@ pub(crate) fn reject_refused_outcome(outcome: ChannelJoinOutcome) -> Result<Chan
     }
 }
 
+/// #21: the serve loop's park-expiry line -- the error's text unchanged as its prefix (the #21
+/// measurement greps for it) plus how long the park was held, from the start of the admission to
+/// the `EX`. That is about the lease the edge gave the park, now readable from client logs: 30 s
+/// base, longer for a persistent acceptor on an edge with adaptive park leases.
+pub(crate) fn park_expired_line(e: &BoxError, held: std::time::Duration) -> String {
+    format!("{e} (held {:.1}s)", held.as_secs_f64())
+}
+
 /// #200: run one already-admitted peer's session to completion — the SPAWNED part of the serve loop.
 /// Rebuilds the relay fallback + a fresh local app stream and clones the shared direct listener, then
 /// runs the session exactly as [`run_one_admission_session`] does. A fresh `channel_local()` per
@@ -356,6 +364,35 @@ pub(crate) fn record_flap_outcome(counter: &std::sync::atomic::AtomicU32, flappe
     }
 }
 
+/// #200: the serve loop's capacity line. With every serve slot busy the loop does not park
+/// (backpressure, by design), so the member is unreachable for new peers until a session ends
+/// -- and that used to happen without a word. Reported once when such an episode starts and once
+/// when it ends, never per iteration. Pure: the loop feeds it the semaphore's state.
+#[derive(Debug, Default)]
+pub(crate) struct SaturationLog {
+    logged: bool,
+}
+
+impl SaturationLog {
+    /// Before waiting for a slot: the line to print when all `slots` are busy and this episode
+    /// has not been reported yet.
+    pub(crate) fn before_acquire(&mut self, available: usize, slots: usize) -> Option<String> {
+        if available > 0 || self.logged {
+            return None;
+        }
+        self.logged = true;
+        Some(format!("ct-agent channel: all {slots} serve slots busy -- not parking until a session ends (#200)"))
+    }
+
+    /// After a slot was acquired: the line that ends a reported episode.
+    pub(crate) fn after_acquire(&mut self) -> Option<&'static str> {
+        if !std::mem::take(&mut self.logged) {
+            return None;
+        }
+        Some("ct-agent channel: a serve slot is free again -- parking (#200)")
+    }
+}
+
 /// #200: drive a persistent serve member as CONCURRENT sessions. `admit` parks at the broker and
 /// returns the next paired peer's session work `W` (called sequentially — only one admission is ever
 /// in flight); `serve` runs a session to completion and is SPAWNED, so the loop returns to `admit`
@@ -397,13 +434,21 @@ where
     // dies within FLAPPING_SESSION_THRESHOLD of being admitted; reset by any session that
     // either succeeds or simply lives long enough to not look like a flap.
     let consecutive_flaps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut saturation = SaturationLog::default();
     loop {
+        // #200: at capacity the loop waits here instead of parking -- say so, once per episode.
+        if let Some(line) = saturation.before_acquire(sem.available_permits(), max.max(1)) {
+            eprintln!("{line}");
+        }
         // `sem` is local and never closed, so `acquire_owned` cannot fail; if it ever
         // did, ending the loop with an error is the right answer, not a panic
         // (ct-agent#176).
         let Ok(permit) = sem.clone().acquire_owned().await else {
             return Err("serve concurrency semaphore closed".into());
         };
+        if let Some(line) = saturation.after_acquire() {
+            eprintln!("{line}");
+        }
         // #250: back off BEFORE the next admit if the last several sessions all died
         // near-instantly -- otherwise a flapping peer re-pairs and dies again at native RTT
         // speed forever, with no gap for the underlying interference (if transient) to clear
@@ -421,6 +466,8 @@ where
             );
             tokio::time::sleep(backoff).await;
         }
+        // #21: the park-expiry line below reports how long this admission's park was held.
+        let admit_started = tokio::time::Instant::now();
         // ct-agent#64: admit() is run inside its own spawned task (joined immediately below,
         // so this is NOT concurrency -- purely panic isolation). serve() has been isolated via
         // tokio::spawn since #200 ("A serve error is a single peer's problem, logged and
@@ -470,15 +517,17 @@ where
                 // #21: a park expiry re-parks IMMEDIATELY on the same transport -- it is neither
                 // a refusal (never counts toward the #231 backoff) nor a failure worth the
                 // generic "admission error" log line (the named line below is the field-visible
-                // contract the #21 measurement greps for). The single fast `retry_backoff` sleep
-                // (200ms in production) is only a tight-loop guard against a misbehaving edge
-                // that reaps instantly; a healthy edge parks for the full TTL between expiries.
+                // contract the #21 measurement greps for; its held-time suffix shows the lease).
+                // The short sleep ([`ex_repark_delay`], 100-500 ms in production) is a tight-loop
+                // guard against a misbehaving edge that reaps instantly, jittered so the parks one
+                // sweep ended do not all return in the same instant; a healthy edge parks for the
+                // full lease between expiries.
                 if is_park_expired(&e) {
                     consecutive_refusals = 0;
                     consecutive_handshake_eofs = 0;
                     consecutive_transients = 0;
-                    eprintln!("ct-agent channel: {e}");
-                    tokio::time::sleep(retry_backoff).await;
+                    eprintln!("ct-agent channel: {}", park_expired_line(&e, admit_started.elapsed()));
+                    tokio::time::sleep(ex_repark_delay(retry_backoff, rand::random::<f64>())).await;
                     continue;
                 }
                 // #40 (CADS-Tunnel#335): checked before refusal classification -- a

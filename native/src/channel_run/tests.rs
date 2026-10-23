@@ -3474,6 +3474,96 @@ async fn serve_loop_backs_off_repeated_connection_refused_then_recovers_200() {
 }
 
 #[test]
+fn ex_repark_delay_stays_between_half_and_two_and_a_half_times_the_base_21() {
+    // #21: the re-park after a park expiry is spread over [b/2, 2.5 b] -- 100-500 ms for the
+    // production 200 ms -- instead of a flat b, so the parks one reaper sweep ended do not all
+    // come back in the same instant. The floor stays a tight-loop guard.
+    let b = Duration::from_millis(200);
+    assert_eq!(ex_repark_delay(b, 0.0), Duration::from_millis(100), "rand01 = 0: half the base");
+    assert_eq!(ex_repark_delay(b, 1.0), Duration::from_millis(500), "rand01 = 1: 2.5 times the base");
+    assert_eq!(ex_repark_delay(b, 0.25), b, "the old flat delay is one point of the range");
+    assert_eq!(ex_repark_delay(b, -1.0), Duration::from_millis(100), "clamped below");
+    assert_eq!(ex_repark_delay(b, 7.0), Duration::from_millis(500), "clamped above");
+    for _ in 0..1000 {
+        let d = ex_repark_delay(b, rand::random::<f64>());
+        assert!(d >= b / 2 && d <= b * 5 / 2, "{d:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn serve_loop_jitters_the_re_park_after_a_park_expiry_21() {
+    // #21: three park expiries in a row. Every re-park waits within [100 ms, 500 ms], and not
+    // the old flat 200 ms each time.
+    use std::sync::{Arc, Mutex};
+    let calls: Arc<Mutex<Vec<tokio::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    let c = calls.clone();
+    let admit = move || {
+        let n = {
+            let mut calls = c.lock().unwrap();
+            calls.push(tokio::time::Instant::now());
+            calls.len()
+        };
+        async move {
+            if n <= 3 {
+                Err::<(), BoxError>(ParkExpired::boxed(
+                    "channel park expired with no partner within the edge park window (#21) -- re-parking",
+                ))
+            } else {
+                std::future::pending().await // the fourth park stays
+            }
+        }
+    };
+    let serve = |_: ()| async { Ok::<(), BoxError>(()) };
+    let driver = tokio::spawn(serve_loop_concurrent(1, Duration::from_millis(200), admit, serve));
+    // Paused clock: the runtime jumps from timer to timer.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    driver.abort();
+
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 4, "three expiries, then the fourth park");
+    let gaps: Vec<Duration> = calls.windows(2).map(|w| w[1] - w[0]).collect();
+    for g in &gaps {
+        assert!(
+            *g >= Duration::from_millis(100) && *g <= Duration::from_millis(500),
+            "every re-park within [100, 500] ms: {gaps:?}"
+        );
+    }
+    assert!(gaps.iter().any(|g| *g != Duration::from_millis(200)), "jittered, not the old flat 200 ms: {gaps:?}");
+}
+
+#[test]
+fn park_expired_line_keeps_the_grep_prefix_and_appends_the_held_time_21() {
+    // #21: the serve loop's park-expiry line is a grep contract (the field measurement counts
+    // it). The held time is APPENDED, so the prefix stays byte-identical, and the line now shows
+    // the lease the edge gave the park.
+    const PREFIX: &str = "channel park expired with no partner within the edge park window (#21) -- re-parking";
+    let e = reject_refused_outcome(ChannelJoinOutcome::ParkExpired).expect_err("an EX is an error to the serve loop");
+    assert_eq!(e.to_string(), PREFIX, "the frozen text itself is unchanged");
+    let line = park_expired_line(&e, Duration::from_millis(600_400));
+    assert!(line.starts_with(PREFIX), "grep prefix unchanged: {line}");
+    assert_eq!(line, format!("{PREFIX} (held 600.4s)"));
+    assert_eq!(park_expired_line(&e, Duration::from_millis(30_040)), format!("{PREFIX} (held 30.0s)"));
+}
+
+#[test]
+fn serve_slot_saturation_is_logged_once_per_episode_200() {
+    // #200: with every serve slot busy the loop stops parking (backpressure) -- it used to do so
+    // without a word. One line when an episode starts, one when it ends, nothing in between.
+    let mut log = SaturationLog::default();
+    assert_eq!(log.before_acquire(3, 8), None, "free slots: nothing to say");
+    assert_eq!(log.after_acquire(), None, "no episode to end");
+    assert_eq!(
+        log.before_acquire(0, 8).as_deref(),
+        Some("ct-agent channel: all 8 serve slots busy -- not parking until a session ends (#200)")
+    );
+    assert_eq!(log.before_acquire(0, 8), None, "the same episode is reported once");
+    assert_eq!(log.after_acquire(), Some("ct-agent channel: a serve slot is free again -- parking (#200)"));
+    assert_eq!(log.after_acquire(), None, "its end is reported once");
+    assert_eq!(log.before_acquire(1, 8), None);
+    assert!(log.before_acquire(0, 8).is_some(), "the next episode is reported again");
+}
+
+#[test]
 fn is_flapping_session_only_flags_a_short_errored_session_250() {
     // #250: the classifier's whole job is telling "pair, then die near-instantly" (flap)
     // apart from every other outcome -- success, a fast-but-real session, or a slow failure.
