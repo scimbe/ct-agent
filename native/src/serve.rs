@@ -1250,7 +1250,18 @@ pub const REVOCATION_LOG_RESTORED: &str = "ct-agent: this tunnel's routing token
 /// (edge restart, network loss, agent restart). A TLS-TCP fallback registration
 /// is a parked one-shot that the revoke drops (read, not measured), so that path
 /// re-registers and flips after [`AMBIGUOUS_REFUSALS_BEFORE_REVOKED`] refusals.
-/// Closing the gap needs the Edge to close the agent connection on revoke.
+///
+/// Two more limits (#291 review). The flag is read once per handshake, in
+/// [`DirectTokenPolicy::decide`]: a direct session admitted before it sets runs
+/// on until the client or the Origin ends it (measured for #291: still carried
+/// 12 s after the flip, while a new handshake with the same token was refused).
+/// And it starts clear in every process: [`run_agent`] serves the direct listener
+/// before the first registration verdict, and a transient failure never sets it,
+/// so a restarted agent serves a revoked token's direct clients until that
+/// verdict -- and for as long as it cannot reach the Edge, which the direct path
+/// is built not to depend on. Closing the revoke gap takes both halves: the Edge
+/// closing the agent connection on revoke, and this agent closing its open direct
+/// sessions when the flag sets.
 #[derive(Debug, Default)]
 pub struct RevocationView {
     revoked: AtomicBool,
