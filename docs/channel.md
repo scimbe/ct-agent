@@ -241,14 +241,35 @@ time. `CT_CHANNEL_DELIVERY_ACK=0` turns it off. The `channel_session` events car
   directions on one).
 - `ok=true` and exit status 0 then mean that both directions were confirmed with matching byte
   counts, and the close event carries `confirmed_sent`/`confirmed_received`. Anything less ends
-  with `ok=false`, a line `ct-agent channel: delivery not confirmed: ... (#299)` (or "the peer
-  ended the session early: ...") that names what is missing, and a non-zero exit in pipe mode. A
-  forward or serve session that ends this way is retried like any other failed session.
-- The wait for the peer's confirmation is bounded by progress: 60 s without a single record from
-  the peer after this side's FIN. A consumer behind the peer that stalls for longer than that
-  ends the session with `ok=false` although nothing was lost.
+  with `ok=false`, a non-zero exit in pipe mode, and a line `ct-agent channel: ... (#299)` that
+  names what is missing: `delivery not confirmed: ...` (this side's bytes lack the peer's
+  confirmation), `the peer's stream is incomplete: ...; our N bytes were confirmed` (the peer's
+  direction never ended), `session cut: ...` (the transport ended while a direction was still
+  open), or `the peer ended the session early: ...`. A forward or serve session that ends this
+  way is retried like any other failed session.
+- **Transport loss is now visible.** A session whose transport ends while a direction is still
+  open -- a forward or serve session cut by a peer restart, an edge restart or a network drop, or
+  a member stopped with Ctrl-C -- ends with `ok=false` (`session cut: ...`) where a legacy session
+  said `ok=true`. That is the normal end of a forward session; nothing was necessarily lost, v2
+  just cannot confirm a direction that never ended. A member that only receives should end its
+  input (`</dev/null`, or Ctrl-D on a terminal) instead of being stopped: then both members end
+  with `ok=true` and exit status 0.
+- **Exit status in pipe mode** (release note): a peer that is stopped or cut before its input
+  ends, a peer that confirms nothing within the bound below, and a relay that cuts the stream now
+  give exit status 1, where a legacy session gave 0.
+- The wait for the peer's confirmation is bounded by progress: it fails after 60 s without a
+  single record from the peer after this side's FIN. A peer that is still delivering this side's
+  bytes into a slow consumer reports its progress (every 15 s while it grows), so only a consumer
+  that stops taking data -- or takes less than one 16 KiB record in about 45 s -- ends the session
+  with `ok=false`. What it had not taken is reported as unconfirmed, not necessarily lost.
 - When the peer-grant check ends a session, the FIN says why, and the peer reports it, e.g. "the
-  peer ended the session early: the peer's own channel grant expired".
+  peer ended the session early: the peer's own channel grant expired". The reason is the peer's
+  own word: it is logged, and no authorization or exit decision rests on it.
+- A persistent `--call-service` client lets its session end with that FIN after stdin's
+  end-of-file (at most 10 s) instead of dropping it, so the serving member records a clean end.
+- The records travel inside the end-to-end Noise session; the edge learns no content from them.
+  It can tell a v2 session by size, though (the handshake is 6 bytes longer, and the end records
+  are small fixed-size frames).
 - Confirmed means "written and flushed into the peer agent's local side" (its stdout, the
   forward engine), not "processed by the application behind it". Only the application protocol
   can confirm that.

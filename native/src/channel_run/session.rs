@@ -391,8 +391,9 @@ where
     if let (Err(e), true) = (&pumped, caps.delivery_ack()) {
         eprintln!("ct-agent channel: {e} (#299)");
     }
-    // A failed v2 session has nothing left to deliver; only its abort record still has to leave
-    // before the process may exit, which a short drain covers.
+    // A failed v2 session is over: the transport ended, the peer ended it, or the peer made no
+    // progress on our bytes for FIN_ACK_IDLE. Only an abort record may still have to leave before
+    // the process may exit, which a short drain covers (see FAILED_DELIVERY_DRAIN).
     let drain = if pumped.is_err() && caps.delivery_ack() { FAILED_DELIVERY_DRAIN } else { RELAY_DRAIN_TIMEOUT };
     graceful_stream_drain(&mut send, &mut recv, drain).await;
     eprintln!("{}", traffic_status_line());

@@ -261,9 +261,11 @@ struct GrantLifetime {
     /// ct-agent#267: the caller's record of that end, when the session runs inside
     /// [`with_grant_end_record`].
     record: Option<GrantEndRecord>,
-    /// This member's own grant expiry, to tell whose grant ran out when the timer (armed with
-    /// the earlier of the two) fires -- the FIN reason of a v2 session (#299).
+    /// The two expiries the timer above is armed from (unix seconds): this member's own, known
+    /// when the gate is built, and the peer's, once its grant verified. They say whose grant ran
+    /// out when the timer fires -- the FIN reason of a v2 session (#299).
     own_expires_at: Option<u64>,
+    peer_expires_at: Option<u64>,
 }
 
 impl GrantLifetime {
@@ -287,12 +289,7 @@ impl GrantLifetime {
             None => false,
         };
         if expired {
-            // #299: the timer runs to the EARLIER of the two expiries once the peer's grant is
-            // verified; at most a second off either way, so a second of slack decides "ours".
-            let own = self
-                .own_expires_at
-                .is_some_and(|at| crate::codec::now_unix().saturating_add(1) >= at);
-            let cause = if own { FinReason::OwnGrantExpired } else { FinReason::PeerGrantEnded };
+            let cause = self.expired_cause();
             return self.end("the channel grant expired".to_string(), cause);
         }
         let watched = match self.watch.as_mut() {
@@ -323,6 +320,20 @@ impl GrantLifetime {
                 false
             }
             Poll::Pending => false,
+        }
+    }
+
+    /// #299: whose grant ran out when the expiry timer fired, for the FIN reason. Decided from the
+    /// two expiries the timer was armed from, not from the clock at firing time: the timer may
+    /// fire up to a second early, and after this side's FIN the gate is only polled when the
+    /// peer's data arrives, so the clock blurred a peer grant that ended a second (or a while)
+    /// before ours (review). A tie is this member's own end -- its grant is over either way. The
+    /// same rule as the grant-end record of ct-agent#308.
+    fn expired_cause(&self) -> FinReason {
+        match (self.own_expires_at, self.peer_expires_at) {
+            (Some(own), Some(peer)) if peer < own => FinReason::PeerGrantEnded,
+            (None, Some(_)) => FinReason::PeerGrantEnded,
+            _ => FinReason::OwnGrantExpired,
         }
     }
 
@@ -410,6 +421,7 @@ impl<P> PeerGrantGate<P> {
                 ended: None,
                 record: GRANT_END_RECORD.try_with(GrantEndRecord::clone).ok(),
                 own_expires_at,
+                peer_expires_at: None,
             },
             revoker: Some(GrantRevokeHandle(revoker)),
         }
@@ -528,6 +540,7 @@ impl<P: AsyncWrite + Unpin> AsyncWrite for PeerGrantGate<P> {
                                 .expires_at
                                 .min(peer.grant.expires_at);
                             this.life.expiry = Some(GrantLifetime::timer(ends_at));
+                            this.life.peer_expires_at = Some(peer.grant.expires_at);
                             if let Some(plan) = &g.check.watch {
                                 let (tx, rx) = oneshot::channel();
                                 this.life.watch = Some(rx);
@@ -994,6 +1007,38 @@ mod tests {
         assert!(a_res.is_err(), "the refusing side ends with an error too");
     }
 
+    #[tokio::test]
+    async fn the_earlier_of_the_two_expiries_names_whose_grant_ran_out_299() {
+        // #299 review: the FIN reason of an expiry follows the two expiries the timer was armed
+        // from, not the clock when it fires. The first case is the reviewer's counterexample: the
+        // peer's grant ends a second before ours, and "now + 1 >= own expiry" called that ours.
+        use super::super::delivery::{with_session_end_cause, SessionEndCause};
+        let now = crate::codec::now_unix();
+        for (own, peer, want) in [
+            (now + 1, Some(now), FinReason::PeerGrantEnded),
+            (now, Some(now + 1), FinReason::OwnGrantExpired),
+            (now, Some(now), FinReason::OwnGrantExpired), // a tie is ours: over either way
+            (now, None, FinReason::OwnGrantExpired),      // the peer's grant not verified yet
+        ] {
+            let mut life = GrantLifetime {
+                expiry: Some(Box::pin(tokio::time::sleep(Duration::ZERO))),
+                revoke: None,
+                watch: None,
+                ended: None,
+                record: None,
+                own_expires_at: Some(own),
+                peer_expires_at: peer,
+            };
+            let cause = SessionEndCause::default();
+            with_session_end_cause(
+                cause.clone(),
+                std::future::poll_fn(|cx| if life.poll_ended(cx) { Poll::Ready(()) } else { Poll::Pending }),
+            )
+            .await;
+            assert_eq!(cause.get(), Some(want), "own {own}, peer {peer:?}");
+        }
+    }
+
     /// The grant's expiry ends the session it authorized,
     /// and closes the local side with it -- the mechanism the forward engines' teardown rests on
     /// (`channel_run::tests` proves the end-to-end effect on real forwarded TCP streams).
@@ -1220,8 +1265,15 @@ mod tests {
     #[tokio::test]
     async fn a_dead_watch_task_ends_the_session_loudly() {
         let (tx, rx) = oneshot::channel::<String>();
-        let mut life =
-            GrantLifetime { expiry: None, revoke: None, watch: Some(rx), ended: None, record: None, own_expires_at: None };
+        let mut life = GrantLifetime {
+            expiry: None,
+            revoke: None,
+            watch: Some(rx),
+            ended: None,
+            record: None,
+            own_expires_at: None,
+            peer_expires_at: None,
+        };
         drop(tx);
         let ended = std::future::poll_fn(|cx| Poll::Ready(life.poll_ended(cx))).await;
         assert!(ended);

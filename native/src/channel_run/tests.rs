@@ -5400,7 +5400,123 @@ async fn delivery_ack_v2_detects_a_clean_eof_injected_by_the_relay_299() {
     assert_eq!(a_err.kind(), io::ErrorKind::UnexpectedEof, "{a_err}");
     assert!(a_err.to_string().contains("end of the peer's stream"), "{a_err}");
     let b_err = b_res.expect_err("B's bytes were never confirmed, so B must not succeed either");
-    assert!(b_err.to_string().contains("confirmation"), "{b_err}");
+    assert!(
+        matches!(
+            ct_common::delivery::delivery_error(&b_err),
+            Some(ct_common::delivery::DeliveryError::TransportEnded { confirmed: false, .. })
+        ),
+        "B names its unconfirmed bytes: {b_err}"
+    );
+}
+
+#[tokio::test]
+async fn persistent_call_loop_ends_the_serve_side_ok_under_delivery_ack_299() {
+    // #299 review: the default persistent `--call-service` client (the #47 reconnect loop)
+    // against a persistent serve peer, both on the real session runner, so protocol v2 is
+    // negotiated. One call is answered, then stdin hits EOF. The loop used to drop the session
+    // right there, before it could send its FIN: the serving member's v2 pump then saw the
+    // transport end mid-protocol and reported `ok=false` for a perfectly normal call session --
+    // and a #250 flap when it was short. The serve side must end Ok.
+    use ct_common::channel::ServiceType;
+    let (kc, ks) = (generate_static_keypair(), generate_static_keypair());
+    let (c_priv, c_pub, s_priv, s_pub) = (kc.private, kc.public, ks.private, ks.public);
+    let (c_t, s_t) = tokio::io::duplex(64 * 1024);
+    let mut reg = ct_common::mcp::default_registry();
+    ct_common::mcp::register_service_tools(&mut reg, &[ServiceType::TextGeneration], |_svc, input| {
+        Ok(format!("{{\"echoed\":\"{input}\"}}"))
+    });
+    let reg = std::sync::Arc::new(reg);
+    let serve_peer = serve_local(move |req: Vec<u8>| {
+        let reg = reg.clone();
+        async move { reg.dispatch(&req) }
+    });
+    let serve = tokio::spawn(async move {
+        let (r, w) = tokio::io::split(s_t);
+        run_channel_session_on_stream(w, r, ChannelRole::Accept, &s_priv, &c_pub, serve_peer).await
+    });
+    let transport = std::sync::Arc::new(std::sync::Mutex::new(Some(c_t)));
+    let admit = {
+        let transport = transport.clone();
+        move |local: ChannelLocal| {
+            let t = transport.lock().ok().and_then(|mut slot| slot.take());
+            async move {
+                let Some(t) = t else {
+                    return Err::<(), BoxError>("this test admits exactly one session".into());
+                };
+                let (r, w) = tokio::io::split(t);
+                run_channel_session_on_stream(w, r, ChannelRole::Initiate, &c_priv, &s_pub, local)
+                    .await
+                    .map_err(Into::into)
+            }
+        }
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (out_write, mut out_read) = tokio::io::duplex(1 << 16);
+    tx.send("a matrix theme".to_string()).await.unwrap();
+    drop(tx); // stdin EOF once the one line is answered
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        run_persistent_call_reconnect_loop_over("text_generation".to_string(), true, admit, &mut rx, out_write),
+    )
+    .await
+    .expect("the client ends after its stdin's end, bounded")
+    .expect("clean stdin EOF");
+    let mut out = Vec::new();
+    out_read.read_to_end(&mut out).await.unwrap();
+    let out = String::from_utf8_lossy(&out).to_string();
+    assert!(out.contains("\"ok\":true") && out.contains("a matrix theme"), "the call was answered: {out}");
+    let serve_res = tokio::time::timeout(Duration::from_secs(10), serve)
+        .await
+        .expect("the serve side's session ends")
+        .expect("serve task");
+    serve_res.expect("the serving member's session of a completed call session ends Ok, not as a cut");
+}
+
+#[tokio::test]
+async fn a_sender_whose_bytes_were_confirmed_is_not_told_they_were_not_when_the_peer_is_stopped_299() {
+    // #299 review, the quickstart flow: A (accept) keeps stdin on a terminal, B pipes one line
+    // and ends. A receives and confirms the line; then A is stopped with Ctrl-C (its session task
+    // aborted) while its own direction is still open. B's session fails -- A's stream never
+    // ended -- but B's own bytes WERE confirmed, and the message must say so instead of
+    // "delivery not confirmed".
+    use ct_common::delivery::{delivery_error, DeliveryError};
+    let (ka, kb) = (generate_static_keypair(), generate_static_keypair());
+    let (a_priv, a_pub, b_priv, b_pub) = (ka.private, ka.public, kb.private, kb.public);
+    let (a_t, b_t) = tokio::io::duplex(64 * 1024);
+    let (a_local, a_app) = tokio::io::duplex(64 * 1024);
+    let (b_local, b_app) = tokio::io::duplex(64 * 1024);
+    let a = tokio::spawn(async move {
+        let (r, w) = tokio::io::split(a_t);
+        run_channel_session_on_stream(w, r, ChannelRole::Accept, &a_priv, &b_pub, a_local).await
+    });
+    let b = tokio::spawn(async move {
+        let (r, w) = tokio::io::split(b_t);
+        run_channel_session_on_stream(w, r, ChannelRole::Initiate, &b_priv, &a_pub, b_local).await
+    });
+    let (mut a_r, _a_input_stays_open) = tokio::io::split(a_app);
+    let (_b_r, mut b_w) = tokio::io::split(b_app);
+    b_w.write_all(b"hello from B\n").await.unwrap();
+    b_w.shutdown().await.unwrap();
+    // A's output ends only once A has taken B's end: its confirmation is on the way then.
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), a_r.read_to_end(&mut got))
+        .await
+        .expect("A delivers B's line and B's end")
+        .unwrap();
+    assert_eq!(got, b"hello from B\n");
+    tokio::time::sleep(Duration::from_millis(300)).await; // A's FIN_ACK reaches B
+    a.abort(); // Ctrl-C on A
+    let b_err = tokio::time::timeout(Duration::from_secs(10), b)
+        .await
+        .expect("B ends")
+        .expect("B's task")
+        .expect_err("A's stream never ended, so B's session did not complete");
+    assert!(
+        matches!(delivery_error(&b_err), Some(DeliveryError::TransportEnded { confirmed: true, peer_fin: false, .. })),
+        "B's own bytes were confirmed by A: {b_err}"
+    );
+    let msg = b_err.to_string();
+    assert!(!msg.contains("not confirmed") && msg.contains("our 13 bytes were confirmed"), "{msg}");
 }
 
 #[tokio::test(start_paused = true)]

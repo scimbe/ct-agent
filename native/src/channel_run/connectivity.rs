@@ -244,8 +244,9 @@ where
             let (listener, endpoint) = match (direct_listener, own_direct_endpoint) {
                 (Some(l), Some(e)) => (l, e),
                 // Relay-only initiator (no dialable direct address): run the plain relay session.
-                // #299: legacy on purpose -- the #104 path stays as it was; its responder runs the
-                // upgradable pump, which answers no capability offer anyway.
+                // #299: legacy on purpose, to leave the opt-in #104 path exactly as it was. An
+                // offer would be safe (an upgradable responder answers none, a plain acceptor
+                // would answer v2), but no v2 test covers this path yet.
                 _ => {
                     return run_channel_session_on_stream_with(
                         relay_send,

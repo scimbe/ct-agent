@@ -16,7 +16,8 @@
 //! * **Why a session ended:** when the peer-grant gate ends a session (a grant expired, the peer's
 //!   grant was revoked or refused) it records the cause in the task-local [`SessionEndCause`], and
 //!   the pump sends that cause as the FIN reason. The peer then reports "the peer's own grant
-//!   expired" instead of a bare cut.
+//!   expired" instead of a bare cut. A reason received is only the peer's word: it is logged and
+//!   nothing else -- no authorization or exit decision rests on it (that needs the control plane).
 //!
 //! [`run_channel_session_on_stream`]: super::run_channel_session_on_stream
 
@@ -49,8 +50,11 @@ pub(crate) fn delivery_offer_from(v: Option<&str>) -> SessionCaps {
 /// Every record from the peer restarts it (ct-common's progress-based bound).
 pub(crate) const FIN_ACK_IDLE: Duration = ct_common::delivery::DEFAULT_FIN_ACK_IDLE;
 
-/// The drain after a FAILED v2 session: there is nothing left to deliver, only the abort record
-/// to let out before the process may exit (#150), so the 30 s of a normal drain are not needed.
+/// The drain after a FAILED v2 session (#150 keeps the process alive until its tail has left). A
+/// v2 session fails when the transport already ended, when the peer ended it, or when the peer
+/// reported no progress on our bytes for [`FIN_ACK_IDLE`] -- a peer that is still delivering says
+/// so with PROGRESS records. None of these leaves a tail worth the 30 s of a normal drain, only an
+/// abort record to let out; what the peer did not take is reported as unconfirmed, not waited for.
 pub(crate) const FAILED_DELIVERY_DRAIN: Duration = Duration::from_secs(2);
 
 /// Why this member's side of a v2 session ended, when something other than its local input did
