@@ -327,6 +327,9 @@ where
             eprintln!("{}", traffic_status_line());
         }
     });
+    // Readiness (`/readyz`) and the shutdown drain count this session as established until the
+    // function returns, the #150 drain below included (health.rs).
+    let _established = super::health::HEALTH.session_established();
 
     // Reborrow the halves so they survive the pump: after the session ends we must drain before
     // returning (#150), because a caller may exit immediately (a single-shot `ct-agent channel` as a
