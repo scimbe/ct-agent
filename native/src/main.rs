@@ -990,7 +990,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if std::env::var("CT_CHANNEL_BROKER").map(|v| !v.is_empty()).unwrap_or(false) {
             let cfg = ct_agent::channel_run::ChannelJoinCliConfig::from_env()
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-            return ct_agent::channel_run::run_channel_join_command(cfg).await;
+            let ran = ct_agent::channel_run::run_channel_join_command(cfg).await;
+            // ct-agent#308: the forward initiator or the persistent serve loop stopped because
+            // this member's own grant ended. The grant is read once per process, so a restart
+            // with the same configuration cannot help: say so with a status of its own (77,
+            // EX_NOPERM) that a supervisor can tell from a crash.
+            if let Err(e) = &ran {
+                if ct_agent::channel_run::is_own_grant_end(e.as_ref()) {
+                    let status = ct_agent::channel_run::OWN_GRANT_ENDED_EXIT;
+                    eprintln!(
+                        "ct-agent channel: {e} -- this member's own channel grant ended; exiting with \
+                         status {status} (a restart with the same grant cannot help, #308)"
+                    );
+                    std::process::exit(status);
+                }
+            }
+            return ran;
         }
         let cfg = ct_agent::channel_run::ChannelRunConfig::from_env()
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
