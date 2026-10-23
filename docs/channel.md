@@ -97,7 +97,7 @@ Broker and relay each get a ladder: **direct QUIC** (`CT_CHANNEL_BROKER` :4435 /
 The edge currently runs **disjoint pairers** per transport class (QUIC relay, `:443`
 front door + WebSocket, QUIC rendezvous). Two members pair **only inside the same pairer** — a
 mixed-transport pair parks in two different rooms, never meets, and both sides are silently
-reaped after the ~30 s park TTL (client-visible as a bogus "edge relay refused the channel join"
+reaped after the 30 s base park lease (client-visible as a bogus "edge relay refused the channel join"
 ~32–41 s in). **Until #495 unifies the pairers: put both halves of a pairing on
 `CT_CHANNEL_FRONT_DOOR_ONLY=1`.** Your own first log line tells you which pairer you landed in:
 `plane-brokered Accept` = front door (correct for arena-style setups); `Accept via relay-gate` =
@@ -133,10 +133,10 @@ sequenceDiagram
     Note over A,E: v0.4.14: the 2-byte phase preamble rides only on<br/>KA-negotiated legs (0x01 rendezvous, 0x02 relay) —<br/>the edge then pairs marked parks phase-compatibly<br/>(unmarked = legacy mixed behavior)
     E->>A: 32-byte possession challenge
     A->>E: 64-byte signature — connection stays FULLY OPEN (v0.4.12: no half-close)
-    Note over E: A parks (TTL 30 s; pump monitors liveness,<br/>KA-negotiated legs get 1 NUL / 10 s)
-    alt no partner within TTL
+    Note over E: A parks for the lease the edge decides: 30 s base,<br/>up to its ceiling for a persistent acceptor on an adaptive edge<br/>(pump monitors liveness, KA-negotiated legs get 1 NUL / 10 s)
+    alt no partner within the lease
         E->>A: bare EX token + clean FIN (drained, no RST)
-        Note over A: ParkExpired → re-park SAME rung,<br/>no ladder advance, no backoff (#21)
+        Note over A: ParkExpired → the walk stops, no backoff (#21);<br/>re-park after 100–500 ms, restarting the ladder at rung 0
     else initiator arrives
         I->>E: join + challenge + signature (same protocol)
         E->>A: OK + peer identity (noise/holder/attestation)\n — newline-terminated, stream stays OPEN
@@ -178,9 +178,11 @@ picture first.
 
 - **`channel join admission exchange stalled (#140)`** — the 45 s admission-exchange bound
   expired. It is 45 s (not the pre-v0.4.8 15 s) because the edge only acks a pairing-path join
-  once the **partner** arrives, and holds a lone first member parked for a 30 s window; the
-  bound must outlast that window plus the partner's own ladder walk ([#140], live-pinned
-  2026-08-13). Since **v0.4.16** this line means what it says — no partner showed up.
+  once the **partner** arrives, and holds a lone first member parked for its lease (30 s base);
+  on a leg without keepalive the bound must outlast that lease plus the partner's own ladder
+  walk ([#140], live-pinned 2026-08-13). A keepalive leg waits for its ack under a 35 s
+  **per-read** bound instead, refreshed by the edge's 10 s ticks, so a longer lease never trips
+  it. Since **v0.4.16** this line means what it says — no partner showed up.
   **Before v0.4.16 it fired on every fresh `:443` pairing even with both partners present**:
   the rendezvous ack read was `take(512).read_to_end`, completing only at EOF/512 bytes,
   while the `:443` edge acks `OK …\n` and keeps the stream open for the splice — both fresh
@@ -203,12 +205,45 @@ picture first.
   at a flat 200 ms forever regardless of the error class — and a one-shot caller stops
   immediately on a definitive refusal; circuit-relay error lines now say `circuit-relay`
   (they printed `relay-gate` from a copied loop body).
-- **`channel park expired ... (#21) -- re-parking`** — the edge reaped an idle park and SAID so
-  (bare `EX` on stream legs, a named `park-expired:` close reason on QUIC). Not an error in any
-  operational sense: the member re-parks the same rung immediately, with no ladder advance and
-  no backoff. A healthy idle serve loop cycles this line every 30 s (the park TTL). Requires
-  v0.4.12 on NAT'd paths — v0.4.11 half-closed the parked leg after the possession signature,
-  which put the flow into the NAT's short FIN-WAIT timer and ate the `EX` on the way back.
+- **`channel park expired ... (#21) -- re-parking (held 30.2s)`** — the edge reaped an idle park
+  and SAID so (bare `EX` on stream legs, a named `park-expired:` close reason on QUIC). Not an
+  error in any operational sense: the ladder walk stops at the rung that parked, with no ladder
+  advance and no backoff, and the serve loop re-parks after a jittered 100–500 ms, so the parks
+  one edge sweep ended do not all return in the same instant. A re-park restarts the ladder at
+  rung 0. The edge decides the park lease: 30 s base, up to its ceiling for persistent acceptors
+  on adaptive edges (an edge in fixed mode gives a raised ceiling to every accept-capable
+  keepalive park, an edge that predates lease modes its raised `CT_EDGE_KA_PARK_TTL_SECS` to
+  every keepalive park). The `(held …)` suffix is how long this park was held, about its lease, so a
+  healthy idle serve loop cycles this line once per lease. Requires v0.4.12 on NAT'd paths —
+  v0.4.11 half-closed the parked leg after the possession signature, which put the flow into the
+  NAT's short FIN-WAIT timer and ate the `EX` on the way back.
+- **`no acceptor for channel … within 75s (attempt …, ct-agent#95) -- last error: the attempt
+  was still parked when the one-shot window closed`** — a one-shot initiator (pipe, `--call`)
+  gives up at its retry window (`CT_CHANNEL_INITIATE_RETRY_SECS`, default 75 s) even while a park
+  is still open, instead of waiting for the edge to end it (~115 s, or the edge's whole keepalive
+  park TTL where an operator raised it); the edge counts the dropped park as a corpse park
+  (#499). It starts no attempt that could only begin at the deadline, so after fast failures the
+  line names the last real error instead; a cut after earlier attempts adds `(previous attempt:
+  …)`, since an attempt started shortly before the deadline may still have been connecting.
+  Forward and persistent CALL initiators (`CT_CHANNEL_CALL_RECONNECT` on, the
+  default; off, a CALL runs one-shot) keep parking as long as the edge holds them: they want to
+  be paired the moment the acceptor parks.
+- **`relay leg found no partner within 45s -- closed it (CT_CHANNEL_RELAY_PAIR_SECS)`** — a `:443`
+  relay leg waits at most 45 s (settable within 35–300 s) for its partner, then closes the leg
+  with a TLS close_notify, which the edge reads as the park's death at once (a corpse park,
+  #499). Transient: the serve loop goes on with its next admission, forward and persistent CALL
+  loops reconnect, and a one-shot call ends with this error. QUIC relay legs keep their own 45 s
+  bound.
+- **`admission error, re-admitting (#200)`** — a transient admission failure (connection refused
+  while the edge restarts, a dropped leg, a stalled exchange). The serve loop retries the first
+  one after 100–200 ms and doubles the wait for each further one in a row, up to 10 s
+  (jittered); an admission, a park expiry, a refusal, a TLS-handshake EOF or a panicking
+  admission resets the streak, and a transient that ended an attempt of 10 s or more (a long
+  park) starts a new one.
+- **`all N serve slots busy -- not parking until a session ends (#200)`** — every serve slot
+  (`CT_CHANNEL_SERVE_CONCURRENCY`) holds a running session, so the member does not park and new
+  peers cannot reach it until one ends; `a serve slot is free again -- parking (#200)` ends the
+  episode. Each line is logged once per episode.
 - **`early eof`** right after pairing — historically ambiguous; the dominant cause (the splice
   ran against a **corpse park** left by a peer process that died while parked, retried on the
   edge's 10 s sweep grid → the N×10 s first-contact staircase) is fixed edge-side since #499
@@ -284,6 +319,8 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_CHANNEL_PEER_NOISE_KEY` / `CT_CHANNEL_PEER_CERT` | the peer's Noise public key (64 hex) and, for the initiator, its transport cert (hex DER) — direct-address mode only |
 | `CT_CHANNEL_CIRCUIT_RELAY` | libp2p Circuit-Relay v2 multiaddr for the DCUtR upgrade path (#136). Absent: no hole-punch is attempted at all |
 | `CT_CHANNEL_RELAY_DIRECT` | dial the relay at this `host:port` instead of the one the grant names — an operator override, not a fallback |
+| `CT_CHANNEL_INITIATE_RETRY_SECS` | initiator only: the admission retry window, default **75** s, 3 s between attempts (#95; `0`, empty or garbage keep 75). A one-shot caller (pipe, `--call`) gives up at the window even while parked or mid-attempt, so keep it well above one ladder walk (the direct QUIC rung alone may take 5 s); forward and persistent CALL initiators (`CT_CHANNEL_CALL_RECONNECT` on) check it only between attempts and stay parked as long as the edge holds them |
+| `CT_CHANNEL_RELAY_PAIR_SECS` | how long a `:443` relay leg waits for its partner before it closes the leg, default **45** s, clamped to 35–300 s (`0`, empty or garbage keep 45). QUIC relay legs keep their own 45 s bound |
 | `CT_CHANNEL_SERVE` / `CT_CHANNEL_SERVE_CONCURRENCY` | accept-side persistent serve, session cap (default 8) |
 | `CT_CHANNEL_DIRECT_UPGRADE=1` | opt-in in-band relay→direct upgrade (#104) |
 | `CT_CHANNEL_REQUIRE_PEER_GRANT` / `CT_CHANNEL_OPERATOR_PUBKEY` | **Opt-in end-to-end check of the peer's grant** (default off). Admission attests the peer's Noise key with the peer's holder key, but all of that comes from the broker; nothing binds the holder to an operator-signed grant, so a compromised broker could present an identity it minted itself. With `CT_CHANNEL_REQUIRE_PEER_GRANT=1` both members send their own grant as the first bytes inside the Noise session, and each checks the other's before any application byte flows: the signature against `CT_CHANNEL_OPERATOR_PUBKEY` (64 hex, required when on), expiry, same channel, holder = the attested peer holder, and the complementary direction. **Switch it on for every member of a channel together**: a member that sends the grant to one that does not expect it breaks that session. On but without an operator key, the join fails. |
