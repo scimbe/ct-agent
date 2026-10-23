@@ -93,6 +93,9 @@ pub async fn join_via_relay_gate_dcutr<P>(
     relay_gate_addr: SocketAddr,
     relay_gate_cert: CertificateDer<'static>,
     own_grant: &ct_common::channel::SignedChannelGrant,
+    // #292: CT_CHANNEL_PEER_PIN, checked right after the relay admission, before the relay stream
+    // and the gate dial.
+    peer_pin: Option<&PeerPin>,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
@@ -130,6 +133,11 @@ where
             return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
         }
     };
+    // #292: this admission IS the relay leg (see `join_via_relay_dcutr`): a refusal closes it at once.
+    if let Err(refused) = check_peer_pin(peer_pin, request, &peer_holder, &peer_noise) {
+        close_refused_relay_conn(relay_conn);
+        return Err(refused);
+    }
     let local = gate_local(local, request, role, peer_holder, holder)?;
     let (relay_send, relay_recv) = open_relay_channel_streams(relay_conn, role).await?;
     let (gate_stream, relay_peer) =
