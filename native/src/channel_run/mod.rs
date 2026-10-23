@@ -130,11 +130,14 @@ pub async fn run_channel_join_with_admission<P>(
     // listener RACES its accept window against the relay leg ([`race_accept_against_relay`])
     // instead of waiting the full `accept_timeout` before it even dials the relay -- off,
     // adaptive (the default: only a keepalive-monitored `:443` leg parks during the race), or on.
-    accept_race: AcceptRaceMode,
+    // `impl Into` (#295 review): a caller still passing the former `bool` keeps compiling --
+    // `false` is the serial order, `true` the #22 opt-in, exactly as before.
+    accept_race: impl Into<AcceptRaceMode>,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
 {
+    let accept_race: AcceptRaceMode = accept_race.into();
     let (peer_endpoint, peer_noise, observed_reflexive, peer_holder) = match admission {
         ChannelJoinOutcome::Admitted { peer_endpoint, peer_noise_pubkey, peer_holder, peer_attestation, observed_reflexive } => {
             let noise = peer_noise_pubkey

@@ -6519,6 +6519,56 @@ fn accept_race_mode_is_adaptive_unless_set_295() {
         assert_eq!(Off.race_policy_for(&relay), None, "=0: serial on every relay");
         assert_eq!(On.race_policy_for(&relay), Some(RaceParkPolicy::AnyLeg), "=1: every leg");
     }
+
+    // #295 review: the start-up hint for a QUIC-first acceptor must not suggest flipping
+    // CT_CHANNEL_FRONT_DOOR_ONLY on this member alone -- that moves it into the `:443` pairer,
+    // where a peer still on QUIC never meets it (docs/channel.md, "Pairing reality").
+    let hint = Auto.startup_note(&ladder(&quic_first));
+    assert!(hint.contains("BOTH members") && hint.contains("Pairing reality"), "{hint}");
+    // #295 review: the `bool` this parameter was keeps its meaning for library callers.
+    assert_eq!(AcceptRaceMode::from(false), Off, "false: the serial order, as before");
+    assert_eq!(AcceptRaceMode::from(true), On, "true: the #22 opt-in, as before");
+}
+
+#[tokio::test]
+async fn the_possession_proof_ends_where_the_relay_join_writes_its_signature_295() {
+    // #295 review: `finish_possession_proof` drives an abandoned admission exchange until
+    // `possession_proof_len` bytes are written. That count must be exactly what the pinned
+    // ct-common relay presenter writes up to and including its signature -- preamble, length,
+    // join, signature -- or a CADS pin bump that changes the layout would cut the proof short
+    // again (or hold the winning direct session for the whole bound). Pinned here against the
+    // real presenter and a minimal edge that reads the proof and then never acks.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let ch = RaceChannel295::new(0x0F, 0x4D);
+    for marker in [None, Some(crate::channel::PHASE_MARKER_RELAY)] {
+        let (client, edge) = tokio::io::duplex(4096);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let (mut edge_r, mut edge_w) = tokio::io::split(edge);
+        let written = AtomicUsize::new(0);
+        let edge_reads_the_proof = async {
+            let preamble = marker.map_or(0, |_| 2);
+            let mut head = vec![0u8; preamble + 2];
+            edge_r.read_exact(&mut head).await.expect("preamble and length");
+            let len = u16::from_be_bytes([head[preamble], head[preamble + 1]]) as usize;
+            let mut join = vec![0u8; len];
+            edge_r.read_exact(&mut join).await.expect("the join");
+            edge_w.write_all(&[0x5Au8; 32]).await.expect("the challenge");
+            let mut signature = [0u8; 64];
+            edge_r.read_exact(&mut signature).await.expect("the signature");
+            head.len() + join.len() + signature.len()
+        };
+        let presenting = async {
+            let mut counted = ProofProgress { inner: &mut client_w, written: &written };
+            let exchange =
+                present_channel_relay_join_on_stream(&mut counted, &mut client_r, &ch.req_b, &ch.holder_b, marker);
+            // No ack ever comes: the presenter waits for it once the proof is out.
+            let _ = tokio::time::timeout(Duration::from_millis(300), exchange).await;
+        };
+        let (read_by_edge, ()) = tokio::join!(edge_reads_the_proof, presenting);
+        let expected = possession_proof_len(&ch.req_b, marker);
+        assert_eq!(read_by_edge, expected, "the edge read exactly the proof ({marker:?})");
+        assert_eq!(written.load(Ordering::Relaxed), expected, "nothing is written past the signature before the ack ({marker:?})");
+    }
 }
 
 #[tokio::test]
@@ -6978,6 +7028,30 @@ enum RelaySaw295 {
     /// A member PRESENTED its join (the edge's authorize step ran for `holder`) -- before that, a
     /// held leg is only a connection.
     Join { holder: [u8; 32], at: std::time::Instant },
+    /// The edge's admission of one connection ended (parked, paired or refused); `holder` is the
+    /// member whose join it read, if any. `definitive_refusal` is what the production `:443`
+    /// listener charges to the client's per-IP refusal budget (`is_definitive_join_refusal`).
+    Admission { holder: Option<[u8; 32]>, definitive_refusal: bool },
+}
+
+/// The edge knobs of [`spawn_front_door_relay_with_295`].
+#[derive(Debug, Clone, Copy)]
+struct RelayOpts295 {
+    /// The edge negotiates the keepalive generation (`false`: a legacy edge, bare ids only).
+    ka: bool,
+    /// The first `drop_first` TCP connections are dropped before TLS (a transient failure).
+    drop_first: usize,
+    /// How long the edge's membership check takes once it has read a join -- its live control
+    /// plane round trip (#295 review).
+    authorize_delay: Duration,
+    /// The edge's deadline for a connection to submit its join and possession proof
+    /// (`CHANNEL_JOIN_TIMEOUT`, 15 s in production).
+    join_timeout: Duration,
+}
+
+impl RelayOpts295 {
+    /// A keepalive edge with an instant membership check and the production join deadline.
+    const KA: Self = Self { ka: true, drop_first: 0, authorize_delay: Duration::ZERO, join_timeout: Duration::from_secs(15) };
 }
 
 /// ct-agent#295: an in-process `:443` channel relay running the PINNED ct-edge's production
@@ -6996,11 +7070,26 @@ async fn spawn_front_door_relay_295(
     tokio::sync::mpsc::UnboundedReceiver<RelaySaw295>,
     tokio::task::JoinHandle<()>,
 ) {
+    spawn_front_door_relay_with_295(op_pub, RelayOpts295 { ka, drop_first, ..RelayOpts295::KA }).await
+}
+
+/// [`spawn_front_door_relay_295`] with every edge knob of [`RelayOpts295`].
+async fn spawn_front_door_relay_with_295(
+    op_pub: [u8; 32],
+    opts: RelayOpts295,
+) -> (
+    SocketAddr,
+    CertificateDer<'static>,
+    tokio::sync::mpsc::UnboundedReceiver<RelaySaw295>,
+    tokio::task::JoinHandle<()>,
+) {
     use ct_common::channel::ChannelId;
     use ct_edge::channel_broker::{
         admit_and_pair_on_boxed_stream, completion_for, finish_relay_pair_over_streams,
-        finish_rendezvous_pair_over_streams, new_shared_channel_pairer, BoxedChannelStream, StreamPairCompletion,
+        finish_rendezvous_pair_over_streams, is_definitive_join_refusal, new_shared_channel_pairer,
+        BoxedChannelStream, StreamPairCompletion,
     };
+    let RelayOpts295 { ka, drop_first, authorize_delay, join_timeout } = opts;
     crate::transport::install_crypto_provider();
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("edge cert");
     let cert = certified.cert.der().clone();
@@ -7038,9 +7127,21 @@ async fn spawn_front_door_relay_295(
                     Some(p) if p == b"ct-edge-channel-ka" || p == b"http/1.1"
                 );
                 let _ = saw.send(RelaySaw295::Tls { ka: keepalive, at: std::time::Instant::now() });
-                let authorize = move |_c: ChannelId, holder: [u8; 32]| {
-                    let _ = saw.send(RelaySaw295::Join { holder, at: std::time::Instant::now() });
-                    async move { Some((op_pub, None, None)) }
+                let presented = std::sync::Arc::new(std::sync::Mutex::new(None::<[u8; 32]>));
+                let authorize = {
+                    let (saw, presented) = (saw.clone(), presented.clone());
+                    move |_c: ChannelId, holder: [u8; 32]| {
+                        let _ = saw.send(RelaySaw295::Join { holder, at: std::time::Instant::now() });
+                        if let Ok(mut p) = presented.lock() {
+                            *p = Some(holder);
+                        }
+                        async move {
+                            if !authorize_delay.is_zero() {
+                                tokio::time::sleep(authorize_delay).await;
+                            }
+                            Some((op_pub, None, None))
+                        }
+                    }
                 };
                 let now = 500u64; // the grants expire at 1_000
                 let boxed: BoxedChannelStream = Box::pin(tls);
@@ -7048,7 +7149,7 @@ async fn spawn_front_door_relay_295(
                     boxed,
                     observed,
                     now,
-                    Duration::from_secs(15),
+                    join_timeout,
                     &authorize,
                     now + 600,
                     &pairer,
@@ -7056,6 +7157,9 @@ async fn spawn_front_door_relay_295(
                     keepalive,
                 )
                 .await;
+                let holder = presented.lock().ok().and_then(|p| *p);
+                let definitive_refusal = matches!(&paired, Err(e) if is_definitive_join_refusal(e));
+                let _ = saw.send(RelaySaw295::Admission { holder, definitive_refusal });
                 if let Ok(Some(((a, a_phase), (b, b_phase)))) = paired {
                     let _ = match completion_for(a_phase, b_phase) {
                         StreamPairCompletion::Splice => finish_relay_pair_over_streams(a, b, now).await,
@@ -7164,6 +7268,28 @@ async fn joined_at_295(
     })
     .await
     .expect("the member presents its join within the bound")
+}
+
+/// Wait until the relay's admission of `holder`'s join ended; returns whether it ended in a
+/// definitive refusal (#295 review).
+async fn admission_refused_definitively_295(
+    saw: &mut tokio::sync::mpsc::UnboundedReceiver<RelaySaw295>,
+    holder: [u8; 32],
+    within: Duration,
+) -> bool {
+    tokio::time::timeout(within, async {
+        loop {
+            match saw.recv().await {
+                Some(RelaySaw295::Admission { holder: Some(h), definitive_refusal }) if h == holder => {
+                    return definitive_refusal
+                }
+                Some(_) => continue,
+                None => panic!("the relay task ended"),
+            }
+        }
+    })
+    .await
+    .expect("the edge's admission of the member ends within the bound")
 }
 
 /// A writes, B reads; B answers, A reads -- both directions of one session.
@@ -7500,6 +7626,145 @@ async fn accept_race_a_keepalive_park_the_race_closed_is_never_paired_295() {
     )
     .await;
     assert!(c_parked.is_err(), "C stays parked: the corpse of B's leg must never pair (or fail) it");
+
+    drop((a_app, b_app));
+    a.abort();
+    b.abort();
+    relay.abort();
+}
+
+#[tokio::test]
+async fn accept_race_a_direct_win_mid_admission_finishes_the_possession_proof_295() {
+    // #295 review: the adaptive default presents a keepalive leg at once, so a direct win often
+    // lands while that leg is INSIDE its admission exchange -- join written, possession signature
+    // not yet (one edge round trip plus the edge's live membership check). Closing the leg there
+    // made the edge read EOF at the signature: a DEFINITIVE `[possession]` refusal for a
+    // legitimate member, which the production `:443` listener charges to the member's per-IP
+    // refusal budget (past it, every join from that address is shed for the rest of the
+    // minute). Here the edge's membership check takes 1 s and A's verified direct dial lands
+    // right after the edge read B's join: B must finish the proof before it closes, so the edge
+    // admits and parks the leg -- a park the close turns into a corpse that never pairs.
+    let ch = RaceChannel295::new(0x0F, 0x4A);
+    let opts = RelayOpts295 { authorize_delay: Duration::from_secs(1), ..RelayOpts295::KA };
+    let (relay_addr, relay_cert, mut saw, relay) = spawn_front_door_relay_with_295(ch.op_pub, opts).await;
+    let (listener, _cert) =
+        crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("B's listener");
+    let b_direct = listener.local_addr().expect("B's direct addr");
+    let (mut b_app, b_local) = tokio::io::duplex(8192);
+    let (b, decisions) = spawn_acceptor_295(
+        &ch,
+        (relay_addr, relay_cert.clone()),
+        listener,
+        Duration::from_secs(8),
+        AcceptRaceMode::Auto,
+        b_local,
+    );
+    let hb = ch.holder_b.verifying_key().to_bytes();
+    // The edge has read B's whole join and is checking membership: B's signature is not written.
+    joined_at_295(&mut saw, hb, Duration::from_secs(5)).await;
+
+    let (mut a_app, a_local) = tokio::io::duplex(8192);
+    let (na, nbpub) = (ch.noise_a.0, ch.noise_b.1);
+    let a = tokio::spawn(async move {
+        let conn = dial_peer_direct(b_direct, Duration::from_secs(5)).await.expect("A reaches B's listener");
+        run_channel_session(&conn, ChannelRole::Initiate, &na, &nbpub, a_local).await
+    });
+    ping_pong_295(&mut a_app, &mut b_app, Duration::from_secs(5)).await;
+    let decided = decisions.lock().unwrap().clone();
+    assert!(
+        matches!(decided.as_slice(), [("direct", ms)] if *ms < 1000),
+        "A's verified direct dial won while the edge was still checking B's membership: {decided:?}"
+    );
+    assert!(
+        !admission_refused_definitively_295(&mut saw, hb, Duration::from_secs(5)).await,
+        "the direct win must not make the edge record a definitive possession refusal for B"
+    );
+
+    // The proof B finished made a park; the close made it a corpse: C is never paired with it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let rungs = [ChannelDialRung { endpoint: relay_addr, kind: ChannelDialKind::FrontDoor }];
+    let c_parked = tokio::time::timeout(
+        Duration::from_millis(1500),
+        park_relay_leg(
+            RelayFallback::Ladder { rungs: &rungs, edge_cert: relay_cert, direct_timeout: Duration::from_millis(400) },
+            &ch.req_c,
+            &ch.holder_c,
+        ),
+    )
+    .await;
+    assert!(c_parked.is_err(), "C stays parked: the leg B finished and closed must never pair (or fail) it");
+
+    drop((a_app, b_app));
+    a.abort();
+    b.abort();
+    relay.abort();
+}
+
+#[tokio::test]
+async fn accept_race_direct_arm_accepts_no_connection_after_its_window_295() {
+    // #295 review: the window must bound when the direct arm ACCEPTS, not only when a dial may
+    // arrive. `timeout_at` polls the accept first and quinn hands out a queued `Incoming` at
+    // once, so a connection that queued while an earlier one was being verified was still
+    // accepted after the window -- each stalling stranger (the listener checks no ALPN and no
+    // grant) bought the next one another verification, and a trickle kept the arm, and a held
+    // relay leg behind it, waiting without bound. Two strangers here: each completes QUIC, opens
+    // its stream only after `stall`, then sends nothing B accepts as a Noise_IK handshake.
+    let (listener, _cert) =
+        crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("B's listener");
+    let addr = listener.local_addr().expect("B's direct addr");
+    let (own, peer) = (generate_static_keypair(), generate_static_keypair());
+    let window = Duration::from_millis(300);
+    let stall = Duration::from_millis(1500);
+    let stranger = |after: Duration| {
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            let Ok(conn) = dial_peer_direct(addr, Duration::from_secs(4)).await else { return };
+            let Ok((mut send, _recv)) = conn.open_bi().await else { return };
+            tokio::time::sleep(stall).await;
+            let _ = send.write_all(&[0u8; 8]).await;
+            let _ = send.finish();
+            conn.closed().await;
+        })
+    };
+    let (first, second) = (stranger(Duration::ZERO), stranger(Duration::from_millis(100)));
+    let started = std::time::Instant::now();
+    let verified = accept_verified_direct(&listener, window, &own.private, &peer.public).await;
+    let ended = started.elapsed();
+    assert!(verified.is_err(), "neither stranger is the attested peer");
+    // Gave up after the first stranger: ~1 stall. Took the queued second one too: ~2 stalls.
+    assert!(
+        ended < stall * 3 / 2,
+        "the arm gives up once the first stranger failed past its {window:?} window, without \
+         accepting the second one that queued meanwhile: ended after {ended:?}"
+    );
+    first.abort();
+    second.abort();
+}
+
+#[tokio::test]
+async fn accept_race_dials_a_held_leg_once_more_when_the_edge_dropped_it_meanwhile_295() {
+    // #295 review: a legacy (non-keepalive) leg is connected at the start of the window but held
+    // unpresented until the direct arm gives up. An edge drops a connection that has not
+    // submitted its join within its join deadline (CHANNEL_JOIN_TIMEOUT, 15 s in production),
+    // and the direct arm can outlive that (a stranger's verification may run past the window).
+    // The held leg then failed when it finally presented and ended the session, where the
+    // serial order would have dialed afresh at that moment. Now it is dialed once more, and A,
+    // parked on the relay, gets its session. (Join deadline scaled down: 400 ms vs a 1.2 s window.)
+    let ch = RaceChannel295::new(0x0F, 0x4B);
+    let opts = RelayOpts295 { ka: false, join_timeout: Duration::from_millis(400), ..RelayOpts295::KA };
+    let (relay_addr, relay_cert, _saw, relay) = spawn_front_door_relay_with_295(ch.op_pub, opts).await;
+    let (listener, _cert) =
+        crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("B's listener");
+    let window = Duration::from_millis(1200);
+    let (mut b_app, b_local) = tokio::io::duplex(8192);
+    let (b, decisions) =
+        spawn_acceptor_295(&ch, (relay_addr, relay_cert.clone()), listener, window, AcceptRaceMode::Auto, b_local);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (mut a_app, a_local) = tokio::io::duplex(8192);
+    let a = spawn_relay_initiator_295(&ch, (relay_addr, relay_cert), a_local);
+    ping_pong_295(&mut a_app, &mut b_app, Duration::from_secs(5)).await;
+    let decided = decisions.lock().unwrap().clone();
+    assert!(matches!(decided.as_slice(), [("relay", _)]), "{decided:?}");
 
     drop((a_app, b_app));
     a.abort();

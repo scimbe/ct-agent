@@ -473,8 +473,23 @@ pub enum AcceptRaceMode {
     /// most [`RACE_PARK_BUDGET`] sessions of a member race at once; the others stay serial.
     Auto,
     /// `1`/`true`/`yes`/`on`: the #22 opt-in as before -- race and park on every relay leg,
-    /// QUIC and legacy `:443` included. The direct arm is the verified one in every mode.
+    /// QUIC and legacy `:443` included. Whenever a race runs (here, or [`Self::Auto`] where it
+    /// races) its direct arm wins only on a verified peer ([`accept_verified_direct`]); the serial
+    /// order still takes the first direct connection as it always did.
     On,
+}
+
+/// ct-agent#295 (review): what this switch was until #295 -- `false` the serial order, `true`
+/// the #22 opt-in -- so a library caller of [`run_channel_join_with_admission`] that passes a
+/// `bool` keeps compiling and keeps its behaviour.
+impl From<bool> for AcceptRaceMode {
+    fn from(race: bool) -> Self {
+        if race {
+            Self::On
+        } else {
+            Self::Off
+        }
+    }
 }
 
 impl AcceptRaceMode {
@@ -498,9 +513,12 @@ impl AcceptRaceMode {
                 "adaptive -- a keepalive-monitored :443 relay leg parks during the accept window \
                  (CT_CHANNEL_ACCEPT_RACE=0 turns it off)"
             }
+            // #295 (review): never suggest the switch for this member alone -- it also moves the
+            // member's admission to the `:443` pairer, where a peer still on QUIC never meets it.
             (_, None) => {
                 "adaptive, serial here -- the relay leg starts on QUIC, which the edge does not \
-                 monitor (CT_CHANNEL_FRONT_DOOR_ONLY=1 makes it race)"
+                 monitor (CT_CHANNEL_FRONT_DOOR_ONLY=1 on BOTH members of the channel makes it \
+                 race; see \"Pairing reality\" in docs/channel.md)"
             }
         }
     }
@@ -701,6 +719,104 @@ async fn close_stream_relay_leg<W: AsyncWrite + Unpin>(send: &mut W) {
     let _ = tokio::time::timeout(RELAY_LEG_CLOSE_TIMEOUT, send.shutdown()).await;
 }
 
+/// ct-agent#295 (review): how long a race loser whose abandon landed INSIDE its `:443` relay
+/// leg's admission exchange keeps that exchange going to finish its possession proof
+/// ([`finish_possession_proof`]) -- normally one edge round trip plus the edge's live membership
+/// check. Bounded like [`RELAY_LEG_CLOSE_TIMEOUT`], so a stalled edge delays the direct session
+/// that just won by at most this much on top of the close.
+const RELAY_LEG_PROOF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// ct-agent#295 (review): the write half of a `:443` relay leg during its admission exchange,
+/// counting the bytes the exchange has handed to it -- [`finish_possession_proof`] reads the
+/// count to tell where an abandon landed.
+pub(crate) struct ProofProgress<'a, W> {
+    pub(crate) inner: &'a mut W,
+    pub(crate) written: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for ProofProgress<'_, W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = std::pin::Pin::new(&mut *this.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = polled {
+            this.written.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+        polled
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// ct-agent#295 (review): how many bytes a `:443` relay leg writes up to and including its
+/// possession signature in `present_channel_relay_join_on_stream` -- the optional `[0xFF, phase]`
+/// preamble, the 2-byte length, the join itself, the ed25519 signature over the edge's challenge.
+pub(crate) fn possession_proof_len(request: &ChannelJoinRequest, phase_marker: Option<u8>) -> usize {
+    phase_marker.map_or(0, |_| 2) + 2 + request.encode().len() + ed25519_dalek::SIGNATURE_LENGTH
+}
+
+/// ct-agent#295 (review): an abandon can land while the race's `:443` relay leg is INSIDE its
+/// admission exchange -- join written, possession signature not yet. Closing there is what the
+/// edge reads as a failed possession proof (`read_exact` of the signature hits EOF): it logs
+/// `channel-join NO [possession]` for a legitimate member and returns a DEFINITIVE refusal, which
+/// its `:443` listener charges to the member's address -- past `JOIN_REFUSALS_PER_MINUTE` it sheds
+/// every join from that address (the member's own rendezvous re-admissions, every member behind
+/// the same NAT) for the rest of the minute. The adaptive default makes a direct win in that
+/// window ordinary: the keepalive leg presents at once, and the window is one edge round trip
+/// plus the edge's live membership check. So the exchange is driven on until the signature is
+/// written, bounded by [`RELAY_LEG_PROOF_TIMEOUT`]: the edge then holds a valid park, which the
+/// caller's explicit close turns into a corpse at once on a keepalive leg (KA EOF = death),
+/// never a refusal. An abandon before the first byte or after the signature needs nothing -- the
+/// edge sees a plain I/O drop, or a parked leg closing.
+async fn finish_possession_proof<F>(
+    mut presenting: std::pin::Pin<&mut F>,
+    written: &std::sync::atomic::AtomicUsize,
+    proof_end: usize,
+) where
+    F: std::future::Future<Output = Result<ChannelJoinOutcome, BoxError>>,
+{
+    use std::sync::atomic::Ordering::Relaxed;
+    let at = written.load(Relaxed);
+    if at == 0 || at >= proof_end {
+        return;
+    }
+    let mut admitted = false;
+    let finished = std::future::poll_fn(|cx| match std::future::Future::poll(presenting.as_mut(), cx) {
+        std::task::Poll::Ready(outcome) => {
+            admitted = matches!(outcome, Ok(ChannelJoinOutcome::Admitted { .. }));
+            std::task::Poll::Ready(())
+        }
+        std::task::Poll::Pending if written.load(Relaxed) >= proof_end => std::task::Poll::Ready(()),
+        std::task::Poll::Pending => std::task::Poll::Pending,
+    });
+    match tokio::time::timeout(RELAY_LEG_PROOF_TIMEOUT, finished).await {
+        Ok(()) if admitted => eprintln!(
+            "ct-agent channel: accept-vs-relay race: relay leg was admitted while finishing its possession \
+             proof -- closing it (#295)"
+        ),
+        Ok(()) => {}
+        Err(_) => eprintln!(
+            "ct-agent channel: accept-vs-relay race: relay leg could not finish its possession proof within \
+             {RELAY_LEG_PROOF_TIMEOUT:?} -- closing it mid-admission (#295)"
+        ),
+    }
+}
+
 /// What [`park_relay_leg_until`] resolved to.
 pub(crate) enum RelayLegPark {
     /// The edge paired and spliced this leg; the Noise session may start on it.
@@ -833,6 +949,9 @@ where
     // CADS-Tunnel#495 U2 (a'): relay_conn's own bi-stream carries the session below --
     // PHASE_MARKER_RELAY, mirroring the :443 relay ladder's phase_marker_for(&stream,
     // PHASE_MARKER_RELAY) call.
+    // #295 (review): unlike the `:443` leg (`finish_possession_proof`), an abandon here can still
+    // cut the possession proof -- the join stream lives inside ct-common's QUIC presenter, and a
+    // CONNECTION_CLOSE discards stream data the edge has not read yet. Only `=1` races a QUIC leg.
     let outcome = tokio::select! {
         biased;
         _ = &mut *abandon => None,
@@ -915,12 +1034,24 @@ where
                         close_stream_relay_leg(&mut send).await;
                         return Ok(RelayLegPark::Abandoned);
                     }
-                    let outcome = tokio::select! {
-                        biased;
-                        _ = &mut *abandon => None,
-                        presented = present_channel_relay_join_on_stream(&mut send, &mut recv, request, holder, phase_marker) => {
-                            Some(presented)
+                    // #295 (review): counted, so an abandon that lands inside the admission
+                    // exchange finishes the possession proof before the close below.
+                    let written = std::sync::atomic::AtomicUsize::new(0);
+                    let outcome = {
+                        let mut counted = ProofProgress { inner: &mut send, written: &written };
+                        let presenting =
+                            present_channel_relay_join_on_stream(&mut counted, &mut recv, request, holder, phase_marker);
+                        tokio::pin!(presenting);
+                        let outcome = tokio::select! {
+                            biased;
+                            _ = &mut *abandon => None,
+                            presented = &mut presenting => Some(presented),
+                        };
+                        if outcome.is_none() {
+                            finish_possession_proof(presenting, &written, possession_proof_len(request, phase_marker))
+                                .await;
                         }
+                        outcome
                     };
                     let Some(outcome) = outcome else {
                         close_stream_relay_leg(&mut send).await;
@@ -998,11 +1129,14 @@ const DIRECT_PEER_CHECK_FAILED: &[u8] = b"peer check failed (#295)";
 /// until a connection VERIFIES as this session's attested peer: the QUIC handshake (bounded by
 /// [`DIRECT_DIAL_TIMEOUT`], the dialer's own patience), the #139-bounded channel stream and the
 /// #126-bounded Noise_IK handshake with `a2a_respond_verified`. A connection that fails any of
-/// it -- another session's initiator, a stranger, a stalled handshake -- is closed and the arm
-/// accepts the next one, so it can no longer make the race give up this session's relay leg.
-/// `window` bounds the ARRIVAL of a connection only: a peer whose dial landed inside the window
-/// is not cut off mid-handshake.
-async fn accept_verified_direct(
+/// it -- another session's initiator, anyone else who reaches the listener over QUIC (it checks
+/// no ALPN and no grant), a stalled handshake -- is closed and the arm accepts the next one, so it
+/// can no longer make the race give up this session's relay leg.
+/// `window` bounds when a connection may be ACCEPTED: none is taken after it, not even one that
+/// queued while an earlier one was being verified. A connection accepted inside the window keeps
+/// its own bounds (5 s QUIC, 15 s stream, 10 s Noise), so a partner is not cut off mid-handshake
+/// and the arm ends at most one such verification after the window.
+pub(crate) async fn accept_verified_direct(
     ep: &Endpoint,
     window: std::time::Duration,
     own_noise_private: &[u8; 32],
@@ -1010,10 +1144,19 @@ async fn accept_verified_direct(
 ) -> Result<VerifiedDirect, BoxError> {
     let deadline = tokio::time::Instant::now() + window;
     loop {
-        let incoming = match tokio::time::timeout_at(deadline, ep.accept()).await {
-            Ok(Some(incoming)) => incoming,
-            Ok(None) => return Err("channel listener closed with no incoming".into()),
-            Err(_) => return Err(format!("no verified direct connection within {window:?}").into()),
+        // #295 (review): the deadline is checked FIRST. `timeout_at(deadline, ep.accept())` polls
+        // the accept before its timer and quinn hands out a queued `Incoming` at once, so after a
+        // slow verification it kept accepting past the window -- a trickle of stalling strangers
+        // kept the arm alive without bound, and a held relay leg aging behind it.
+        let incoming = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(format!("no verified direct connection within {window:?}").into())
+            }
+            accepted = ep.accept() => match accepted {
+                Some(incoming) => incoming,
+                None => return Err("channel listener closed with no incoming".into()),
+            },
         };
         let remote = incoming.remote_address();
         let conn = match tokio::time::timeout(DIRECT_DIAL_TIMEOUT, incoming).await {
@@ -1084,28 +1227,36 @@ fn note_race_decision(winner: &'static str, ms: u128) {
 /// * **direct** = [`accept_verified_direct`]: accept, QUIC handshake, channel stream and the
 ///   Noise_IK handshake against the ATTESTED peer key, all before the arm may win. Until #295
 ///   the QUIC handshake alone decided, so on the shared `--serve` listener another session's
-///   initiator (or any stranger) won the race, made this session give up its parked relay leg,
-///   and only then failed the Noise check (#22 Befund 3) -- while this session's real partner
-///   waited on the relay for a leg that had just been closed. A handshake that stalls or fails
-///   still never ends the session (#22 Befund 1); the arm keeps accepting within the window.
+///   initiator (or anyone who reaches the listener over QUIC) won the race, made this session
+///   give up its parked relay leg, and only then failed the Noise check (#22 Befund 3) -- while
+///   this session's real partner waited on the relay for a leg that had just been closed. A
+///   handshake that stalls or fails still never ends the session (#22 Befund 1); the arm keeps
+///   accepting within the window.
 /// * **relay** = [`park_relay_leg_until`]: connect, present, park until paired + spliced. Under
 ///   [`RaceParkPolicy::MonitoredOnly`] a leg the edge would not see abandoned is held
 ///   connected but unpresented until the direct arm has given up.
 ///
 /// Whichever completes first wins. Direct won -> the relay leg is told to abandon and closes
 /// its transport EXPLICITLY (QUIC CONNECTION_CLOSE / TLS close_notify) before the direct
-/// session starts; relay won -> the accept future is dropped and the session runs on the
-/// leg. Either path failing keeps the other one awaited. A relay leg that failed early is
-/// dialed once more when the direct arm has given up too -- the moment the serial order would
-/// have dialed it first (#295), so a transient connect failure at the start of the window costs
-/// no more than it does serially; a definitive refusal or a park expiry is returned as it is
-/// (the serve loops' backoff / re-park policy keys on those typed errors).
+/// session starts -- a `:443` leg caught inside its admission exchange first finishes its
+/// possession proof (bounded, `finish_possession_proof`), which the edge would otherwise count
+/// as a refusal; relay won -> the accept future is dropped and the session runs on the leg. Either path failing
+/// keeps the other one awaited. A relay leg that fails without a typed refusal or park expiry
+/// is dialed once more, at the earliest when the direct arm has given up -- the moment the
+/// serial order dials it first (#295): a connect failure at the start of the window, or a held
+/// leg the edge dropped while it waited, costs no more than it does serially. A definitive
+/// refusal or a park expiry is returned as it is (the serve loops' backoff / re-park policy keys
+/// on those typed errors).
 ///
 /// Split-brain is impossible on this side alone (Befund 1): the initiator is serial -- it
 /// parks on the relay only after its direct dial came back `Unreachable`, dropping the
 /// `connecting` future -- so the peer we are paired with can never be on both transports.
-/// When both futures are ready in the same poll the relay is preferred (`biased`): an
-/// admitted relay leg means the partner is definitely waiting there.
+/// When both futures are ready in the same poll, the VERIFIED direct connection is preferred
+/// (`biased`, #295 review): it is proven to be this session's attested peer, whereas an
+/// admitted relay leg is only the edge's first-in-first-out pick among the channel's waiting
+/// initiators -- with concurrent serve sessions possibly another session's. Taking the relay
+/// would close a verified peer and run Noise against a maybe-wrong one; taking the direct
+/// closes the admitted leg like any other loser.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn race_accept_against_relay<P>(
     ep: Endpoint,
@@ -1163,6 +1314,40 @@ where
     ));
     let won = tokio::select! {
         biased;
+        verified = &mut direct => match verified {
+            Ok(verified) => Won::Direct { verified, relay_live: true },
+            Err(direct_err) => {
+                eprintln!(
+                    "ct-agent channel: accept-vs-relay race: direct path gave up after {}ms ({direct_err}) -- \
+                     the relay leg stays parked, awaiting it (#22)",
+                    elapsed_ms()
+                );
+                // #295: a held leg presents now -- the park keeps the serial order, only its
+                // transport connect was saved.
+                if let Some(release) = release_tx.take() {
+                    let _ = release.send(());
+                }
+                match relay_leg.as_mut().await {
+                    Ok(RelayLegPark::Admitted(leg)) => Won::Relay(leg),
+                    Ok(RelayLegPark::Abandoned) => {
+                        return Err("relay leg abandoned before the race was decided (#22)".into())
+                    }
+                    // #295 (review): an untyped failure from here on -- above all a HELD leg the
+                    // edge dropped while it sat connected but unpresented past the edge's join
+                    // deadline -- would end the session where the serial order dials the relay
+                    // only now. So dial it once more, as for an early failure below.
+                    Err(relay_err) if !is_definitive_admission_refusal(&relay_err) && !is_park_expired(&relay_err) => {
+                        eprintln!(
+                            "ct-agent channel: accept-vs-relay race: relay leg failed after {}ms ({relay_err}) -- \
+                             dialing it once more, as the serial order dials the relay only now (#295)",
+                            elapsed_ms()
+                        );
+                        Won::Relay(park_relay_leg(serial_relay, request, holder).await?)
+                    }
+                    Err(relay_err) => return Err(relay_err),
+                }
+            }
+        },
         parked = &mut relay_leg => match parked {
             Ok(RelayLegPark::Admitted(leg)) => Won::Relay(leg),
             Ok(RelayLegPark::Abandoned) => {
@@ -1196,39 +1381,24 @@ where
                 }
             }
         },
-        verified = &mut direct => match verified {
-            Ok(verified) => Won::Direct { verified, relay_live: true },
-            Err(direct_err) => {
-                eprintln!(
-                    "ct-agent channel: accept-vs-relay race: direct path gave up after {}ms ({direct_err}) -- \
-                     the relay leg stays parked, awaiting it (#22)",
-                    elapsed_ms()
-                );
-                // #295: a held leg presents now -- the park keeps the serial order, only its
-                // transport connect was saved.
-                if let Some(release) = release_tx.take() {
-                    let _ = release.send(());
-                }
-                match relay_leg.as_mut().await? {
-                    RelayLegPark::Admitted(leg) => Won::Relay(leg),
-                    RelayLegPark::Abandoned => {
-                        return Err("relay leg abandoned before the race was decided (#22)".into())
-                    }
-                }
-            }
-        },
     };
     match won {
         Won::Direct { verified, relay_live } => {
+            // #295 (review): the moment the race was decided, before the loser's close -- which
+            // may now include finishing a possession proof and must not inflate "won after".
+            let ms = elapsed_ms();
             // Tell the parked leg to close itself explicitly and wait (bounded) for it to do so:
             // the transport lives inside that future, so this is the only place it can be
             // closed rather than dropped. A leg that was admitted in the same instant (the
             // same-instant tie, impossible for the partner we are paired with -- see above)
             // is closed the same way so the edge learns now, not at the park TTL. A held leg
-            // was never presented: it closes without ever having been a park (#295).
+            // was never presented: it closes without ever having been a park (#295). A leg the
+            // abandon caught inside its admission exchange first finishes its possession proof
+            // (`finish_possession_proof`, #295 review) -- hence the proof bound in this wait.
             if relay_live {
                 let _ = abandon_tx.send(());
-                match tokio::time::timeout(RELAY_LEG_CLOSE_TIMEOUT * 2, relay_leg.as_mut()).await {
+                let closing = RELAY_LEG_PROOF_TIMEOUT + RELAY_LEG_CLOSE_TIMEOUT * 2;
+                match tokio::time::timeout(closing, relay_leg.as_mut()).await {
                     Ok(Ok(RelayLegPark::Admitted(leg))) => {
                         eprintln!("ct-agent channel: accept-vs-relay race: relay leg was admitted in the same instant -- closing it (#22)");
                         leg.close().await;
@@ -1239,7 +1409,6 @@ where
             drop(relay_leg);
             drop(release_tx);
             drop(claim); // the park is closed: it no longer counts against the member's cap
-            let ms = elapsed_ms();
             #[cfg(test)]
             note_race_decision("direct", ms);
             eprintln!("ct-agent channel: accept-vs-relay race: direct won after {ms}ms -- relay leg closed (#22)");
