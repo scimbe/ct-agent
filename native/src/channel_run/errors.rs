@@ -120,6 +120,77 @@ pub(crate) fn is_revoked_grant_refusal(e: &BoxError) -> bool {
     admission_refusal(e).is_some_and(|r| r.category.as_deref() == Some(GRANT_REVOKED_CATEGORY))
 }
 
+/// The edge's refusal category for a grant that does not verify (expired, or not signed by the
+/// channel's operator key).
+pub(crate) const GRANT_VERIFY_CATEGORY: &str = "grant-verify";
+
+/// ct-agent#308: an admission refusal that says THIS member's own grant ended -- `[grant-revoked]`
+/// always, `[grant-verify]` only once the own grant is past its expiry by this member's clock
+/// (`now >= expires_at`, the rule `verify_stateless` applies). Before that a `[grant-verify]` may
+/// be clock skew or a wrong operator key and keeps the definitive-refusal backoff. `None`: not an
+/// own grant end. Returns the refusal's operator-facing text.
+pub(crate) fn own_grant_refusal(e: &BoxError, own_expires_at: Option<u64>, now: u64) -> Option<String> {
+    let refusal = admission_refusal(e)?;
+    let own_end = match refusal.category.as_deref() {
+        Some(GRANT_REVOKED_CATEGORY) => true,
+        Some(GRANT_VERIFY_CATEGORY) => own_expires_at.is_some_and(|at| now >= at),
+        _ => false,
+    };
+    own_end.then(|| refusal.to_string())
+}
+
+/// ct-agent#308: the exit status of a `ct-agent channel` process whose OWN channel grant ended
+/// (expired, or revoked): `EX_NOPERM` from `sysexits.h`. The process holds one grant for its
+/// whole life, so a restart with the same grant cannot help; a supervisor should not restart it
+/// (systemd: `RestartPreventExitStatus=77`; `ct-agent-supervisor` stops on it).
+pub const OWN_GRANT_ENDED_EXIT: i32 = 77;
+
+/// ct-agent#308: the long-running channel modes (the forward initiator's reconnect loop, the
+/// persistent serve loop) stopped because this member's own grant ended. `main` maps it to
+/// [`OWN_GRANT_ENDED_EXIT`]; `Display` is the reason.
+#[derive(Debug)]
+pub struct OwnGrantEnded(pub String);
+
+impl std::fmt::Display for OwnGrantEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OwnGrantEnded {}
+
+impl OwnGrantEnded {
+    pub(crate) fn boxed(reason: impl Into<String>) -> BoxError {
+        Box::new(Self(reason.into()))
+    }
+}
+
+/// For a loop whose caller speaks `io::Error` (the forward loop is generic over its error).
+impl From<OwnGrantEnded> for std::io::Error {
+    fn from(e: OwnGrantEnded) -> Self {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
+    }
+}
+
+/// Whether `e` is, or wraps, an [`OwnGrantEnded`] -- the test `main` maps to
+/// [`OWN_GRANT_ENDED_EXIT`]. Walks the `source()` chain and looks inside an `io::Error`, whose
+/// `source()` skips the error it carries.
+pub fn is_own_grant_end(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if err.is::<OwnGrantEnded>() {
+            return true;
+        }
+        if let Some(inner) = err.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()) {
+            if inner.is::<OwnGrantEnded>() {
+                return true;
+            }
+        }
+        cur = err.source();
+    }
+    false
+}
+
 /// #20: typed marker for a DEFINITIVE broker/relay refusal -- the peer's wire `NO`. `Display`
 /// emits the exact historical strings (field-visible contract: operators grep these, docs quote
 /// them, the sort bridge's fault attribution matches on them), but in-process classification
@@ -182,7 +253,7 @@ pub(crate) fn refusal_category_hint(category: &str) -> Option<&'static str> {
              grant minted for a different holder key; re-check which identity/holder key \
              this block runs as"
         }
-        "grant-verify" => {
+        GRANT_VERIFY_CATEGORY => {
             "the grant failed signature/validity verification — expired, or not signed by \
              this channel's operator key; fetch a fresh grant"
         }

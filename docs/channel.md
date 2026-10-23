@@ -588,8 +588,51 @@ concerns the direct-connect path `serve_direct`, not the forward.)
 - An initiator that is refused with `[grant-revoked]` stops at once instead of retrying for its
   75 s window: a revoked grant never becomes valid again, so it needs a newly issued one. A
   forward initiator (`CT_CHANNEL_FORWARD`), which otherwise reconnects after a dropped session,
-  stops the same way: it prints the refusal and exits with a failure status instead of asking
-  again. Every other refusal keeps the reconnect with backoff.
+  and a persistent serve member stop the same way: they print the refusal and exit with status
+  **77** instead of asking again (see the next section). Every other refusal keeps the reconnect
+  with backoff.
+
+### When this member's own grant ends: exit status 77 ([#308])
+
+`ct-agent channel` reads its grant once, at start. Once **this member's own** grant has expired
+or been revoked, nothing the process does can make it valid again, so the two long-running modes
+stop instead of retrying for ever:
+
+| Mode | This member's own grant ended by | Then |
+|---|---|---|
+| Forward initiator (`CT_CHANNEL_FORWARD`) | its expiry (also while it waits at the edge for a peer), an admission refused with `[grant-revoked]`, or one refused with `[grant-verify]` once the grant is past its expiry | closes the forward listener and exits with status **77** |
+| Persistent serve (`CT_CHANNEL_ROLE=accept` + `CT_CHANNEL_SERVE=1`) | the same | stops parking and exits with status **77** |
+
+77 is `EX_NOPERM` from `sysexits.h`. Every other failure keeps exit status 1, and the one-shot
+modes (pipe, `CT_CHANNEL_CALL…`) keep theirs. A `[grant-verify]` refusal before the grant's own
+expiry (clock skew, a grant signed by another operator key) keeps the 30 s refusal backoff.
+
+**When only the peer's grant ended** — the peer's grant expired first, or the accept side's
+re-check found it revoked — this member's grant is still good: a forward initiator reconnects with
+its usual backoff, and the edge refuses the peer at admission until it holds a valid grant again.
+Through v0.7.40 a peer whose grant expired first stopped the initiator for good, because the
+session ended at the earlier of the two expiries and that end counted as the initiator's own.
+
+**Every session ends at this member's own expiry**, with or without the peer-grant check: pipe,
+service call, serve and stream-handler sessions used to outlive the grant that admitted them
+(only a session with the check ended). Issue grants with enough lifetime, or renew them before
+they run out.
+
+| Variable | Meaning |
+|---|---|
+| `CT_CHANNEL_FORWARD_ON_GRANT_END` | Forward initiator only. `exit` (the default, also when unset or empty): as above. `refuse`: the end state of v0.7.40 and earlier — the listener stays bound and closes every new connection with one log line, the process keeps running (the loopback port stays reserved, e.g. on a host shared with other users). Any other value is an error at start (exit status 1) |
+
+Supervisors:
+
+- `ct-agent-supervisor` treats 77 as final: it records the exit, does not restart the child and
+  exits with 77 itself.
+- **systemd**: with `Restart=always` or `Restart=on-failure`, add `RestartPreventExitStatus=77`.
+  The unit then stays in the failed state (`systemctl status` shows `status=77`) instead of being
+  restarted into the same refusal; without it, the restarts usually end in the unit's start limit.
+- **Kubernetes**: the exit code does not stop restarts. With `restartPolicy: Always` the container
+  is restarted with a growing back-off (up to 5 minutes) and the pod shows `CrashLoopBackOff`;
+  `kubectl describe pod` shows `Last State: Terminated` with `Exit Code: 77`. That is the signal to
+  put a newly issued grant into the Secret: the next start then works without further action.
 
 | Variable | Meaning |
 |---|---|
@@ -775,3 +818,4 @@ needed exactly once, at `sign`, so an operator can review the unsigned skeleton 
 [#47]: https://github.com/scimbe/ct-agent/issues/47
 [#299]: https://github.com/scimbe/ct-agent/issues/299
 [#314]: https://github.com/scimbe/ct-agent/issues/314
+[#308]: https://github.com/scimbe/ct-agent/issues/308
