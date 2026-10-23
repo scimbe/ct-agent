@@ -60,6 +60,12 @@ pub const TRANSPORT_SWITCH: &str = "transport_switch";
 pub const FALLBACK_EXHAUSTED: &str = "fallback_exhausted";
 /// `{reason}`: a direct-connect client was refused at the routing-token check (#45).
 pub const DIRECT_REFUSED: &str = "direct_refused";
+/// `{}`: a direct-connect handshake that carried NO routing token was served, i.e.
+/// `CT_DIRECT_REQUIRE_TOKEN` is off (ct-agent#291). The one outcome the token check lets
+/// through on the direct path, so it is counted: rate-limited like every other
+/// peer-triggerable event, while the counter on `/metrics` stays exact -- the number to read
+/// before relying on the required mode.
+pub const DIRECT_LEGACY_SERVED: &str = "direct_legacy_served";
 /// `{state: open|close, peer}`: an A2A channel session started or ended.
 pub const CHANNEL_SESSION: &str = "channel_session";
 /// `{tool, ok}`: a `bridge/*` tool was invoked (refusals count as `ok=false`).
@@ -109,13 +115,14 @@ pub const FORWARD_OPEN: &str = "forward_open";
 pub const FORWARD_CLOSE: &str = "forward_close";
 
 /// Every event kind, in the order `/metrics` renders `ct_agent_events_total{kind}`.
-pub const KINDS: [&str; 19] = [
+pub const KINDS: [&str; 20] = [
     REGISTERED,
     REGISTRATION_FAILED,
     DISCONNECTED,
     TRANSPORT_SWITCH,
     FALLBACK_EXHAUSTED,
     DIRECT_REFUSED,
+    DIRECT_LEGACY_SERVED,
     CHANNEL_SESSION,
     BRIDGE_CALL,
     MANIFEST_INSTALL,
@@ -818,6 +825,19 @@ mod tests {
             assert!(text.contains(&format!("{{kind=\"{kind}\"}} ")), "series for {kind}");
         }
         assert!(text.ends_with('\n'));
+    }
+
+    #[test]
+    fn a_served_tokenless_direct_handshake_is_its_own_counted_kind_291() {
+        // #291: "how many direct clients still send no token" must be a number on /metrics,
+        // apart from the refusals -- it is what an operator reads before relying on the
+        // required mode, or before dropping an opt-out.
+        let c = EventCounters::new();
+        c.bump(DIRECT_LEGACY_SERVED);
+        assert_eq!(c.get(DIRECT_LEGACY_SERVED), 1);
+        assert_eq!(c.get(DIRECT_REFUSED), 0, "not mixed into the refusals");
+        let text = c.render_prometheus();
+        assert!(text.contains("\nct_agent_events_total{kind=\"direct_legacy_served\"} 1\n"), "{text}");
     }
 
     #[test]

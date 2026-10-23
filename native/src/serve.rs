@@ -1483,11 +1483,17 @@ fn check_direct_token(
         }
         return Err(DirectConnectRefused(decision));
     }
-    if decision == DirectTokenDecision::ServeLegacy && policy.debug {
-        eprintln!(
-            "ct-agent: direct-connect: handshake carried no routing token (pre-#45 client); \
-             accepted because CT_DIRECT_REQUIRE_TOKEN is off (#45)"
-        );
+    if decision == DirectTokenDecision::ServeLegacy {
+        // #291: the one outcome the token check lets through on the direct path, so it is
+        // counted. Always on the /metrics counter; the event line within the peer-triggered
+        // budget, since a peer can produce one per connection before it is authenticated.
+        crate::events::emit_limited(crate::events::DIRECT_LEGACY_SERVED, serde_json::json!({}));
+        if policy.debug {
+            eprintln!(
+                "ct-agent: direct-connect: handshake carried no routing token (pre-#45 client); \
+                 accepted because CT_DIRECT_REQUIRE_TOKEN is off (#45)"
+            );
+        }
     }
     Ok(())
 }
@@ -5480,6 +5486,22 @@ mod tests {
         assert!(dialed, "origin dialed for the legacy client");
         assert_eq!(metrics.tunnels_opened.get(), 1);
         assert_eq!(metrics.tunnels_failed.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_served_tokenless_direct_client_is_counted_as_direct_legacy_served_291() {
+        // #291: a token-less handshake served because CT_DIRECT_REQUIRE_TOKEN is off is
+        // counted on /metrics (ct_agent_events_total{kind="direct_legacy_served"}). `>`, not
+        // `+ 1`: other tests in this binary serve token-less clients in parallel.
+        let before = crate::events::EVENT_COUNTS.get(crate::events::DIRECT_LEGACY_SERVED);
+        let policy = DirectTokenPolicy::new(RoutingToken([0x45; 32]), false);
+        let rig = direct_token_rig(Some(policy), Vec::new()).await;
+        let (dialed, _) = direct_token_rig_expect_served(rig, b"counted-legacy").await;
+        assert!(dialed, "served, not refused");
+        assert!(
+            crate::events::EVENT_COUNTS.get(crate::events::DIRECT_LEGACY_SERVED) > before,
+            "the served token-less handshake was counted"
+        );
     }
 
     #[tokio::test]
