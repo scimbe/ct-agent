@@ -337,6 +337,9 @@ by default) used with port 22.
    `-o HostKeyAlias=<name>`.
 
 **You are done when** you get the shell prompt of member A's machine. If the session drops (peer
-restart, network), the listener on B reconnects with backoff. Once B's own grant has expired, or the grant
-check has recorded the end of the session, it stays bound but closes every new connection and logs the
-reason. Do not rely on revoking a grant to stop a running forward (see the note at the top).
+restart, network) or only A's grant has ended, the listener on B reconnects with backoff. Once B's
+own grant has ended (expired, or an admission refused with `[grant-revoked]`), `ct-agent` on B
+closes the listener and exits with status 77; with `CT_CHANNEL_FORWARD_ON_GRANT_END=refuse` it
+keeps the port bound instead and closes every new connection with a log line. See
+[exit status 77](channel.md#when-this-members-own-grant-ends-exit-status-77-308). Do not rely on
+revoking a grant to stop a running forward (see the note at the top).

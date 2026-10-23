@@ -10,6 +10,11 @@
 //! env config, so it drops in wherever `ct-agent` is invoked today (a systemd unit, a launch
 //! script, `watchdog-serve-roles.sh`'s `serve-role.sh`).
 //!
+//! One exit status is final (ct-agent#308): 77 (`EX_NOPERM`) means the child's own channel grant
+//! expired or was revoked. The child reads its grant once, so every restart would be refused the
+//! same way; the supervisor logs it, does not restart, and exits 77 itself, so the layer above
+//! (systemd with `RestartPreventExitStatus=77`, a container runtime) sees the same verdict.
+//!
 //! Env:
 //! - `CT_AGENT_SUPERVISOR_BIN` (default `ct-agent`, resolved via `PATH`): the real binary to
 //!   supervise.
@@ -49,6 +54,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ct_agent::channel_run::OWN_GRANT_ENDED_EXIT;
 use ct_agent::reconnect::Backoff;
 use ct_common::sync::MutexExt;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -70,6 +76,9 @@ enum CrashReason {
     /// Exited 0 — not a crash, but still recorded so "why did it stop" has an answer even for
     /// a deliberate clean shutdown (e.g. a one-shot `--call-service` invocation finishing).
     CleanExitOk,
+    /// ct-agent#308: exited with `OWN_GRANT_ENDED_EXIT` (77) -- the child's own channel grant
+    /// expired or was revoked. The grant is read once per process, so a restart cannot help.
+    GrantEnded,
 }
 
 impl std::fmt::Display for CrashReason {
@@ -79,8 +88,16 @@ impl std::fmt::Display for CrashReason {
             CrashReason::Panic(msg) => write!(f, "panic: {msg}"),
             CrashReason::CleanExit(code) => write!(f, "clean exit code {code}"),
             CrashReason::CleanExitOk => write!(f, "exited 0"),
+            CrashReason::GrantEnded => write!(f, "own channel grant ended (exit code {OWN_GRANT_ENDED_EXIT})"),
         }
     }
+}
+
+/// The status the supervisor itself ends with instead of restarting the child, if any
+/// (ct-agent#308): a child whose own channel grant ended would only be refused again, every
+/// restart, so the supervisor stops and passes the status on to whatever supervises it.
+fn final_status(reason: &CrashReason) -> Option<i32> {
+    matches!(reason, CrashReason::GrantEnded).then_some(OWN_GRANT_ENDED_EXIT)
 }
 
 /// One record in the crash history: the reason, when it happened (unix seconds), and how long
@@ -215,6 +232,15 @@ async fn main() {
         };
 
         eprintln!("ct-agent-supervisor: {child_bin} exited after {uptime:?} -- {reason}");
+        // Before the history update: no restart follows, so none is counted, and the process
+        // ends at once -- the status endpoint would never serve the record. The line above logs it.
+        if let Some(status) = final_status(&reason) {
+            eprintln!(
+                "ct-agent-supervisor: not restarting {child_bin}: its own channel grant ended and the \
+                 same grant cannot work again; exiting with status {status} (#308)"
+            );
+            std::process::exit(status);
+        }
         {
             // Poison-tolerant (ct-agent#176): the crash history is diagnostic state --
             // a panic while it was held must not stop the supervisor from restarting
@@ -360,6 +386,11 @@ fn classify_exit(signal: Option<i32>, code: Option<i32>, stderr_ring: &VecDeque<
     let code = code.unwrap_or(-1);
     if code == 0 {
         return CrashReason::CleanExitOk;
+    }
+    // Before the panic scan: the child chose this status itself (a panic exits 101), whatever
+    // an earlier stderr line may have quoted.
+    if code == OWN_GRANT_ENDED_EXIT {
+        return CrashReason::GrantEnded;
     }
     if let Some(panic_line) = stderr_ring.iter().rev().find(|l| l.contains("panicked at")) {
         const MAX_LEN: usize = 300;
@@ -583,6 +614,44 @@ mod tests {
                 assert!(msg.len() <= 300, "expected truncation at or before 300 bytes, got len {}", msg.len());
             }
             other => panic!("expected Panic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exit_77_is_final_and_wins_over_a_quoted_panic_line_308() {
+        // The child chose 77 itself: an earlier stderr line that merely quotes a panic must not
+        // turn it into a restartable crash.
+        let r = classify_exit(None, Some(77), &ring(&["log: a peer reported 'panicked at x.rs:1:1'"]));
+        assert!(matches!(r, CrashReason::GrantEnded), "{r}");
+        assert_eq!(final_status(&r), Some(77));
+        assert!(r.to_string().contains("grant ended"), "{r}");
+        for restarted in [
+            classify_exit(None, Some(1), &ring(&[])),
+            classify_exit(None, Some(0), &ring(&[])),
+            classify_exit(Some(9), None, &ring(&[])),
+            classify_exit(None, Some(101), &ring(&["thread 'main' panicked at x.rs:1:1"])),
+        ] {
+            assert_eq!(final_status(&restarted), None, "{restarted} is restarted as before");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_exits_77_ends_the_supervision_308() {
+        let args = vec![
+            "-c".to_string(),
+            "echo 'ct-agent channel: the channel grant expired' >&2; exit 77".to_string(),
+        ];
+        let end = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_once("sh", &args, tokio::io::sink(), std::future::pending()),
+        )
+        .await
+        .expect("the child exits")
+        .unwrap();
+        match end {
+            RunEnd::Exited(reason) => assert_eq!(final_status(&reason), Some(77), "{reason}"),
+            RunEnd::Stopped => panic!("not stopped"),
         }
     }
 

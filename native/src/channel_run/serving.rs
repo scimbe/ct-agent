@@ -336,11 +336,88 @@ pub(crate) fn record_flap_outcome(counter: &std::sync::atomic::AtomicU32, flappe
 /// we have no capacity to serve) and released when the session ends. A transient `admit` error is
 /// logged and retried after `retry_backoff`; a **refused** (definitive, not-a-member) admission
 /// backs off exponentially instead — see [`admission_retry_backoff`]. A `serve` error is a single
-/// peer's problem, logged and dropped. Never returns under normal operation. Injectable so the
-/// concurrency contract is unit-testable without a real broker/relay.
+/// peer's problem, logged and dropped. Injectable so the concurrency contract is unit-testable
+/// without a real broker/relay.
+///
+/// ct-agent#308: `own_expires_at` is this member's own grant expiry (`None`: no own grant to
+/// watch, the tests' shape). The loop ends with [`OwnGrantEnded`] -- the process then exits with
+/// [`OWN_GRANT_ENDED_EXIT`] -- when that grant expires, wherever the loop is (parked at the edge,
+/// backing off, at capacity), and when an admission refusal says the same (`[grant-revoked]`, or
+/// `[grant-verify]` past the own expiry, see [`own_grant_refusal`]). The process holds that one
+/// grant for its whole life, so retrying either only loads the edge, for ever. Otherwise it
+/// never returns under normal operation.
+///
+/// The sessions belong to the loop (a `JoinSet`, as the #180 connection tasks do): before it
+/// returns an own grant end it winds them down ([`end_running_sessions`]), because the process
+/// exits right after (`std::process::exit` runs no destructor, and a stream handler's process
+/// group is only killed by its session's Drop, #183).
 pub(crate) async fn serve_loop_concurrent<A, Fa, S, Fs, W>(
     max: usize,
     retry_backoff: std::time::Duration,
+    own_expires_at: Option<u64>,
+    admit: A,
+    serve: S,
+) -> Result<(), BoxError>
+where
+    A: FnMut() -> Fa,
+    Fa: std::future::Future<Output = Result<W, BoxError>> + Send + 'static,
+    S: Fn(W) -> Fs,
+    Fs: std::future::Future<Output = Result<(), BoxError>> + Send + 'static,
+    W: Send + 'static,
+{
+    let mut sessions = tokio::task::JoinSet::new();
+    let expiry = async {
+        match own_expires_at {
+            Some(at) => {
+                grant_expiry_timer(at).await;
+                at
+            }
+            None => std::future::pending().await,
+        }
+    };
+    // `biased`: an own grant that is already over stops the loop before it parks once more.
+    let (served, expired) = tokio::select! {
+        biased;
+        at = expiry => {
+            let reason = format!("this member's channel grant expired (expires_at {at})");
+            eprintln!("ct-agent channel: {reason} -- stopping the persistent serve loop (#308)");
+            (Err(OwnGrantEnded::boxed(reason)), true)
+        }
+        served = serve_loop_admitting(max, retry_backoff, own_expires_at, &mut sessions, admit, serve) => (served, false),
+    };
+    if served.as_ref().is_err_and(|e| is_own_grant_end(e.as_ref())) {
+        end_running_sessions(&mut sessions, expired).await;
+    }
+    served
+}
+
+/// ct-agent#308: the sessions a serve loop still runs when it stops for its own grant end. After
+/// the own expiry (`expired`) every running session's gate holds the same expiry (R1) and fires
+/// within a second of the loop's timer, ending its session the regular way, close event included;
+/// they get [`GRANT_TEARDOWN_BUDGET`] for that. What still runs then -- and every session after a
+/// `[grant-revoked]` admission, which no gate learns about -- is aborted and awaited, so its
+/// future is dropped (and a stream handler's process group killed) before the process exits.
+async fn end_running_sessions(sessions: &mut tokio::task::JoinSet<()>, expired: bool) {
+    if expired {
+        let _ = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, async {
+            while sessions.join_next().await.is_some() {}
+        })
+        .await;
+    }
+    sessions.abort_all();
+    let _ = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, async {
+        while sessions.join_next().await.is_some() {}
+    })
+    .await;
+}
+
+/// The admit/serve cycle of [`serve_loop_concurrent`], without its own-expiry stop. Its sessions
+/// run in `sessions`, owned by the caller.
+async fn serve_loop_admitting<A, Fa, S, Fs, W>(
+    max: usize,
+    retry_backoff: std::time::Duration,
+    own_expires_at: Option<u64>,
+    sessions: &mut tokio::task::JoinSet<()>,
     mut admit: A,
     serve: S,
 ) -> Result<(), BoxError>
@@ -365,6 +442,8 @@ where
     // either succeeds or simply lives long enough to not look like a flap.
     let consecutive_flaps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     loop {
+        // Finished sessions leave their (empty) result in the set until it is read.
+        while sessions.try_join_next().is_some() {}
         // `sem` is local and never closed, so `acquire_owned` cannot fail; if it ever
         // did, ending the loop with an error is the right answer, not a panic
         // (ct-agent#176).
@@ -397,14 +476,18 @@ where
         // convergence.rs::drain_probe_round (#490) already isolates for its DNS probes) used to
         // propagate out of this whole function and crash the persistent serve process, tearing
         // down every concurrently-running session with it -- a far larger blast radius than one
-        // bad admission attempt.
-        match tokio::spawn(admit()).await {
+        // bad admission attempt. Guarded (ct-agent#308): when the loop is dropped mid-admission
+        // -- its own grant expired while parked -- the parked admission goes with it.
+        match crate::task_guard::TaskGuard::from_handle(tokio::spawn(admit())).await {
             Ok(Ok(work)) => {
                 consecutive_refusals = 0;
                 consecutive_handshake_eofs = 0;
-                let fut = serve(work);
+                // ct-agent#308: inside a grant-end record, so the session runner bounds its wait
+                // for a peer that never closes after a grant end, and reports such a session as
+                // not ok. Spawned into the loop's set (see `serve_loop_concurrent`).
+                let fut = with_grant_end_record(GrantEndRecord::default(), serve(work));
                 let flap_counter = consecutive_flaps.clone();
-                tokio::spawn(async move {
+                sessions.spawn(async move {
                     let _permit = permit; // held for the whole session; frees a slot on drop
                     let started = std::time::Instant::now();
                     let result = fut.await;
@@ -432,6 +515,12 @@ where
             }
             Ok(Err(e)) => {
                 drop(permit);
+                // ct-agent#308: the edge says this member's own grant is over. It never becomes
+                // valid again in this process, so the loop stops instead of backing off for ever.
+                if let Some(reason) = own_grant_refusal(&e, own_expires_at, crate::codec::now_unix()) {
+                    eprintln!("ct-agent channel: {reason} -- stopping the persistent serve loop (#308)");
+                    return Err(OwnGrantEnded::boxed(reason));
+                }
                 // #21: a park expiry re-parks IMMEDIATELY on the same transport -- it is neither
                 // a refusal (never counts toward the #231 backoff) nor a failure worth the
                 // generic "admission error" log line (the named line below is the field-visible
@@ -513,12 +602,34 @@ pub(crate) async fn run_one_admission_session(
     run_one_admission_session_with_local(cfg, request, broker_ladder, relay_ladder, front_door_cert, local).await
 }
 
+/// ct-agent#308 (R1): a one-shot session that a grant end cut short -- this member's own expiry,
+/// or the peer's grant -- reaches its pump as a clean EOF and returns `Ok`: a pipe transfer cut
+/// at the expiry looked like a complete one, exit status 0. Run inside a grant-end record, such a
+/// session is an error (`PermissionDenied`, exit status 1 like every one-shot failure). The peer
+/// of an ungated session cannot tell: it only sees a clean close.
+pub(crate) async fn one_shot_session<F>(session: F) -> Result<(), BoxError>
+where
+    F: std::future::Future<Output = Result<(), BoxError>>,
+{
+    let record = GrantEndRecord::default();
+    let ran = with_grant_end_record(record.clone(), session).await;
+    match (ran, record.ended()) {
+        (Ok(()), Some(end)) => Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("the session was cut short: {}", end.reason),
+        ))),
+        (ran, _) => ran,
+    }
+}
+
 /// ct-agent#267: the plane-brokered one-shot path with `CT_CHANNEL_FORWARD`
 /// set. Binds the forward listener ONCE and keeps re-admitting sessions over it with backoff
 /// ([`super::forward_stream::run_forward_initiate_reconnect_loop`]) instead of running exactly
-/// one session: a peer restart or a relay/network drop no longer ends the forward, only a grant
-/// that expired or was revoked does. A bad spec or a listener that cannot bind still fails loudly
-/// before any admission, as `channel_local`'s forward branch does.
+/// one session: a peer restart, a relay/network drop or the end of the PEER's grant no longer
+/// ends the forward, only this member's own grant end does (ct-agent#308: exit status 77, or
+/// refusing for good with `CT_CHANNEL_FORWARD_ON_GRANT_END=refuse`). A bad spec, a bad
+/// `CT_CHANNEL_FORWARD_ON_GRANT_END` or a listener that cannot bind still fails loudly before any
+/// admission, as `channel_local`'s forward branch does.
 //
 pub(crate) async fn run_forward_initiate_sessions(
     raw_spec: &str,
@@ -530,19 +641,23 @@ pub(crate) async fn run_forward_initiate_sessions(
 ) -> Result<(), BoxError> {
     use super::forward_stream as fs;
     let spec = fs::parse_forward_spec(raw_spec)?;
+    let on_own_end = fs::on_own_grant_end_from(std::env::var(fs::FORWARD_ON_GRANT_END_ENV).ok().as_deref())?;
     let (max_streams, idle) = fs::forward_limits_from_env();
     let (listener, bound) = fs::bind_forward_listener(spec.listen)?;
     eprintln!(
         "ct-agent channel: CT_CHANNEL_FORWARD {bound} -> {} (max_streams={max_streams}, \
-         idle={idle:?}, scimbe/ct-agent#255; reconnects after a session end, #267)",
+         idle={idle:?}, scimbe/ct-agent#255; reconnects after a session end, #267; on its own \
+         grant end: {on_own_end:?}, #308)",
         spec.target
     );
+    let own_expires_at = request.grant.grant.expires_at;
     fs::run_forward_initiate_reconnect_loop(
         listener,
         spec.target,
         max_streams,
         idle,
-        request.grant.grant.expires_at,
+        own_expires_at,
+        on_own_end,
         |local| {
             run_one_admission_session_with_local(
                 cfg,
@@ -553,7 +668,7 @@ pub(crate) async fn run_forward_initiate_sessions(
                 ChannelLocal::Forward(Ok(local)),
             )
         },
-        is_revoked_grant_refusal,
+        |e: &BoxError| own_grant_refusal(e, Some(own_expires_at), crate::codec::now_unix()).is_some(),
     )
     .await
 }

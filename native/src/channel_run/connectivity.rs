@@ -1101,7 +1101,18 @@ pub(crate) fn dial_failure_action(consecutive: u32) -> Option<std::time::Duratio
 /// attempt; its **outer** `Err` is a dial/setup failure, terminal for a one-shot
 /// join and retried with [`dial_failure_action`]'s bounded backoff in serve mode, while the
 /// **inner** `Result` is the admission outcome, routed through [`dcutr_loop_action`].
-pub(crate) async fn run_dcutr_join_loop<T, F, Fut>(label: &str, serve_loop: bool, join: F) -> Result<T, BoxError>
+///
+/// ct-agent#308: `own_expires_at` (a persistent serve member's own grant expiry; `None` for a
+/// one-shot join) stops the loop with [`OwnGrantEnded`] -- exit status 77, as the plane-brokered
+/// serve loop -- once that grant expired, wherever the loop is, and on an admission refusal that
+/// says the same (see [`own_grant_refusal`]). Retrying with a grant that never becomes valid
+/// again only loads the edge, for ever.
+pub(crate) async fn run_dcutr_join_loop<T, F, Fut>(
+    label: &str,
+    serve_loop: bool,
+    own_expires_at: Option<u64>,
+    join: F,
+) -> Result<T, BoxError>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<Result<T, BoxError>, BoxError>>,
@@ -1110,12 +1121,31 @@ where
     let mut consecutive_refusals: u32 = 0;
     let mut consecutive_dial_failures: u32 = 0;
     loop {
+        let joined = match own_expires_at {
+            // Already over by this member's clock: no dial with a grant that cannot work.
+            Some(at) if crate::codec::now_unix() >= at => return Err(own_expiry_ends_dcutr_loop(label, at)),
+            Some(at) => {
+                let session = join();
+                tokio::pin!(session);
+                tokio::select! {
+                    biased;
+                    joined = &mut session => joined,
+                    () = grant_expiry_timer(at) => {
+                        // A running session's gate holds the same expiry (R1) and ends it the
+                        // regular way within the teardown budget; a parked join is dropped.
+                        let _ = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, &mut session).await;
+                        return Err(own_expiry_ends_dcutr_loop(label, at));
+                    }
+                }
+            }
+            None => join().await,
+        };
         // In serve mode a dial/setup failure (an edge restart, a network blip) is retried with
         // its own exponential backoff instead of ending the persistent serve process -- but not
         // forever: a failure that never clears (a misconfigured relay address fails at once,
         // every time) ends the loop after MAX_CONSECUTIVE_DCUTR_DIAL_FAILURES so the operator
         // or a supervisor sees it. One-shot callers keep the old `?`.
-        let result = match join().await {
+        let result = match joined {
             Ok(result) => {
                 consecutive_dial_failures = 0;
                 result
@@ -1128,7 +1158,7 @@ where
                             "ct-agent channel: {label} dial failed ({consecutive_dial_failures}/\
                              {MAX_CONSECUTIVE_DCUTR_DIAL_FAILURES}), retrying in {delay:?}: {e}"
                         );
-                        tokio::time::sleep(equal_jitter(delay, rand::random::<f64>())).await;
+                        backoff_within_grant(label, equal_jitter(delay, rand::random::<f64>()), own_expires_at).await?;
                         continue;
                     }
                     None => {
@@ -1141,6 +1171,14 @@ where
             }
             Err(e) => return Err(e),
         };
+        // ct-agent#308: the edge says this member's own grant is over; it never becomes valid
+        // again in this process.
+        if let (Some(_), Err(e)) = (own_expires_at, &result) {
+            if let Some(reason) = own_grant_refusal(e, own_expires_at, crate::codec::now_unix()) {
+                eprintln!("ct-agent channel: {reason} -- stopping the persistent {label} serve loop (#308)");
+                return Err(OwnGrantEnded::boxed(reason));
+            }
+        }
         match dcutr_loop_action(&result, serve_loop, attempt, ONE_SHOT_DCUTR_ADMISSION_RETRIES, consecutive_refusals) {
             DcutrLoopAction::RetryReset { delay, consecutive_refusals: refusals } => {
                 if let Err(e) = &result {
@@ -1151,7 +1189,7 @@ where
                 // #114-style jitter (see errors::equal_jitter): dcutr_loop_action stays pure/
                 // deterministic for testability, so jitter is applied here at the sleep site
                 // instead, same as the other four admission-layer backoff call sites.
-                tokio::time::sleep(equal_jitter(delay, rand::random::<f64>())).await;
+                backoff_within_grant(label, equal_jitter(delay, rand::random::<f64>()), own_expires_at).await?;
             }
             DcutrLoopAction::RetryBounded { next_attempt, delay } => {
                 attempt = next_attempt;
@@ -1163,6 +1201,29 @@ where
                 tokio::time::sleep(delay).await;
             }
             DcutrLoopAction::Stop => return result,
+        }
+    }
+}
+
+/// ct-agent#308: the end of a persistent DCUtR serve loop whose own grant expired at `at`.
+fn own_expiry_ends_dcutr_loop(label: &str, at: u64) -> BoxError {
+    let reason = format!("this member's channel grant expired (expires_at {at})");
+    eprintln!("ct-agent channel: {reason} -- stopping the persistent {label} serve loop (#308)");
+    OwnGrantEnded::boxed(reason)
+}
+
+/// ct-agent#308: a serve loop's backoff `delay`, unless this member's own grant (when the loop
+/// watches one) expires first -- then the loop's end. A refusal backoff lasts up to 30 s.
+pub(crate) async fn backoff_within_grant(label: &str, delay: std::time::Duration, own_expires_at: Option<u64>) -> Result<(), BoxError> {
+    match own_expires_at {
+        Some(at) => tokio::select! {
+            biased;
+            () = grant_expiry_timer(at) => Err(own_expiry_ends_dcutr_loop(label, at)),
+            () = tokio::time::sleep(delay) => Ok(()),
+        },
+        None => {
+            tokio::time::sleep(delay).await;
+            Ok(())
         }
     }
 }

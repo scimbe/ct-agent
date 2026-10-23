@@ -43,17 +43,27 @@
 //! process neither exited nor reconnected: a peer restart or a relay drop killed the forward
 //! until a manual restart. Now the listener belongs to [`run_forward_initiate_reconnect_loop`],
 //! which hands it to one fresh engine per session. When a session ends for any reason other than
-//! a grant end (recorded as state by the gate, [`super::peer_grant::GrantEndRecord`], or this
-//! member's own grant past its expiry), the loop admits a new session after a backoff of
+//! this member's OWN grant end, the loop admits a new session after a backoff of
 //! [`FORWARD_RECONNECT_MIN`] doubling up to [`FORWARD_RECONNECT_MAX`], each wait jittered into the
 //! upper half of its step (ct-agent#314); connections made in the
-//! meantime wait in the listen backlog and are served by the next session. After a grant end the
-//! listener stays open but refuses every connection with a log line (#264), without reconnecting.
-//! An admission that the edge refuses because the grant is on the revocation list is final too:
-//! the grant is fixed for the life of the process and never becomes valid again, so the loop
-//! returns that error and the process ends with a failure status, as a one-shot dial does.
+//! meantime wait in the listen backlog and are served by the next session. That includes a
+//! session that ended because the PEER's grant expired or was revoked (ct-agent#308): this
+//! member's grant is still good, the peer may come back with a new one, and the edge refuses it
+//! at admission until then.
+//!
+//! ## This member's own grant end is the forward's end (ct-agent#308)
+//!
+//! The grant is fixed for the life of the process (read once from the environment), so once it
+//! expired or was revoked nothing the loop does can make the forward work again. Own grant ends
+//! are: the expiry the gate records as this member's, this member's expiry by the clock (also
+//! while the loop waits for a peer at the edge), an admission refused with `[grant-revoked]`, and
+//! `[grant-verify]` once the own grant is past its expiry. By default the loop then returns
+//! [`super::errors::OwnGrantEnded`], which drops the listener and ends the process with
+//! [`super::errors::OWN_GRANT_ENDED_EXIT`] (77), so a supervisor sees it.
+//! [`FORWARD_ON_GRANT_END_ENV`]`=refuse` keeps the earlier end state instead: the listener stays
+//! bound and refuses every connection with a log line (#264), and the process keeps running.
 //
-// See ct-agent#255 and ct-agent#267.
+// See ct-agent#255, ct-agent#267 and ct-agent#308.
 
 use std::collections::HashMap;
 use std::io;
@@ -67,8 +77,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
+use super::errors::{OwnGrantEnded, OWN_GRANT_ENDED_EXIT};
 use super::forward::accept_forward_request_with;
 use super::forward_wire::Frame;
+use super::peer_grant::{
+    grant_expiry_timer, with_grant_end_record, GrantEnd, GrantEndRecord, GrantEndScope, GRANT_TEARDOWN_BUDGET,
+};
 use super::service_calls::LocalDuplex;
 use crate::events;
 use crate::task_guard::TaskGuard;
@@ -270,19 +284,78 @@ pub(crate) fn next_forward_reconnect_delay(prev: Option<Duration>, lasted: Durat
     }
 }
 
-/// Why the session that just ended must not be replaced, decided from state only
-/// (ct-agent#267): the gate's recorded grant end, or this member's own grant past its expiry
-/// (`now >= expires_at`, the rule `verify_stateless` applies) -- the latter also covers a member
-/// running without the peer-grant check, whose gate records nothing. `None`: reconnect.
+/// The grant end of the session that just ended, decided from state only (ct-agent#267, #308):
+/// this member's own grant past its expiry (`now >= expires_at`, the rule `verify_stateless`
+/// applies; it also covers a session whose gate recorded nothing), else what the gate recorded --
+/// an own end, or a peer end that the loop reconnects after. `None`: no grant end at all.
 pub(crate) fn forward_grant_end(
-    recorded: Option<String>,
+    recorded: Option<GrantEnd>,
     own_expires_at: u64,
     now: u64,
-) -> Option<String> {
-    recorded.or_else(|| {
-        (now >= own_expires_at)
-            .then(|| format!("this member's channel grant expired (expires_at {own_expires_at})"))
-    })
+) -> Option<GrantEnd> {
+    match recorded {
+        Some(end) if end.scope == GrantEndScope::Own => Some(end),
+        _ if now >= own_expires_at => Some(GrantEnd::own(format!(
+            "this member's channel grant expired (expires_at {own_expires_at})"
+        ))),
+        other => other,
+    }
+}
+
+/// `CT_CHANNEL_FORWARD_ON_GRANT_END`: what a forward initiator does once its own grant ended
+/// (ct-agent#308). `exit` (the default) or `refuse`.
+pub const FORWARD_ON_GRANT_END_ENV: &str = "CT_CHANNEL_FORWARD_ON_GRANT_END";
+
+/// What a forward initiator does once its own grant ended (see the module doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnOwnGrantEnd {
+    /// Release the listener and end the process with exit status 77.
+    Exit,
+    /// Keep the listener bound and refuse every connection (#264); the process keeps running,
+    /// so no other local user can take the loopback port.
+    Refuse,
+}
+
+/// [`FORWARD_ON_GRANT_END_ENV`] parsed: unset, empty or `exit` is [`OnOwnGrantEnd::Exit`],
+/// `refuse` is [`OnOwnGrantEnd::Refuse`], anything else an error at start -- a typo must not
+/// silently pick a behaviour.
+pub(crate) fn on_own_grant_end_from(raw: Option<&str>) -> Result<OnOwnGrantEnd, String> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("exit") => Ok(OnOwnGrantEnd::Exit),
+        Some("refuse") => Ok(OnOwnGrantEnd::Refuse),
+        Some(other) => Err(format!(
+            "{FORWARD_ON_GRANT_END_ENV}={other:?} is not understood (use `exit` or `refuse`)"
+        )),
+    }
+}
+
+/// The forward's end after this member's own grant ended (ct-agent#308): the error that ends
+/// the process with exit status 77, or -- with `refuse` -- the #264 end state, which never returns.
+async fn end_forward_for_own_grant<E: From<OwnGrantEnded>>(
+    listener: &TcpListener,
+    on_own_end: OnOwnGrantEnd,
+    lasted: Duration,
+    reason: String,
+) -> Result<(), E> {
+    match on_own_end {
+        OnOwnGrantEnd::Exit => {
+            eprintln!(
+                "ct-agent channel: forward ended after {lasted:?}: {reason} -- this member's own grant \
+                 no longer authorizes it; releasing the forward listener, exit status \
+                 {OWN_GRANT_ENDED_EXIT} (#308)"
+            );
+            Err(E::from(OwnGrantEnded(reason)))
+        }
+        OnOwnGrantEnd::Refuse => {
+            eprintln!(
+                "ct-agent channel: forward ended after {lasted:?}: {reason} -- not reconnecting, the \
+                 forward listener refuses every new connection ({FORWARD_ON_GRANT_END_ENV}=refuse, \
+                 #264, #308)"
+            );
+            refuse_forward_connections(listener, &reason).await;
+            Ok(())
+        }
+    }
 }
 
 /// The #264 end state after a grant end: the listener stays bound and every connection is
@@ -304,52 +377,75 @@ async fn refuse_forward_connections(listener: &TcpListener, why: &str) {
 }
 
 /// The initiate side's session loop (ct-agent#267, see the module doc): one shared `listener`,
-/// one fresh engine and one `admit` call per session, reconnecting with backoff until a grant
-/// end, after which it refuses connections for good. `admit` runs one whole session (admission
-/// included) over the duplex it is given and returns when that session ends; it is the seam the
-/// tests drive without a broker.
+/// one fresh engine and one `admit` call per session, reconnecting with backoff until this
+/// member's own grant ended (ct-agent#308). `admit` runs one whole session (admission included)
+/// over the duplex it is given and returns when that session ends; it is the seam the tests drive
+/// without a broker.
 ///
-/// `is_final` names the admission errors that never clear on their own (a refusal because the
-/// grant is on the revocation list): the loop then stops and returns that error instead of
-/// asking again, so the process ends like a one-shot dial does. Otherwise it returns only if
-/// the listener's refusing loop ever could.
+/// `is_own_grant_refusal` names the admission errors that say this member's own grant ended (a
+/// refusal because the grant is on the revocation list). What happens then is `on_own_end`:
+/// return [`OwnGrantEnded`] (the process exits with 77), or refuse connections for good.
+#[allow(clippy::too_many_arguments)] // the six forward settings plus the two seams the tests drive
 pub(crate) async fn run_forward_initiate_reconnect_loop<A, Fut, E, F>(
     listener: Arc<TcpListener>,
     target: String,
     max_streams: usize,
     idle: Duration,
     own_expires_at: u64,
+    on_own_end: OnOwnGrantEnd,
     mut admit: A,
-    is_final: F,
+    is_own_grant_refusal: F,
 ) -> Result<(), E>
 where
     A: FnMut(LocalDuplex) -> Fut,
     Fut: std::future::Future<Output = Result<(), E>>,
-    E: std::fmt::Display,
+    E: std::fmt::Display + From<OwnGrantEnded>,
     F: Fn(&E) -> bool,
 {
     let mut delay: Option<Duration> = None;
+    let mut lasted = Duration::ZERO;
+    let expired = || format!("this member's channel grant expired (expires_at {own_expires_at})");
     loop {
-        let record = super::peer_grant::GrantEndRecord::default();
+        // ct-agent#308: an own grant that is already over by this member's clock ends the forward
+        // here -- before a fresh engine could take a connection from the listen backlog, and
+        // before the expired grant is presented to the edge once more.
+        if crate::codec::now_unix() >= own_expires_at {
+            return end_forward_for_own_grant(&listener, on_own_end, lasted, expired()).await;
+        }
+        let record = GrantEndRecord::default();
         let local = forward_initiate_on(listener.clone(), target.clone(), max_streams, idle);
         let started = std::time::Instant::now();
-        let outcome = super::peer_grant::with_grant_end_record(record.clone(), admit(local)).await;
-        let lasted = started.elapsed();
-        if let Some(why) =
-            forward_grant_end(record.ended(), own_expires_at, crate::codec::now_unix())
-        {
-            eprintln!(
-                "ct-agent channel: forward session ended after {lasted:?}: {why} -- not reconnecting, \
-                 the forward listener refuses every new connection (#264, #267)"
-            );
-            refuse_forward_connections(&listener, &why).await;
-            return Ok(());
-        }
-        if let Err(e) = &outcome {
-            if is_final(e) {
-                eprintln!("ct-agent channel: forward session failed after {lasted:?}: {e} -- not reconnecting");
-                return outcome;
+        // ct-agent#308: the own grant also runs out while this member waits at the edge for a
+        // peer (a park lasts as long as the edge allows); the forward ends then, not at the next
+        // session end. `biased`: a session that ends in the same instant reports its own end.
+        let outcome = {
+            let session = with_grant_end_record(record.clone(), admit(local));
+            tokio::pin!(session);
+            tokio::select! {
+                biased;
+                outcome = &mut session => Some(outcome),
+                () = grant_expiry_timer(own_expires_at) => {
+                    // A running session's gate holds the same expiry (R1) and fires within a
+                    // second of this timer: it ends the session the regular way, streams closed
+                    // within the teardown budget and its close event emitted. Only a session
+                    // still parked at the edge after that budget is dropped here.
+                    let _ = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, &mut session).await;
+                    None
+                }
             }
+        };
+        lasted = started.elapsed();
+        let Some(outcome) = outcome else {
+            return end_forward_for_own_grant(&listener, on_own_end, lasted, expired()).await;
+        };
+        let end = forward_grant_end(record.ended(), own_expires_at, crate::codec::now_unix()).or_else(|| {
+            match &outcome {
+                Err(e) if is_own_grant_refusal(e) => Some(GrantEnd::own(e.to_string())),
+                _ => None,
+            }
+        });
+        if let Some(GrantEnd { scope: GrantEndScope::Own, reason }) = end {
+            return end_forward_for_own_grant(&listener, on_own_end, lasted, reason).await;
         }
         let step = next_forward_reconnect_delay(delay, lasted);
         delay = Some(step);
@@ -357,17 +453,34 @@ where
         // into [step/2, step]. After an edge restart every forward initiator of a fleet ended its
         // session in the same second and came back in lockstep (1, 2, 4 ... s).
         let wait = super::errors::equal_jitter(step, rand::random::<f64>());
-        match outcome {
-            Ok(()) => eprintln!(
+        match (end, outcome) {
+            // ct-agent#308: until v0.7.40 a peer whose grant expired first stopped this member
+            // for good -- the session clock runs to the earlier expiry and was recorded as "the"
+            // grant end -- although this member's own grant was still valid.
+            (Some(peer_end), _) => eprintln!(
+                "ct-agent channel: forward session ended after {lasted:?}: {} -- the peer's grant, \
+                 not this member's: reconnecting in {wait:?}; the edge refuses the peer until it \
+                 holds a valid grant again (#308)",
+                peer_end.reason
+            ),
+            (None, Ok(())) => eprintln!(
                 "ct-agent channel: forward session ended after {lasted:?} without a grant end \
                  (peer restart or relay/network drop) -- reconnecting in {wait:?} (#267)"
             ),
-            Err(e) => eprintln!(
+            (None, Err(e)) => eprintln!(
                 "ct-agent channel: forward session failed after {lasted:?}: {e} -- reconnecting \
                  in {wait:?} (#267)"
             ),
         }
-        tokio::time::sleep(wait).await;
+        // ct-agent#308: the own grant can also run out during the backoff (up to 30 s); the
+        // forward ends then, with its listener, not when the wait is over.
+        tokio::select! {
+            biased;
+            () = grant_expiry_timer(own_expires_at) => {
+                return end_forward_for_own_grant(&listener, on_own_end, lasted, expired()).await;
+            }
+            () = tokio::time::sleep(wait) => {}
+        }
     }
 }
 
@@ -2159,21 +2272,34 @@ mod tests {
     }
 
     #[test]
-    fn only_a_recorded_grant_end_or_an_expired_own_grant_stops_the_reconnect() {
+    fn only_this_members_own_grant_end_stops_the_reconnect_308() {
+        let own = |end: Option<GrantEnd>| end.map(|e| e.scope) == Some(GrantEndScope::Own);
+        assert_eq!(forward_grant_end(None, 1_000, 999), None, "a valid grant reconnects");
+        assert!(own(forward_grant_end(None, 1_000, 1_000)), "now == expires_at is expired");
         assert_eq!(
-            forward_grant_end(None, 1_000, 999),
-            None,
-            "a valid grant reconnects"
+            forward_grant_end(Some(GrantEnd::own("revoked")), 1_000, 0),
+            Some(GrantEnd::own("revoked")),
+            "a recorded own end wins even while the own grant is still valid by the clock"
         );
-        assert!(
-            forward_grant_end(None, 1_000, 1_000).is_some(),
-            "now == expires_at is expired"
-        );
+        // ct-agent#308: the peer's end is reported as such -- the loop reconnects after it...
         assert_eq!(
-            forward_grant_end(Some("revoked".into()), 1_000, 0).as_deref(),
-            Some("revoked"),
-            "a recorded end wins even while the own grant is still valid"
+            forward_grant_end(Some(GrantEnd::peer("the peer's grant expired")), 1_000, 999),
+            Some(GrantEnd::peer("the peer's grant expired")),
         );
+        // ...unless this member's own grant is over too.
+        assert!(own(forward_grant_end(Some(GrantEnd::peer("the peer's grant expired")), 1_000, 1_000)));
+    }
+
+    #[test]
+    fn the_own_grant_end_mode_defaults_to_exit_and_refuses_a_typo_308() {
+        assert_eq!(on_own_grant_end_from(None), Ok(OnOwnGrantEnd::Exit));
+        assert_eq!(on_own_grant_end_from(Some("")), Ok(OnOwnGrantEnd::Exit), "compose passes unset as empty");
+        assert_eq!(on_own_grant_end_from(Some(" exit ")), Ok(OnOwnGrantEnd::Exit));
+        assert_eq!(on_own_grant_end_from(Some("refuse")), Ok(OnOwnGrantEnd::Refuse));
+        for typo in ["Refuse", "refused", "keep", "1"] {
+            let err = on_own_grant_end_from(Some(typo)).unwrap_err();
+            assert!(err.contains(FORWARD_ON_GRANT_END_ENV), "{typo}: {err}");
+        }
     }
 
     #[test]
