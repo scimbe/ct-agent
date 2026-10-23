@@ -154,8 +154,8 @@ pub(crate) fn reject_refused_outcome(outcome: ChannelJoinOutcome) -> Result<Chan
             ))
         }
         // #21: a park expiry becomes the DISTINCT typed error so [`serve_loop_concurrent`]
-        // routes it through its immediate-re-park path (no refusal backoff, no ladder advance)
-        // instead of spawning it as a session or backing off as if refused.
+        // routes it through its re-park path (a short jittered pause, no refusal backoff, no
+        // ladder advance) instead of spawning it as a session or backing off as if refused.
         ChannelJoinOutcome::ParkExpired => Err(ParkExpired::boxed(
             "channel park expired with no partner within the edge park window (#21) -- re-parking",
         )),
@@ -516,9 +516,9 @@ where
             }
             Err(join_err) => {
                 // A panic inside admit() itself -- see this match's own doc comment above.
-                // Not a refusal, not a handshake-EOF: fold it into the generic transient-error
-                // backoff path so a repeatedly-panicking admit still eventually backs off,
-                // exactly like any other admission error.
+                // Not a refusal, not a handshake-EOF, and not on the transient streak either: it
+                // is retried after the flat `retry_backoff`, as it always was, and every streak
+                // starts over -- a panic is a bug to fix, not an outage the backoff waits out.
                 drop(permit);
                 consecutive_handshake_eofs = 0;
                 consecutive_refusals = 0;
@@ -536,10 +536,11 @@ where
                 // a refusal (never counts toward the #231 backoff) nor a failure worth the
                 // generic "admission error" log line (the named line below is the field-visible
                 // contract the #21 measurement greps for; its held-time suffix shows the lease).
-                // The short sleep ([`ex_repark_delay`], 100-500 ms in production) is a tight-loop
-                // guard against a misbehaving edge that reaps instantly, jittered so the parks one
-                // sweep ended do not all return in the same instant; a healthy edge parks for the
-                // full lease between expiries.
+                // "Immediately" means without any backoff: only a short sleep ([`ex_repark_delay`],
+                // 100-500 ms in production), a tight-loop guard against a misbehaving edge that
+                // reaps instantly, jittered so the parks one sweep ended do not all return in the
+                // same instant. The re-park is a fresh admission and walks the ladder from rung 0
+                // again; a healthy edge parks for the full lease between expiries.
                 if is_park_expired(&e) {
                     consecutive_refusals = 0;
                     consecutive_handshake_eofs = 0;

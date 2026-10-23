@@ -375,9 +375,11 @@ impl RelayPairTimeout {
 /// orphaned process retrying a not-member holder measured at ~24-47 admission attempts/second
 /// against the production edge, plausibly starving OTHER, genuinely valid joins of admission
 /// capacity (the exact symptom #231 describes). Backs off exponentially
-/// (`retry_backoff * 2^consecutive_refusals`), capped at [`REFUSED_ADMISSION_BACKOFF_CAP`]; a
-/// transient error always gets the fast, unchanged `retry_backoff` so a genuine brief CP/edge
-/// blip (#140) still recovers quickly. Pure — the loop supplies `consecutive_refusals`.
+/// (`retry_backoff * 2^consecutive_refusals`), capped at [`REFUSED_ADMISSION_BACKOFF_CAP`]; for a
+/// transient error it returns the fast, unchanged `retry_backoff`. The serve loop now takes a
+/// transient's delay from [`transient_admission_backoff`] instead, whose first retry is that same
+/// fast one, so a genuine brief CP/edge blip (#140) still recovers quickly. Pure — the loop
+/// supplies `consecutive_refusals`.
 pub(crate) fn admission_retry_backoff(
     retry_backoff: std::time::Duration,
     refused: bool,

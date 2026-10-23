@@ -7023,9 +7023,11 @@ async fn relay_leg_gives_up_and_closes_when_the_partner_never_arrives_22() {
     let (fd_listener, acceptor, edge_cert) =
         build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap()).await.expect("tls-tcp listener");
     let fd_addr = fd_listener.local_addr().expect("front-door addr");
+    // The 300 ms bound below also covers the leg's TLS handshake and admission (about 10 ms
+    // here); a runner too starved to finish them in time fails at these two expects.
     let edge = tokio::spawn(async move {
         let (tcp, peer) = fd_listener.accept().await.expect("the relay leg connects");
-        let tls = acceptor.accept(tcp).await.expect("tls accept");
+        let tls = acceptor.accept(tcp).await.expect("tls accept, inside the 300 ms pair bound");
         let (mut stream, ..) = admit_channel_join_on_duplex(
             tls,
             peer,
@@ -7037,7 +7039,7 @@ async fn relay_leg_gives_up_and_closes_when_the_partner_never_arrives_22() {
             },
         )
         .await
-        .expect("admit the relay leg over :443");
+        .expect("admit the relay leg over :443, inside the 300 ms pair bound");
         let mut buf = [0u8; 64];
         stream.read(&mut buf).await
     });

@@ -211,7 +211,9 @@ picture first.
   advance and no backoff, and the serve loop re-parks after a jittered 100–500 ms, so the parks
   one edge sweep ended do not all return in the same instant. A re-park restarts the ladder at
   rung 0. The edge decides the park lease: 30 s base, up to its ceiling for persistent acceptors
-  on adaptive edges. The `(held …)` suffix is how long this park was held, about its lease, so a
+  on adaptive edges (an edge in fixed mode gives a raised ceiling to every accept-capable
+  keepalive park, an edge that predates lease modes its raised `CT_EDGE_KA_PARK_TTL_SECS` to
+  every keepalive park). The `(held …)` suffix is how long this park was held, about its lease, so a
   healthy idle serve loop cycles this line once per lease. Requires v0.4.12 on NAT'd paths —
   v0.4.11 half-closed the parked leg after the possession signature, which put the flow into the
   NAT's short FIN-WAIT timer and ate the `EX` on the way back.
@@ -219,16 +221,25 @@ picture first.
   was still parked when the one-shot window closed`** — a one-shot initiator (pipe, `--call`)
   gives up at its retry window (`CT_CHANNEL_INITIATE_RETRY_SECS`, default 75 s) even while a park
   is still open, instead of waiting for the edge to end it (~115 s, or the edge's whole keepalive
-  park TTL where an operator raised it). Forward and persistent CALL initiators keep parking as
-  long as the edge holds them: they want to be paired the moment the acceptor parks.
+  park TTL where an operator raised it); the edge counts the dropped park as a corpse park
+  (#499). It starts no attempt that could only begin at the deadline, so after fast failures the
+  line names the last real error instead; a cut after earlier attempts adds `(previous attempt:
+  …)`, since an attempt started shortly before the deadline may still have been connecting.
+  Forward and persistent CALL initiators (`CT_CHANNEL_CALL_RECONNECT` on, the
+  default; off, a CALL runs one-shot) keep parking as long as the edge holds them: they want to
+  be paired the moment the acceptor parks.
 - **`relay leg found no partner within 45s -- closed it (CT_CHANNEL_RELAY_PAIR_SECS)`** — a `:443`
   relay leg waits at most 45 s (settable within 35–300 s) for its partner, then closes the leg
-  with a TLS close_notify, which the edge reads as the park's death at once. Transient: the
-  session attempt fails and is retried like any other. QUIC relay legs keep their own 45 s bound.
+  with a TLS close_notify, which the edge reads as the park's death at once (a corpse park,
+  #499). Transient: the serve loop goes on with its next admission, forward and persistent CALL
+  loops reconnect, and a one-shot call ends with this error. QUIC relay legs keep their own 45 s
+  bound.
 - **`admission error, re-admitting (#200)`** — a transient admission failure (connection refused
   while the edge restarts, a dropped leg, a stalled exchange). The serve loop retries the first
   one after 100–200 ms and doubles the wait for each further one in a row, up to 10 s
-  (jittered); an admission, a park expiry, a refusal or a TLS-handshake EOF resets the streak.
+  (jittered); an admission, a park expiry, a refusal, a TLS-handshake EOF or a panicking
+  admission resets the streak, and a transient that ended an attempt of 10 s or more (a long
+  park) starts a new one.
 - **`all N serve slots busy -- not parking until a session ends (#200)`** — every serve slot
   (`CT_CHANNEL_SERVE_CONCURRENCY`) holds a running session, so the member does not park and new
   peers cannot reach it until one ends; `a serve slot is free again -- parking (#200)` ends the
@@ -308,7 +319,7 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_CHANNEL_PEER_NOISE_KEY` / `CT_CHANNEL_PEER_CERT` | the peer's Noise public key (64 hex) and, for the initiator, its transport cert (hex DER) — direct-address mode only |
 | `CT_CHANNEL_CIRCUIT_RELAY` | libp2p Circuit-Relay v2 multiaddr for the DCUtR upgrade path (#136). Absent: no hole-punch is attempted at all |
 | `CT_CHANNEL_RELAY_DIRECT` | dial the relay at this `host:port` instead of the one the grant names — an operator override, not a fallback |
-| `CT_CHANNEL_INITIATE_RETRY_SECS` | initiator only: the admission retry window, default **75** s, one attempt every 3 s (#95; `0`, empty or garbage keep 75). A one-shot caller (pipe, `--call`) gives up at the window even while parked; forward and persistent CALL initiators check it only between attempts and stay parked as long as the edge holds them |
+| `CT_CHANNEL_INITIATE_RETRY_SECS` | initiator only: the admission retry window, default **75** s, 3 s between attempts (#95; `0`, empty or garbage keep 75). A one-shot caller (pipe, `--call`) gives up at the window even while parked or mid-attempt, so keep it well above one ladder walk (the direct QUIC rung alone may take 5 s); forward and persistent CALL initiators (`CT_CHANNEL_CALL_RECONNECT` on) check it only between attempts and stay parked as long as the edge holds them |
 | `CT_CHANNEL_RELAY_PAIR_SECS` | how long a `:443` relay leg waits for its partner before it closes the leg, default **45** s, clamped to 35–300 s (`0`, empty or garbage keep 45). QUIC relay legs keep their own 45 s bound |
 | `CT_CHANNEL_SERVE` / `CT_CHANNEL_SERVE_CONCURRENCY` | accept-side persistent serve, session cap (default 8) |
 | `CT_CHANNEL_DIRECT_UPGRADE=1` | opt-in in-band relay→direct upgrade (#104) |
