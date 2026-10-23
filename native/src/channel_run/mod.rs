@@ -358,13 +358,28 @@ pub(crate) fn gate_local<P>(
     peer_holder: [u8; 32],
     holder: &SigningKey,
 ) -> Result<PeerGrantGate<P>, BoxError> {
-    let forward = forward_session_configured();
+    gate_local_from(local, request, role, peer_holder, holder, &|k: &str| std::env::var(k).ok())
+}
+
+/// [`gate_local`] over a variable lookup (the testable seam). It is the one place every plane
+/// session decides whether it runs the peer-grant check -- the persistent serve loop's sessions
+/// included (`serve_admitted_session` -> `run_channel_join_with_admission`), which ct-agent#314
+/// suspected of skipping it.
+pub(crate) fn gate_local_from<P>(
+    local: P,
+    request: &ChannelJoinRequest,
+    role: ChannelRole,
+    peer_holder: [u8; 32],
+    holder: &SigningKey,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<PeerGrantGate<P>, BoxError> {
+    let forward = forward_session_configured_from(env);
     let watch = if forward && role == ChannelRole::Accept {
-        let cp_url = std::env::var("CT_AGENT_CP_URL").ok().filter(|s| !s.trim().is_empty());
-        let required = revocation_required(std::env::var(REVOCATION_ENV).ok().as_deref())?;
+        let cp_url = env("CT_AGENT_CP_URL").filter(|s| !s.trim().is_empty());
+        let required = revocation_required(env(REVOCATION_ENV).as_deref())?;
         match resolve_cp(cp_url, required)? {
             Some(cp_url) => {
-                let config = grant_watch::WatchConfig::from_env()?.requiring(required);
+                let config = grant_watch::WatchConfig::from_lookup(env)?.requiring(required);
                 Some(grant_watch::WatchPlan::control_plane(&cp_url, holder, &request.grant, config))
             }
             None => {
@@ -378,7 +393,7 @@ pub(crate) fn gate_local<P>(
     } else {
         None
     };
-    let check = PeerGrantPolicy::from_env_for(forward)?.map(|policy| PeerGrantCheck {
+    let check = PeerGrantPolicy::from_lookup_for(env, forward)?.map(|policy| PeerGrantCheck {
         policy,
         own_grant: request.grant.clone(),
         peer_holder,
@@ -466,7 +481,14 @@ pub(crate) fn check_revocation_config_from(
 
 /// Whether this process runs a TCP forward session, on either side.
 fn forward_session_configured() -> bool {
-    std::env::var(forward_stream::FORWARD_ENV).is_ok() || forward::forward_allow_configured()
+    forward_session_configured_from(&|k: &str| std::env::var(k).ok())
+}
+
+/// [`forward_session_configured`] over a variable lookup: the same rule as `channel_local`'s two
+/// forward branches (`CT_CHANNEL_FORWARD` set, or a non-empty `CT_CHANNEL_FORWARD_ALLOW`).
+fn forward_session_configured_from(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    env(forward_stream::FORWARD_ENV).is_some()
+        || !forward::parse_forward_allowlist(env(forward::FORWARD_ALLOW_ENV).as_deref()).is_empty()
 }
 
 /// The peer's attested Noise key and the holder that attested it.

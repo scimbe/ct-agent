@@ -225,6 +225,19 @@ picture first.
   drives a pair-and-die storm at native RTT speed. Any session that succeeds or simply lives
   ≥500 ms resets the streak (real arena rounds run ~85 ms *inside* an already-held session; a
   fresh session that does real work runs well past 500 ms).
+- **`channel_session state=refused reason=the peer did not present its grant within 10s`**
+  ([#314]) — the peer-grant check (always on for a TCP forward, opt-in otherwise) got no grant
+  from the peer. The 10 s count from the start of the session, right after the Noise handshake.
+  Through v0.7.40 they counted from admission, so a slow pairing (direct dial 5 s, accept window
+  8 s, a relay rung, the handshake) could use them up before the peer could answer: the refusal
+  then came milliseconds after `state=open`. When this side of a session fails like that, the
+  session ends within 2 s even if the peer never sends another byte; before, a peer that had
+  finished the handshake and then stayed silent held the session for ever — a forward initiator
+  never reconnected and an accept member lost a serve slot. A refusal is **not a grant end**: a
+  forward initiator reconnects with backoff (1 s doubling up to 30 s, each wait jittered into the
+  upper half of its step), the serve loop parks again. A peer that never presents its grant is
+  usually not a forward member of this channel at all: a second process with the same identity
+  but without `CT_CHANNEL_FORWARD_ALLOW`, or a member older than the forward check.
 
 ## Registration (the Browser-Plane/mesh tunnel, not channels — but same binary)
 
@@ -286,7 +299,7 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_CHANNEL_RELAY_DIRECT` | dial the relay at this `host:port` instead of the one the grant names — an operator override, not a fallback |
 | `CT_CHANNEL_SERVE` / `CT_CHANNEL_SERVE_CONCURRENCY` | accept-side persistent serve, session cap (default 8) |
 | `CT_CHANNEL_DIRECT_UPGRADE=1` | opt-in in-band relay→direct upgrade (#104) |
-| `CT_CHANNEL_REQUIRE_PEER_GRANT` / `CT_CHANNEL_OPERATOR_PUBKEY` | **Opt-in end-to-end check of the peer's grant** (default off). Admission attests the peer's Noise key with the peer's holder key, but all of that comes from the broker; nothing binds the holder to an operator-signed grant, so a compromised broker could present an identity it minted itself. With `CT_CHANNEL_REQUIRE_PEER_GRANT=1` both members send their own grant as the first bytes inside the Noise session, and each checks the other's before any application byte flows: the signature against `CT_CHANNEL_OPERATOR_PUBKEY` (64 hex, required when on), expiry, same channel, holder = the attested peer holder, and the complementary direction. **Switch it on for every member of a channel together**: a member that sends the grant to one that does not expect it breaks that session. On but without an operator key, the join fails. |
+| `CT_CHANNEL_REQUIRE_PEER_GRANT` / `CT_CHANNEL_OPERATOR_PUBKEY` | **Opt-in end-to-end check of the peer's grant** (default off). Admission attests the peer's Noise key with the peer's holder key, but all of that comes from the broker; nothing binds the holder to an operator-signed grant, so a compromised broker could present an identity it minted itself. With `CT_CHANNEL_REQUIRE_PEER_GRANT=1` both members send their own grant as the first bytes inside the Noise session, and each checks the other's before any application byte flows: the signature against `CT_CHANNEL_OPERATOR_PUBKEY` (64 hex, required when on), expiry, same channel, holder = the attested peer holder, and the complementary direction. **Switch it on for every member of a channel together**: a member that sends the grant to one that does not expect it breaks that session. On but without an operator key, the join fails. **A TCP forward runs this check on both sides whatever the switch says** (`CT_CHANNEL_FORWARD` set, or `CT_CHANNEL_FORWARD_ALLOW` non-empty), the sessions of a persistent serve accept member included; setting it on a forward member changes nothing and does not fix a forward that is refused with "did not present its grant" ([#314], see [Failure semantics](#failure-semantics-and-timers-what-an-error-actually-means)). |
 | `CT_AGENT_SERVICE_HANDLER_CMD` / `CT_AGENT_SERVICES` | the handler command + offered service slugs on the serve side |
 | `CT_SERVICE_TYPE` | not read by `ct-agent` itself — set **in the handler child's own environment** by `CT_AGENT_SERVICE_HANDLER_CMD` (#149-A.1) so one handler script can branch on which of several registered `service/<slug>` calls was actually invoked |
 | `CT_CHANNEL_REFLEXIVE_EDGE` | `host:port` of the edge's QUIC "whoami" listener (its `'W'` reflexive-address echo, #248/#238). Defaults to the relay-gate host on port `4433`; override only when the edge's QUIC listener is somewhere else. |
@@ -538,3 +551,4 @@ needed exactly once, at `sign`, so an operator can review the unsigned skeleton 
 [#250]: https://github.com/scimbe/ct-agent/issues/15
 [#330]: https://github.com/scimbe/ct-agent/issues/16
 [#47]: https://github.com/scimbe/ct-agent/issues/47
+[#314]: https://github.com/scimbe/ct-agent/issues/314

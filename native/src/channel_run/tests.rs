@@ -8010,6 +8010,228 @@ async fn forward_initiator_keeps_retrying_a_refusal_that_can_still_clear() {
     looping.abort();
 }
 
+// --- ct-agent#314: a session whose own side failed ends, even if the peer stays silent ---------
+//
+// The field report: a forward initiator logged `state=open`, then "the peer did not present its
+// grant within 10s", and never dialled again while its process stayed up. #267's reconnect
+// decision is not the cause (a gate refusal is no grant end, pinned in `peer_grant`'s tests).
+// The session itself never returned: `noise_pump` hands a local read error back from its
+// outbound direction without closing the cipher side, and its `join!` then waits for the inbound
+// direction, which ends only when the peer sends a byte or closes. A peer that finished the
+// Noise handshake and then stays silent -- a wedged process, an ungated member waiting for a
+// whole frame, a half-dead splice -- held the session and the loop behind it for ever.
+
+/// A peer that completes the Noise handshake in `role` and then holds the transport open without
+/// ever writing a byte or closing it.
+async fn silent_noise_peer(
+    transport: tokio::io::DuplexStream,
+    role: ChannelRole,
+    own_private: [u8; 32],
+    peer_public: [u8; 32],
+) {
+    let (mut r, mut w) = tokio::io::split(transport);
+    let _ = match role {
+        ChannelRole::Initiate => ct_common::a2a::a2a_initiate(&mut w, &mut r, &own_private, &peer_public).await,
+        ChannelRole::Accept => ct_common::a2a::a2a_respond(&mut w, &mut r, &own_private).await,
+    };
+    // Both halves stay alive: no byte, no FIN, ever.
+    std::future::pending::<()>().await;
+}
+
+/// One gated session in `role` against [`silent_noise_peer`] in the other role: what it returned
+/// (`None`: still running after three grant timeouts) and after how long.
+async fn gated_session_against_a_silent_peer(role: ChannelRole) -> (Option<io::Result<()>>, Duration) {
+    let (initiate_check, accept_check) = forward_grant_checks(crate::codec::now_unix() + 3600);
+    let check = match role {
+        ChannelRole::Initiate => initiate_check,
+        ChannelRole::Accept => accept_check,
+    };
+    let peer_role = match role {
+        ChannelRole::Initiate => ChannelRole::Accept,
+        ChannelRole::Accept => ChannelRole::Initiate,
+    };
+    let (me, peer) = (generate_static_keypair(), generate_static_keypair());
+    let (me_priv, me_pub, peer_priv, peer_pub) = (me.private, me.public, peer.private, peer.public);
+    let (my_transport, peer_transport) = tokio::io::duplex(1 << 16);
+    let silent = tokio::spawn(silent_noise_peer(peer_transport, peer_role, peer_priv, me_pub));
+    let (_app, local) = tokio::io::duplex(4096);
+    let gate = PeerGrantGate::new(local, Some(check));
+    let (r, w) = tokio::io::split(my_transport);
+    let started = tokio::time::Instant::now();
+    let ended = tokio::time::timeout(
+        PEER_GRANT_TIMEOUT * 3,
+        run_channel_session_on_stream(w, r, role, &me_priv, &peer_pub, gate),
+    )
+    .await
+    .ok();
+    let after = started.elapsed();
+    silent.abort();
+    (ended, after)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_grant_timeout_ends_the_session_even_if_the_peer_stays_silent_314() {
+    for role in [ChannelRole::Initiate, ChannelRole::Accept] {
+        let (ended, after) = gated_session_against_a_silent_peer(role).await;
+        let err = ended
+            .unwrap_or_else(|| panic!("{role:?}: the session must return, not wait for the silent peer for ever"))
+            .expect_err("a session whose gate refused the peer is not a clean end");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{role:?}: {err}");
+        assert!(err.to_string().contains("did not present its grant"), "{role:?}: {err}");
+        assert!(
+            after <= PEER_GRANT_TIMEOUT + LOCAL_FAILURE_GRACE + LOCAL_FAILURE_DRAIN + Duration::from_millis(100),
+            "{role:?}: ended after {after:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn forward_initiator_reconnects_after_a_silent_peer_never_presents_its_grant_314() {
+    // The #314 shape end to end over the reconnect loop: every admission pairs with a peer that
+    // completes the handshake and never presents its grant. Each session must end, so the loop
+    // admits again with backoff -- on unchanged code the first session never returned.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (listener, _bound) =
+        bind_forward_listener("127.0.0.1:0".parse().unwrap()).expect("the loopback listener binds");
+    let admissions = std::sync::Arc::new(AtomicUsize::new(0));
+    let silent_peers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (counted, peers) = (admissions.clone(), silent_peers.clone());
+    let admit = move |local: LocalDuplex| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        let (initiate_check, _) = forward_grant_checks(crate::codec::now_unix() + 3600);
+        let (a, b) = (generate_static_keypair(), generate_static_keypair());
+        let (a_priv, a_pub, b_priv, b_pub) = (a.private, a.public, b.private, b.public);
+        let (a_transport, b_transport) = tokio::io::duplex(1 << 16);
+        peers
+            .lock()
+            .unwrap()
+            .push(tokio::spawn(silent_noise_peer(b_transport, ChannelRole::Accept, b_priv, a_pub)).abort_handle());
+        async move {
+            let gate = PeerGrantGate::new(local, Some(initiate_check));
+            let (ar, aw) = tokio::io::split(a_transport);
+            run_channel_session_on_stream(aw, ar, ChannelRole::Initiate, &a_priv, &b_pub, gate).await
+        }
+    };
+    let looping = tokio::spawn(run_forward_initiate_reconnect_loop(
+        listener,
+        "127.0.0.1:9".to_string(),
+        forward_stream::DEFAULT_MAX_STREAMS,
+        Duration::from_secs(forward_stream::DEFAULT_IDLE_SECS),
+        crate::codec::now_unix() + 3600,
+        admit,
+        |_: &io::Error| false,
+    ));
+    let deadline = tokio::time::Instant::now() + PEER_GRANT_TIMEOUT * 3;
+    while admissions.load(Ordering::SeqCst) < 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        admissions.load(Ordering::SeqCst) >= 2,
+        "the initiator must admit again after a session whose peer never presented its grant"
+    );
+    assert!(!looping.is_finished(), "a refusal is no grant end: the forward keeps going (#267)");
+    looping.abort();
+    for peer in silent_peers.lock().unwrap().iter() {
+        peer.abort();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn forward_reconnect_waits_are_jittered_so_a_fleet_does_not_reconnect_in_lockstep_314() {
+    // After an edge restart every forward initiator ends its session in the same second; with a
+    // deterministic 1, 2, 4 ... s backoff they all came back in lockstep. Each wait now lies in
+    // [step/2, step] of the unchanged doubling sequence, and is not the bare step.
+    use std::sync::{Arc, Mutex};
+    let (listener, _bound) =
+        bind_forward_listener("127.0.0.1:0".parse().unwrap()).expect("the loopback listener binds");
+    let admitted_at: Arc<Mutex<Vec<tokio::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    let times = admitted_at.clone();
+    let looping = tokio::spawn(run_forward_initiate_reconnect_loop(
+        listener,
+        "127.0.0.1:9".to_string(),
+        forward_stream::DEFAULT_MAX_STREAMS,
+        Duration::from_secs(forward_stream::DEFAULT_IDLE_SECS),
+        crate::codec::now_unix() + 3600,
+        move |_local: LocalDuplex| {
+            times.lock().unwrap().push(tokio::time::Instant::now());
+            async { Err::<(), io::Error>(io::Error::other("the edge is restarting")) }
+        },
+        |_: &io::Error| false,
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while admitted_at.lock().unwrap().len() < 5 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    looping.abort();
+    let at = admitted_at.lock().unwrap().clone();
+    assert!(at.len() >= 5, "the loop kept reconnecting: {} admissions", at.len());
+    // The timer wheel rounds a sleep up to the next millisecond.
+    let tick = Duration::from_millis(1);
+    let mut step = FORWARD_RECONNECT_MIN;
+    let mut shorter = 0;
+    for pair in at.windows(2).take(4) {
+        let gap = pair[1] - pair[0];
+        assert!(gap >= step / 2 && gap <= step + tick, "gap {gap:?} outside [{:?}, {step:?}]", step / 2);
+        if gap + tick < step {
+            shorter += 1;
+        }
+        step = (step * 2).min(FORWARD_RECONNECT_MAX);
+    }
+    assert!(shorter > 0, "every wait was the bare deterministic step: no jitter");
+}
+
+#[tokio::test]
+async fn a_persistent_serve_forward_accept_presents_its_grant_without_the_opt_in_314() {
+    // The issue's own hypothesis, pinned as refuted: a persistent-serve accept member of a forward
+    // (CT_CHANNEL_SERVE=1 + CT_CHANNEL_FORWARD_ALLOW) never ran the gate, and
+    // CT_CHANNEL_REQUIRE_PEER_GRANT=1 was the fix. Every plane session -- the serve loop's
+    // included -- builds its gate in `gate_local`, and a forward forces the check there whatever
+    // the opt-in says: the accept side's first bytes towards the peer are its own grant.
+    use ed25519_dalek::Signer as _;
+    let operator = ed25519_dalek::SigningKey::from_bytes(&[0x41u8; 32]);
+    let holder = ed25519_dalek::SigningKey::from_bytes(&[0x03u8; 32]);
+    let g = ct_common::channel::ChannelGrant {
+        channel: ct_common::channel::ChannelId([0x97u8; 32]),
+        holder: holder.verifying_key().to_bytes(),
+        direction: ct_common::channel::Direction::Accept,
+        rights: ct_common::channel::Rights::ReadWrite,
+        delegable: false,
+        expires_at: crate::codec::now_unix() + 3600,
+    };
+    let request = ChannelJoinRequest {
+        grant: ct_common::channel::SignedChannelGrant { signature: operator.sign(&g.signing_bytes()).to_bytes(), grant: g },
+        endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+    };
+    let operator_hex = crate::codec::hex_encode(&operator.verifying_key().to_bytes());
+    let serve_forward_accept = |k: &str| match k {
+        "CT_CHANNEL_ROLE" => Some("accept".to_string()),
+        "CT_CHANNEL_SERVE" => Some("1".to_string()),
+        forward::FORWARD_ALLOW_ENV => Some("127.0.0.1:5432".to_string()),
+        OPERATOR_PUBKEY_ENV => Some(operator_hex.clone()),
+        _ => None, // no CT_CHANNEL_REQUIRE_PEER_GRANT
+    };
+    let (_app, local) = tokio::io::duplex(4096);
+    let mut gate = gate_local_from(local, &request, ChannelRole::Accept, [0x02u8; 32], &holder, &serve_forward_accept)
+        .expect("a forward accept member with an operator key builds its gate");
+    let mut first = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(5), gate.read_exact(&mut first))
+        .await
+        .expect("the grant is the first thing the session reads")
+        .unwrap();
+    assert_eq!(&first, b"CTPG1", "the accept side presents its grant without the opt-in");
+
+    // The control: the same member without the allowlist is no forward, and without the opt-in
+    // its gate stays transparent -- so the line above is the forward rule, not a default.
+    let not_a_forward = |k: &str| (k == OPERATOR_PUBKEY_ENV).then(|| operator_hex.clone());
+    let (mut app, local) = tokio::io::duplex(4096);
+    let mut gate = gate_local_from(local, &request, ChannelRole::Accept, [0x02u8; 32], &holder, &not_a_forward)
+        .expect("builds");
+    app.write_all(b"plain").await.unwrap();
+    let mut got = [0u8; 5];
+    gate.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"plain");
+}
+
 /// Reads until `tcp` either delivers exactly `expect_len` bytes or EOFs, returning exactly the
 /// bytes it got. An empty result is a clean refusal (the cap bit before a single echo byte came
 /// back); `expect_len` bytes is a full echo; anything in between is the truncation this test
