@@ -6,7 +6,8 @@
 //! are the wire-outcome vocabulary the serve loop routes on; the backoff constants and
 //! pure functions are the policy for HOW each class retries. Keeping them in one module
 //! makes the contract reviewable at a glance: refusals back off exponentially, park
-//! expiries re-park immediately, flaps back off on a shorter cap, transients retry fast.
+//! expiries re-park immediately, flaps back off on a shorter cap, transients retry fast
+//! once and then back off on the same shorter cap.
 
 use super::BoxError;
 
@@ -274,6 +275,28 @@ pub(crate) fn handshake_eof_backoff(
     retry_backoff
         .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
         .min(HANDSHAKE_EOF_BACKOFF_CAP)
+}
+
+/// Ceiling on the serve loop's backoff after consecutive TRANSIENT admission failures (see
+/// [`transient_admission_backoff`]) -- the same 10 s as [`HANDSHAKE_EOF_BACKOFF_CAP`], for the
+/// same reason: an edge restart or a dropped path clears on its own, so the loop keeps checking
+/// well before a definitive refusal's 30 s.
+pub(crate) const TRANSIENT_ADMISSION_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// #200: the serve loop's delay after `consecutive` transient admission failures in a row
+/// (connection refused while the edge restarts, a dropped leg, a stalled exchange, a DNS error).
+/// The first keeps today's fast `retry_backoff`, so a one-off blip (#140) still recovers at
+/// once; each further one doubles it, capped at [`TRANSIENT_ADMISSION_BACKOFF_CAP`]. Before
+/// this, such failures were retried at a flat 100-200 ms for as long as they lasted: two refused
+/// connects per attempt, 5-7 attempts a second per agent through a whole edge restart. Pure.
+pub(crate) fn transient_admission_backoff(
+    retry_backoff: std::time::Duration,
+    consecutive: u32,
+) -> std::time::Duration {
+    let shift = consecutive.saturating_sub(1).min(16);
+    retry_backoff
+        .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
+        .min(TRANSIENT_ADMISSION_BACKOFF_CAP)
 }
 
 /// #21: typed marker for a park expiry -- the edge reaped this member's park because no partner

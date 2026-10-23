@@ -3354,6 +3354,25 @@ fn handshake_eof_backoff_is_exponential_and_capped_between_transient_and_refusal
     );
 }
 
+#[test]
+fn transient_admission_backoff_keeps_the_first_delay_then_doubles_to_the_cap_200() {
+    // A transient admission failure keeps today's fast first retry (a one-off blip, #140, must
+    // still recover at once); a streak of them -- an edge restart -- doubles up to a 10 s cap
+    // instead of retrying at 100-200 ms for the whole outage.
+    let base = Duration::from_millis(200);
+    assert_eq!(transient_admission_backoff(base, 0), base, "no streak yet: the fast retry");
+    assert_eq!(transient_admission_backoff(base, 1), base, "the first transient: today's delay");
+    assert_eq!(transient_admission_backoff(base, 2), base * 2);
+    assert_eq!(transient_admission_backoff(base, 3), base * 4);
+    assert_eq!(transient_admission_backoff(base, 100), TRANSIENT_ADMISSION_BACKOFF_CAP, "capped");
+    assert_eq!(transient_admission_backoff(base, u32::MAX), TRANSIENT_ADMISSION_BACKOFF_CAP, "never overflows");
+    assert_eq!(TRANSIENT_ADMISSION_BACKOFF_CAP, Duration::from_secs(10));
+    assert!(
+        TRANSIENT_ADMISSION_BACKOFF_CAP <= REFUSED_ADMISSION_BACKOFF_CAP,
+        "a transient clears on its own -- it never waits longer than a definitive refusal"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn serve_loop_concurrent_backs_off_after_repeated_handshake_eofs_without_touching_the_refusal_streak_40() {
     // #40 (CADS-Tunnel#335) end-to-end: the field incident was two peers hammering a
@@ -3389,6 +3408,69 @@ async fn serve_loop_concurrent_backs_off_after_repeated_handshake_eofs_without_t
 
     assert!(attempt.load(Ordering::SeqCst) >= 4, "the loop kept making progress through both failure classes");
     driver.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn serve_loop_backs_off_repeated_connection_refused_then_recovers_200() {
+    // An edge restart as the serve loop sees it: every admission fails with a refused TCP
+    // connect (the real shape, inside the dial error) until the edge listens again. The loop
+    // used to retry that at a flat 100-200 ms -- 5-7 attempts a second per agent for the whole
+    // restart. Now (a) the gaps grow, so the first 3 s see at most 6 attempts; (b) a park expiry
+    // resets the streak, so the next transient waits only the fast delay again; (c) the loop
+    // recovers and serves the next admission.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    let calls: Arc<Mutex<Vec<tokio::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    let c = calls.clone();
+    let admit = move || {
+        let n = {
+            let mut calls = c.lock().unwrap();
+            calls.push(tokio::time::Instant::now());
+            calls.len() - 1
+        };
+        async move {
+            let refused = || -> BoxError {
+                Box::new(ChannelDialError::ConnectFailed(Box::new(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionRefused,
+                ))))
+            };
+            match n {
+                0..=7 | 9 => Err(refused()),
+                8 => Err(ParkExpired::boxed(
+                    "channel park expired with no partner within the edge park window (#21) -- re-parking",
+                )),
+                10 => Ok(()),
+                _ => std::future::pending().await,
+            }
+        }
+    };
+    let served = Arc::new(AtomicUsize::new(0));
+    let s = served.clone();
+    let serve = move |_: ()| {
+        let s = s.clone();
+        async move {
+            s.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await; // holds the only slot: the loop stops admitting
+            Ok::<(), BoxError>(())
+        }
+    };
+    let driver = tokio::spawn(serve_loop_concurrent(1, Duration::from_millis(200), admit, serve));
+    // Paused clock: the runtime jumps from timer to timer, so the whole sequence (at most ~35 s
+    // of backoff) runs without being waited out.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    driver.abort();
+
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 11, "8 refused, the park expiry, 1 refused, the admission");
+    assert_eq!(served.load(Ordering::SeqCst), 1, "the loop recovered and served the admission");
+    let early = calls.iter().filter(|t| t.duration_since(calls[0]) < Duration::from_secs(3)).count();
+    assert!(early <= 6, "a refusing edge is not hammered: {early} attempts in the first 3 s");
+    let gaps: Vec<Duration> = calls.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(gaps.iter().all(|g| *g <= TRANSIENT_ADMISSION_BACKOFF_CAP), "never beyond the cap: {gaps:?}");
+    assert!(
+        gaps[9] <= Duration::from_millis(200),
+        "the park expiry reset the streak, the next transient waits the fast delay: {gaps:?}"
+    );
 }
 
 #[test]

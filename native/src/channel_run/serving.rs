@@ -362,7 +362,8 @@ pub(crate) fn record_flap_outcome(counter: &std::sync::atomic::AtomicU32, flappe
 /// the next peer immediately instead of blocking on the whole session. `max` bounds in-flight
 /// sessions via a semaphore whose permit is taken BEFORE parking (backpressure: we never admit a peer
 /// we have no capacity to serve) and released when the session ends. A transient `admit` error is
-/// logged and retried after `retry_backoff`; a **refused** (definitive, not-a-member) admission
+/// logged and retried after `retry_backoff`, doubling per consecutive transient up to 10 s
+/// ([`transient_admission_backoff`]); a **refused** (definitive, not-a-member) admission
 /// backs off exponentially instead — see [`admission_retry_backoff`]. A `serve` error is a single
 /// peer's problem, logged and dropped. Never returns under normal operation. Injectable so the
 /// concurrency contract is unit-testable without a real broker/relay.
@@ -386,6 +387,10 @@ where
     // different cause and a different natural resolution time than a definitive refusal, so
     // its own streak must not affect, or be affected by, the refusal streak.
     let mut consecutive_handshake_eofs: u32 = 0;
+    // Independent from both streaks above: a TRANSIENT failure (connection refused while the edge
+    // restarts, a dropped leg, a stalled exchange) escalates on its own streak instead of
+    // retrying at a flat 100-200 ms for the whole outage. Any other outcome resets it.
+    let mut consecutive_transients: u32 = 0;
     // #250: shared across spawned sessions (all admissions on this loop are for the SAME
     // channel/holder -- an accept-side member has exactly one fixed remote grant, so there is
     // no "other peer" a global backoff could unfairly delay). Incremented by a session that
@@ -430,6 +435,7 @@ where
             Ok(Ok(work)) => {
                 consecutive_refusals = 0;
                 consecutive_handshake_eofs = 0;
+                consecutive_transients = 0;
                 let fut = serve(work);
                 let flap_counter = consecutive_flaps.clone();
                 tokio::spawn(async move {
@@ -451,6 +457,7 @@ where
                 drop(permit);
                 consecutive_handshake_eofs = 0;
                 consecutive_refusals = 0;
+                consecutive_transients = 0;
                 eprintln!(
                     "ct-agent channel: WARNING -- an admission attempt panicked ({join_err}); treating \
                      it as a transient admission error rather than crashing the persistent serve loop \
@@ -469,6 +476,7 @@ where
                 if is_park_expired(&e) {
                     consecutive_refusals = 0;
                     consecutive_handshake_eofs = 0;
+                    consecutive_transients = 0;
                     eprintln!("ct-agent channel: {e}");
                     tokio::time::sleep(retry_backoff).await;
                     continue;
@@ -480,6 +488,7 @@ where
                 // saturated cap (CADS-Tunnel#335's field-observed failure mode).
                 if is_transport_handshake_eof(&e) {
                     consecutive_refusals = 0;
+                    consecutive_transients = 0;
                     consecutive_handshake_eofs = consecutive_handshake_eofs.saturating_add(1);
                     let backoff = equal_jitter(
                         handshake_eof_backoff(retry_backoff, consecutive_handshake_eofs),
@@ -497,8 +506,13 @@ where
                 consecutive_handshake_eofs = 0;
                 let refused = is_definitive_admission_refusal(&e);
                 consecutive_refusals = if refused { consecutive_refusals.saturating_add(1) } else { 0 };
+                consecutive_transients = if refused { 0 } else { consecutive_transients.saturating_add(1) };
                 let backoff = equal_jitter(
-                    admission_retry_backoff(retry_backoff, refused, consecutive_refusals),
+                    if refused {
+                        admission_retry_backoff(retry_backoff, refused, consecutive_refusals)
+                    } else {
+                        transient_admission_backoff(retry_backoff, consecutive_transients)
+                    },
                     rand::random::<f64>(),
                 );
                 eprintln!("ct-agent channel: admission error, re-admitting (#200): {e}");
