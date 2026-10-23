@@ -84,6 +84,10 @@ USAGE:
     ct-agent channel agent-card           Write (and optionally register) this agent's card
     ct-agent channel agent-card --verify <file>  Verify a card file's signature/expiry
     ct-agent channel super-peer           Run as an opt-in LAN-local relay for same-network members
+    ct-agent channel health [readyz|healthz]
+                                Ask this container's running member on CT_CHANNEL_HEALTH_LISTEN;
+                                 exit 0 on 200, 1 otherwise, 2 on a usage error (an exec probe
+                                 without curl or python)
     ct-agent channel                      Join a channel (CT_CHANNEL_* env config)
     ct-agent manifest create              Print an UNSIGNED service manifest skeleton
     ct-agent manifest sign                Sign a manifest skeleton with the holder key
@@ -100,6 +104,15 @@ USAGE:
 
 Every subcommand is configured entirely via CT_*/CT_AGENT_*/CT_CHANNEL_* environment
 variables, not flags -- see docs.bunsenbrenner.org for the full reference per command.
+
+`ct-agent channel` (joining a channel) ends on SIGTERM or SIGINT after a drain: it takes no new
+peers or connections, waits up to CT_CHANNEL_SHUTDOWN_DRAIN_SECS (default 5) for the sessions --
+for a forward, the forwarded streams -- still in flight, then exits with status 0 (a one-shot
+pipe or call whose transfer the drain cut: 143 for SIGTERM, 130 for SIGINT). Another signal 1 s
+or more after the first exits at once. CT_CHANNEL_HEALTH_LISTEN=<ip:port> (opt-in) serves GET
+/healthz (200 while the process runs) and GET /readyz (200 while a session is established or, on
+the accept side, while parked at the edge, and briefly after either; 503 otherwise and while
+shutting down) for probes.
 
 `login` (RFC 8628 OAuth 2.0 Device Authorization Grant, against the same Keycloak realm the
 portal login uses) reads CT_OIDC_ISSUER (the realm URL, e.g.
@@ -800,6 +813,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ct_agent::super_peer::run(listen, upstream).await?;
             return Ok(());
         }
+        // `ct-agent channel health [readyz|healthz]`: ask the health listener of the member running
+        // in this container (CT_CHANNEL_HEALTH_LISTEN, same environment) and exit 0 on 200, 1
+        // otherwise, 2 on a usage error -- a Kubernetes exec probe that needs no curl or python
+        // and works on a loopback-only listener.
+        if std::env::args().nth(2).as_deref() == Some("health") {
+            let which = std::env::args().nth(3);
+            let code = ct_agent::channel_run::run_health_probe(which.as_deref()).await;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
         // #117 `ct-agent channel register`: register the operator's channel authority with
         // the control plane (POST /me/channels, owner = the OIDC subject) so the edge
         // accepts the grants that operator signs — the last CP round-trip that makes an
@@ -971,7 +996,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(sub) = std::env::args().nth(2) {
             const KNOWN: &[&str] = &[
                 "init", "operator-init", "member-material", "join-pipeline-role", "grant", "grant-revoke",
-                "invite", "bind-topology", "super-peer", "register", "allowlist", "agent-card",
+                "invite", "bind-topology", "super-peer", "health", "register", "allowlist", "agent-card",
             ];
             if !KNOWN.contains(&sub.as_str()) {
                 eprintln!("ct-agent: unrecognized channel subcommand '{sub}'\n");
@@ -981,6 +1006,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         // Configuration that can never work is refused here, before any network is set up.
         if let Err(e) = ct_agent::channel_run::check_revocation_config() {
+            eprintln!("ct-agent channel: {e}");
+            std::process::exit(1);
+        }
+        // SIGTERM/SIGINT end this process after a bounded drain, with status 0 unless the drain
+        // cut a one-shot transfer -- without a handler, a container's PID 1 ignored SIGTERM and
+        // every pod stop waited for SIGKILL -- and CT_CHANNEL_HEALTH_LISTEN serves /healthz and
+        // /readyz. A bad value of either, or of CT_CHANNEL_FORWARD_SESSION_WINDOW_KIB, is refused
+        // here like the check above.
+        if let Err(e) = ct_agent::channel_run::start_channel_lifecycle().await {
             eprintln!("ct-agent channel: {e}");
             std::process::exit(1);
         }

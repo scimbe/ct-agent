@@ -5493,6 +5493,161 @@ async fn large_transfer_is_not_truncated_when_the_sender_tears_down_after_the_se
     assert_eq!(got, expected, "delivered bytes are byte-exact and complete");
 }
 
+// SIGTERM/SIGINT and readiness wired into the real persistent serve admission: the park the
+// serve loop holds at a `:443` front door (admitted by the production gate, never answered)
+// counts as parked, so an accept member is ready on it, and the stop closes that leg and walks
+// no further rung. Driven through `shutdown::admit_next_peer` -- the one call the serve loop's
+// admission closure makes -- with this test's own stop token and health counts.
+#[tokio::test]
+async fn a_serve_members_park_counts_for_readiness_and_the_stop_closes_it() {
+    use super::health::{with_health, ChannelHealth};
+    use ct_common::channel::ChannelId;
+    use ct_edge::channel_broker::admit_channel_join_on_duplex;
+    use ct_edge::transport::build_tcp_tls_listener_at;
+
+    // `serve_cfg`'s operator and channel.
+    let op_pub = SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes();
+    let channel = [0xD1u8; 32];
+    let (fd_listener, acceptor, edge_cert) =
+        build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap()).await.expect("tls-tcp listener");
+    let fd_addr = fd_listener.local_addr().expect("front-door addr");
+    let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+    let edge = tokio::spawn(async move {
+        let (tcp, peer) = fd_listener.accept().await.expect("the member's leg connects");
+        let tls = acceptor.accept(tcp).await.expect("tls accept");
+        let (mut stream, _req, _op, _noise, _attest, _observed) = admit_channel_join_on_duplex(
+            tls,
+            peer,
+            500u64, // now < expires_at (1_000)
+            Duration::from_secs(5),
+            &move |c: ChannelId, _h: [u8; 32]| {
+                let ok = c.0 == channel;
+                async move { ok.then_some((op_pub, None, None)) }
+            },
+        )
+        .await
+        .expect("admit the member's join over :443");
+        let _ = parked_tx.send(());
+        // Parked: no answer ever. Read until the member closes the leg.
+        let mut buf = [0u8; 64];
+        while let Ok(n) = stream.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
+        // A member that had only lost this leg would walk on to the ladder's next rung.
+        tokio::time::timeout(Duration::from_secs(1), fd_listener.accept()).await.is_ok()
+    });
+
+    let cfg = serve_cfg(Some(fd_addr), Some(hex_encode(edge_cert.as_ref())), true);
+    let request = ChannelJoinRequest { grant: cfg.grant.clone(), endpoint: "203.0.113.7:7007".to_string() };
+    let ctx = ServeSessionCtx::from_cfg(&cfg, request, None);
+    let health: &'static ChannelHealth = Box::leak(Box::new(ChannelHealth::new()));
+    let stop = tokio_util::sync::CancellationToken::new();
+    let admission = with_health(health, super::shutdown::admit_next_peer(&ctx, &stop));
+    tokio::pin!(admission);
+    tokio::select! {
+        out = &mut admission => panic!("the admission ended before the edge held its park: {out:?}"),
+        parked = parked_rx => parked.expect("the edge parked the join"),
+    }
+    assert_eq!(health.parks(), 1, "the park on the ladder counts as parked");
+    let why = health
+        .readiness_at(crate::codec::now_unix(), true)
+        .expect("an accept member parked at the edge is ready");
+    assert!(why.contains("parked at the edge"), "{why}");
+
+    stop.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1500), &mut admission).await.is_err(),
+        "after the stop the admission never resolves, so the serve loop parks no more"
+    );
+    let next_rung = tokio::time::timeout(Duration::from_secs(5), edge)
+        .await
+        .expect("the stop closed the parked leg")
+        .expect("edge task");
+    assert!(!next_rung, "the whole admission is gone, not just its leg");
+    assert_eq!(health.parks(), 0);
+}
+
+// The SIGTERM drain must wait for a QUIC session until the peer acknowledged its tail (#134), not
+// only until its pump returned: a one-shot pipe whose session completes during the drain would
+// otherwise exit under `run_channel_session`'s `stopped()` wait and cut that tail after all. The
+// peer runs on a runtime of its own, which the test freezes once the peer's FIN has reached this
+// side, so nothing acknowledges the tail until the test thaws it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quic_session_stays_in_flight_until_the_peer_acknowledged_its_tail() {
+    use super::health::{with_health, ChannelHealth};
+    use crate::transport::{build_channel_dialer, build_direct_listener_at};
+
+    let ours = generate_static_keypair();
+    let theirs = generate_static_keypair();
+    let (our_priv, our_pub, their_priv, their_pub) = (ours.private, ours.public, theirs.private, theirs.public);
+
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+    let (freeze_tx, freeze_rx) = tokio::sync::oneshot::channel::<()>();
+    let (frozen_tx, frozen_rx) = tokio::sync::oneshot::channel::<()>();
+    let (thaw_tx, thaw_rx) = std::sync::mpsc::channel::<()>();
+    let peer = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("peer runtime");
+        rt.block_on(async move {
+            let (server, _cert) = build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("listener");
+            addr_tx.send(server.local_addr().expect("addr")).expect("hand over the address");
+            let conn = server.accept().await.expect("incoming").await.expect("conn");
+            // Nothing to send: the peer FINs right after the handshake. What it receives stays in
+            // its local buffer (kept open, so the session never fails on it).
+            let (peer_run, peer_test) = tokio::io::duplex(64 * 1024);
+            let (peer_test_r, mut peer_test_w) = tokio::io::split(peer_test);
+            // A shutdown, not a drop: the duplex closes only with both halves gone.
+            peer_test_w.shutdown().await.expect("the peer's EOF");
+            let session = tokio::spawn(async move {
+                let _ = run_channel_session(&conn, ChannelRole::Accept, &their_priv, &our_pub, peer_run).await;
+                conn
+            });
+            freeze_rx.await.expect("freeze");
+            let _ = frozen_tx.send(());
+            // Blocks this runtime's only thread: no task of the peer runs, its QUIC stack included.
+            let _ = thaw_rx.recv();
+            let _ = tokio::time::timeout(Duration::from_secs(10), session).await;
+            drop(peer_test_r);
+        });
+    });
+
+    let addr = addr_rx.recv_timeout(Duration::from_secs(10)).expect("the peer's address");
+    let endpoint = build_channel_dialer().expect("dialer");
+    let conn = endpoint.connect(addr, "localhost").expect("cfg").await.expect("conn");
+    let (our_run, our_test) = tokio::io::duplex(64 * 1024);
+    let (mut our_test_r, mut our_test_w) = tokio::io::split(our_test);
+    let health: &'static ChannelHealth = Box::leak(Box::new(ChannelHealth::new()));
+    let session = tokio::spawn(with_health(health, async move {
+        let ended = run_channel_session(&conn, ChannelRole::Initiate, &our_priv, &their_pub, our_run).await;
+        (ended, conn)
+    }));
+    // The peer's FIN arrives here as EOF: from now on this side needs nothing more from the peer.
+    let mut nothing = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), our_test_r.read_to_end(&mut nothing))
+        .await
+        .expect("the peer's EOF within 10 s")
+        .expect("read");
+    assert_eq!(health.in_flight(false), 1, "the session is established");
+    freeze_tx.send(()).expect("freeze");
+    frozen_rx.await.expect("the peer froze");
+    // The tail, then this side's EOF: the pump is over at once, and the session waits in
+    // `stopped()` for an acknowledgement the frozen peer cannot send.
+    our_test_w.write_all(b"the tail").await.expect("tail");
+    our_test_w.shutdown().await.expect("eof");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!session.is_finished(), "the session waits for the acknowledgement of its tail");
+    assert_eq!(health.in_flight(false), 1, "so the shutdown drain must keep waiting for it too");
+    thaw_tx.send(()).expect("thaw");
+    let (ended, _conn) = tokio::time::timeout(Duration::from_secs(10), session)
+        .await
+        .expect("the session ends once the peer acknowledged the tail")
+        .expect("session task");
+    ended.expect("a clean session");
+    assert_eq!(health.in_flight(false), 0);
+    peer.join().expect("peer thread");
+}
+
 #[tokio::test]
 async fn open_channel_streams_bounds_a_stalled_setup_instead_of_hanging() {
     // #139 (frozen): after dial_peer_direct connects, open_bi/accept_bi were unbounded — a QUIC

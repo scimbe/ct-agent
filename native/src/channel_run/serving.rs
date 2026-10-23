@@ -133,7 +133,10 @@ pub(crate) async fn admit_one_peer(ctx: &ServeSessionCtx) -> Result<ChannelJoinO
                 .connect(ctx.broker_addr, "localhost")?
                 .await?;
             // CADS-Tunnel#495 U2 (a'): broker_conn is admission-only -- PHASE_MARKER_RENDEZVOUS.
-            present_channel_join_marked(&broker_conn, &ctx.request, &ctx.holder, PHASE_MARKER_RENDEZVOUS).await?
+            // Parked from here on, for `/readyz` (health.rs) -- the ladder counts its legs alike.
+            super::health::health()
+                .parked(present_channel_join_marked(&broker_conn, &ctx.request, &ctx.holder, PHASE_MARKER_RENDEZVOUS))
+                .await?
         }
     };
     reject_refused_outcome(outcome)
@@ -582,7 +585,10 @@ where
             None => {
                 let broker_conn = crate::transport::build_channel_dialer()?.connect(cfg.broker_addr, "localhost")?.await?;
                 // CADS-Tunnel#495 U2 (a'): broker_conn is admission-only -- PHASE_MARKER_RENDEZVOUS.
-                present_channel_join_marked(&broker_conn, request, &cfg.holder, PHASE_MARKER_RENDEZVOUS).await
+                // Parked from here on, for `/readyz` (health.rs).
+                super::health::health()
+                    .parked(present_channel_join_marked(&broker_conn, request, &cfg.holder, PHASE_MARKER_RENDEZVOUS))
+                    .await
             }
         }
     };
