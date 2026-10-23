@@ -3473,6 +3473,47 @@ async fn serve_loop_backs_off_repeated_connection_refused_then_recovers_200() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn serve_loop_keeps_the_fast_retry_after_transients_that_end_long_parks_200() {
+    // A transient that ends a LONG attempt -- a QUIC park whose 45 s client bound fires before
+    // the edge's close after a slow admission, a path that silently kills an idle keepalive park
+    // -- already paced the loop by itself. It starts a new streak, so such parks do not stretch
+    // every re-park towards the 10 s cap (the member would be unparked a tenth of the time);
+    // only fast, repeating failures (an edge restart) escalate.
+    use std::sync::{Arc, Mutex};
+    let calls: Arc<Mutex<Vec<tokio::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    let c = calls.clone();
+    let admit = move || {
+        let n = {
+            let mut calls = c.lock().unwrap();
+            calls.push(tokio::time::Instant::now());
+            calls.len()
+        };
+        async move {
+            if n <= 4 {
+                tokio::time::sleep(Duration::from_secs(45)).await;
+                Err::<(), BoxError>("channel join admission exchange stalled (#140)".into())
+            } else {
+                std::future::pending().await // the fifth park stays
+            }
+        }
+    };
+    let serve = |_: ()| async { Ok::<(), BoxError>(()) };
+    let driver = tokio::spawn(serve_loop_concurrent(1, Duration::from_millis(200), admit, serve));
+    // Paused clock: the runtime jumps from timer to timer.
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    driver.abort();
+
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 5, "four long parks ended by a transient, then the fifth park");
+    let pauses: Vec<Duration> =
+        calls.windows(2).map(|w| (w[1] - w[0]).saturating_sub(Duration::from_secs(45))).collect();
+    assert!(
+        pauses.iter().all(|p| *p <= Duration::from_millis(200)),
+        "every re-park after a long attempt keeps the fast delay: {pauses:?}"
+    );
+}
+
 #[test]
 fn ex_repark_delay_stays_between_half_and_two_and_a_half_times_the_base_21() {
     // #21: the re-park after a park expiry is spread over [b/2, 2.5 b] -- 100-500 ms for the

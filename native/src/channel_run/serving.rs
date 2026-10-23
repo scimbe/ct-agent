@@ -499,8 +499,8 @@ where
         match tokio::spawn(admit()).await {
             Ok(Ok(work)) => {
                 consecutive_refusals = 0;
-                consecutive_handshake_eofs = 0;
                 consecutive_transients = 0;
+                consecutive_handshake_eofs = 0;
                 let fut = serve(work);
                 let flap_counter = consecutive_flaps.clone();
                 tokio::spawn(async move {
@@ -573,6 +573,12 @@ where
                 consecutive_handshake_eofs = 0;
                 let refused = is_definitive_admission_refusal(&e);
                 consecutive_refusals = if refused { consecutive_refusals.saturating_add(1) } else { 0 };
+                // A transient that ended a long attempt (a park a slow admission or a silent path
+                // ended after tens of seconds) already paced the loop by itself: it starts a new
+                // streak instead of stretching every re-park towards the cap.
+                if admit_started.elapsed() >= TRANSIENT_ADMISSION_BACKOFF_CAP {
+                    consecutive_transients = 0;
+                }
                 consecutive_transients = if refused { 0 } else { consecutive_transients.saturating_add(1) };
                 let backoff = equal_jitter(
                     if refused {
