@@ -12,7 +12,7 @@
 //!
 //! One exit status is final (ct-agent#308): 77 (`EX_NOPERM`) means the child's own channel grant
 //! expired or was revoked. The child reads its grant once, so every restart would be refused the
-//! same way; the supervisor records it, does not restart, and exits 77 itself, so the layer above
+//! same way; the supervisor logs it, does not restart, and exits 77 itself, so the layer above
 //! (systemd with `RestartPreventExitStatus=77`, a container runtime) sees the same verdict.
 //!
 //! Env:
@@ -232,6 +232,15 @@ async fn main() {
         };
 
         eprintln!("ct-agent-supervisor: {child_bin} exited after {uptime:?} -- {reason}");
+        // Before the history update: no restart follows, so none is counted, and the process
+        // ends at once -- the status endpoint would never serve the record. The line above logs it.
+        if let Some(status) = final_status(&reason) {
+            eprintln!(
+                "ct-agent-supervisor: not restarting {child_bin}: its own channel grant ended and the \
+                 same grant cannot work again; exiting with status {status} (#308)"
+            );
+            std::process::exit(status);
+        }
         {
             // Poison-tolerant (ct-agent#176): the crash history is diagnostic state --
             // a panic while it was held must not stop the supervisor from restarting
@@ -249,14 +258,6 @@ async fn main() {
                     .unwrap_or(0),
                 uptime_secs: uptime.as_secs(),
             });
-        }
-
-        if let Some(status) = final_status(&reason) {
-            eprintln!(
-                "ct-agent-supervisor: not restarting {child_bin}: its own channel grant ended and the \
-                 same grant cannot work again; exiting with status {status} (#308)"
-            );
-            std::process::exit(status);
         }
 
         if uptime >= HEALTHY_UPTIME_THRESHOLD {

@@ -317,7 +317,8 @@ where
 ///
 /// When reading `local` fails (e.g. the peer-grant gate refusing the peer), the session ends with
 /// that error within [`LOCAL_FAILURE_GRACE`] plus [`LOCAL_FAILURE_DRAIN`], whether or not the peer
-/// ever sends another byte (ct-agent#314).
+/// ever sends another byte (ct-agent#314). The same bound holds once the session's grant ended,
+/// for a session run inside a grant-end record (ct-agent#308).
 pub async fn run_channel_session_on_stream<W, R, P>(
     send: W,
     recv: R,
@@ -399,11 +400,25 @@ where
     // after this side failed (see `LocalFailSignal`). So it races that failure: the peer gets
     // LOCAL_FAILURE_GRACE to end the session the normal way, then the pump is dropped (releasing
     // the reborrowed halves) and the session ends with the local error.
+    //
+    // ct-agent#308: the same bound once the session's grant ended. The gate hands the pump an EOF
+    // then -- a clean end, not an error -- and the pump FINs the peer and waits for its close, so
+    // a peer that never closes (a wedged process, a half-open path) held the session: a forward
+    // initiator's reconnect after the PEER's grant end, or a serve slot. The signal exists for a
+    // session that runs inside a grant-end record (forward, one-shot and serve sessions).
     let (failed_tx, mut failed_rx) = tokio::sync::oneshot::channel();
     let local = LocalFailSignal { inner: local, failed: Some(failed_tx) };
+    let grant_end = super::peer_grant::current_grant_end_record();
+    let grant_end_signal = async {
+        match &grant_end {
+            Some(record) => record.wait().await,
+            None => std::future::pending().await,
+        }
+    };
     let (pumped, gave_up) = {
         let pump = noise_pump(session, BiStream { send: &mut send, recv: &mut recv }, local);
         tokio::pin!(pump);
+        tokio::pin!(grant_end_signal);
         tokio::select! {
             biased;
             pumped = &mut pump => (pumped, false),
@@ -417,15 +432,29 @@ where
                     (Err(failure), true)
                 }
             },
+            () = &mut grant_end_signal => match tokio::time::timeout(LOCAL_FAILURE_GRACE, &mut pump).await {
+                Ok(pumped) => (pumped, false),
+                Err(_) => {
+                    eprintln!(
+                        "ct-agent channel: the session's channel grant ended and the peer did not \
+                         close the session within {LOCAL_FAILURE_GRACE:?} -- ending it (#308)"
+                    );
+                    let why = "the channel grant ended and the peer did not close the session";
+                    (Err(io::Error::new(io::ErrorKind::PermissionDenied, why)), true)
+                }
+            },
         }
     };
     drop(ticker);
     let drain = if gave_up { LOCAL_FAILURE_DRAIN } else { RELAY_DRAIN_TIMEOUT };
     graceful_stream_drain(&mut send, &mut recv, drain).await;
     eprintln!("{}", traffic_status_line());
+    // ct-agent#308: a session the grant ended was cut short, even when its pump saw only clean
+    // EOFs -- not `ok`.
+    let grant_ended = grant_end.as_ref().and_then(super::peer_grant::GrantEndRecord::ended);
     crate::events::emit(
         crate::events::CHANNEL_SESSION,
-        serde_json::json!({ "state": "close", "peer": peer_hex, "ok": pumped.is_ok() }),
+        serde_json::json!({ "state": "close", "peer": peer_hex, "ok": pumped.is_ok() && grant_ended.is_none() }),
     );
     pumped
 }

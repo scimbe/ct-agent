@@ -708,7 +708,10 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             let request = &request;
             let cfg = &cfg;
             let relay_gate_cert = &relay_gate_cert;
-            return run_dcutr_join_loop("relay-gate", serve_loop, move || async move {
+            // ct-agent#308: a persistent serve member stops (exit status 77) once its own grant
+            // is over; a one-shot join that a grant end cut short is an error, not a clean end.
+            let own_expires_at = serve_loop.then_some(request.grant.grant.expires_at);
+            let joined = run_dcutr_join_loop("relay-gate", serve_loop, own_expires_at, move || async move {
                 let relay_conn =
                     dial_relay_preferring_direct(cfg.relay_addr_direct, cfg.relay_addr, DIRECT_DIAL_TIMEOUT).await?;
                 // Admission via the relay gate happens below, after this call -- peer not yet known.
@@ -725,8 +728,8 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                     &cfg.grant,
                 )
                 .await)
-            })
-            .await;
+            });
+            return if serve_loop { joined.await } else { one_shot_session(joined).await };
         }
         if let Some(circuit) = cfg.circuit_relay.clone() {
             eprintln!(
@@ -737,9 +740,11 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             let request = &request;
             let cfg = &cfg;
             let circuit = &circuit;
+            // ct-agent#308: as on the relay-gate path above.
+            let own_expires_at = serve_loop.then_some(request.grant.grant.expires_at);
             // #24: the label is a parameter now -- this branch used to print
             // "relay-gate admission error" from its copied loop body.
-            return run_dcutr_join_loop("circuit-relay", serve_loop, move || async move {
+            let joined = run_dcutr_join_loop("circuit-relay", serve_loop, own_expires_at, move || async move {
                 let relay_conn = crate::transport::build_channel_dialer()?
                     .connect(cfg.relay_addr, "localhost")?
                     .await?;
@@ -755,8 +760,8 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                     circuit.clone(),
                 )
                 .await)
-            })
-            .await;
+            });
+            return if serve_loop { joined.await } else { one_shot_session(joined).await };
         }
     }
     // Broker admission (the grant + possession proof are the auth; Noise_IK authenticates
@@ -808,7 +813,9 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             return run_forward_initiate_sessions(&raw, &cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert)
                 .await;
         }
-        return run_one_admission_session(&cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert).await;
+        // ct-agent#308: a one-shot session that a grant end cut short (R1) is an error, not exit 0.
+        return one_shot_session(run_one_admission_session(&cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert))
+            .await;
     }
     // #200: persistent serve is now CONCURRENT. The #179 loop admitted a peer, served it to
     // completion, and only THEN re-admitted the next — so two users clicking Build within the same

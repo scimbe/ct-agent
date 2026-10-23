@@ -10,7 +10,7 @@ linked — those threads carry the full evidence.
 
 | Mode | Selected by | Behavior |
 |---|---|---|
-| **Persistent call mode — the DEFAULT since v0.5.0** ([#19](https://github.com/scimbe/ct-agent/issues/19); opt-in `=1` since v0.4.9) | `CT_CHANNEL_CALL_SERVICE=<slug>` | **One held session** for the process's life; each stdin **line** is one call, each response is one NDJSON envelope line: `{"ok":true,"output":…}` or `{"ok":false,"error":…}` as the structured last line before a non-zero exit. stdin EOF = clean teardown. Measured effect on the sort arena: per-round faults 12–15% → 0%, ~85 ms/round steady state, transport overhead ×27 lower. **Reconnects internally on a mid-run session death since v0.6.0** ([#47], default on): the process no longer exits when the network session drops — it redials, backing off exponentially on repeated near-instant failures (reusing the same [#250] flapping-backoff policy the SERVE side already uses), and any stdin line queued during a reconnect is answered once the new session is up rather than lost with the whole process. Previously (through v0.5.x) a mid-run death called `exit(1)` immediately, and the calling application was responsible for detecting the dead process and respawning it with its own backoff — see `CT_CHANNEL_CALL_RECONNECT` below to restore that exact behavior if your integration still wants to own the retry itself. |
+| **Persistent call mode — the DEFAULT since v0.5.0** ([#19](https://github.com/scimbe/ct-agent/issues/19); opt-in `=1` since v0.4.9) | `CT_CHANNEL_CALL_SERVICE=<slug>` | **One held session** for the process's life; each stdin **line** is one call, each response is one NDJSON envelope line: `{"ok":true,"output":…}` or `{"ok":false,"error":…}` as the structured last line before a non-zero exit. stdin EOF = clean teardown. Measured effect on the sort arena: per-round faults 12–15% → 0%, ~85 ms/round steady state, transport overhead ×27 lower. **Reconnects internally on a mid-run session death since v0.6.0** ([#47], default on): the process no longer exits when the network session drops — it redials, backing off exponentially on repeated near-instant failures (reusing the same [#250] flapping-backoff policy the SERVE side already uses), and any stdin line queued during a reconnect is answered once the new session is up rather than lost with the whole process. Previously (through v0.5.x) a mid-run death called `exit(1)` immediately, and the calling application was responsible for detecting the dead process and respawning it with its own backoff — see `CT_CHANNEL_CALL_RECONNECT` below to restore that exact behavior if your integration still wants to own the retry itself. Once this member's own grant has ended it stops redialling and exits with status 77 ([#308], see [exit status 77](#when-this-members-own-grant-ends-exit-status-77-308)). |
 | One-shot service call (opt-out) | `CT_CHANNEL_CALL_SERVICE=<slug>` **+** `CT_CHANNEL_CALL_PERSISTENT=0` | The pre-v0.5.0 default: join → pair → Noise → **one** `service/<slug>` call (stdin = input, stdout = **bare** output) → exit. The historical crew-bridge `CREW_*_CMD` contract — **a caller still expecting bare one-shot output must set `=0` when upgrading to v0.5.0** (migration note in the release; only explicit `0`/`false`/`no` opts out). |
 | One-shot raw MCP call | `CT_CHANNEL_CALL=<method>` (+ `CT_CHANNEL_CALL_PARAMS`) | One JSON-RPC request/response, prints the whole envelope, exits. |
 | Persistent serve | `CT_CHANNEL_ROLE=accept` + `CT_CHANNEL_SERVE=1` | Parks at the broker, serves each paired peer's session **concurrently** (up to `CT_CHANNEL_SERVE_CONCURRENCY`, default 8, [#200]) — a JSON-RPC request loop per session, any number of calls per session. `CT_AGENT_SERVICE_HANDLER_CMD` spawns a fresh handler per request (the handler stays stateless even under a held session). |
@@ -390,9 +390,10 @@ concerns the direct-connect path `serve_direct`, not the forward.)
 - An initiator that is refused with `[grant-revoked]` stops at once instead of retrying for its
   75 s window: a revoked grant never becomes valid again, so it needs a newly issued one. A
   forward initiator (`CT_CHANNEL_FORWARD`), which otherwise reconnects after a dropped session,
-  and a persistent serve member stop the same way: they print the refusal and exit with status
-  **77** instead of asking again (see the next section). Every other refusal keeps the reconnect
-  with backoff.
+  a persistent serve member and the reconnecting call mode stop the same way: they print the
+  refusal and exit with status **77** instead of asking again (see the next section; a forward
+  initiator with `CT_CHANNEL_FORWARD_ON_GRANT_END=refuse` keeps its port and refuses instead).
+  Every other refusal keeps the reconnect with backoff.
 
 | Variable | Meaning |
 |---|---|
@@ -402,40 +403,64 @@ concerns the direct-connect path `serve_direct`, not the forward.)
 ### When this member's own grant ends: exit status 77 ([#308])
 
 `ct-agent channel` reads its grant once, at start. Once **this member's own** grant has expired
-or been revoked, nothing the process does can make it valid again, so the two long-running modes
+or been revoked, nothing the process does can make it valid again, so the long-running modes
 stop instead of retrying for ever:
 
 | Mode | This member's own grant ended by | Then |
 |---|---|---|
-| Forward initiator (`CT_CHANNEL_FORWARD`) | its expiry (also while it waits at the edge for a peer), an admission refused with `[grant-revoked]`, or one refused with `[grant-verify]` once the grant is past its expiry | closes the forward listener and exits with status **77** |
-| Persistent serve (`CT_CHANNEL_ROLE=accept` + `CT_CHANNEL_SERVE=1`) | the same | stops parking and exits with status **77** |
+| Forward initiator (`CT_CHANNEL_FORWARD`) | its expiry (also while it waits at the edge for a peer or between two attempts), an admission refused with `[grant-revoked]`, or one refused with `[grant-verify]` once the grant is past its expiry | closes the forward listener and exits with status **77** |
+| Persistent serve (`CT_CHANNEL_ROLE=accept` + `CT_CHANNEL_SERVE=1`), over the edge broker and in the relay-only modes (`CT_CHANNEL_RELAY_GATE`, `CT_CHANNEL_CIRCUIT_RELAY`) | the same | stops parking and exits with status **77** |
+| Reconnecting call mode (`CT_CHANNEL_CALL_SERVICE`, persistent with `CT_CHANNEL_CALL_RECONNECT` on, the default) | the same | stops redialling and exits with status **77**; stdin lines not yet answered stay unanswered |
 
-77 is `EX_NOPERM` from `sysexits.h`. Every other failure keeps exit status 1, and the one-shot
-modes (pipe, `CT_CHANNEL_CALL…`) keep theirs. A `[grant-verify]` refusal before the grant's own
-expiry (clock skew, a grant signed by another operator key) keeps the 30 s refusal backoff.
+77 is `EX_NOPERM` from `sysexits.h`. Every other failure keeps exit status 1. A `[grant-verify]`
+refusal before the grant's own expiry (clock skew, a grant signed by another operator key) keeps
+the 30 s refusal backoff. The own expiry counts by this member's clock, to the second.
 
-**When only the peer's grant ended** — the peer's grant expired first, or the accept side's
-re-check found it revoked — this member's grant is still good: a forward initiator reconnects with
-its usual backoff, and the edge refuses the peer at admission until it holds a valid grant again.
-Through v0.7.40 a peer whose grant expired first stopped the initiator for good, because the
-session ended at the earlier of the two expiries and that end counted as the initiator's own.
+Sessions still running when such a loop stops get up to 5 s to end through their own expiry (see
+below), which closes their streams and logs their end; after a `[grant-revoked]` refusal, which no
+running session learns about, they are ended at once. Either way each session is ended before the
+process exits, so a stream handler (`CT_AGENT_STREAM_HANDLER_CMD`) and its process group go with
+it.
+
+The one-shot modes (pipe, a single call, a non-serve accept) keep exit status 1 for a refused
+admission. A one-shot session that the end of a grant cut short -- a pipe transfer still running
+at the expiry -- now ends with status 1 and `the session was cut short: …` instead of looking
+complete with status 0. Its peer cannot tell unless it runs the peer-grant check: without it, it
+sees the session close normally.
+
+**When only the peer's grant ended**, this member's grant is still good. For a forward initiator
+that is a peer grant that expired first (with the peer-grant check, which a forward always runs,
+a session ends at the earlier of the two expiries): it reconnects with its usual backoff, and the
+edge refuses the peer at admission until it holds a valid grant again. Through v0.7.40 that peer
+stopped the initiator for good, because the end counted as the initiator's own. The re-check runs
+on the accept side and asks about the initiator's grant: a revoked initiator grant ends the accept
+side's session as the peer's end, while the initiator sees its session drop and its next admission
+refused with `[grant-revoked]` -- its own end, status 77. If the control plane answers that the
+accept member itself is no longer a member (`asker-not-member`), that end is the accept member's
+own. The `channel_session state=grant_ended` event names whose grant it was (`whose=own|peer`).
+After any grant end a peer that never closes the session is waited for at most about 4 s (2 s,
+then 2 s of drain), like after a local failure ([#314]).
 
 **Every session ends at this member's own expiry**, with or without the peer-grant check: pipe,
 service call, serve and stream-handler sessions used to outlive the grant that admitted them
-(only a session with the check ended). Issue grants with enough lifetime, or renew them before
-they run out.
+(only a session with the check ended). Such a session's `channel_session state=close` event says
+`ok=false`. Issue grants with enough lifetime, or renew them before they run out.
 
 | Variable | Meaning |
 |---|---|
-| `CT_CHANNEL_FORWARD_ON_GRANT_END` | Forward initiator only. `exit` (the default, also when unset or empty): as above. `refuse`: the end state of v0.7.40 and earlier — the listener stays bound and closes every new connection with one log line, the process keeps running (the loopback port stays reserved, e.g. on a host shared with other users). Any other value is an error at start (exit status 1) |
+| `CT_CHANNEL_FORWARD_ON_GRANT_END` | Forward initiator only. `exit` (the default, also when unset or empty): as above. `refuse`: after every own grant end the listener stays bound and closes every new connection with one log line, and the process keeps running (the loopback port stays reserved, e.g. on a host shared with other users). That is the end state of v0.7.40 after an expiry; after a `[grant-revoked]` admission v0.7.40 exited with status 1, `refuse` keeps the port there too. Any other value is an error at start (exit status 1) |
 
 Supervisors:
 
-- `ct-agent-supervisor` treats 77 as final: it records the exit, does not restart the child and
+- `ct-agent-supervisor` treats 77 as final: it logs the exit, does not restart the child and
   exits with 77 itself.
-- **systemd**: with `Restart=always` or `Restart=on-failure`, add `RestartPreventExitStatus=77`.
-  The unit then stays in the failed state (`systemctl status` shows `status=77`) instead of being
-  restarted into the same refusal; without it, the restarts usually end in the unit's start limit.
+- **systemd**: with `Restart=always` or `Restart=on-failure` and a grant that is replaced by
+  hand, add `RestartPreventExitStatus=77`. The unit then stays in the failed state (`systemctl
+  status` shows `status=77`) instead of being restarted into the same refusal; without it, the
+  restarts usually end in the unit's start limit. If the grant is renewed in place, e.g. in an
+  `EnvironmentFile=` that systemd reads again on every start, leave 77 restartable and give
+  `RestartSec=`/`StartLimitIntervalSec=` enough room for the renewal instead: the restart that
+  follows the renewal then picks up the new grant by itself.
 - **Kubernetes**: the exit code does not stop restarts. With `restartPolicy: Always` the container
   is restarted with a growing back-off (up to 5 minutes) and the pod shows `CrashLoopBackOff`;
   `kubectl describe pod` shows `Last State: Terminated` with `Exit Code: 77`. That is the signal to

@@ -346,6 +346,11 @@ pub(crate) fn record_flap_outcome(counter: &std::sync::atomic::AtomicU32, flappe
 /// `[grant-verify]` past the own expiry, see [`own_grant_refusal`]). The process holds that one
 /// grant for its whole life, so retrying either only loads the edge, for ever. Otherwise it
 /// never returns under normal operation.
+///
+/// The sessions belong to the loop (a `JoinSet`, as the #180 connection tasks do): before it
+/// returns an own grant end it winds them down ([`end_running_sessions`]), because the process
+/// exits right after (`std::process::exit` runs no destructor, and a stream handler's process
+/// group is only killed by its session's Drop, #183).
 pub(crate) async fn serve_loop_concurrent<A, Fa, S, Fs, W>(
     max: usize,
     retry_backoff: std::time::Duration,
@@ -360,26 +365,59 @@ where
     Fs: std::future::Future<Output = Result<(), BoxError>> + Send + 'static,
     W: Send + 'static,
 {
-    let Some(expires_at) = own_expires_at else {
-        return serve_loop_admitting(max, retry_backoff, None, admit, serve).await;
+    let mut sessions = tokio::task::JoinSet::new();
+    let expiry = async {
+        match own_expires_at {
+            Some(at) => {
+                grant_expiry_timer(at).await;
+                at
+            }
+            None => std::future::pending().await,
+        }
     };
     // `biased`: an own grant that is already over stops the loop before it parks once more.
-    tokio::select! {
+    let (served, expired) = tokio::select! {
         biased;
-        () = grant_expiry_timer(expires_at) => {
-            let reason = format!("this member's channel grant expired (expires_at {expires_at})");
+        at = expiry => {
+            let reason = format!("this member's channel grant expired (expires_at {at})");
             eprintln!("ct-agent channel: {reason} -- stopping the persistent serve loop (#308)");
-            Err(OwnGrantEnded::boxed(reason))
+            (Err(OwnGrantEnded::boxed(reason)), true)
         }
-        served = serve_loop_admitting(max, retry_backoff, own_expires_at, admit, serve) => served,
+        served = serve_loop_admitting(max, retry_backoff, own_expires_at, &mut sessions, admit, serve) => (served, false),
+    };
+    if served.as_ref().is_err_and(|e| is_own_grant_end(e.as_ref())) {
+        end_running_sessions(&mut sessions, expired).await;
     }
+    served
 }
 
-/// The admit/serve cycle of [`serve_loop_concurrent`], without its own-expiry stop.
+/// ct-agent#308: the sessions a serve loop still runs when it stops for its own grant end. After
+/// the own expiry (`expired`) every running session's gate holds the same expiry (R1) and fires
+/// within a second of the loop's timer, ending its session the regular way, close event included;
+/// they get [`GRANT_TEARDOWN_BUDGET`] for that. What still runs then -- and every session after a
+/// `[grant-revoked]` admission, which no gate learns about -- is aborted and awaited, so its
+/// future is dropped (and a stream handler's process group killed) before the process exits.
+async fn end_running_sessions(sessions: &mut tokio::task::JoinSet<()>, expired: bool) {
+    if expired {
+        let _ = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, async {
+            while sessions.join_next().await.is_some() {}
+        })
+        .await;
+    }
+    sessions.abort_all();
+    let _ = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, async {
+        while sessions.join_next().await.is_some() {}
+    })
+    .await;
+}
+
+/// The admit/serve cycle of [`serve_loop_concurrent`], without its own-expiry stop. Its sessions
+/// run in `sessions`, owned by the caller.
 async fn serve_loop_admitting<A, Fa, S, Fs, W>(
     max: usize,
     retry_backoff: std::time::Duration,
     own_expires_at: Option<u64>,
+    sessions: &mut tokio::task::JoinSet<()>,
     mut admit: A,
     serve: S,
 ) -> Result<(), BoxError>
@@ -404,6 +442,8 @@ where
     // either succeeds or simply lives long enough to not look like a flap.
     let consecutive_flaps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     loop {
+        // Finished sessions leave their (empty) result in the set until it is read.
+        while sessions.try_join_next().is_some() {}
         // `sem` is local and never closed, so `acquire_owned` cannot fail; if it ever
         // did, ending the loop with an error is the right answer, not a panic
         // (ct-agent#176).
@@ -442,9 +482,12 @@ where
             Ok(Ok(work)) => {
                 consecutive_refusals = 0;
                 consecutive_handshake_eofs = 0;
-                let fut = serve(work);
+                // ct-agent#308: inside a grant-end record, so the session runner bounds its wait
+                // for a peer that never closes after a grant end, and reports such a session as
+                // not ok. Spawned into the loop's set (see `serve_loop_concurrent`).
+                let fut = with_grant_end_record(GrantEndRecord::default(), serve(work));
                 let flap_counter = consecutive_flaps.clone();
-                tokio::spawn(async move {
+                sessions.spawn(async move {
                     let _permit = permit; // held for the whole session; frees a slot on drop
                     let started = std::time::Instant::now();
                     let result = fut.await;
@@ -557,6 +600,26 @@ pub(crate) async fn run_one_admission_session(
     // the peer's Noise key isn't known yet at this call site.
     let local = channel_local(None);
     run_one_admission_session_with_local(cfg, request, broker_ladder, relay_ladder, front_door_cert, local).await
+}
+
+/// ct-agent#308 (R1): a one-shot session that a grant end cut short -- this member's own expiry,
+/// or the peer's grant -- reaches its pump as a clean EOF and returns `Ok`: a pipe transfer cut
+/// at the expiry looked like a complete one, exit status 0. Run inside a grant-end record, such a
+/// session is an error (`PermissionDenied`, exit status 1 like every one-shot failure). The peer
+/// of an ungated session cannot tell: it only sees a clean close.
+pub(crate) async fn one_shot_session<F>(session: F) -> Result<(), BoxError>
+where
+    F: std::future::Future<Output = Result<(), BoxError>>,
+{
+    let record = GrantEndRecord::default();
+    let ran = with_grant_end_record(record.clone(), session).await;
+    match (ran, record.ended()) {
+        (Ok(()), Some(end)) => Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("the session was cut short: {}", end.reason),
+        ))),
+        (ran, _) => ran,
+    }
 }
 
 /// ct-agent#267: the plane-brokered one-shot path with `CT_CHANNEL_FORWARD`
