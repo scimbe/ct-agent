@@ -10,3 +10,20 @@ members = ["native", "wasm"]
 # ct-edge/ct-client dev-dependency pins (kept at the same tag by convention).
 [workspace.dependencies]
 ct-common = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.4.20" }
+
+# #304/#309/#310: the debug-build tests push tens of MiB through Noise (ChaCha20-Poly1305 from
+# RustCrypto, via snow) and run libp2p handshakes, one runtime thread per test. At opt-level 0
+# that crypto was nearly all of the CPU time of the 64 MiB forward test (15-17 s CPU; 0.4-0.5 s
+# with this profile), for about 15 s more in a cold build. Only these crates are optimized:
+# debug assertions and overflow checks stay on, and release builds are unaffected.
+[profile.dev.package]
+chacha20 = { opt-level = 3 }
+poly1305 = { opt-level = 3 }
+chacha20poly1305 = { opt-level = 3 }
+blake2 = { opt-level = 3 }
+snow = { opt-level = 3 }
+curve25519-dalek = { opt-level = 3 }
+x25519-dalek = { opt-level = 3 }
+ed25519-dalek = { opt-level = 3 }
+sha2 = { opt-level = 3 }
+ring = { opt-level = 3 }
