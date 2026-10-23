@@ -6530,12 +6530,12 @@ async fn admit_one_shot_with_retry_stops_at_once_on_a_revoked_grant() {
         calls.fetch_add(1, Ordering::SeqCst);
         async { Err::<ChannelJoinOutcome, BoxError>(AdmissionRefused::boxed_with_category("edge broker refused the channel join", Some("pairing"))) }
     };
-    // Same window, a refusal that can still clear up: tried at 0, 3, 6, 9 s and once more at the
-    // deadline, then the named timeout error.
+    // Same window, a refusal that can still clear up: tried at 0, 3, 6 and 9 s, then the named
+    // timeout error (a fifth try could only start at the deadline, with no time left, #95).
     let err = admit_one_shot_with_retry(std::time::Duration::from_secs(10), &channel, InitiateWait::OneShot, admit)
         .await
         .expect_err("the window closes without an acceptor");
-    assert_eq!(calls.load(Ordering::SeqCst), 5, "a pairing refusal is retried until the window closes");
+    assert_eq!(calls.load(Ordering::SeqCst), 4, "a pairing refusal is retried until the window closes");
     assert!(err.to_string().contains("no acceptor for channel"), "{err}");
     assert!(!is_revoked_grant_refusal(&AdmissionRefused::boxed_with_category("x", Some("pairing"))));
 }
@@ -6549,17 +6549,19 @@ async fn admit_one_shot_with_retry_cuts_a_single_long_park_at_the_window_95() {
     use ct_common::channel::ChannelId;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    // Set when the parked attempt's future is dropped -- the stand-in for its TLS leg.
-    struct DropFlag(Arc<AtomicBool>);
+    // Records when the parked attempt's future is dropped -- the stand-in for its TLS leg.
+    struct DropFlag(Arc<AtomicBool>, Arc<std::sync::Mutex<Option<tokio::time::Instant>>>);
     impl Drop for DropFlag {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
+            *self.1.lock().unwrap() = Some(tokio::time::Instant::now());
         }
     }
     let dropped = Arc::new(AtomicBool::new(false));
-    let flag = dropped.clone();
+    let dropped_at = Arc::new(std::sync::Mutex::new(None));
+    let (flag, at) = (dropped.clone(), dropped_at.clone());
     let admit = move || {
-        let guard = DropFlag(flag.clone());
+        let guard = DropFlag(flag.clone(), at.clone());
         async move {
             let _guard = guard;
             // One park the edge holds for 600 s, then ends with EX.
@@ -6577,6 +6579,80 @@ async fn admit_one_shot_with_retry_cuts_a_single_long_park_at_the_window_95() {
     assert!(msg.contains("ct-agent#95"), "the window's named error: {msg}");
     assert!(msg.contains("still parked"), "says the attempt was cut while parked: {msg}");
     assert!(dropped.load(Ordering::SeqCst), "the cut attempt was dropped, and its leg with it");
+    // At the window, not when its park would have ended (where it is dropped either way).
+    let dropped_after = dropped_at.lock().unwrap().map(|t| t - started);
+    assert!(
+        dropped_after.is_some_and(|d| d <= Duration::from_secs(75) + Duration::from_millis(1)),
+        "dropped at the window: {dropped_after:?}"
+    );
+}
+
+/// ct-agent#95: a real attempt is still connecting on its first poll. One that could only start
+/// at the deadline would be cut right there, and its "still parked" would replace the real cause
+/// (an edge that refuses connects, a holder that is not a member) in the window's error -- that
+/// is exactly when an operator needs it. A one-shot caller starts no such attempt: the window
+/// ends with the last real result.
+#[tokio::test(start_paused = true)]
+async fn admit_one_shot_with_retry_starts_no_attempt_at_the_deadline_95() {
+    use ct_common::channel::ChannelId;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let window = Duration::from_secs(10);
+
+    // An edge that refuses every connect, after a 5 ms round trip.
+    let calls = AtomicU32::new(0);
+    let admit = || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Err::<ChannelJoinOutcome, BoxError>(Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "connect to edge: connection refused",
+            )))
+        }
+    };
+    let started = tokio::time::Instant::now();
+    let err = admit_one_shot_with_retry(window, &ChannelId([0x46u8; 32]), InitiateWait::OneShot, admit)
+        .await
+        .expect_err("the edge refuses every connect");
+    let msg = err.to_string();
+    assert!(msg.contains("ct-agent#95"), "the window's named error: {msg}");
+    assert!(msg.contains("connection refused"), "names the real cause: {msg}");
+    assert!(!msg.contains("still parked"), "no attempt was parked: {msg}");
+    // At 0, 3, 6 and 9 s; a fifth could only start at the deadline, with no time left to run.
+    assert_eq!(calls.load(Ordering::SeqCst), 4, "no attempt is started at the deadline");
+    assert!(started.elapsed() <= window, "still within the window: {:?}", started.elapsed());
+
+    // A holder that is not a member, refused as the direct-QUIC join reports it: a value.
+    let admit = || async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Ok::<_, BoxError>(ChannelJoinOutcome::Refused { category: Some("not-member".to_string()) })
+    };
+    let err = admit_one_shot_with_retry(window, &ChannelId([0x47u8; 32]), InitiateWait::OneShot, admit)
+        .await
+        .expect_err("the holder is refused every time");
+    let msg = err.to_string();
+    assert!(msg.contains("not-member"), "names the refusal: {msg}");
+    assert!(!msg.contains("still parked"), "no attempt was parked: {msg}");
+}
+
+/// ct-agent#95: an attempt that starts shortly before the window closes can still be cut before
+/// it finished connecting. Its cut then says so in the spec's words, and names the previous
+/// attempt's result with it, so the real cause is still in the error.
+#[tokio::test(start_paused = true)]
+async fn admit_one_shot_with_retry_names_the_previous_result_when_it_cuts_a_late_attempt_95() {
+    use ct_common::channel::ChannelId;
+    // Each attempt fails after 2 s: at 0, 5 and 10 s; the third has 1 s left of the 11 s window.
+    let admit = || async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        Err::<ChannelJoinOutcome, BoxError>("connect to edge: connection refused".into())
+    };
+    let err = admit_one_shot_with_retry(Duration::from_secs(11), &ChannelId([0x48u8; 32]), InitiateWait::OneShot, admit)
+        .await
+        .expect_err("the edge refuses every connect");
+    let msg = err.to_string();
+    assert!(msg.contains("(attempt 3, ct-agent#95)"), "the third attempt was cut: {msg}");
+    assert!(msg.contains("still parked"), "the cut in the spec's words: {msg}");
+    assert!(msg.contains("previous attempt: connect to edge: connection refused"), "the real cause stays: {msg}");
 }
 
 /// ct-agent#95: forward and persistent CALL initiators WANT a long park -- they are paired the

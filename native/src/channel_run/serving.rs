@@ -272,7 +272,8 @@ pub(crate) fn initiate_retry_window_from_env(value: Option<&str>) -> std::time::
 /// distinguishable message instead of the prior silent-stall/silent-exit nondeterminism.
 ///
 /// `wait` (see [`InitiateWait`]): a `OneShot` attempt is cut at the window itself, so a caller
-/// never waits past it however long the edge parks it.
+/// never waits past it however long the edge parks it, and no attempt is started that could only
+/// begin at the deadline.
 pub(crate) async fn admit_one_shot_with_retry<A, Fut>(
     window: std::time::Duration,
     channel: &ct_common::channel::ChannelId,
@@ -285,15 +286,24 @@ where
 {
     let deadline = tokio::time::Instant::now() + window;
     let mut attempt: u32 = 0;
+    // The last finished attempt's result, named with a cut attempt's (see below).
+    let mut previous: Option<String> = None;
     loop {
         attempt += 1;
         // ct-agent#95: dropping a cut attempt drops its TLS stream; the edge's park pump reads
         // that as the death of a keepalive park at once, so no stale park is left for a partner.
-        // The deadline check below then returns the named error.
+        // The deadline check below then returns the named error. An attempt started shortly
+        // before the deadline may be cut while still connecting, so the previous attempt's
+        // result goes with the cut: a real cause (a refusal, an unreachable edge) stays visible.
         let result = match wait {
             InitiateWait::OneShot => match tokio::time::timeout_at(deadline, admit()).await {
                 Ok(r) => r,
-                Err(_) => Err("the attempt was still parked when the one-shot window closed".into()),
+                Err(_) => Err(match previous.take() {
+                    None => "the attempt was still parked when the one-shot window closed".into(),
+                    Some(p) => {
+                        format!("the attempt was still parked when the one-shot window closed (previous attempt: {p})").into()
+                    }
+                }),
             },
             InitiateWait::Persistent => admit().await,
         };
@@ -306,7 +316,11 @@ where
             }
         }
         let now = tokio::time::Instant::now();
-        if now >= deadline {
+        // ct-agent#95: a one-shot attempt that could only start at the deadline would be cut on
+        // its first poll, before its first byte -- a dial thrown away, and a "still parked" in
+        // place of this attempt's real result. The window ends here instead.
+        let no_time_left = wait == InitiateWait::OneShot && now + INITIATE_RETRY_INTERVAL >= deadline;
+        if now >= deadline || no_time_left {
             let reason = match &result {
                 Ok(outcome) => format!("-- the peer may be between park windows (#21), offline, or parked at a different pairer (last outcome: {outcome:?})"),
                 Err(e) => format!("-- last error: {e}"),
@@ -335,6 +349,10 @@ where
                 next_check - now
             ),
         }
+        previous = Some(match &result {
+            Ok(outcome) => format!("{outcome:?}"),
+            Err(e) => e.to_string(),
+        });
         tokio::time::sleep_until(next_check).await;
     }
 }
