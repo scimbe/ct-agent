@@ -207,15 +207,17 @@ initiates. One person can be all three.
 
 7. **You are done when** `received.txt` on A contains `hello from B` (after a few seconds). With stdin
    on a terminal, A does not exit by itself after receiving; stop it with Ctrl-C. A started without a
-   terminal (`nohup`, `</dev/null`, a service unit) has its stdin at end-of-file from the start. Against
-   an edge that runs CADS-Tunnel v0.5.0 or later this works: the edge passes A's end-of-file on as a
-   half-close, A still receives, and A exits once B has finished (CADS-Tunnel#856). Against an older
-   edge, keep A's stdin open on the `:443` front door (a terminal, or a FIFO with a writer that stays
-   open): there A silently loses the data ([#299](https://github.com/scimbe/ct-agent/issues/299)). In
-   both cases `ok=true` in the `channel_session` close event (and exit status 0) only says that the
-   transport closed cleanly, not that the peer received everything ([raw pipe](channel.md#modes)). The
-   forward mode in section 4 is not affected. Without a service handler `ct-agent channel` is a raw
-   pipe: stdin goes to the peer and the peer's bytes arrive on stdout.
+   terminal (`nohup`, `</dev/null`, a service unit) has its stdin at end-of-file from the start. That
+   works when both members run a ct-agent with [delivery confirmation](channel.md#delivery-confirmation-protocol-v2-299)
+   (`delivery=ack` in the `channel_session` events), whatever the edge: A still receives, A exits once
+   B has finished, and `ok=true` with exit status 0 means that the peer confirmed the bytes. If a
+   member runs an older ct-agent, it works against an edge with CADS-Tunnel v0.5.0 or later
+   (CADS-Tunnel#856); against an older edge, keep A's stdin open on the `:443` front door (a
+   terminal, or a FIFO with a writer that stays open), because there A silently loses the data
+   ([#299](https://github.com/scimbe/ct-agent/issues/299)). In that legacy case `ok=true` only says
+   that the transport closed cleanly ([raw pipe](channel.md#modes)). The forward mode in section 4 is
+   not affected. Without a service handler `ct-agent channel` is a raw pipe: stdin goes to the peer
+   and the peer's bytes arrive on stdout.
 
 Other modes (a held service session with one JSON line per call, a persistent server, a call
 without any broker) are in the [channel reference](channel.md#modes).

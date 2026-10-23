@@ -961,6 +961,9 @@ pub async fn run_channel_command(cfg: ChannelRunConfig) -> Result<(), BoxError> 
 mod session;
 pub use session::*;
 
+// ct-agent#299: protocol v2 (end-to-end delivery confirmation), negotiated per session.
+mod delivery;
+
 // Security audit: the peer's grant, checked end to end after the Noise handshake (opt-in).
 mod peer_grant;
 pub use peer_grant::*;

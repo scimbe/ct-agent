@@ -13,9 +13,14 @@ use std::task::{Context, Poll};
 use quinn::Connection;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use ct_common::a2a::{a2a_initiate, a2a_respond_verified};
+use ct_common::a2a::{a2a_initiate_with_caps, a2a_respond_verified_with_caps};
 use ct_common::channel_quic::DIRECT_STREAM_SETUP_TIMEOUT;
+use ct_common::delivery::{noise_pump_v2, SessionCaps};
 use ct_common::noise::noise_pump;
+
+use super::delivery::{
+    delivery_offer, with_session_end_cause, SessionEndCause, FAILED_DELIVERY_DRAIN, FIN_ACK_IDLE,
+};
 
 /// Which side of the A2A session this agent drives. Selected from the channel
 /// grant's `Direction`: the initiator dials + opens the stream; the responder
@@ -258,6 +263,13 @@ where
 /// `tokio::io::split`ting the stream and passing the halves here. So a member whose relay
 /// port is also blocked (a truly `:443`-only network) relays over `:443` unchanged; the
 /// Noise_IK session stays end-to-end and the edge only forwards ciphertext.
+///
+/// ct-agent#299: the session offers protocol v2 (end-to-end delivery confirmation, see
+/// `channel_run::delivery`) unless `CT_CHANNEL_DELIVERY_ACK=0`. With a v2 peer, `Ok` means the
+/// peer confirmed every byte sent and this side confirmed every byte received; anything short of
+/// that is an `Err` naming what is missing, so the `channel_session` close event says `ok=false`
+/// and a pipe-mode process exits non-zero. With an older peer the session is legacy, byte for
+/// byte, and `Ok` keeps meaning "the transport closed cleanly".
 pub async fn run_channel_session_on_stream<W, R, P>(
     send: W,
     recv: R,
@@ -265,6 +277,27 @@ pub async fn run_channel_session_on_stream<W, R, P>(
     own_noise_private: &[u8; 32],
     peer_noise_public: &[u8; 32],
     local: P,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    run_channel_session_on_stream_with(send, recv, role, own_noise_private, peer_noise_public, local, delivery_offer())
+        .await
+}
+
+/// [`run_channel_session_on_stream`] with the capability offer explicit (#299):
+/// `SessionCaps::NONE` sends and accepts empty handshake payloads, i.e. the legacy session byte
+/// for byte -- what the #104 upgradable relay path keeps.
+pub(crate) async fn run_channel_session_on_stream_with<W, R, P>(
+    send: W,
+    recv: R,
+    role: ChannelRole,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+    local: P,
+    offer: SessionCaps,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -283,10 +316,12 @@ where
     // a peer that admits then stalls) would block `read_frame` forever, hanging the session.
     const A2A_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     let handshake_started = std::time::Instant::now();
+    // #299: the capability offer rides in the handshake payloads; an empty offer is the
+    // pre-v2 handshake byte for byte, and a peer from before v2 answers with nothing.
     let handshake = async {
         match role {
             ChannelRole::Initiate => {
-                a2a_initiate(&mut send, &mut recv, own_noise_private, peer_noise_public).await
+                a2a_initiate_with_caps(&mut send, &mut recv, own_noise_private, peer_noise_public, offer).await
             }
             // ct-agent#35: was the plain, unverified `a2a_respond` -- the caller had already
             // attestation-verified `peer_noise_public` (run_channel_join_with_admission,
@@ -294,14 +329,16 @@ where
             // nothing about who it was talking to at the Noise layer. `a2a_respond_verified`
             // refuses the session if the live peer's static key doesn't match.
             ChannelRole::Accept => {
-                a2a_respond_verified(&mut send, &mut recv, own_noise_private, peer_noise_public).await
+                a2a_respond_verified_with_caps(&mut send, &mut recv, own_noise_private, peer_noise_public, offer)
+                    .await
             }
         }
     };
-    let session = tokio::time::timeout(A2A_HANDSHAKE_TIMEOUT, handshake)
+    let (session, caps) = tokio::time::timeout(A2A_HANDSHAKE_TIMEOUT, handshake)
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "a2a Noise_IK handshake timed out (#126)"))?
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let delivery = if caps.delivery_ack() { "ack" } else { "legacy" };
     if debug_timing_enabled() {
         eprintln!(
             "ct-agent channel: debug handshake completed in {}ms (role={role:?})",
@@ -315,7 +352,7 @@ where
     let peer_hex = super::cli_config::hex_encode(peer_noise_public);
     crate::events::emit(
         crate::events::CHANNEL_SESSION,
-        serde_json::json!({ "state": "open", "peer": peer_hex }),
+        serde_json::json!({ "state": "open", "peer": peer_hex, "delivery": delivery }),
     );
     // #248: unconditional (no debug flag) periodic status while this session's pump runs —
     // aborted the moment the pump finishes, one way or another, via the handle drop below.
@@ -334,13 +371,39 @@ where
     // `:443`/TLS-TCP relay socket's tail the way a bare host would. `graceful_stream_drain` FINs and
     // waits (bounded) for the peer to close, keeping the process + netns alive until our tail is
     // delivered. (The QUIC path keeps its stronger `stopped()` ack-wait in `run_channel_session`.)
-    let pumped = noise_pump(session, BiStream { send: &mut send, recv: &mut recv }, local).await;
+    let pumped = if caps.delivery_ack() {
+        // #299: the gate records why it ends a session in this cell, and the pump turns that into
+        // the FIN reason the peer reads (see `channel_run::delivery`).
+        let cause = SessionEndCause::default();
+        let for_fin = cause.clone();
+        let pump = noise_pump_v2(
+            session,
+            BiStream { send: &mut send, recv: &mut recv },
+            local,
+            FIN_ACK_IDLE,
+            move |err: Option<&io::Error>| for_fin.fin_reason(err),
+        );
+        with_session_end_cause(cause, pump).await.map(Some)
+    } else {
+        noise_pump(session, BiStream { send: &mut send, recv: &mut recv }, local).await.map(|()| None)
+    };
     drop(ticker);
-    graceful_stream_drain(&mut send, &mut recv, RELAY_DRAIN_TIMEOUT).await;
+    if let (Err(e), true) = (&pumped, caps.delivery_ack()) {
+        eprintln!("ct-agent channel: {e} (#299)");
+    }
+    // A failed v2 session has nothing left to deliver; only its abort record still has to leave
+    // before the process may exit, which a short drain covers.
+    let drain = if pumped.is_err() && caps.delivery_ack() { FAILED_DELIVERY_DRAIN } else { RELAY_DRAIN_TIMEOUT };
+    graceful_stream_drain(&mut send, &mut recv, drain).await;
     eprintln!("{}", traffic_status_line());
-    crate::events::emit(
-        crate::events::CHANNEL_SESSION,
-        serde_json::json!({ "state": "close", "peer": peer_hex, "ok": pumped.is_ok() }),
-    );
-    pumped
+    let close = match &pumped {
+        // What the peer confirmed, not just what was written to the transport.
+        Ok(Some(report)) => serde_json::json!({
+            "state": "close", "peer": peer_hex, "ok": true, "delivery": delivery,
+            "confirmed_sent": report.sent, "confirmed_received": report.received,
+        }),
+        _ => serde_json::json!({ "state": "close", "peer": peer_hex, "ok": pumped.is_ok(), "delivery": delivery }),
+    };
+    crate::events::emit(crate::events::CHANNEL_SESSION, close);
+    pumped.map(|_| ())
 }

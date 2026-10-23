@@ -57,6 +57,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use ct_common::channel::{Direction, SignedChannelGrant};
+use ct_common::delivery::FinReason;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::oneshot;
 
@@ -260,6 +261,9 @@ struct GrantLifetime {
     /// ct-agent#267: the caller's record of that end, when the session runs inside
     /// [`with_grant_end_record`].
     record: Option<GrantEndRecord>,
+    /// This member's own grant expiry, to tell whose grant ran out when the timer (armed with
+    /// the earlier of the two) fires -- the FIN reason of a v2 session (#299).
+    own_expires_at: Option<u64>,
 }
 
 impl GrantLifetime {
@@ -283,18 +287,27 @@ impl GrantLifetime {
             None => false,
         };
         if expired {
-            return self.end("the channel grant expired".to_string());
+            // #299: the timer runs to the EARLIER of the two expiries once the peer's grant is
+            // verified; at most a second off either way, so a second of slack decides "ours".
+            let own = self
+                .own_expires_at
+                .is_some_and(|at| crate::codec::now_unix().saturating_add(1) >= at);
+            let cause = if own { FinReason::OwnGrantExpired } else { FinReason::PeerGrantEnded };
+            return self.end("the channel grant expired".to_string(), cause);
         }
         let watched = match self.watch.as_mut() {
             Some(rx) => std::future::Future::poll(Pin::new(rx), cx),
             None => Poll::Pending,
         };
         match watched {
-            Poll::Ready(Ok(why)) => return self.end(why),
+            Poll::Ready(Ok(why)) => return self.end(why, FinReason::PeerGrantEnded),
             // The task that asks the control plane is gone without having answered: the revocation
             // check no longer runs, and a session must not go on unwatched. Fail closed, loudly.
             Poll::Ready(Err(_)) => {
-                return self.end("the peer-grant re-check stopped unexpectedly; failing closed".to_string());
+                return self.end(
+                    "the peer-grant re-check stopped unexpectedly; failing closed".to_string(),
+                    FinReason::LocalError,
+                );
             }
             Poll::Pending => {}
         }
@@ -303,7 +316,7 @@ impl GrantLifetime {
             None => Poll::Pending,
         };
         match revoked {
-            Poll::Ready(Ok(why)) => self.end(format!("the channel grant was revoked: {why}")),
+            Poll::Ready(Ok(why)) => self.end(format!("the channel grant was revoked: {why}"), FinReason::PeerGrantEnded),
             // Nobody holds the handle (never taken, or dropped unused): only expiry can end it.
             Poll::Ready(Err(_)) => {
                 self.revoke = None;
@@ -315,7 +328,9 @@ impl GrantLifetime {
 
     /// Record the end once -- logged and emitted, because "my forward died" must be answerable
     /// from this member's own output without a broker round trip -- and report it as ended.
-    fn end(&mut self, why: String) -> bool {
+    /// `cause` is what a v2 session tells the peer about it (#299).
+    fn end(&mut self, why: String, cause: FinReason) -> bool {
+        super::delivery::note_session_end(cause);
         eprintln!("ct-agent channel: {why} -- ending the session and every stream it forwards");
         crate::events::emit(
             crate::events::CHANNEL_SESSION,
@@ -373,6 +388,7 @@ impl<P> PeerGrantGate<P> {
         let expiry = check
             .as_ref()
             .map(|c| GrantLifetime::timer(c.own_grant.grant.expires_at));
+        let own_expires_at = check.as_ref().map(|c| c.own_grant.grant.expires_at);
         let (revoker, revoke) = oneshot::channel();
         let gate = check.map(|check| Gate {
             out: check.prelude(),
@@ -393,6 +409,7 @@ impl<P> PeerGrantGate<P> {
                 watch: None,
                 ended: None,
                 record: GRANT_END_RECORD.try_with(GrantEndRecord::clone).ok(),
+                own_expires_at,
             },
             revoker: Some(GrantRevokeHandle(revoker)),
         }
@@ -414,6 +431,7 @@ fn denied(why: &str) -> io::Error {
 
 impl Gate {
     fn fail(&mut self, why: String) -> io::Error {
+        super::delivery::note_session_end(FinReason::PeerGrantRefused);
         let err = denied(&why);
         crate::events::emit(
             crate::events::CHANNEL_SESSION,
@@ -883,6 +901,99 @@ mod tests {
         assert!(a_failed, "the initiator's session ended with an error");
     }
 
+    /// #299: the gated initiator runs the real session runner; the acceptor is a bare protocol-v2
+    /// peer (ct-common's handshake and pump) whose local side presents `b_prelude` and then reads.
+    /// Returns the initiator's session result and the acceptor's pump error.
+    async fn v2_peer_against_a_gate(a_check: PeerGrantCheck, b_prelude: Vec<u8>) -> (io::Result<()>, io::Error) {
+        use super::super::run_channel_session_on_stream;
+        use ct_common::a2a::a2a_respond_verified_with_caps;
+        use ct_common::delivery::{noise_pump_v2, SessionCaps};
+        use ct_common::noise::generate_static_keypair;
+        let (a, b) = (generate_static_keypair(), generate_static_keypair());
+        let (a_priv, a_pub, b_priv, b_pub) = (a.private, a.public, b.private, b.public);
+        let (a_transport, mut b_transport) = tokio::io::duplex(16 * 1024);
+        let (_a_app, a_local) = tokio::io::duplex(16 * 1024);
+        let a_gate = PeerGrantGate::new(a_local, Some(a_check));
+        let a_task = tokio::spawn(async move {
+            let (r, w) = tokio::io::split(a_transport);
+            run_channel_session_on_stream(w, r, ChannelRole::Initiate, &a_priv, &b_pub, a_gate).await
+        });
+        let (tb, caps) = {
+            let (mut r, mut w) = tokio::io::split(&mut b_transport);
+            a2a_respond_verified_with_caps(&mut w, &mut r, &b_priv, &a_pub, SessionCaps::DELIVERY_ACK)
+                .await
+                .expect("the bare v2 acceptor's handshake")
+        };
+        assert!(caps.delivery_ack(), "the agent offers protocol v2 by default");
+        let (b_plain, b_app) = tokio::io::duplex(16 * 1024);
+        let (mut b_r, mut b_w) = tokio::io::split(b_app);
+        b_w.write_all(&b_prelude).await.unwrap();
+        let reader = tokio::spawn(async move {
+            let mut sink = Vec::new();
+            let _ = b_r.read_to_end(&mut sink).await;
+            (sink, b_w)
+        });
+        let b_err = noise_pump_v2(tb, b_transport, b_plain, Duration::from_secs(60), |_: Option<&io::Error>| {
+            FinReason::Normal
+        })
+        .await
+        .expect_err("the gated side ends the session early, so the peer must not see a delivered session");
+        let a_res = tokio::time::timeout(Duration::from_secs(60), a_task)
+            .await
+            .expect("the initiator's session ends")
+            .expect("the initiator's task");
+        reader.abort();
+        (a_res, b_err)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_v2_peer_learns_that_this_members_own_grant_expired_299() {
+        // The initiator's own grant runs out a second into the session. Its gate ends the
+        // session, and under protocol v2 the FIN tells the acceptor why -- instead of the clean
+        // close a legacy peer cannot tell from "the other side finished" (#299, #308).
+        let f = Fixture::new();
+        let mut a_check = f.check(ChannelRole::Initiate);
+        a_check.own_grant =
+            grant(&f.operator, CHANNEL, f.initiator, Direction::Initiate, crate::codec::now_unix() + 1);
+        let b_grant = grant(&f.operator, CHANNEL, f.acceptor, Direction::Accept, crate::codec::now_unix() + 3600);
+        let (a_res, b_err) = v2_peer_against_a_gate(a_check, prelude_of(&b_grant)).await;
+        assert_eq!(
+            ct_common::delivery::delivery_error(&b_err),
+            Some(&ct_common::delivery::DeliveryError::PeerEnded {
+                reason: FinReason::OwnGrantExpired,
+                announced: PRELUDE_LEN as u64,
+                received: PRELUDE_LEN as u64,
+            }),
+            "{b_err}"
+        );
+        assert!(b_err.to_string().contains("the peer's own channel grant expired"), "{b_err}");
+        let a_err = a_res.expect_err("the member whose grant ended reports ok=false, not a delivered session");
+        assert_eq!(a_err.kind(), io::ErrorKind::PermissionDenied, "{a_err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_v2_peer_learns_that_its_grant_was_refused_299() {
+        // The acceptor presents a grant the operator never signed: the initiator's gate refuses
+        // it, and the acceptor learns that from the FIN reason rather than from a bare close.
+        let f = Fixture::new();
+        let forged = grant(
+            &SigningKey::from_bytes(&[0x66; 32]),
+            CHANNEL,
+            f.acceptor,
+            Direction::Accept,
+            crate::codec::now_unix() + 3600,
+        );
+        let (a_res, b_err) = v2_peer_against_a_gate(f.check(ChannelRole::Initiate), prelude_of(&forged)).await;
+        assert!(
+            matches!(
+                ct_common::delivery::delivery_error(&b_err),
+                Some(ct_common::delivery::DeliveryError::PeerEnded { reason: FinReason::PeerGrantRefused, .. })
+            ),
+            "{b_err}"
+        );
+        assert!(a_res.is_err(), "the refusing side ends with an error too");
+    }
+
     /// The grant's expiry ends the session it authorized,
     /// and closes the local side with it -- the mechanism the forward engines' teardown rests on
     /// (`channel_run::tests` proves the end-to-end effect on real forwarded TCP streams).
@@ -1109,7 +1220,8 @@ mod tests {
     #[tokio::test]
     async fn a_dead_watch_task_ends_the_session_loudly() {
         let (tx, rx) = oneshot::channel::<String>();
-        let mut life = GrantLifetime { expiry: None, revoke: None, watch: Some(rx), ended: None, record: None };
+        let mut life =
+            GrantLifetime { expiry: None, revoke: None, watch: Some(rx), ended: None, record: None, own_expires_at: None };
         drop(tx);
         let ended = std::future::poll_fn(|cx| Poll::Ready(life.poll_ended(cx))).await;
         assert!(ended);

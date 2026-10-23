@@ -5231,6 +5231,304 @@ async fn pipe_member_with_local_eof_still_receives_over_the_ka_park_pump_299() {
     let _ = tokio::time::timeout(Duration::from_secs(5), edge).await;
 }
 
+/// #299 (protocol v2): how [`relay_299`] treats one direction of a session. A relay sees the
+/// 2-byte frame lengths in the clear, and a frame boundary is the one place it can truncate a
+/// Noise stream without the receiver's AEAD noticing -- what the edge splice could always do.
+#[derive(Clone, Copy)]
+enum RelayCut299 {
+    /// Forward everything; the end of the source becomes an end towards the destination.
+    Never,
+    /// Forward this many frames, then end the destination cleanly and swallow the rest.
+    CleanEofAfter(usize),
+    /// Forward this many frames, then swallow every later one and keep the destination open.
+    SwallowAfter(usize),
+}
+
+async fn relay_direction_299(
+    mut from: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    mut to: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    cut: RelayCut299,
+) {
+    let mut frames = 0usize;
+    let mut closed = false;
+    loop {
+        let mut len = [0u8; 2];
+        if from.read_exact(&mut len).await.is_err() {
+            break;
+        }
+        let mut body = vec![0u8; u16::from_be_bytes(len) as usize];
+        if from.read_exact(&mut body).await.is_err() {
+            break;
+        }
+        frames += 1;
+        match cut {
+            RelayCut299::CleanEofAfter(k) if frames > k => {
+                if !closed {
+                    let _ = to.shutdown().await;
+                    closed = true;
+                }
+                continue; // keep draining, so the sender is never held up by the relay
+            }
+            RelayCut299::SwallowAfter(k) if frames > k => continue,
+            _ => {}
+        }
+        if to.write_all(&len).await.is_err() || to.write_all(&body).await.is_err() {
+            break;
+        }
+    }
+    match cut {
+        RelayCut299::SwallowAfter(_) => std::future::pending::<()>().await,
+        _ => {
+            let _ = to.shutdown().await;
+        }
+    }
+}
+
+/// A relay between member A's transport and member B's, with a rule per direction. Returns A's
+/// and B's transport ends.
+fn relay_299(a_to_b: RelayCut299, b_to_a: RelayCut299) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+    let (a_end, relay_a) = tokio::io::duplex(64 * 1024);
+    let (b_end, relay_b) = tokio::io::duplex(64 * 1024);
+    let (ra_r, ra_w) = tokio::io::split(relay_a);
+    let (rb_r, rb_w) = tokio::io::split(relay_b);
+    tokio::spawn(relay_direction_299(ra_r, rb_w, a_to_b));
+    tokio::spawn(relay_direction_299(rb_r, ra_w, b_to_a));
+    (a_end, b_end)
+}
+
+/// The park pump before CADS-Tunnel#856 in miniature: forwards both ways until EITHER side ends
+/// its write direction, then drops both legs at once.
+fn tearing_relay_299() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+    let (a_end, relay_a) = tokio::io::duplex(64 * 1024);
+    let (b_end, relay_b) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let (mut ar, mut aw) = tokio::io::split(relay_a);
+        let (mut br, mut bw) = tokio::io::split(relay_b);
+        let a_to_b = async {
+            let _ = tokio::io::copy(&mut ar, &mut bw).await;
+        };
+        let b_to_a = async {
+            let _ = tokio::io::copy(&mut br, &mut aw).await;
+        };
+        tokio::select! {
+            _ = a_to_b => {}
+            _ = b_to_a => {}
+        }
+    });
+    (a_end, b_end)
+}
+
+/// One member's local side as two tasks: the input (`None` keeps it open) and the output. The
+/// write half outlives the end of the output -- dropping both halves would end the input too.
+fn local_side_299(app: tokio::io::DuplexStream, input: Option<Vec<u8>>) -> tokio::task::JoinHandle<Vec<u8>> {
+    let (mut r, mut w) = tokio::io::split(app);
+    tokio::spawn(async move {
+        if let Some(bytes) = input {
+            let _ = w.write_all(&bytes).await;
+            let _ = w.shutdown().await;
+        }
+        std::future::pending::<()>().await;
+        let _ = w.flush().await;
+    });
+    tokio::spawn(async move {
+        let mut got = Vec::new();
+        let _ = r.read_to_end(&mut got).await;
+        got
+    })
+}
+
+/// Both members on the real session runner over the given transports, A accepting and B
+/// initiating as in #299. Returns both session results and what each member's local side got.
+async fn session_pair_299(
+    a_t: tokio::io::DuplexStream,
+    b_t: tokio::io::DuplexStream,
+    a_input: Option<Vec<u8>>,
+    b_input: Option<Vec<u8>>,
+) -> (io::Result<()>, io::Result<()>, Vec<u8>, Vec<u8>) {
+    let ka = generate_static_keypair();
+    let kb = generate_static_keypair();
+    let (a_priv, a_pub, b_priv, b_pub) = (ka.private, ka.public, kb.private, kb.public);
+    let (a_local, a_app) = tokio::io::duplex(64 * 1024);
+    let (b_local, b_app) = tokio::io::duplex(64 * 1024);
+    let a = tokio::spawn(async move {
+        let (r, w) = tokio::io::split(a_t);
+        run_channel_session_on_stream(w, r, ChannelRole::Accept, &a_priv, &b_pub, a_local).await
+    });
+    let b = tokio::spawn(async move {
+        let (r, w) = tokio::io::split(b_t);
+        run_channel_session_on_stream(w, r, ChannelRole::Initiate, &b_priv, &a_pub, b_local).await
+    });
+    let a_out = local_side_299(a_app, a_input);
+    let b_out = local_side_299(b_app, b_input);
+    let a_res = a.await.expect("A's session task");
+    let b_res = b.await.expect("B's session task");
+    (a_res, b_res, a_out.await.expect("A's output"), b_out.await.expect("B's output"))
+}
+
+#[tokio::test]
+async fn delivery_ack_v2_half_closed_member_still_receives_299() {
+    // #299 at the session runner, protocol v2 negotiated by default: A's local input is at EOF
+    // from the start (`< /dev/null`), B sends N bytes and ends. A receives all of them and both
+    // sessions end Ok -- now with the peer's confirmation behind the Ok. Also over a relay that
+    // drops a whole leg on a half-close (the edge before CADS-Tunnel#856): v2 ends a direction
+    // with a FIN record, not with a transport half-close, so that edge cannot cost the data.
+    let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    for (label, (a_t, b_t)) in [
+        ("plain relay", relay_299(RelayCut299::Never, RelayCut299::Never)),
+        ("pre-#856 relay", tearing_relay_299()),
+    ] {
+        let (a_res, b_res, a_got, b_got) = session_pair_299(a_t, b_t, Some(Vec::new()), Some(data.clone())).await;
+        assert_eq!(a_got.len(), data.len(), "{label}: A receives every byte B sent");
+        assert_eq!(a_got, data, "{label}: byte-exact");
+        assert!(b_got.is_empty(), "{label}");
+        a_res.unwrap_or_else(|e| panic!("{label}: A's session: {e}"));
+        b_res.unwrap_or_else(|e| panic!("{label}: B's session: {e}"));
+    }
+}
+
+#[tokio::test]
+async fn delivery_ack_v2_detects_a_clean_eof_injected_by_the_relay_299() {
+    // The relay forwards B -> A for a while and then ends A's side with a perfectly clean close
+    // at a frame boundary. A legacy session reports that as Ok -- the silent loss of #299. Under
+    // v2 both members fail and say what is missing. Frames on B -> A: handshake message 2, then
+    // three records.
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let (a_t, b_t) = relay_299(RelayCut299::Never, RelayCut299::CleanEofAfter(1 + 3));
+    let (a_res, b_res, a_got, _) = session_pair_299(a_t, b_t, Some(Vec::new()), Some(data.clone())).await;
+    assert!(a_got.len() < data.len(), "the relay really cut the stream");
+    let a_err = a_res.expect_err("A must not report a truncated stream as a delivered session");
+    assert_eq!(a_err.kind(), io::ErrorKind::UnexpectedEof, "{a_err}");
+    assert!(a_err.to_string().contains("end of the peer's stream"), "{a_err}");
+    let b_err = b_res.expect_err("B's bytes were never confirmed, so B must not succeed either");
+    assert!(b_err.to_string().contains("confirmation"), "{b_err}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn delivery_ack_v2_reports_unacknowledged_bytes_299() {
+    // #299 from the sender's side: B's bytes vanish on the way (the relay swallows B -> A after
+    // the handshake, as a dead splice does), and B used to exit 0 with `ok=true`. Under v2 B never
+    // gets a FIN_ACK: it fails after the FIN_ACK bound and names the bytes nobody confirmed.
+    let data: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    let (a_t, b_t) = relay_299(RelayCut299::Never, RelayCut299::SwallowAfter(1));
+    let started = tokio::time::Instant::now();
+    // Bounded on the test side as well: a legacy session (v2 switched off) never ends here --
+    // A waits for B's end forever while B has already reported Ok.
+    let (a_res, b_res, a_got, _) = tokio::time::timeout(
+        super::delivery::FIN_ACK_IDLE * 3,
+        session_pair_299(a_t, b_t, Some(Vec::new()), Some(data.clone())),
+    )
+    .await
+    .expect("both members end within the FIN_ACK bound, not never");
+    assert!(a_got.is_empty(), "nothing of B's reached A");
+    let b_err = b_res.expect_err("B must not report success for bytes nobody confirmed");
+    assert_eq!(b_err.kind(), io::ErrorKind::TimedOut, "{b_err}");
+    assert!(b_err.to_string().contains(&format!("our {} bytes", data.len())), "{b_err}");
+    assert!(a_res.is_err(), "A never heard B's end of stream either");
+    let waited = started.elapsed();
+    assert!(waited >= super::delivery::FIN_ACK_IDLE, "bounded by the FIN_ACK idle time: {waited:?}");
+    assert!(waited < super::delivery::FIN_ACK_IDLE * 2, "and not much longer: {waited:?}");
+}
+
+#[tokio::test]
+async fn delivery_ack_v2_falls_back_to_legacy_with_an_old_peer_299() {
+    // An agent from before v2 (ct-agent v0.7.40 and older) runs `a2a_initiate` or
+    // `a2a_respond_verified` and the legacy `noise_pump`. It reads the capability offer, ignores
+    // it and answers nothing, so the session is legacy and carries data both ways -- whichever
+    // role the new agent has.
+    use ct_common::a2a::{a2a_initiate, a2a_respond_verified};
+    use ct_common::noise::noise_pump;
+    for new_role in [ChannelRole::Accept, ChannelRole::Initiate] {
+        let (kn, ko) = (generate_static_keypair(), generate_static_keypair());
+        let (new_priv, new_pub, old_priv, old_pub) = (kn.private, kn.public, ko.private, ko.public);
+        let (new_t, mut old_t) = tokio::io::duplex(64 * 1024);
+        let (new_local, new_app) = tokio::io::duplex(64 * 1024);
+        let new = tokio::spawn(async move {
+            let (r, w) = tokio::io::split(new_t);
+            run_channel_session_on_stream(w, r, new_role, &new_priv, &old_pub, new_local).await
+        });
+        let session = {
+            let (mut r, mut w) = tokio::io::split(&mut old_t);
+            match new_role {
+                ChannelRole::Accept => a2a_initiate(&mut w, &mut r, &old_priv, &new_pub).await,
+                ChannelRole::Initiate => a2a_respond_verified(&mut w, &mut r, &old_priv, &new_pub).await,
+            }
+            .expect("the old agent completes the handshake with the new one")
+        };
+        let (old_local, old_app) = tokio::io::duplex(64 * 1024);
+        let old = tokio::spawn(noise_pump(session, old_t, old_local));
+        let (mut new_r, mut new_w) = tokio::io::split(new_app);
+        let (mut old_r, mut old_w) = tokio::io::split(old_app);
+        new_w.write_all(b"from the new agent").await.unwrap();
+        new_w.shutdown().await.unwrap();
+        old_w.write_all(b"from the old agent").await.unwrap();
+        old_w.shutdown().await.unwrap();
+        let mut at_old = Vec::new();
+        old_r.read_to_end(&mut at_old).await.unwrap();
+        let mut at_new = Vec::new();
+        new_r.read_to_end(&mut at_new).await.unwrap();
+        assert_eq!(at_old, b"from the new agent", "{new_role:?}");
+        assert_eq!(at_new, b"from the old agent", "{new_role:?}");
+        new.await.unwrap().unwrap_or_else(|e| panic!("{new_role:?}: the new agent's legacy session: {e}"));
+        old.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_session_runner_answers_a_v2_offer_unless_delivery_ack_is_switched_off_299() {
+    // What this agent answers a v2 peer: protocol v2 by default, and nothing (the legacy session,
+    // byte for byte) when it runs with CT_CHANNEL_DELIVERY_ACK=0 -- which selects exactly
+    // `run_channel_session_on_stream_with(.., SessionCaps::NONE)`.
+    use ct_common::a2a::a2a_initiate_with_caps;
+    use ct_common::delivery::{noise_pump_v2, FinReason, SessionCaps};
+    use ct_common::noise::noise_pump;
+    for opted_out in [false, true] {
+        let (ka, kp) = (generate_static_keypair(), generate_static_keypair());
+        let (a_priv, a_pub, p_priv, p_pub) = (ka.private, ka.public, kp.private, kp.public);
+        let (agent_t, mut peer_t) = tokio::io::duplex(64 * 1024);
+        let (a_local, a_app) = tokio::io::duplex(64 * 1024);
+        let agent = tokio::spawn(async move {
+            let (r, w) = tokio::io::split(agent_t);
+            if opted_out {
+                run_channel_session_on_stream_with(w, r, ChannelRole::Accept, &a_priv, &p_pub, a_local, SessionCaps::NONE)
+                    .await
+            } else {
+                run_channel_session_on_stream(w, r, ChannelRole::Accept, &a_priv, &p_pub, a_local).await
+            }
+        });
+        let (session, caps) = {
+            let (mut r, mut w) = tokio::io::split(&mut peer_t);
+            a2a_initiate_with_caps(&mut w, &mut r, &p_priv, &a_pub, SessionCaps::DELIVERY_ACK)
+                .await
+                .expect("handshake with the agent")
+        };
+        assert_eq!(caps.delivery_ack(), !opted_out, "opted out: {opted_out}");
+        let (p_local, p_app) = tokio::io::duplex(64 * 1024);
+        let peer = if caps.delivery_ack() {
+            tokio::spawn(async move {
+                noise_pump_v2(session, peer_t, p_local, Duration::from_secs(60), |_: Option<&io::Error>| {
+                    FinReason::Normal
+                })
+                .await
+                .map(|_| ())
+            })
+        } else {
+            tokio::spawn(noise_pump(session, peer_t, p_local))
+        };
+        let (mut a_r, mut a_w) = tokio::io::split(a_app);
+        let (mut p_r, mut p_w) = tokio::io::split(p_app);
+        p_w.write_all(b"ping").await.unwrap();
+        p_w.shutdown().await.unwrap();
+        a_w.write_all(b"pong").await.unwrap();
+        a_w.shutdown().await.unwrap();
+        let (mut at_agent, mut at_peer) = (Vec::new(), Vec::new());
+        a_r.read_to_end(&mut at_agent).await.unwrap();
+        p_r.read_to_end(&mut at_peer).await.unwrap();
+        assert_eq!((at_agent.as_slice(), at_peer.as_slice()), (&b"ping"[..], &b"pong"[..]));
+        agent.await.unwrap().unwrap_or_else(|e| panic!("opted out {opted_out}: {e}"));
+        peer.await.unwrap().unwrap();
+    }
+}
+
 #[tokio::test]
 async fn run_channel_join_auto_falls_back_to_the_relay_when_direct_is_blocked() {
     // #72 AF4-relay-orchestrate: the auto-recovery. The rendezvous hands the
