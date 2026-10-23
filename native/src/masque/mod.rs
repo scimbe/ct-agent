@@ -121,8 +121,10 @@ pub async fn dial_quic_via_masque(
 }
 
 /// The OUTER (agent-to-proxy-front-door) TLS config of a MASQUE dial: `roots` as
-/// the trust anchors, ALPN `h2`, never early data (#290, same rule as the edge
-/// dials in `crate::transport`).
+/// the trust anchors, ALPN `h2`, never early data, TLS 1.3 sessions only (#290, the
+/// same rules as the edge dials in `crate::transport`). The front door is a server
+/// this crate does not build; should it negotiate TLS 1.2, a kept 1.2 session would
+/// resume without a fresh key exchange, with the `x-ct-masque-token` bearer inside.
 fn outer_tls_config(roots: rustls::RootCertStore) -> Arc<rustls::ClientConfig> {
     crate::transport::install_crypto_provider();
     let mut tls_config = rustls::ClientConfig::builder()
@@ -130,20 +132,26 @@ fn outer_tls_config(roots: rustls::RootCertStore) -> Arc<rustls::ClientConfig> {
         .with_no_client_auth();
     tls_config.alpn_protocols = vec![b"h2".to_vec()];
     tls_config.enable_early_data = false;
+    tls_config.resumption = crate::transport::tls13_only_resumption();
     Arc::new(tls_config)
 }
 
 /// #290: the production outer config -- the real public CA set -- built once per
 /// process. A config per dial kept no TLS session, so every MASQUE redial paid a full
 /// handshake with the front door (and rebuilt the root store); the kept one lets the
-/// redial resume.
+/// redial resume. `CT_TLS_RESUMPTION=0` builds one per dial again
+/// ([`crate::transport::tls_resumption_on`]).
 fn public_front_door_tls() -> Arc<rustls::ClientConfig> {
     static CONFIG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
-    Arc::clone(CONFIG.get_or_init(|| {
+    let build = || {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         outer_tls_config(roots)
-    }))
+    };
+    if !crate::transport::tls_resumption_on() {
+        return build();
+    }
+    Arc::clone(CONFIG.get_or_init(build))
 }
 
 /// Same as [`dial_quic_via_masque`], but with the OUTER (agent-to-proxy-front-door)

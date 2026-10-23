@@ -240,6 +240,51 @@ fn the_public_front_door_config_is_built_once_and_never_sends_early_data_290() {
     assert!(!first.enable_early_data);
 }
 
+#[tokio::test]
+async fn the_kept_front_door_config_never_resumes_a_tls12_session_290() {
+    // #290: the outer config lives as long as the process now, and the MASQUE front door is
+    // a server ct-agent does not build. Should it negotiate TLS 1.2, a kept rustls store
+    // would resume by session id: the old master secret, no fresh key exchange, and the
+    // `x-ct-masque-token` bearer inside. Every dial against such a server stays a full
+    // handshake (TLS 1.3 resumption, a fresh key exchange each time, stays allowed).
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::transport::install_crypto_provider();
+    let (cert, _, key) = test_cert();
+    let server = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone()], key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                if let Ok(mut tls) = acceptor.accept(tcp).await {
+                    let _ = tls.write_all(b"k").await;
+                    let _ = tls.flush().await;
+                    let _ = tls.read(&mut [0u8; 1]).await;
+                }
+            });
+        }
+    });
+
+    let kept = outer_tls_config(test_proxy_roots(&cert));
+    for round in 0..3 {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let sni = rustls::pki_types::ServerName::try_from("masque.test").unwrap();
+        let mut tls = TlsConnector::from(kept.clone()).connect(sni, tcp).await.unwrap();
+        tls.read_exact(&mut [0u8; 1]).await.unwrap();
+        assert_eq!(tls.get_ref().1.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_2));
+        assert_eq!(
+            tls.get_ref().1.handshake_kind(),
+            Some(rustls::HandshakeKind::Full),
+            "round {round}: no TLS 1.2 session may be kept"
+        );
+    }
+}
+
 // ADR-0024 M4: the real regression that caused a live outage on
 // kali.bunsenbrenner.org -- `dial_quic_via_masque_with_proxy_roots`'s connection-
 // driving task was fire-and-forget `tokio::spawn`ed, so every failure AFTER the h2
