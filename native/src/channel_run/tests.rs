@@ -5067,6 +5067,171 @@ async fn two_443_only_members_learn_each_others_noise_key_and_form_the_tunnel() 
 }
 
 #[tokio::test]
+async fn pipe_member_with_local_eof_still_receives_over_the_ka_park_pump_299() {
+    // #299: a pipe member whose stdin is already at EOF when the session opens (an accept side
+    // started with `< /dev/null`) never received what the peer sent, and both sides still
+    // reported `ok=true`. The edge half of the cause: every admitted `:443` leg runs through the
+    // park pump (`admit_and_pair_on_boxed_stream`), and before CADS-Tunnel#856 a keepalive leg's
+    // client EOF tore the WHOLE pump down -- A's own FIN closed A's receive direction too, and
+    // B's bytes hit a dead splice. Every agent leg is a keepalive leg (the KA ALPN is offered
+    // first since v0.4.13). The other `:443` tests here pair with `admit_and_pair_on_stream`,
+    // which has no pump, so they could not see it. This one goes through the real KA park pump:
+    // A's local input ends at once, B sends N bytes and then ends; A must receive all N bytes
+    // and both sessions must end Ok. Red with the dev-dependency ct-edge v0.4.20, green from
+    // v0.5.0 (#856 forwards a client EOF as a half-close and keeps the other direction).
+    use ct_common::channel::{
+        member_noise_attest_bytes, ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant,
+        CHANNEL_ENDPOINT_RELAY_ONLY,
+    };
+    use ct_edge::channel_broker::{
+        admit_and_pair_on_boxed_stream, finish_relay_pair_over_streams, BoxedChannelStream, ChannelPairer,
+    };
+    use ct_edge::transport::build_tcp_tls_listener_at;
+    use ed25519_dalek::Signer;
+    use std::sync::Mutex;
+    use tokio::io::{duplex, split};
+
+    let op = SigningKey::from_bytes(&[0x63u8; 32]);
+    let op_pub = op.verifying_key().to_bytes();
+    let channel = [0x99u8; 32];
+    let holder_a = SigningKey::from_bytes(&[0x64u8; 32]);
+    let holder_b = SigningKey::from_bytes(&[0x65u8; 32]);
+    let ha_pub = holder_a.verifying_key().to_bytes();
+    let noise_a = generate_static_keypair();
+    let noise_b = generate_static_keypair();
+    let (na, na_pub) = (noise_a.private, noise_a.public);
+    let (nb, nb_pub) = (noise_b.private, noise_b.public);
+    let attest_a = holder_a
+        .sign(&member_noise_attest_bytes(&ChannelId(channel), &ha_pub, &na_pub))
+        .to_bytes();
+    let attest_b = holder_b
+        .sign(&member_noise_attest_bytes(&ChannelId(channel), &holder_b.verifying_key().to_bytes(), &nb_pub))
+        .to_bytes();
+    let signed = |h: &SigningKey, dir| {
+        let g = ChannelGrant {
+            channel: ChannelId(channel),
+            holder: SigningKey::verifying_key(h).to_bytes(),
+            direction: dir,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }
+    };
+    // As in #299: A accepts, B initiates; both are `:443`-only.
+    let req_a = ChannelJoinRequest {
+        grant: signed(&holder_a, Direction::Accept),
+        endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+    };
+    let req_b = ChannelJoinRequest {
+        grant: signed(&holder_b, Direction::Initiate),
+        endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+    };
+
+    // The front door as the edge runs it for a KA-negotiated client: every admitted leg is
+    // wrapped in the park pump (`keepalive = true`), then the two legs are relay-spliced.
+    let (listener, acceptor, edge_cert) =
+        build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap()).await.expect("tls-tcp listener");
+    let fd_addr = listener.local_addr().expect("front-door addr");
+    let edge = tokio::spawn(async move {
+        let pairer: Mutex<ChannelPairer<_>> = Mutex::new(ChannelPairer::new());
+        let authorize = move |c: ChannelId, h: [u8; 32]| async move {
+            if c.0 != channel {
+                return None;
+            }
+            let (noise, attest) = if h == ha_pub { (na_pub, attest_a) } else { (nb_pub, attest_b) };
+            Some((op_pub, Some(noise), Some(attest)))
+        };
+        let mut paired = None;
+        for _ in 0..2 {
+            let (tcp, peer) = listener.accept().await.expect("accept tcp");
+            let tls = acceptor.accept(tcp).await.expect("tls accept");
+            let boxed: BoxedChannelStream = Box::pin(tls);
+            if let Some(((x, _), (y, _))) = admit_and_pair_on_boxed_stream(
+                boxed,
+                peer,
+                500u64,
+                Duration::from_secs(5),
+                &authorize,
+                10_000u64,
+                &pairer,
+                None,
+                true, // keepalive: the pump every agent leg runs through (#500 K2)
+            )
+            .await
+            .expect("admit + pair the :443 member")
+            {
+                paired = Some((x, y));
+            }
+        }
+        let (x, y) = paired.expect("two same-channel members paired over :443");
+        // Not unwrapped: against a pre-#856 edge the splice ends with an error, and the
+        // assertions below are the ones that must name the failure.
+        let _ = finish_relay_pair_over_streams(x, y, 500u64).await;
+    });
+
+    let join_and_run = move |req: ChannelJoinRequest,
+                             holder: SigningKey,
+                             role: ChannelRole,
+                             own: [u8; 32],
+                             cert: rustls::pki_types::CertificateDer<'static>,
+                             local: tokio::io::DuplexStream| async move {
+        let stream = crate::transport::tcp_tls_connect_channel(fd_addr, cert).await.expect("tls-tcp connect");
+        let (mut recv, mut send) = split(stream);
+        let outcome = present_channel_relay_join_on_stream(&mut send, &mut recv, &req, &holder, None)
+            .await
+            .expect("relay join");
+        let peer_noise = match outcome {
+            ChannelJoinOutcome::Admitted { peer_noise_pubkey, .. } => {
+                peer_noise_pubkey.expect("the ack conveys the peer's Noise key (#122)")
+            }
+            other => panic!("the :443 join must be Admitted, got {other:?}"),
+        };
+        run_channel_session_on_stream(send, recv, role, &own, &peer_noise, local).await
+    };
+
+    let (a_app, a_local) = duplex(64 * 1024);
+    let (b_app, b_local) = duplex(64 * 1024);
+    let a = tokio::spawn(join_and_run(req_a, holder_a, ChannelRole::Accept, na, edge_cert.clone(), a_local));
+    let b = tokio::spawn(join_and_run(req_b, holder_b, ChannelRole::Initiate, nb, edge_cert, b_local));
+
+    // A: stdin at EOF from the start (`< /dev/null`), stdout still wanted.
+    let (mut a_out, mut a_in) = split(a_app);
+    a_in.shutdown().await.expect("A's local input ends at once");
+    // B: N bytes (several Noise records), then EOF -- `echo ... | ct-agent channel`.
+    let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    let (mut b_out, mut b_in) = split(b_app);
+    let sent = payload.clone();
+    let b_writer = tokio::spawn(async move {
+        b_in.write_all(&sent).await.expect("B writes its payload");
+        b_in.shutdown().await.expect("B's local input ends");
+        let mut rest = Vec::new();
+        let _ = b_out.read_to_end(&mut rest).await;
+        rest
+    });
+
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), a_out.read_to_end(&mut got))
+        .await
+        .expect("A's local output ends within 20s")
+        .expect("A reads its local output");
+    assert_eq!(
+        got.len(),
+        payload.len(),
+        "A, whose local input is at EOF, must still receive every byte B sent over the KA park pump (#299)"
+    );
+    assert_eq!(got, payload, "byte-exact");
+
+    let a_res = tokio::time::timeout(Duration::from_secs(20), a).await.expect("A's session ends").expect("A joins");
+    let b_res = tokio::time::timeout(Duration::from_secs(20), b).await.expect("B's session ends").expect("B joins");
+    a_res.expect("A's session ends Ok");
+    b_res.expect("B's session ends Ok");
+    let b_got = b_writer.await.expect("B's writer joins");
+    assert!(b_got.is_empty(), "A sent nothing, so B's local output carries nothing");
+    let _ = tokio::time::timeout(Duration::from_secs(5), edge).await;
+}
+
+#[tokio::test]
 async fn run_channel_join_auto_falls_back_to_the_relay_when_direct_is_blocked() {
     // #72 AF4-relay-orchestrate: the auto-recovery. The rendezvous hands the
     // initiator a peer endpoint that BLACKHOLES (bound-but-silent), so the direct
