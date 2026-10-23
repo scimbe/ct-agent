@@ -824,12 +824,12 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
         move || {
             let c = admit_ctx.clone();
             // SIGTERM/SIGINT: the park in flight closes and no new one opens (shutdown.rs).
-            async move { shutdown::unless_stopped(shutdown::process_stop(), admit_one_peer(&c)).await }
+            async move { shutdown::admit_next_peer(&c, shutdown::process_stop()).await }
         },
         move |admission| {
             let c = ctx.clone();
             // Counted from the pairing on, so the shutdown drain waits for it (health.rs).
-            health::HEALTH.serving(async move { serve_admitted_session(c, admission).await })
+            health::health().serving(async move { serve_admitted_session(c, admission).await })
         },
     )
     .await
@@ -1016,7 +1016,8 @@ mod redact;
 pub(crate) use redact::redact_secrets;
 
 // A long-running channel process: the opt-in health listener (CT_CHANNEL_HEALTH_LISTEN) with
-// the activity it reports, and the SIGTERM/SIGINT drain that ends the process with status 0.
+// the activity it reports, and the SIGTERM/SIGINT drain that ends the process (status 0 on
+// request; a one-shot transfer the stop cut keeps the signal's own status).
 mod health;
 pub use health::run_health_probe;
 mod shutdown;

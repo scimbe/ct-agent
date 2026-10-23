@@ -134,7 +134,7 @@ pub(crate) async fn admit_one_peer(ctx: &ServeSessionCtx) -> Result<ChannelJoinO
                 .await?;
             // CADS-Tunnel#495 U2 (a'): broker_conn is admission-only -- PHASE_MARKER_RENDEZVOUS.
             // Parked from here on, for `/readyz` (health.rs) -- the ladder counts its legs alike.
-            super::health::HEALTH
+            super::health::health()
                 .parked(present_channel_join_marked(&broker_conn, &ctx.request, &ctx.holder, PHASE_MARKER_RENDEZVOUS))
                 .await?
         }
@@ -586,7 +586,7 @@ where
                 let broker_conn = crate::transport::build_channel_dialer()?.connect(cfg.broker_addr, "localhost")?.await?;
                 // CADS-Tunnel#495 U2 (a'): broker_conn is admission-only -- PHASE_MARKER_RENDEZVOUS.
                 // Parked from here on, for `/readyz` (health.rs).
-                super::health::HEALTH
+                super::health::health()
                     .parked(present_channel_join_marked(&broker_conn, request, &cfg.holder, PHASE_MARKER_RENDEZVOUS))
                     .await
             }

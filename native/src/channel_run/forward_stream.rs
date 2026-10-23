@@ -231,7 +231,7 @@ pub(crate) fn forward_initiate_on_with(
     let (session_side, engine_side) = tokio::io::duplex(ENGINE_DUPLEX_BUF);
     let (up_tx, session_up) = tokio::sync::oneshot::channel();
     // The window this member grants (CT_CHANNEL_FORWARD_SESSION_WINDOW_KIB) and the process stop
-    // (SIGTERM/SIGINT, `shutdown`): the engine takes no new connection once the process stops.
+    // (SIGTERM/SIGINT, `shutdown`): the engine refuses new connections once the process stops.
     let window = session_window_from_env();
     let stop = super::shutdown::process_stop().clone();
     let pump = TaskGuard::spawn(async move {
@@ -1362,8 +1362,8 @@ async fn run_forward_initiate_engine(
 /// The initiate side's engine (#255): every accepted local connection becomes one stream.
 /// Reads frames cancel-safe (frame_fut), never waits on a credited stream, never writes itself.
 /// `window` is the session window it grants the peer ([`FORWARD_SESSION_WINDOW_ENV`]). Once
-/// `stop` is cancelled (the process is shutting down, see `shutdown`) it takes no new local
-/// connection; the streams already running go on until they end or the process exits.
+/// `stop` is cancelled (the process is shutting down, see `shutdown`) it closes every new local
+/// connection at once; the streams already running go on until they end or the process exits.
 #[allow(clippy::too_many_arguments)] // the session's settings plus the duplex, listener and both signals
 async fn run_forward_initiate_engine_with(
     engine_side: tokio::io::DuplexStream,
@@ -1392,7 +1392,9 @@ async fn run_forward_initiate_engine_with(
         let _ = ctrl_tx.send(hello_frame(window as u32));
     }
     let mut session_recv = SessionRecv::granting(window);
-    // The process is shutting down: no new local connection becomes a stream any more.
+    // The process is shutting down: no new local connection becomes a stream any more, each is
+    // closed at once (the accept branch checks the token itself, so a connection that races the
+    // stop is refused as well).
     let mut stopping = false;
     let mut unacked_since: Option<tokio::time::Instant> = None;
     let mut dead_check = tokio::time::interval(SESSION_DEAD_AFTER / 4);
@@ -1433,13 +1435,21 @@ async fn run_forward_initiate_engine_with(
             () = stop.cancelled(), if !stopping => {
                 stopping = true;
                 eprintln!(
-                    "ct-agent channel: forward listener takes no new connections -- the process is shutting down \
+                    "ct-agent channel: forward listener refuses new connections -- the process is shutting down \
                      ({} stream(s) still running)",
                     running.len()
                 );
             }
-            accepted = listener.accept(), if accepting && !stopping => {
+            // While stopping the listener is still polled, and every new connection is closed at
+            // once (#264's refusal): left in the backlog it would hang its client for the whole
+            // drain and then be reset at the exit, where a closed one is a fast failure the client
+            // (a relay, a browser behind a Service) can retry on another endpoint.
+            accepted = listener.accept(), if accepting || stopping => {
                 match accepted {
+                    Ok((tcp, peer_addr)) if stop.is_cancelled() => {
+                        drop(tcp);
+                        eprintln!("ct-agent channel: forward listener refused {peer_addr}: the process is shutting down");
+                    }
                     Ok((tcp, _peer_addr)) => {
                         if running.len() >= max_streams {
                             drop(tcp);
@@ -1470,7 +1480,7 @@ async fn run_forward_initiate_engine_with(
                         }
                         let session = session_send.clone();
                         // Counted for the shutdown drain from here on, not from the task's first poll.
-                        let task = streams.spawn(super::health::HEALTH.forward_stream(WRITTEN.scope(written.clone(), async move {
+                        let task = streams.spawn(super::health::health().forward_stream(WRITTEN.scope(written.clone(), async move {
                             // Without flow control the Open takes the pumps' queue and never waits
                             // forever on a peer that stopped reading.
                             if credited
@@ -1763,7 +1773,7 @@ async fn run_forward_accept_engine_with(
                                 let session = session_send.clone();
                                 let flow = (credit.is_some() || session.is_some()).then_some(PumpFlow { credit, session });
                                 // Counted for the shutdown drain from here on, dial included.
-                                let task = streams.spawn(super::health::HEALTH.forward_stream(WRITTEN.scope(written.clone(), dial_and_pump_forward_target(id, target, out_tx.clone(), rx, idle, flow))));
+                                let task = streams.spawn(super::health::health().forward_stream(WRITTEN.scope(written.clone(), dial_and_pump_forward_target(id, target, out_tx.clone(), rx, idle, flow))));
                                 running.insert(id, task.id());
                             }
                         }
@@ -4477,31 +4487,50 @@ mod tests {
         const W: usize = 1 << 20;
         let (mut frames, mut w, _engine) = accept_sending_at_the_wire(W as u32).await;
         let mut unacked = 0usize;
-        loop {
-            match tokio::time::timeout(Duration::from_millis(300), frames.recv()).await {
+        // Stream credit is always returned, so only the session window holds the sender back:
+        // without an acknowledgement it stops within one chunk of the window's end, well past
+        // three quarters of it (three times the default window). Waited for by amount under a
+        // generous deadline, not by a pause, so a slow runner only makes this take longer.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while unacked < W * 3 / 4 {
+            match tokio::time::timeout_at(deadline, frames.recv()).await {
                 Ok(Some(Frame::Data { id: CONTROL_ID, .. })) => {}
                 Ok(Some(Frame::Data { id, payload })) => {
                     unacked += payload.len();
                     assert!(unacked <= W, "{unacked} bytes unacknowledged with a window of {W}");
-                    // Stream credit is always returned: only the session window is under test.
                     window_frame(id, payload.len() as u32).write(&mut w).await.unwrap();
                 }
                 Ok(Some(_)) => {}
-                Ok(None) => panic!("the engine ended after {unacked} bytes"),
-                Err(_) => break, // stands still: the window is used up
+                // A sender that stands still short of it ends here: its unacknowledged data and
+                // our silence look like a dead peer after SESSION_DEAD_AFTER (3 s in tests).
+                Ok(None) => panic!("the engine ended after {unacked} bytes: the granted {W} was not used"),
+                Err(_) => panic!("only {unacked} bytes on their way after 10 s: the granted {W} was not used"),
             }
         }
-        // Half the granted window is already twice the default one.
-        assert!(
-            unacked > W / 2,
-            "only {unacked} bytes on their way: the granted {W} was not used"
-        );
+        // And never past the window: whatever still arrives stays within it.
+        let quiet = tokio::time::Instant::now() + Duration::from_millis(300);
+        while let Ok(Some(f)) = tokio::time::timeout_at(quiet, frames.recv()).await {
+            match f {
+                Frame::Data { id: CONTROL_ID, .. } => {}
+                Frame::Data { id, payload } => {
+                    unacked += payload.len();
+                    assert!(unacked <= W, "{unacked} bytes unacknowledged with a window of {W}");
+                    window_frame(id, payload.len() as u32).write(&mut w).await.unwrap();
+                }
+                _ => {}
+            }
+        }
     }
 
-    // SIGTERM/SIGINT: once the process stops, the initiate engine takes no new local connection,
-    // while a stream that already runs keeps carrying data and counts as work in flight.
+    // SIGTERM/SIGINT: once the process stops, the initiate engine closes every new local
+    // connection at once -- not left in the listen backlog, where its client would hang for the
+    // whole drain and then be reset -- while a stream that already runs keeps carrying data and
+    // counts as work in flight.
     #[tokio::test]
-    async fn a_stopped_initiate_engine_takes_no_new_connection_and_keeps_its_streams() {
+    async fn a_stopped_initiate_engine_refuses_new_connections_and_keeps_its_streams() {
+        use crate::channel_run::health::{with_health, ChannelHealth};
+        // Counts of this test's own (the engine's task counts in them), untouched by other tests.
+        let health: &'static ChannelHealth = Box::leak(Box::new(ChannelHealth::new()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (session_side, engine_side) = tokio::io::duplex(1 << 16);
@@ -4509,16 +4538,19 @@ mod tests {
         hello_frame(SESSION_WINDOW as u32).write(&mut w).await.unwrap();
         let stop = tokio_util::sync::CancellationToken::new();
         let (up_tx, session_up) = tokio::sync::oneshot::channel();
-        let engine = tokio::spawn(run_forward_initiate_engine_with(
-            engine_side,
-            Arc::new(listener),
-            "127.0.0.1:1".to_string(),
-            64,
-            Duration::from_secs(60),
-            true,
-            SESSION_WINDOW,
-            session_up,
-            stop.clone(),
+        let engine = tokio::spawn(with_health(
+            health,
+            run_forward_initiate_engine_with(
+                engine_side,
+                Arc::new(listener),
+                "127.0.0.1:1".to_string(),
+                64,
+                Duration::from_secs(60),
+                true,
+                SESSION_WINDOW,
+                session_up,
+                stop.clone(),
+            ),
         ));
         let _ = up_tx.send(());
         let mut frames = frames_of(r);
@@ -4530,15 +4562,18 @@ mod tests {
                 other => panic!("no Open for the first connection: {other:?}"),
             }
         };
-        assert!(
-            crate::channel_run::health::HEALTH.forward_streams() >= 1,
-            "a running stream is work in flight for the drain"
-        );
+        assert_eq!(health.forward_streams(), 1, "a running stream is work in flight for the drain");
         stop.cancel();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        // The kernel's backlog still completes the connect; the engine must not take it.
+        // The kernel's backlog still completes the connect; the engine closes it at once.
         let mut late = TcpStream::connect(addr).await.unwrap();
-        late.write_all(b"late").await.unwrap();
+        let _ = late.write_all(b"late").await;
+        let mut buf = [0u8; 16];
+        let closed = tokio::time::timeout(Duration::from_secs(2), late.read(&mut buf)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "the late connection must be closed at once, not left pending until the exit: {closed:?}"
+        );
         first.write_all(b"still here").await.unwrap();
         let mut carried = Vec::new();
         let until = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -4550,6 +4585,7 @@ mod tests {
             }
         }
         assert_eq!(carried, b"still here", "the running stream kept going");
+        assert_eq!(health.forward_streams(), 1, "the refused connection never became a stream");
         assert!(!engine.is_finished(), "the session itself goes on until the process exits");
     }
 }

@@ -274,20 +274,35 @@ side, a stdio pipe -- handles **SIGTERM and SIGINT** (Ctrl-C on Windows):
 1. It takes no new work from that moment: a persistent serve member drops the admission it has
    parked at the edge (the leg closes, so the edge drops the park -- a keepalive leg at once --
    instead of pairing a peer with a process that is going away) and parks no more; a forward
-   initiator takes no new local connection (it waits in the listen backlog and is reset when the
-   process exits). Sessions already running go on; `/readyz` (below) answers 503.
+   initiator closes every new local connection at once (with a log line), so its client sees a
+   failure it can retry elsewhere instead of hanging in the listen backlog for the whole drain.
+   Sessions already running go on; `/readyz` (below) answers 503.
 2. It waits until nothing is in flight -- for a forward member the forwarded streams (an idle
-   forward session is not waited for), for every other member its sessions -- for at most
+   forward session is not waited for), for every other member its sessions, including a QUIC
+   session's wait for the peer to acknowledge its last bytes -- for at most
    `CT_CHANNEL_SHUTDOWN_DRAIN_SECS` (default **5**; `0`: no wait; at most 3600).
-3. It exits with status **0**, also when the drain time ran out. A second signal exits at once.
+3. It exits with status **0** when nothing was cut, and always for a member that runs for good (a
+   forward, a persistent serve member), also when the drain time ran out: "stopped on request". A
+   one-shot member (a pipe, a call) whose transfer the drain had to cut exits with the status the
+   signal itself gives a process -- **143** for SIGTERM, **130** for SIGINT and Ctrl-C -- so a
+   caller that checks `$?` does not take a cut transfer for a complete one.
+
+Another stop signal ends the drain at once, if it comes **1 s or more** after the first. A copy of
+the same stop comes sooner and is ignored (logged): under systemd's default
+`KillMode=control-group` every process of the unit gets SIGTERM at once, so a wrapper script or
+`ct-agent-supervisor` that passes SIGTERM on delivers it a second time a few milliseconds later.
+The reconnect loops (a forward initiator's, the relay-only DCUtR serve loop's, a persistent
+`--call`'s) are not stopped on their own: a session that ends during the drain leaves nothing in
+flight, so the process exits within about 100 ms -- before a forward initiator reconnects (1 s at
+the earliest); an admission one of the other loops starts in that window ends with the process.
 
 Without a handler a container's PID 1 ignores SIGTERM, so until this every pod stop waited out the
 whole termination grace period and ended in SIGKILL. Keep the drain below what the orchestrator
 allows between SIGTERM and SIGKILL: Kubernetes' `terminationGracePeriodSeconds` (30 s by default),
 `docker stop` (10 s), `ct-agent-supervisor` (forwards SIGTERM, then 10 s). A wrapper that runs as
-PID 1 in place of `ct-agent` must pass SIGTERM on, or none of this happens. Status 0 here means
-"stopped on request"; a member that stops on its own because its grant ended is a different case
-([#308](https://github.com/scimbe/ct-agent/issues/308)).
+PID 1 in place of `ct-agent` must pass SIGTERM on (or `exec` it), or none of this happens. Status 0
+here means "stopped on request"; a member that stops on its own because its grant ended is a
+different case ([#308](https://github.com/scimbe/ct-agent/issues/308)).
 
 `CT_CHANNEL_HEALTH_LISTEN=<ip:port>` (opt-in, off by default) serves two routes for probes:
 
@@ -316,6 +331,12 @@ livenessProbe:
   periodSeconds: 20
   timeoutSeconds: 3
 ```
+
+Put the readiness probe only on a pod that **is** the tunnel endpoint (a Deployment of its own for
+the accept or initiate member). Readiness is per pod: on a sidecar it would take the whole pod --
+and the Service endpoints of its other containers -- out of service whenever the member cannot park
+or has had no session for 15 s (an edge outage, a refusal backoff). For a sidecar use the liveness
+probe on `healthz` alone.
 
 A bad value of `CT_CHANNEL_HEALTH_LISTEN`, `CT_CHANNEL_SHUTDOWN_DRAIN_SECS` or
 `CT_CHANNEL_FORWARD_SESSION_WINDOW_KIB` fails the start (exit 1). The relay-only DCUtR variants
@@ -352,8 +373,9 @@ established sessions only.
 | `CT_OIDC_ISSUER` | `ct-agent login` only: the Keycloak realm URL (e.g. `https://auth.bunsenbrenner.org/realms/ct-demo`) — same knob CADS-Tunnel's own portal login already reads |
 | `CT_OIDC_CLI_CLIENT_ID` | `ct-agent login` only: overrides the realm's public device-grant CLI client id (default `ct-agent-cli`) |
 | `CT_AGENT_LOGIN_TOKEN_FILE` | overrides where `ct-agent login` stores (and `channel register`/`allowlist` read) the token; default `<CT_AGENT_STATE_DIR>/oidc-token.json`, else `$HOME/.ct-agent/oidc-token.json` |
-| `CT_CHANNEL_SHUTDOWN_DRAIN_SECS` | how long a channel process stopped by SIGTERM/SIGINT waits for its sessions (a forward member: its forwarded streams) before it exits with status 0; default 5, `0` = no wait, at most 3600. See [Stopping and probing a long-running member](#stopping-and-probing-a-long-running-member) |
-| `CT_CHANNEL_HEALTH_LISTEN` | opt-in `ip:port` serving `GET /healthz` and `GET /readyz`; `ct-agent channel health [readyz\|healthz]` probes it (exit 0/1). Same section |
+| `CT_CHANNEL_SHUTDOWN_DRAIN_SECS` | how long a channel process stopped by SIGTERM/SIGINT waits for its sessions (a forward member: its forwarded streams) before it exits -- status 0, or 143/130 for a one-shot transfer the drain cut; default 5, `0` = no wait, at most 3600. See [Stopping and probing a long-running member](#stopping-and-probing-a-long-running-member) |
+| `CT_CHANNEL_HEALTH_LISTEN` | opt-in `ip:port` serving `GET /healthz` and `GET /readyz`; `ct-agent channel health [readyz\|healthz]` probes it (exit 0 on 200, 1 otherwise, 2 on a usage error). Same section |
+| `CT_CHANNEL_FORWARD_SESSION_WINDOW_KIB` | the forward session window this member grants its peer, whole KiB from 64 to 16384 (default 256); set it on the member that receives the bulk. See "Tuning the window" under the forward's flow control below |
 
 **`CT_CHANNEL_PHASE_MARKER=off` (or `0`/`false`/`no`) is a measurement tool, not a tuning knob.** It
 suppresses the v0.4.14 phase preamble while keeping everything else identical — the only way

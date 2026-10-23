@@ -17,8 +17,9 @@
 //!
 //! The listener reuses the observability listener's bounds (connection cap, header and connection
 //! timeouts) and, on a loopback bind, its DNS-rebinding guard. `ct-agent channel health
-//! [readyz|healthz]` asks it from inside the container and exits 0 or 1, so an exec probe needs
-//! neither curl nor python and the port can stay on loopback.
+//! [readyz|healthz]` asks it from inside the container and exits 0 (200), 1 (anything else) or 2
+//! (a usage error), so an exec probe needs neither curl nor python and the port can stay on
+//! loopback.
 
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -61,6 +62,10 @@ pub(crate) struct ChannelHealth {
     serving: AtomicUsize,
     /// Forwarded TCP streams on either side, from the accepted connection or the peer's `Open`.
     forward_streams: AtomicUsize,
+    /// QUIC sessions past their pump, waiting for the peer to acknowledge the tail (the #134
+    /// send-drain in `run_channel_session`). `established` has ended for them, but a process
+    /// that exits now still cuts that tail.
+    quic_tails: AtomicUsize,
     /// Unix time the last session ended (0: none yet).
     session_ended_at: AtomicU64,
     /// Unix time the last park the edge held ended -- paired or expired (0: none yet).
@@ -71,6 +76,25 @@ pub(crate) struct ChannelHealth {
 
 /// The process-wide health every production call site counts in.
 pub(crate) static HEALTH: ChannelHealth = ChannelHealth::new();
+
+tokio::task_local! {
+    /// A test's own instance in place of [`HEALTH`], for the code it runs inside
+    /// [`with_health`]. Production never sets one.
+    static SCOPED: &'static ChannelHealth;
+}
+
+/// The instance the calling task counts in: [`HEALTH`], or a test's own one ([`with_health`]).
+/// The counting call sites go through this, so a test can check the real wiring (a park on the
+/// ladder, a session's tail) on counts no other test in the process touches.
+pub(crate) fn health() -> &'static ChannelHealth {
+    SCOPED.try_with(|h| *h).unwrap_or(&HEALTH)
+}
+
+/// `fut`, counting in `health` instead of [`HEALTH`]. Tasks it spawns count in [`HEALTH`] again.
+#[cfg(test)]
+pub(crate) async fn with_health<F: Future>(health: &'static ChannelHealth, fut: F) -> F::Output {
+    SCOPED.scope(health, fut).await
+}
 
 /// Counts one unit until dropped; with a stamp, it also records when it ended (stamp first, so a
 /// reader that sees the count drop also sees the time).
@@ -102,6 +126,7 @@ impl ChannelHealth {
             parked: AtomicUsize::new(0),
             serving: AtomicUsize::new(0),
             forward_streams: AtomicUsize::new(0),
+            quic_tails: AtomicUsize::new(0),
             session_ended_at: AtomicU64::new(0),
             park_ended_at: AtomicU64::new(0),
             stopping: AtomicBool::new(false),
@@ -150,6 +175,12 @@ impl ChannelHealth {
         }
     }
 
+    /// A QUIC session's pump is over and it waits for the peer to acknowledge the tail (#134):
+    /// counted until the ticket drops, so the shutdown drain does not exit under that wait.
+    pub(crate) fn quic_tail(&'static self) -> Ticket {
+        Ticket::new(&self.quic_tails, None)
+    }
+
     /// A shutdown started: `/readyz` answers 503 from now on.
     pub(crate) fn set_stopping(&self) {
         self.stopping.store(true, Ordering::SeqCst);
@@ -160,15 +191,24 @@ impl ChannelHealth {
         self.forward_streams.load(Ordering::SeqCst)
     }
 
+    /// Admissions parked right now (tests check the ladder's and the serve loop's wiring).
+    #[cfg(test)]
+    pub(crate) fn parks(&self) -> usize {
+        self.parked.load(Ordering::SeqCst)
+    }
+
     /// What the shutdown drain waits for. A forward member's sessions live as long as its peer
-    /// does, so only the streams on them are work in flight; for any other member a session is
-    /// (`serving` covers a persistent-serve session from its pairing on, `established` every other
-    /// mode, and the larger of the two counts each session once).
+    /// does, so only the streams on them are work in flight; for any other member a session is.
+    /// `serving` covers a persistent-serve session from its pairing to its end; every other
+    /// session is `established` and then, on QUIC, in its tail wait (`quic_tails`) -- one after
+    /// the other, so their sum counts it once, and the larger of the two figures counts a serve
+    /// session once.
     pub(crate) fn in_flight(&self, forward: bool) -> usize {
         if forward {
             self.forward_streams()
         } else {
-            self.serving.load(Ordering::SeqCst).max(self.established.load(Ordering::SeqCst))
+            let sessions = self.established.load(Ordering::SeqCst) + self.quic_tails.load(Ordering::SeqCst);
+            self.serving.load(Ordering::SeqCst).max(sessions)
         }
     }
 
@@ -453,6 +493,27 @@ mod tests {
         assert_eq!(h.in_flight(false), 1, "still setting up or running");
         drop(serve);
         assert_eq!(h.in_flight(false), 0);
+        // A QUIC session in its tail wait is still in flight, but no session to be ready on.
+        let fresh = private();
+        let tail = fresh.quic_tail();
+        assert_eq!((fresh.in_flight(false), fresh.in_flight(true)), (1, 0));
+        assert!(fresh.readiness_at(now_unix(), false).is_err(), "a tail wait is no session");
+        drop(tail);
+        assert_eq!(fresh.in_flight(false), 0);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_instance_takes_the_counts_of_the_code_it_runs_and_of_nothing_else() {
+        let h = private();
+        assert!(std::ptr::eq(health(), &HEALTH), "outside a scope: the process-wide instance");
+        let inside = with_health(h, async {
+            let _session = health().session_established();
+            assert!(std::ptr::eq(health(), h));
+            h.in_flight(false)
+        })
+        .await;
+        assert_eq!(inside, 1, "the scoped code counted in the test's instance");
+        assert_eq!(h.in_flight(false), 0, "and the ticket ended with it");
     }
 
     #[test]
