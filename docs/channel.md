@@ -394,6 +394,11 @@ concerns the direct-connect path `serve_direct`, not the forward.)
   **77** instead of asking again (see the next section). Every other refusal keeps the reconnect
   with backoff.
 
+| Variable | Meaning |
+|---|---|
+| `CT_CHANNEL_GRANT_RECHECK_SECS` | Re-check interval of a forward session (default 30, minimum 5) |
+| `CT_CHANNEL_GRANT_RECHECK_GRACE_SECS` | The grace for an answer that **cannot be read** (timeout, `5xx`, `405`, TLS error, garbage): the session ends when no valid answer has come for this long (default 90, at least one interval). It does not apply to a definite answer: `revoked` or `not-member` ends the session at once, `valid` resets the clock |
+
 ### When this member's own grant ends: exit status 77 ([#308])
 
 `ct-agent channel` reads its grant once, at start. Once **this member's own** grant has expired
@@ -435,11 +440,6 @@ Supervisors:
   is restarted with a growing back-off (up to 5 minutes) and the pod shows `CrashLoopBackOff`;
   `kubectl describe pod` shows `Last State: Terminated` with `Exit Code: 77`. That is the signal to
   put a newly issued grant into the Secret: the next start then works without further action.
-
-| Variable | Meaning |
-|---|---|
-| `CT_CHANNEL_GRANT_RECHECK_SECS` | Re-check interval of a forward session (default 30, minimum 5) |
-| `CT_CHANNEL_GRANT_RECHECK_GRACE_SECS` | The grace for an answer that **cannot be read** (timeout, `5xx`, `405`, TLS error, garbage): the session ends when no valid answer has come for this long (default 90, at least one interval). It does not apply to a definite answer: `revoked` or `not-member` ends the session at once, `valid` resets the clock |
 
 ### Accept side — the gate
 
