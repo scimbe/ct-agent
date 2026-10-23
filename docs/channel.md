@@ -219,6 +219,15 @@ picture first.
   behavior. Remaining causes: a mode/config mismatch such as gate mode without reachable
   QUIC. ([#18] closed 2026-08-14 as superseded — its first-contact premise resolved into
   the #494 ack deadlock plus the already-fixed corpse/supersede classes.)
+- **The 8 s accept window and the race ([#22], [#295])**: an acceptor with a bound direct listener
+  waits up to 8 s for its partner's direct dial, which itself gives up after 5 s. With the
+  adaptive default (`CT_CHANNEL_ACCEPT_RACE` unset) a keepalive `:443` relay leg parks during that
+  window, so a partner whose direct dial fails pairs at ~5 s instead of ~8 s; the log names the
+  winner (`accept-vs-relay race: relay won after N ms` / `direct won after N ms`). A direct
+  connection wins only after its Noise_IK handshake verified the attested peer: another session's
+  initiator on the shared `--serve` listener (or a stranger) is closed with `failed the
+  attested-peer check` and the relay leg stays parked. A relay leg that fails at the start of the
+  window is dialed once more when the window ends, as the serial order would.
 - **Flap backoff (v0.4.10, [#250])**: a session that dies within 500 ms of pairing is a "flap";
   3+ consecutive flaps back off exponentially (cap 10 s) before the next admit — a peer whose
   connection is killed post-handshake (AV/DPI middleboxes are the leading field cause) no longer
@@ -286,6 +295,7 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_CHANNEL_RELAY_DIRECT` | dial the relay at this `host:port` instead of the one the grant names — an operator override, not a fallback |
 | `CT_CHANNEL_SERVE` / `CT_CHANNEL_SERVE_CONCURRENCY` | accept-side persistent serve, session cap (default 8) |
 | `CT_CHANNEL_DIRECT_UPGRADE=1` | opt-in in-band relay→direct upgrade (#104) |
+| `CT_CHANNEL_ACCEPT_RACE` | accept side with a bound direct listener only (relay-only members are unaffected): whether the relay leg runs **in parallel** with the 8 s direct accept window instead of after it ([#22], [#295]). **Unset = adaptive**: races only when the relay ladder is `:443`-only (`CT_CHANNEL_FRONT_DOOR_ONLY=1`) — a leg that negotiated keepalive parks at once, a legacy leg is connected at once but presents its join only after the window; a relay that starts on QUIC keeps the serial order (the edge does not see an abandoned QUIC park). At most two sessions of one member race at once (the edge queues at most four parks per member, the rendezvous park included); further concurrent sessions keep the serial order. `0` = serial (the default before #295), `1` = race on every relay leg (the #22 opt-in, unbudgeted). In every mode a direct connection wins only once its Noise_IK handshake verified the attested peer |
 | `CT_CHANNEL_REQUIRE_PEER_GRANT` / `CT_CHANNEL_OPERATOR_PUBKEY` | **Opt-in end-to-end check of the peer's grant** (default off). Admission attests the peer's Noise key with the peer's holder key, but all of that comes from the broker; nothing binds the holder to an operator-signed grant, so a compromised broker could present an identity it minted itself. With `CT_CHANNEL_REQUIRE_PEER_GRANT=1` both members send their own grant as the first bytes inside the Noise session, and each checks the other's before any application byte flows: the signature against `CT_CHANNEL_OPERATOR_PUBKEY` (64 hex, required when on), expiry, same channel, holder = the attested peer holder, and the complementary direction. **Switch it on for every member of a channel together**: a member that sends the grant to one that does not expect it breaks that session. On but without an operator key, the join fails. |
 | `CT_AGENT_SERVICE_HANDLER_CMD` / `CT_AGENT_SERVICES` | the handler command + offered service slugs on the serve side |
 | `CT_SERVICE_TYPE` | not read by `ct-agent` itself — set **in the handler child's own environment** by `CT_AGENT_SERVICE_HANDLER_CMD` (#149-A.1) so one handler script can branch on which of several registered `service/<slug>` calls was actually invoked |
@@ -528,6 +538,8 @@ needed exactly once, at `sign`, so an operator can review the unsigned skeleton 
 | `activate` | `CT_MANIFEST_PROTECTED_NAMES` | optional, comma-separated substrings this install's resources must never collide with |
 
 [#16]: https://github.com/scimbe/ct-agent/issues/16
+[#22]: https://github.com/scimbe/ct-agent/issues/22
+[#295]: https://github.com/scimbe/ct-agent/issues/295
 [#165]: https://github.com/scimbe/ct-agent/issues/165
 [#18]: https://github.com/scimbe/ct-agent/issues/18
 [#140]: https://github.com/scimbe/ct-agent/issues/15

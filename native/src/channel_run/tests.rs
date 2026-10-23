@@ -4191,12 +4191,17 @@ fn channel_advertise_address_splits_bind_from_dial_target() {
     let cfg = lookup(&with_upgrade).expect("direct-upgrade opt-in parses");
     assert!(cfg.direct_upgrade, "CT_CHANNEL_DIRECT_UPGRADE=1 opts in");
 
-    // ct-agent#22 (b): CT_CHANNEL_ACCEPT_RACE absent -> off, today's serial accept-then-relay.
-    assert!(!cfg.accept_race, "accept-vs-relay race defaults to off");
+    // ct-agent#22 (b) / #295: CT_CHANNEL_ACCEPT_RACE absent -> adaptive (races only a
+    // keepalive-monitored :443 leg); =1 keeps the #22 opt-in, =0 today's serial order.
+    assert_eq!(cfg.accept_race, AcceptRaceMode::Auto, "accept-vs-relay race defaults to adaptive (#295)");
     let mut with_race = base.clone();
     with_race.push(("CT_CHANNEL_ACCEPT_RACE", "1".into()));
     let cfg = lookup(&with_race).expect("accept-race opt-in parses");
-    assert!(cfg.accept_race, "CT_CHANNEL_ACCEPT_RACE=1 opts in");
+    assert_eq!(cfg.accept_race, AcceptRaceMode::On, "CT_CHANNEL_ACCEPT_RACE=1 opts in");
+    let mut without_race = base.clone();
+    without_race.push(("CT_CHANNEL_ACCEPT_RACE", "0".into()));
+    let cfg = lookup(&without_race).expect("accept-race opt-out parses");
+    assert_eq!(cfg.accept_race, AcceptRaceMode::Off, "CT_CHANNEL_ACCEPT_RACE=0 opts out (#295)");
 }
 
 #[test]
@@ -4634,7 +4639,7 @@ async fn run_channel_join_with_admission_runs_the_direct_session_from_a_443_ladd
             std::time::Duration::from_secs(5),
             a_local_run,
             false,
-            false, // ct-agent#22 (b): accept_race off (serial)
+            AcceptRaceMode::Off, // ct-agent#22 (b): accept_race off (serial)
         )
         .await
     });
@@ -5254,7 +5259,7 @@ async fn quic_lazy_relay_dials_only_on_fallback_and_forms_the_tunnel() {
             std::time::Duration::from_secs(2),
             a_local_run,
             false,
-            false, // ct-agent#22 (b): accept_race off (serial)
+            AcceptRaceMode::Off, // ct-agent#22 (b): accept_race off (serial)
         )
         .await
     });
@@ -5888,7 +5893,7 @@ async fn two_relay_only_members_join_without_a_dialable_address_and_relay_splice
             std::time::Duration::from_secs(5),
             a_local,
             false,
-            false, // ct-agent#22 (b): accept_race off (serial)
+            AcceptRaceMode::Off, // ct-agent#22 (b): accept_race off (serial)
         )
         .await
     });
@@ -5919,7 +5924,7 @@ async fn two_relay_only_members_join_without_a_dialable_address_and_relay_splice
             std::time::Duration::from_secs(5),
             b_local,
             false,
-            false, // ct-agent#22 (b): accept_race off (serial)
+            AcceptRaceMode::Off, // ct-agent#22 (b): accept_race off (serial)
         )
         .await
     });
@@ -6032,7 +6037,7 @@ async fn direct_upgrade_opt_in_still_completes_over_the_relay_when_the_candidate
             std::time::Duration::from_secs(5),
             a_local,
             true, // #104 direct_upgrade opt-in
-            false, // ct-agent#22 (b): accept_race off (serial)
+            AcceptRaceMode::Off, // ct-agent#22 (b): accept_race off (serial)
         )
         .await
     });
@@ -6062,7 +6067,7 @@ async fn direct_upgrade_opt_in_still_completes_over_the_relay_when_the_candidate
             std::time::Duration::from_secs(5),
             b_local,
             true, // #104 direct_upgrade opt-in
-            false, // ct-agent#22 (b): accept_race off (serial)
+            AcceptRaceMode::Off, // ct-agent#22 (b): accept_race off (serial)
         )
         .await
     });
@@ -6461,17 +6466,59 @@ async fn a_revoked_grant_refused_over_the_dial_path_is_final() {
 
 #[test]
 fn accept_race_flag_is_opt_in_22() {
-    // ct-agent#22 (b) (frozen): the race is OPT-IN until the edge advertises abandoned-park
-    // detection on both transports (the `cl=1` ack tag). Unset/empty/typo must all keep
-    // today's serial accept-then-relay -- a typo can never silently enable a race the edge
-    // cannot yet police.
-    assert!(!accept_race_enabled_from(None), "unset: off (serial accept-then-relay)");
-    assert!(!accept_race_enabled_from(Some("")), "empty: off");
-    assert!(!accept_race_enabled_from(Some("0")), "0: off");
-    assert!(!accept_race_enabled_from(Some("ture")), "a typo never silently enables the race");
-    assert!(accept_race_enabled_from(Some("1")), "1 opts in");
-    assert!(accept_race_enabled_from(Some(" Yes ")), "yes (trimmed, any case) opts in");
-    assert!(accept_race_enabled_from(Some("true")), "true opts in");
+    // ct-agent#22 (b) (frozen): the explicit opt-in -- "race every leg, the edge may not be
+    // able to police it" -- takes an explicit on spelling; a typo can never silently select it.
+    // #295 changed what the NON-opt-in states mean (unset/empty/typo: adaptive, `0`: serial;
+    // see accept_race_mode_is_adaptive_unless_set_295), not this.
+    let opted_in = |v: Option<&str>| accept_race_mode_from(v) == AcceptRaceMode::On;
+    assert!(!opted_in(None), "unset: not the opt-in (adaptive since #295)");
+    assert!(!opted_in(Some("")), "empty: not the opt-in");
+    assert!(!opted_in(Some("0")), "0: off");
+    assert!(!opted_in(Some("ture")), "a typo never silently enables the race on every leg");
+    assert!(opted_in(Some("1")), "1 opts in");
+    assert!(opted_in(Some(" Yes ")), "yes (trimmed, any case) opts in");
+    assert!(opted_in(Some("true")), "true opts in");
+}
+
+#[test]
+fn accept_race_mode_is_adaptive_unless_set_295() {
+    // #295: unset is the adaptive default; only an explicit off spelling restores the serial
+    // order, only an explicit on spelling races every leg. A typo stays adaptive -- which never
+    // parks a leg the edge cannot see abandoned -- and is reported once (crate::envflag).
+    for unset in [None, Some(""), Some("  "), Some("ture"), Some("adaptive")] {
+        assert_eq!(accept_race_mode_from(unset), AcceptRaceMode::Auto, "{unset:?}");
+    }
+    for off in ["0", "false", "No", " off "] {
+        assert_eq!(accept_race_mode_from(Some(off)), AcceptRaceMode::Off, "{off:?}");
+    }
+    for on in ["1", "TRUE", "yes", "on"] {
+        assert_eq!(accept_race_mode_from(Some(on)), AcceptRaceMode::On, "{on:?}");
+    }
+
+    // Which race each mode runs for which relay shape: the adaptive default races only a
+    // relay made of `:443` rungs (CT_CHANNEL_FRONT_DOOR_ONLY), and then parks only a
+    // keepalive-monitored leg at once; a relay that starts on QUIC stays serial.
+    let fd: SocketAddr = "127.0.0.1:443".parse().unwrap();
+    let quic: SocketAddr = "127.0.0.1:4436".parse().unwrap();
+    let cert = CertificateDer::from(vec![0u8; 4]);
+    let front_door_only = [
+        ChannelDialRung { endpoint: fd, kind: ChannelDialKind::FrontDoor },
+        ChannelDialRung { endpoint: fd, kind: ChannelDialKind::FrontDoorBoring },
+    ];
+    let quic_first = [
+        ChannelDialRung { endpoint: quic, kind: ChannelDialKind::Direct },
+        ChannelDialRung { endpoint: fd, kind: ChannelDialKind::FrontDoor },
+    ];
+    let ladder = |rungs| RelayFallback::Ladder { rungs, edge_cert: cert.clone(), direct_timeout: Duration::from_secs(5) };
+    use AcceptRaceMode::{Auto, Off, On};
+    assert_eq!(Auto.race_policy_for(&ladder(&front_door_only)), Some(RaceParkPolicy::MonitoredOnly));
+    assert_eq!(Auto.race_policy_for(&ladder(&quic_first)), None, "QUIC first: serial");
+    assert_eq!(Auto.race_policy_for(&RelayFallback::QuicLazy(quic)), None, "QUIC relay: serial");
+    assert_eq!(Auto.race_policy_for(&ladder(&[])), None, "no rung: nothing to race");
+    for relay in [ladder(&front_door_only), ladder(&quic_first), RelayFallback::QuicLazy(quic)] {
+        assert_eq!(Off.race_policy_for(&relay), None, "=0: serial on every relay");
+        assert_eq!(On.race_policy_for(&relay), Some(RaceParkPolicy::AnyLeg), "=1: every leg");
+    }
 }
 
 #[tokio::test]
@@ -6584,7 +6631,7 @@ async fn accept_race_direct_wins_and_closes_the_parked_relay_leg_22() {
             Duration::from_secs(8),
             b_local,
             false,
-            true, // ct-agent#22 (b): accept-vs-relay race ON
+            AcceptRaceMode::On, // ct-agent#22 (b): accept-vs-relay race ON (=1, every leg)
         )
         .await
     });
@@ -6703,7 +6750,7 @@ async fn accept_race_relay_wins_far_below_the_accept_window_when_no_direct_dial_
             accept_timeout,
             b_local,
             false,
-            true, // ct-agent#22 (b): accept-vs-relay race ON
+            AcceptRaceMode::On, // ct-agent#22 (b): accept-vs-relay race ON (=1, every leg)
         )
         .await
     });
@@ -6811,7 +6858,7 @@ async fn accept_race_off_does_not_dial_the_relay_before_the_accept_window_expire
             accept_timeout,
             b_local,
             false,
-            false, // ct-agent#22 (b): race OFF -- the default, today's serial order
+            AcceptRaceMode::Off, // ct-agent#22 (b): race OFF (=0) -- today's serial order
         )
         .await
     });
@@ -6826,6 +6873,765 @@ async fn accept_race_off_does_not_dial_the_relay_before_the_accept_window_expire
     );
 
     b.abort();
+}
+
+// ct-agent#295: the accept race, hardened (the direct arm wins only on a verified Noise_IK peer)
+// and adaptive by default (only a keepalive-monitored `:443` leg parks during the race), plus the
+// measurement harness the issue asks for. Wherever park liveness or pairing matters, the relay
+// below is the PINNED ct-edge's production `:443` pairing path, not a mock.
+
+/// ct-agent#295: one channel's members for the race tests. B accepts and its admission attests
+/// A; A initiates; C is a third member of the same channel (initiate direction) whose Noise key
+/// B's session did NOT attest -- another serve session's initiator on the shared listener, or
+/// any stranger holding a valid grant.
+struct RaceChannel295 {
+    op_pub: [u8; 32],
+    holder_a: SigningKey,
+    holder_b: SigningKey,
+    holder_c: SigningKey,
+    /// (private, public)
+    noise_a: ([u8; 32], [u8; 32]),
+    noise_b: ([u8; 32], [u8; 32]),
+    noise_c: ([u8; 32], [u8; 32]),
+    req_a: ChannelJoinRequest,
+    req_b: ChannelJoinRequest,
+    req_c: ChannelJoinRequest,
+    a_attestation: [u8; 64],
+    b_attestation: [u8; 64],
+}
+
+impl RaceChannel295 {
+    /// `op_seed` names the operator (the relay below authorizes one operator); `seed` keeps the
+    /// channels and holders of concurrently running tests and of harness samples apart.
+    fn new(op_seed: u8, seed: u8) -> Self {
+        use ct_common::channel::{
+            member_noise_attest_bytes, ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant,
+        };
+        use ed25519_dalek::Signer;
+        let op = SigningKey::from_bytes(&[op_seed; 32]);
+        let channel = [seed ^ 0xA5; 32];
+        let member = |n: u8| SigningKey::from_bytes(&[seed ^ n; 32]);
+        let (holder_a, holder_b, holder_c) = (member(0x11), member(0x22), member(0x33));
+        let keys = |k: ct_common::noise::StaticKeypair| (k.private, k.public);
+        let (noise_a, noise_b, noise_c) =
+            (keys(generate_static_keypair()), keys(generate_static_keypair()), keys(generate_static_keypair()));
+        let signed = |h: &SigningKey, direction| {
+            let g = ChannelGrant {
+                channel: ChannelId(channel),
+                holder: h.verifying_key().to_bytes(),
+                direction,
+                rights: Rights::ReadWrite,
+                delegable: false,
+                expires_at: 1_000,
+            };
+            SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }
+        };
+        let attest = |h: &SigningKey, noise_pub: &[u8; 32]| {
+            let holder = h.verifying_key().to_bytes();
+            h.sign(&member_noise_attest_bytes(&ChannelId(channel), &holder, noise_pub)).to_bytes()
+        };
+        Self {
+            op_pub: op.verifying_key().to_bytes(),
+            req_a: ChannelJoinRequest { grant: signed(&holder_a, Direction::Initiate), endpoint: "203.0.113.1:7001".into() },
+            // B advertises a public address its direct path cannot be reached on (the #295 shape).
+            req_b: ChannelJoinRequest { grant: signed(&holder_b, Direction::Accept), endpoint: "203.0.113.2:7002".into() },
+            req_c: ChannelJoinRequest { grant: signed(&holder_c, Direction::Initiate), endpoint: "203.0.113.3:7003".into() },
+            a_attestation: attest(&holder_a, &noise_a.1),
+            b_attestation: attest(&holder_b, &noise_b.1),
+            holder_a,
+            holder_b,
+            holder_c,
+            noise_a,
+            noise_b,
+            noise_c,
+        }
+    }
+
+    /// What B's rendezvous ack hands it: A is the attested peer.
+    fn admission_b(&self) -> ChannelJoinOutcome {
+        ChannelJoinOutcome::Admitted {
+            peer_endpoint: self.req_a.endpoint.clone(),
+            peer_noise_pubkey: Some(self.noise_a.1),
+            peer_holder: Some(self.holder_a.verifying_key().to_bytes()),
+            peer_attestation: Some(self.a_attestation),
+            observed_reflexive: None, // no `r=` evidence: part (a) of #22 stays silent
+        }
+    }
+
+    /// What A's rendezvous ack hands it: B, advertised at `b_endpoint`.
+    fn admission_a(&self, b_endpoint: SocketAddr) -> ChannelJoinOutcome {
+        ChannelJoinOutcome::Admitted {
+            peer_endpoint: b_endpoint.to_string(),
+            peer_noise_pubkey: Some(self.noise_b.1),
+            peer_holder: Some(self.holder_b.verifying_key().to_bytes()),
+            peer_attestation: Some(self.b_attestation),
+            observed_reflexive: None,
+        }
+    }
+}
+
+/// What [`spawn_front_door_relay_295`] saw, in order.
+#[derive(Debug, Clone, Copy)]
+enum RelaySaw295 {
+    /// A TLS connection completed; `ka` = it negotiated the keepalive generation.
+    Tls { ka: bool, at: std::time::Instant },
+    /// A member PRESENTED its join (the edge's authorize step ran for `holder`) -- before that, a
+    /// held leg is only a connection.
+    Join { holder: [u8; 32], at: std::time::Instant },
+}
+
+/// ct-agent#295: an in-process `:443` channel relay running the PINNED ct-edge's production
+/// pairing path -- the front door's ALPN server preference (keepalive ids first, as
+/// `pki::build_channel_front_door_acceptor` lists them), `admit_and_pair_on_boxed_stream` (phase
+/// peek, park keepalive pump and its corpse flag, the shared pairer) and the splice -- in front
+/// of a fixed authorizer for `op_pub`. `ka: false` is a legacy edge that only knows the bare
+/// ids; the first `drop_first` TCP connections are dropped before TLS (a transient failure).
+async fn spawn_front_door_relay_295(
+    ka: bool,
+    op_pub: [u8; 32],
+    drop_first: usize,
+) -> (
+    SocketAddr,
+    CertificateDer<'static>,
+    tokio::sync::mpsc::UnboundedReceiver<RelaySaw295>,
+    tokio::task::JoinHandle<()>,
+) {
+    use ct_common::channel::ChannelId;
+    use ct_edge::channel_broker::{
+        admit_and_pair_on_boxed_stream, completion_for, finish_relay_pair_over_streams,
+        finish_rendezvous_pair_over_streams, new_shared_channel_pairer, BoxedChannelStream, StreamPairCompletion,
+    };
+    crate::transport::install_crypto_provider();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("edge cert");
+    let cert = certified.cert.der().clone();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        certified.key_pair.serialize_der(),
+    ));
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone()], key)
+        .expect("edge tls config");
+    tls.alpn_protocols = if ka {
+        vec![b"ct-edge-channel-ka".to_vec(), b"ct-edge-channel".to_vec(), b"http/1.1".to_vec(), b"h2".to_vec()]
+    } else {
+        vec![b"ct-edge-channel".to_vec(), b"h2".to_vec()]
+    };
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("front door");
+    let addr = listener.local_addr().expect("front door addr");
+    let (saw_tx, saw_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pairer = new_shared_channel_pairer();
+    let task = tokio::spawn(async move {
+        let mut accepted = 0usize;
+        loop {
+            let Ok((tcp, observed)) = listener.accept().await else { return };
+            accepted += 1;
+            if accepted <= drop_first {
+                drop(tcp);
+                continue;
+            }
+            let (acceptor, pairer, saw) = (acceptor.clone(), pairer.clone(), saw_tx.clone());
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else { return };
+                let keepalive = matches!(
+                    tls.get_ref().1.alpn_protocol(),
+                    Some(p) if p == b"ct-edge-channel-ka" || p == b"http/1.1"
+                );
+                let _ = saw.send(RelaySaw295::Tls { ka: keepalive, at: std::time::Instant::now() });
+                let authorize = move |_c: ChannelId, holder: [u8; 32]| {
+                    let _ = saw.send(RelaySaw295::Join { holder, at: std::time::Instant::now() });
+                    async move { Some((op_pub, None, None)) }
+                };
+                let now = 500u64; // the grants expire at 1_000
+                let boxed: BoxedChannelStream = Box::pin(tls);
+                let paired = admit_and_pair_on_boxed_stream(
+                    boxed,
+                    observed,
+                    now,
+                    Duration::from_secs(15),
+                    &authorize,
+                    now + 600,
+                    &pairer,
+                    None,
+                    keepalive,
+                )
+                .await;
+                if let Ok(Some(((a, a_phase), (b, b_phase)))) = paired {
+                    let _ = match completion_for(a_phase, b_phase) {
+                        StreamPairCompletion::Splice => finish_relay_pair_over_streams(a, b, now).await,
+                        StreamPairCompletion::RendezvousClose => finish_rendezvous_pair_over_streams(a, b, now).await,
+                    };
+                }
+            });
+        }
+    });
+    (addr, cert, saw_rx, task)
+}
+
+/// The race decisions an acceptor task reported ([`RACE_DECISIONS`]).
+type RaceDecisions295 = std::sync::Arc<std::sync::Mutex<Vec<(&'static str, u128)>>>;
+
+/// ct-agent#295: B through the production `run_channel_join_with_admission`, with its bound
+/// `listener` and a single `:443` relay rung, inside a [`RACE_DECISIONS`] scope.
+fn spawn_acceptor_295(
+    ch: &RaceChannel295,
+    relay: (SocketAddr, CertificateDer<'static>),
+    listener: Endpoint,
+    window: Duration,
+    mode: AcceptRaceMode,
+    b_local: tokio::io::DuplexStream,
+) -> (tokio::task::JoinHandle<Result<(), BoxError>>, RaceDecisions295) {
+    let (req, holder, own, admission) = (ch.req_b.clone(), ch.holder_b.clone(), ch.noise_b.0, ch.admission_b());
+    let decisions = RaceDecisions295::default();
+    let b = tokio::spawn(RACE_DECISIONS.scope(decisions.clone(), async move {
+        let rungs = [ChannelDialRung { endpoint: relay.0, kind: ChannelDialKind::FrontDoor }];
+        run_channel_join_with_admission(
+            admission,
+            RelayFallback::Ladder { rungs: &rungs, edge_cert: relay.1, direct_timeout: Duration::from_millis(400) },
+            &req,
+            &holder,
+            ChannelRole::Accept,
+            &own,
+            Some(listener),
+            DIRECT_DIAL_TIMEOUT,
+            window,
+            b_local,
+            false,
+            mode,
+        )
+        .await
+    }));
+    (b, decisions)
+}
+
+/// ct-agent#295: A as the production initiator -- direct dial to `b_endpoint`, then the single
+/// `:443` relay rung once that dial comes back `Unreachable`.
+fn spawn_initiator_295(
+    ch: &RaceChannel295,
+    b_endpoint: SocketAddr,
+    relay: (SocketAddr, CertificateDer<'static>),
+    a_local: tokio::io::DuplexStream,
+) -> tokio::task::JoinHandle<Result<(), BoxError>> {
+    let (req, holder, own, admission) = (ch.req_a.clone(), ch.holder_a.clone(), ch.noise_a.0, ch.admission_a(b_endpoint));
+    tokio::spawn(async move {
+        let rungs = [ChannelDialRung { endpoint: relay.0, kind: ChannelDialKind::FrontDoor }];
+        run_channel_join_with_admission(
+            admission,
+            RelayFallback::Ladder { rungs: &rungs, edge_cert: relay.1, direct_timeout: Duration::from_millis(400) },
+            &req,
+            &holder,
+            ChannelRole::Initiate,
+            &own,
+            None,
+            DIRECT_DIAL_TIMEOUT,
+            CHANNEL_ACCEPT_TIMEOUT,
+            a_local,
+            false,
+            AcceptRaceMode::Off,
+        )
+        .await
+    })
+}
+
+/// ct-agent#295: A straight onto the single `:443` relay rung (its direct dial already failed).
+fn spawn_relay_initiator_295(
+    ch: &RaceChannel295,
+    relay: (SocketAddr, CertificateDer<'static>),
+    a_local: tokio::io::DuplexStream,
+) -> tokio::task::JoinHandle<Result<(), BoxError>> {
+    let (req, holder, own, peer) = (ch.req_a.clone(), ch.holder_a.clone(), ch.noise_a.0, ch.noise_b.1);
+    tokio::spawn(async move {
+        let rungs = [ChannelDialRung { endpoint: relay.0, kind: ChannelDialKind::FrontDoor }];
+        join_via_relay_ladder(&rungs, relay.1, Duration::from_millis(400), &req, &holder, ChannelRole::Initiate, &own, &peer, a_local, None)
+            .await
+    })
+}
+
+/// Wait until the relay saw `holder` present its join; returns when.
+async fn joined_at_295(
+    saw: &mut tokio::sync::mpsc::UnboundedReceiver<RelaySaw295>,
+    holder: [u8; 32],
+    within: Duration,
+) -> std::time::Instant {
+    tokio::time::timeout(within, async {
+        loop {
+            match saw.recv().await {
+                Some(RelaySaw295::Join { holder: h, at }) if h == holder => return at,
+                Some(_) => continue,
+                None => panic!("the relay task ended"),
+            }
+        }
+    })
+    .await
+    .expect("the member presents its join within the bound")
+}
+
+/// A writes, B reads; B answers, A reads -- both directions of one session.
+async fn ping_pong_295(a_app: &mut tokio::io::DuplexStream, b_app: &mut tokio::io::DuplexStream, within: Duration) {
+    tokio::time::timeout(within, async {
+        a_app.write_all(b"ping").await.expect("a writes");
+        let mut got = [0u8; 4];
+        b_app.read_exact(&mut got).await.expect("b reads A's bytes");
+        assert_eq!(&got, b"ping");
+        b_app.write_all(b"pong").await.expect("b writes");
+        a_app.read_exact(&mut got).await.expect("a reads B's bytes");
+        assert_eq!(&got, b"pong");
+    })
+    .await
+    .expect("A and B exchange bytes within the bound");
+}
+
+/// C dials B's listener directly and runs a full initiator session under its OWN Noise key,
+/// pinned to B's real public key -- the handshake is cryptographically valid, only the identity
+/// is not the one B's session attested. Returns once C's session has ended.
+async fn foreign_direct_dial_295(ch: &RaceChannel295, b_direct: SocketAddr) {
+    let conn = dial_peer_direct(b_direct, Duration::from_secs(5)).await.expect("C reaches B's listener");
+    let (_c_app, c_local) = tokio::io::duplex(1024);
+    let ended = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_channel_session(&conn, ChannelRole::Initiate, &ch.noise_c.0, &ch.noise_b.1, c_local),
+    )
+    .await;
+    assert!(ended.is_ok(), "B ends C's session promptly instead of serving it");
+}
+
+#[tokio::test]
+async fn accept_race_a_foreign_direct_dial_leaves_the_relay_leg_to_the_real_partner_295() {
+    // #295, the #22 Befund-3 failure end to end. B races (the adaptive
+    // default; a keepalive `:443` leg on the production pairer). A FOREIGN initiator C dials
+    // B's listener first. Before #295 the completed QUIC handshake won the race: B closed its
+    // parked relay leg, then failed the Noise check against C -- and B's real partner A,
+    // arriving on the relay after its own direct dial failed, found no live park and waited for
+    // nothing. Now C is refused inside the direct arm, B's leg stays parked, and A pairs with it.
+    let ch = RaceChannel295::new(0x0F, 0x41);
+    let (relay_addr, relay_cert, mut saw, relay) = spawn_front_door_relay_295(true, ch.op_pub, 0).await;
+    let (listener, _cert) =
+        crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("B's listener");
+    let b_direct = listener.local_addr().expect("B's direct addr");
+    let (mut b_app, b_local) = tokio::io::duplex(8192);
+    let (b, decisions) = spawn_acceptor_295(
+        &ch,
+        (relay_addr, relay_cert.clone()),
+        listener,
+        Duration::from_secs(8),
+        AcceptRaceMode::Auto,
+        b_local,
+    );
+    joined_at_295(&mut saw, ch.holder_b.verifying_key().to_bytes(), Duration::from_secs(5)).await;
+
+    foreign_direct_dial_295(&ch, b_direct).await;
+
+    let (mut a_app, a_local) = tokio::io::duplex(8192);
+    let a = spawn_relay_initiator_295(&ch, (relay_addr, relay_cert), a_local);
+    ping_pong_295(&mut a_app, &mut b_app, Duration::from_secs(5)).await;
+    let decided = decisions.lock().unwrap().clone();
+    assert!(matches!(decided.as_slice(), [("relay", _)]), "the relay leg won, C did not: {decided:?}");
+
+    drop((a_app, b_app));
+    a.abort();
+    b.abort();
+    relay.abort();
+}
+
+#[tokio::test]
+async fn accept_race_keeps_accepting_after_a_foreign_direct_dial_and_the_real_one_wins_295() {
+    // #295: refusing C does not end the direct arm -- it keeps accepting within the window, and
+    // A's direct dial that follows is verified and wins; the session runs directly. (Before
+    // #295, C won the race and B's whole join failed on C's key, A included.)
+    let ch = RaceChannel295::new(0x0F, 0x42);
+    let (relay_addr, relay_cert, mut saw, relay) = spawn_front_door_relay_295(true, ch.op_pub, 0).await;
+    let (listener, _cert) =
+        crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("B's listener");
+    let b_direct = listener.local_addr().expect("B's direct addr");
+    let (mut b_app, b_local) = tokio::io::duplex(8192);
+    let (b, decisions) =
+        spawn_acceptor_295(&ch, (relay_addr, relay_cert), listener, Duration::from_secs(8), AcceptRaceMode::Auto, b_local);
+    joined_at_295(&mut saw, ch.holder_b.verifying_key().to_bytes(), Duration::from_secs(5)).await;
+
+    foreign_direct_dial_295(&ch, b_direct).await;
+
+    let (mut a_app, a_local) = tokio::io::duplex(8192);
+    let (na, nbpub) = (ch.noise_a.0, ch.noise_b.1);
+    let a = tokio::spawn(async move {
+        let conn = dial_peer_direct(b_direct, Duration::from_secs(5)).await.expect("A reaches B's listener");
+        run_channel_session(&conn, ChannelRole::Initiate, &na, &nbpub, a_local).await
+    });
+    ping_pong_295(&mut a_app, &mut b_app, Duration::from_secs(5)).await;
+    let decided = decisions.lock().unwrap().clone();
+    assert!(matches!(decided.as_slice(), [("direct", _)]), "A's verified direct dial won: {decided:?}");
+
+    drop((a_app, b_app));
+    a.abort();
+    b.abort();
+    relay.abort();
+}
+
+#[tokio::test]
+async fn accept_race_by_default_parks_a_keepalive_front_door_leg_at_once_295() {
+    // #295: the adaptive default's payoff. B's relay ladder is `:443` only and the edge speaks
+    // the keepalive generation, so B presents its relay join at once, in parallel with its
+    // accept window; A, arriving on the relay after its direct dial to B's filtered address
+    // failed, pairs at once instead of waiting out B's window. Until #295 the default was the
+    // serial order -- B's join came only after the window.
+    let ch = RaceChannel295::new(0x0F, 0x43);
+    let (relay_addr, relay_cert, mut saw, relay) = spawn_front_door_relay_295(true, ch.op_pub, 0).await;
+    let (listener, _cert) =
+        crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("B's listener");
+    let window = Duration::from_secs(4);
+    let started = std::time::Instant::now();
+    let (mut b_app, b_local) = tokio::io::duplex(8192);
+    let (b, decisions) =
+        spawn_acceptor_295(&ch, (relay_addr, relay_cert.clone()), listener, window, AcceptRaceMode::Auto, b_local);
+    let b_joined = joined_at_295(&mut saw, ch.holder_b.verifying_key().to_bytes(), Duration::from_secs(5)).await;
+    assert!(
+        b_joined.duration_since(started) < window / 4,
+        "a keepalive leg is presented at once, not after the {window:?} window: {:?}",
+        b_joined.duration_since(started)
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (mut a_app, a_local) = tokio::io::duplex(8192);
+    let a = spawn_relay_initiator_295(&ch, (relay_addr, relay_cert), a_local);
+    ping_pong_295(&mut a_app, &mut b_app, Duration::from_secs(5)).await;
+    assert!(started.elapsed() < window / 2, "the session is up far below the window: {:?}", started.elapsed());
+    let decided = decisions.lock().unwrap().clone();
+    assert!(matches!(decided.as_slice(), [("relay", _)]), "{decided:?}");
+
+    drop((a_app, b_app));
+    a.abort();
+    b.abort();
+    relay.abort();
+}
+
+#[tokio::test]
+async fn accept_race_by_default_holds_a_legacy_front_door_leg_unpresented_295() {
+    // #295, the #22 Nachtrag rule: a `:443` leg that negotiated NO keepalive cannot be seen
+    // abandoned by the edge (its EOF is a tolerated legacy half-close), so it must not park
+    // during the race. The adaptive default connects it at once but presents its join only once
+    // the accept window has passed: the park keeps the serial order, only the connect is saved.
+    let ch = RaceChannel295::new(0x0F, 0x44);
+    let (relay_addr, relay_cert, mut saw, relay) = spawn_front_door_relay_295(false, ch.op_pub, 0).await;
+    let (listener, _cert) =
+        crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("B's listener");
+    let window = Duration::from_millis(1500);
+    let started = std::time::Instant::now();
+    let (mut b_app, b_local) = tokio::io::duplex(8192);
+    let (b, decisions) =
+        spawn_acceptor_295(&ch, (relay_addr, relay_cert.clone()), listener, window, AcceptRaceMode::Auto, b_local);
+    match tokio::time::timeout(Duration::from_secs(1), saw.recv()).await {
+        Ok(Some(RelaySaw295::Tls { ka, at })) => {
+            assert!(!ka, "the legacy edge negotiates no keepalive");
+            assert!(at.duration_since(started) < window / 2, "B connects its leg early: {:?}", at.duration_since(started));
+        }
+        other => panic!("B's relay leg connects at once, got {other:?}"),
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (mut a_app, a_local) = tokio::io::duplex(8192);
+    let a = spawn_relay_initiator_295(&ch, (relay_addr, relay_cert), a_local);
+    let b_joined = joined_at_295(&mut saw, ch.holder_b.verifying_key().to_bytes(), Duration::from_secs(5)).await;
+    assert!(
+        b_joined.duration_since(started) >= window,
+        "an unmonitored leg presents only after the {window:?} window: {:?}",
+        b_joined.duration_since(started)
+    );
+    ping_pong_295(&mut a_app, &mut b_app, Duration::from_secs(5)).await;
+    let decided = decisions.lock().unwrap().clone();
+    assert!(matches!(decided.as_slice(), [("relay", _)]), "{decided:?}");
+
+    drop((a_app, b_app));
+    a.abort();
+    b.abort();
+    relay.abort();
+}
+
+#[tokio::test]
+async fn accept_race_by_default_stays_serial_when_the_relay_leg_is_quic_295() {
+    // #295: the adaptive default never races a relay that starts on QUIC -- the edge does not
+    // monitor a QUIC park, and holding an idle QUIC relay connection is what #103 removed. Same
+    // proof as the `=0` test above: the relay is not even dialed before the window expired.
+    let ch = RaceChannel295::new(0x0F, 0x45);
+    let (listener, _cert) =
+        crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("B's listener");
+    let (relay_ep, _relay_cert) = build_server_endpoint_with_cert().expect("relay ep");
+    let relay_addr = relay_ep.local_addr().expect("relay addr");
+    let started = std::time::Instant::now();
+    let relay = tokio::spawn(async move {
+        let incoming = relay_ep.accept().await.expect("the acceptor eventually dials the relay");
+        let connected_at = started.elapsed();
+        let _conn = incoming.await;
+        connected_at
+    });
+    let window = Duration::from_millis(600);
+    let (req, holder, own, admission) = (ch.req_b.clone(), ch.holder_b.clone(), ch.noise_b.0, ch.admission_b());
+    let (_b_app, b_local) = tokio::io::duplex(8192);
+    let b = tokio::spawn(async move {
+        run_channel_join_with_admission(
+            admission,
+            RelayFallback::QuicLazy(relay_addr),
+            &req,
+            &holder,
+            ChannelRole::Accept,
+            &own,
+            Some(listener),
+            Duration::from_secs(5),
+            window,
+            b_local,
+            false,
+            AcceptRaceMode::Auto,
+        )
+        .await
+    });
+    let connected_at = tokio::time::timeout(Duration::from_secs(5), relay)
+        .await
+        .expect("the serial fallback dials the relay once the accept window expired")
+        .expect("relay task");
+    assert!(connected_at >= window, "adaptive + QUIC relay: dialed only AFTER the {window:?} window, was {connected_at:?}");
+    b.abort();
+}
+
+#[tokio::test]
+async fn accept_race_dials_an_early_failed_relay_leg_once_more_when_the_window_ends_295() {
+    // #295: as the default, the race must not be more fragile than the serial order. A relay
+    // leg whose connect fails at the start of the window (here the front door drops the first
+    // connection) used to fail the whole session once the direct arm gave up too -- although the
+    // serial order would only have dialed at the window's end. Now the race dials once more
+    // exactly then, and A, parked on the relay, gets its session.
+    let ch = RaceChannel295::new(0x0F, 0x46);
+    let (relay_addr, relay_cert, mut saw, relay) = spawn_front_door_relay_295(true, ch.op_pub, 1).await;
+    let (listener, _cert) =
+        crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("B's listener");
+    let window = Duration::from_millis(1500);
+    let started = std::time::Instant::now();
+    let (mut b_app, b_local) = tokio::io::duplex(8192);
+    let (b, decisions) =
+        spawn_acceptor_295(&ch, (relay_addr, relay_cert.clone()), listener, window, AcceptRaceMode::Auto, b_local);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (mut a_app, a_local) = tokio::io::duplex(8192);
+    let a = spawn_relay_initiator_295(&ch, (relay_addr, relay_cert), a_local);
+    let b_joined = joined_at_295(&mut saw, ch.holder_b.verifying_key().to_bytes(), Duration::from_secs(5)).await;
+    assert!(b_joined.duration_since(started) >= window, "the second attempt comes at the window's end");
+    ping_pong_295(&mut a_app, &mut b_app, Duration::from_secs(5)).await;
+    let decided = decisions.lock().unwrap().clone();
+    assert!(matches!(decided.as_slice(), [("relay", _)]), "{decided:?}");
+
+    drop((a_app, b_app));
+    a.abort();
+    b.abort();
+    relay.abort();
+}
+
+#[tokio::test]
+async fn accept_race_by_default_races_at_most_two_sessions_of_a_member_at_once_295() {
+    // #295: every racing session keeps a relay park of its member queued, and the edge
+    // supersedes a member's oldest park beyond four (the serve loop's rendezvous park counts
+    // too). Under a burst of first contacts unbounded racing would supersede live parks, so the
+    // adaptive default races at most two sessions of one member at once; a third concurrent one
+    // keeps the serial order -- its join comes only after its accept window.
+    let ch = RaceChannel295::new(0x0F, 0x48);
+    let (relay_addr, relay_cert, mut saw, relay) = spawn_front_door_relay_295(true, ch.op_pub, 0).await;
+    let window = Duration::from_millis(1500);
+    let started = std::time::Instant::now();
+    let mut sessions = Vec::new();
+    for _ in 0..3 {
+        let (listener, _cert) =
+            crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("B's listener");
+        let (b_app, b_local) = tokio::io::duplex(1024);
+        let (b, _decisions) =
+            spawn_acceptor_295(&ch, (relay_addr, relay_cert.clone()), listener, window, AcceptRaceMode::Auto, b_local);
+        sessions.push((b, b_app));
+    }
+    let hb = ch.holder_b.verifying_key().to_bytes();
+    let mut joins = Vec::new();
+    for _ in 0..3 {
+        joins.push(joined_at_295(&mut saw, hb, Duration::from_secs(5)).await.duration_since(started));
+    }
+    assert!(joins[0] < window / 2 && joins[1] < window / 2, "two sessions race and park at once: {joins:?}");
+    assert!(joins[2] >= window, "the third keeps the serial order: {joins:?}");
+
+    for (b, _b_app) in sessions {
+        b.abort();
+    }
+    relay.abort();
+}
+
+#[tokio::test]
+async fn accept_race_a_keepalive_park_the_race_closed_is_never_paired_295() {
+    // #295, the property the adaptive default rests on -- checked against the PINNED edge's
+    // production park pump, not a mock: when the direct path wins, the race closes its keepalive
+    // `:443` leg, the edge flags that park dead at once (KA: EOF = death), and a later initiator
+    // on the relay is never spliced to the corpse -- it parks and waits for a live partner.
+    let ch = RaceChannel295::new(0x0F, 0x47);
+    let (relay_addr, relay_cert, mut saw, relay) = spawn_front_door_relay_295(true, ch.op_pub, 0).await;
+    let (listener, _cert) =
+        crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("B's listener");
+    let b_direct = listener.local_addr().expect("B's direct addr");
+    let (mut b_app, b_local) = tokio::io::duplex(8192);
+    let (b, decisions) = spawn_acceptor_295(
+        &ch,
+        (relay_addr, relay_cert.clone()),
+        listener,
+        Duration::from_secs(8),
+        AcceptRaceMode::Auto,
+        b_local,
+    );
+    joined_at_295(&mut saw, ch.holder_b.verifying_key().to_bytes(), Duration::from_secs(5)).await;
+
+    let (mut a_app, a_local) = tokio::io::duplex(8192);
+    let (na, nbpub) = (ch.noise_a.0, ch.noise_b.1);
+    let a = tokio::spawn(async move {
+        let conn = dial_peer_direct(b_direct, Duration::from_secs(5)).await.expect("A reaches B's listener");
+        run_channel_session(&conn, ChannelRole::Initiate, &na, &nbpub, a_local).await
+    });
+    ping_pong_295(&mut a_app, &mut b_app, Duration::from_secs(5)).await;
+    let decided = decisions.lock().unwrap().clone();
+    assert!(matches!(decided.as_slice(), [("direct", _)]), "{decided:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // C presents on the relay: B's closed park must not answer it.
+    let rungs = [ChannelDialRung { endpoint: relay_addr, kind: ChannelDialKind::FrontDoor }];
+    let c_parked = tokio::time::timeout(
+        Duration::from_millis(1500),
+        park_relay_leg(
+            RelayFallback::Ladder { rungs: &rungs, edge_cert: relay_cert, direct_timeout: Duration::from_millis(400) },
+            &ch.req_c,
+            &ch.holder_c,
+        ),
+    )
+    .await;
+    assert!(c_parked.is_err(), "C stays parked: the corpse of B's leg must never pair (or fail) it");
+
+    drop((a_app, b_app));
+    a.abort();
+    b.abort();
+    relay.abort();
+}
+
+/// Nearest-rank percentile of an ascending slice.
+fn percentile_295(sorted: &[u128], p: f64) -> u128 {
+    let rank = ((p * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
+    sorted[rank - 1]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ct-agent#295 measurement harness, ~6 min of real timers: cargo test --lib -- --ignored --nocapture first_contact_with_a_filtered"]
+async fn first_contact_with_a_filtered_advertised_address_race_off_vs_on_295() {
+    // #295: the measurement series the issue asks for, reproducible on one host.
+    // The shape "public but filtered advertised address": A's direct dial goes to an address
+    // nothing answers on -- a bound loopback UDP socket nobody reads swallows every QUIC Initial,
+    // exactly a DROP filter -- so it runs into DIRECT_DIAL_TIMEOUT (5 s) and A falls back to the
+    // relay; B's real listener is elsewhere and nobody reaches it, so B waits per its race mode
+    // (CHANNEL_ACCEPT_TIMEOUT, 8 s). Production timers on both sides, production client code
+    // (`run_channel_join_with_admission` for A and B), and the pinned ct-edge's production `:443`
+    // pairing path with the keepalive ALPN (B's relay join names its TEST-NET advertised address,
+    // which the edge admits; only A's simulated rendezvous ack carries the black hole instead).
+    // Per sample: a fresh channel and fresh members, both sides start at the same instant (both
+    // hold their rendezvous ack), first contact = when B reads A's first application byte. The
+    // arms take turns, so drift hits all of them alike. Measures client scheduling, not a network.
+    const PER_ARM: usize = 20;
+    const OPERATOR: u8 = 0x0E;
+    let arms = [
+        ("off (=0)", AcceptRaceMode::Off),
+        ("adaptive (unset)", AcceptRaceMode::Auto),
+        ("on (=1)", AcceptRaceMode::On),
+    ];
+    let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").expect("black hole");
+    let filtered = blackhole.local_addr().expect("black hole addr");
+    let probe = RaceChannel295::new(OPERATOR, 0x80);
+    let (relay_addr, relay_cert, _saw, relay) = spawn_front_door_relay_295(true, probe.op_pub, 0).await;
+    let mut first_contact: Vec<Vec<u128>> = vec![Vec::new(); arms.len()];
+    let mut won_after: Vec<Vec<(&'static str, u128)>> = vec![Vec::new(); arms.len()];
+    for i in 0..PER_ARM * arms.len() {
+        let arm = i % arms.len();
+        let ch = RaceChannel295::new(OPERATOR, 0x81 + i as u8);
+        let (listener, _cert) =
+            crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("B's listener");
+        let (mut a_app, a_local) = tokio::io::duplex(8192);
+        let (mut b_app, b_local) = tokio::io::duplex(8192);
+        let started = std::time::Instant::now();
+        let (b, decisions) = spawn_acceptor_295(
+            &ch,
+            (relay_addr, relay_cert.clone()),
+            listener,
+            CHANNEL_ACCEPT_TIMEOUT,
+            arms[arm].1,
+            b_local,
+        );
+        let a = spawn_initiator_295(&ch, filtered, (relay_addr, relay_cert.clone()), a_local);
+        a_app.write_all(b"ping").await.expect("a writes");
+        let mut got = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(30), b_app.read_exact(&mut got))
+            .await
+            .expect("first contact within 30 s")
+            .expect("b reads A's first bytes");
+        let ms = started.elapsed().as_millis();
+        b_app.write_all(b"pong").await.expect("b writes");
+        tokio::time::timeout(Duration::from_secs(5), a_app.read_exact(&mut got))
+            .await
+            .expect("both directions work")
+            .expect("a reads");
+        first_contact[arm].push(ms);
+        won_after[arm].extend(decisions.lock().unwrap().iter().copied());
+        eprintln!("ct-agent#295 harness: sample {:2} {:<17} first contact {ms} ms", i + 1, arms[arm].0);
+        drop((a_app, b_app));
+        a.abort();
+        b.abort();
+    }
+    relay.abort();
+
+    eprintln!(
+        "\nct-agent#295 first contact, \"public but filtered advertised address\" (loopback, black-holed \
+         direct address, pinned ct-edge :443 KA pairer); DIRECT_DIAL_TIMEOUT {} ms, CHANNEL_ACCEPT_TIMEOUT {} ms",
+        DIRECT_DIAL_TIMEOUT.as_millis(),
+        CHANNEL_ACCEPT_TIMEOUT.as_millis()
+    );
+    eprintln!("{:<17} {:>3} {:>6} {:>6} {:>6} {:>6} {:>6}   (ms until B reads A's first byte)", "arm", "n", "min", "p10", "p50", "p90", "max");
+    let mut medians = Vec::new();
+    for (arm, (name, _)) in arms.iter().enumerate() {
+        let mut v = first_contact[arm].clone();
+        v.sort_unstable();
+        medians.push(percentile_295(&v, 0.5));
+        eprintln!(
+            "{name:<17} {:>3} {:>6} {:>6} {:>6} {:>6} {:>6}",
+            v.len(),
+            v[0],
+            percentile_295(&v, 0.1),
+            percentile_295(&v, 0.5),
+            percentile_295(&v, 0.9),
+            v[v.len() - 1]
+        );
+    }
+    eprintln!("race decisions (`won after N ms`):");
+    for (arm, (name, mode)) in arms.iter().enumerate() {
+        let mut ms: Vec<u128> = won_after[arm].iter().map(|(_, ms)| *ms).collect();
+        ms.sort_unstable();
+        let winners: Vec<&str> = won_after[arm].iter().map(|(w, _)| *w).collect();
+        if ms.is_empty() {
+            eprintln!("{name:<17} no race (serial order)");
+            assert_eq!(*mode, AcceptRaceMode::Off, "only the off arm runs without a race");
+            continue;
+        }
+        eprintln!(
+            "{name:<17} {} x {}: min {} p50 {} p90 {} max {}",
+            winners.len(),
+            winners[0],
+            ms[0],
+            percentile_295(&ms, 0.5),
+            percentile_295(&ms, 0.9),
+            ms[ms.len() - 1]
+        );
+        assert!(winners.iter().all(|w| *w == "relay"), "nobody can reach B directly: {winners:?}");
+        assert_eq!(ms.len(), PER_ARM, "one race decision per sample");
+    }
+    for (arm, (name, _)) in arms.iter().enumerate() {
+        let mut v = first_contact[arm].clone();
+        v.sort_unstable();
+        eprintln!("raw {name}: {v:?}");
+    }
+    assert!(
+        medians[0] > medians[1] + 2_000 && medians[0] > medians[2] + 2_000,
+        "racing the accept window must save the window minus the dial timeout (about 3 s): {medians:?}"
+    );
 }
 
 // ct-agent#220: streaming (unframed) handler mode -- `spawn_stream_handler`/`ChannelLocal::Stream`.

@@ -41,8 +41,8 @@ pub(crate) struct ServeSessionCtx {
     pub(crate) listener: Option<Endpoint>,
     /// #104, mirrors [`ChannelJoinCliConfig::direct_upgrade`] (`CT_CHANNEL_DIRECT_UPGRADE`).
     pub(crate) direct_upgrade: bool,
-    /// ct-agent#22 (b), mirrors [`ChannelJoinCliConfig::accept_race`] (`CT_CHANNEL_ACCEPT_RACE`).
-    pub(crate) accept_race: bool,
+    /// ct-agent#22 (b) / #295, mirrors [`ChannelJoinCliConfig::accept_race`] (`CT_CHANNEL_ACCEPT_RACE`).
+    pub(crate) accept_race: AcceptRaceMode,
 }
 
 impl ServeSessionCtx {

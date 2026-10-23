@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use quinn::Connection;
+use snow::TransportState;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use ct_common::a2a::{a2a_initiate, a2a_respond_verified};
@@ -207,6 +208,25 @@ where
     // #126; this was the remaining gap). The dialer's idle-timeout (#139) is the transport-level
     // backstop; this is the direct, tight bound on the exact call central traced.
     let (mut send, mut recv) = open_channel_streams(conn, role, DIRECT_STREAM_SETUP_TIMEOUT).await?;
+    // ct-agent#295: the handshake and the pump are two steps now (the accept race runs the first
+    // one inside its direct arm); this composition is byte-for-byte the former single call.
+    let session = handshake_channel_session(&mut send, &mut recv, role, own_noise_private, peer_noise_public).await?;
+    run_handshaken_quic_session(session, send, recv, peer_noise_public, local).await
+}
+
+/// ct-agent#295: what [`run_channel_session`] does after its Noise_IK handshake -- the pump and
+/// the #134 send-drain -- for a direct connection whose handshake already ran and verified the
+/// attested peer inside the acceptor's accept-vs-relay race.
+pub(crate) async fn run_handshaken_quic_session<P>(
+    session: TransportState,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    peer_noise_public: &[u8; 32],
+    local: P,
+) -> io::Result<()>
+where
+    P: AsyncRead + AsyncWrite + Unpin,
+{
     // Pass the streams by `&mut` so `send` survives the pump (it moves the halves into a
     // `BiStream`), letting us drain it afterwards. #134: the pump FINs on plaintext EOF via
     // `shutdown()` = quinn `SendStream::finish()`, which only QUEUES the FIN — it does NOT wait
@@ -217,7 +237,7 @@ where
     // bounded `graceful_stream_drain` at the end of that fn: #150 found the "OS keeps draining a FIN'd
     // socket after close" assumption FALSE when `ct-agent` is a container's PID 1, since the netns is
     // torn down on exit with no stack left to flush the tail.)
-    run_channel_session_on_stream(&mut send, &mut recv, role, own_noise_private, peer_noise_public, local).await?;
+    pump_channel_session(session, &mut send, &mut recv, peer_noise_public, local).await?;
     // Graceful send-drain: wait until the peer has acknowledged receipt of all our stream data
     // (`stopped()` resolves after our `finish()` once the peer acks) BEFORE returning — so the
     // caller can drop the connection / exit without truncating the tail. Bounded so a vanished
@@ -259,8 +279,8 @@ where
 /// port is also blocked (a truly `:443`-only network) relays over `:443` unchanged; the
 /// Noise_IK session stays end-to-end and the edge only forwards ciphertext.
 pub async fn run_channel_session_on_stream<W, R, P>(
-    send: W,
-    recv: R,
+    mut send: W,
+    mut recv: R,
     role: ChannelRole,
     own_noise_private: &[u8; 32],
     peer_noise_public: &[u8; 32],
@@ -271,10 +291,34 @@ where
     R: AsyncRead + Unpin,
     P: AsyncRead + AsyncWrite + Unpin,
 {
+    // ct-agent#295: handshake, then pump -- two steps so the acceptor's race can verify a direct
+    // connection's peer before letting it win. Same order, bounds and counters as before.
+    let session = handshake_channel_session(&mut send, &mut recv, role, own_noise_private, peer_noise_public).await?;
+    pump_channel_session(session, &mut send, &mut recv, peer_noise_public, local).await
+}
+
+/// The #126-bounded Noise_IK handshake of a channel session over already-split halves:
+/// `a2a_initiate` pins the peer, `a2a_respond_verified` refuses any initiator whose static key is
+/// not the attested `peer_noise_public`. ct-agent#295: split out of
+/// [`run_channel_session_on_stream`] so the accept-vs-relay race runs it INSIDE its direct arm
+/// -- a direct connection may only win once it is this session's attested peer, not as soon as
+/// some QUIC handshake completed on the shared listener. [`pump_channel_session`] continues on
+/// the same halves.
+pub(crate) async fn handshake_channel_session<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    role: ChannelRole,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+) -> io::Result<TransportState>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
     // #248: count every wire byte this session moves, handshake included — real traffic
     // either way, and simpler than carving the handshake out. Shadows send/recv with
-    // counting wrappers for the rest of this function; noise_pump and a2a_initiate/
-    // a2a_respond see the identical AsyncRead/AsyncWrite behavior, just counted.
+    // counting wrappers; a2a_initiate/a2a_respond (and the pump, which wraps its own halves
+    // the same way) see the identical AsyncRead/AsyncWrite behavior, just counted.
     let mut send = CountingWriter { inner: send };
     let mut recv = CountingReader { inner: recv };
     // #126: bound the post-pairing Noise_IK handshake. Every dial/accept step around this
@@ -308,7 +352,27 @@ where
             handshake_started.elapsed().as_millis()
         );
     }
+    Ok(session)
+}
 
+/// The rest of a channel session after [`handshake_channel_session`]: the status line, the
+/// open/close session events, the live ticker, the Noise pump, and the #150 drain -- the part of
+/// [`run_channel_session_on_stream`] that only starts once the peer is verified (ct-agent#295).
+pub(crate) async fn pump_channel_session<W, R, P>(
+    session: TransportState,
+    send: &mut W,
+    recv: &mut R,
+    peer_noise_public: &[u8; 32],
+    local: P,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    // #248: counted like the handshake (see there).
+    let mut send = CountingWriter { inner: send };
+    let mut recv = CountingReader { inner: recv };
     eprintln!("{}", traffic_status_line());
     // ct-agent#178: one structured open/close pair per session, keyed by the peer's
     // (attestation-verified) Noise static key.
