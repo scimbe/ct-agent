@@ -9,6 +9,18 @@
 //! Usage:
 //!   whoami_lab echo <listen-addr>     -- runs the echo server forever
 //!   whoami_lab query <target-addr>    -- one whoami query, prints the reported address (or ERR)
+//!
+//! #296 punch pair -- does a peer reach the listener on the reflexive address the listener
+//! advertises? Both roles print `REFLEXIVE <addr>`, then wait (up to 15 s) for the peer's
+//! reflexive address to appear in `<peer-file>` (the lab script writes it there):
+//!   whoami_lab punch-listen <echo-addr> <peer-file> [--throwaway]
+//!       -- one endpoint that dials and listens (`transport::build_channel_endpoint`); learns
+//!          its reflexive THROUGH that endpoint, or with `--throwaway` from a separate socket
+//!          as before #296. Sends one punch toward the peer from the listening socket, then
+//!          accepts: `ACCEPTED <remote>` (exit 0) or `NO-INBOUND` (exit 1).
+//!   whoami_lab punch-dial <echo-addr> <peer-file>
+//!       -- learns its reflexive through its own endpoint and dials the peer's from that same
+//!          socket for up to 15 s: `CONNECTED <peer>` (exit 0) or `UNREACHABLE` (exit 1).
 
 // ct-agent#176: the data plane is panic-free by construction. Every `unwrap`/`expect`/
 // `panic!`/`unreachable!`/`todo!`/`unimplemented!` in NON-test code is a build error
@@ -31,7 +43,7 @@ use std::net::SocketAddr;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut args = std::env::args().skip(1);
-    let cmd = args.next().ok_or("usage: whoami_lab <echo|query> <addr>")?;
+    let cmd = args.next().ok_or("usage: whoami_lab <echo|query|punch-listen|punch-dial> <addr> [...]")?;
     let addr: SocketAddr = args.next().ok_or("missing address")?.parse()?;
 
     match cmd.as_str() {
@@ -48,8 +60,108 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         }
-        other => Err(format!("unknown subcommand {other:?} (expected echo|query)").into()),
+        "punch-listen" | "punch-dial" => {
+            let peer_file = args.next().ok_or("missing <peer-file>")?;
+            let throwaway = args.next().as_deref() == Some("--throwaway");
+            if cmd == "punch-listen" {
+                punch_listen(addr, &peer_file, throwaway).await
+            } else {
+                punch_dial(addr, &peer_file).await
+            }
+        }
+        other => Err(format!("unknown subcommand {other:?} (expected echo|query|punch-listen|punch-dial)").into()),
     }
+}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+const PUNCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// #296: print this role's reflexive address for the lab script, at once (stdout is a file).
+fn announce(reflexive: SocketAddr) {
+    use std::io::Write;
+    println!("REFLEXIVE {reflexive}");
+    let _ = std::io::stdout().flush();
+}
+
+/// #296: the peer's reflexive address, once the lab script has written it to `path`.
+async fn read_peer(path: &str) -> Result<SocketAddr, BoxError> {
+    let deadline = tokio::time::Instant::now() + PUNCH_WINDOW;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(addr) = text.trim().parse::<SocketAddr>() {
+                return Ok(addr);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("no peer address in {path} within {PUNCH_WINDOW:?}").into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// #296: the listening half. The endpoint dials and listens on one socket; only where the
+/// ADVERTISED reflexive comes from differs between the two modes, so the pair isolates exactly
+/// what #296 is about.
+async fn punch_listen(echo: SocketAddr, peer_file: &str, throwaway: bool) -> Result<(), BoxError> {
+    let timeout = std::time::Duration::from_secs(5);
+    let (endpoint, _cert) = ct_agent::transport::build_channel_endpoint()?;
+    let reflexive = if throwaway {
+        ct_agent::channel_run::discover_udp_reflexive(echo, timeout).await
+    } else {
+        ct_agent::channel_run::whoami_via(&endpoint, echo, timeout).await
+    }
+    .ok_or("no reflexive address reported")?;
+    announce(reflexive);
+    let peer = read_peer(peer_file).await?;
+    // The punch: one QUIC Initial from the listening socket toward the peer's mapping, so a NAT
+    // that filters by remote address lets the peer's dial in. Its own outcome does not matter.
+    if let Ok(connecting) = endpoint.connect(peer, "localhost") {
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), connecting).await;
+        });
+    }
+    match tokio::time::timeout(PUNCH_WINDOW, async {
+        let incoming = endpoint.accept().await?;
+        incoming.await.ok()
+    })
+    .await
+    {
+        Ok(Some(conn)) => {
+            println!("ACCEPTED {}", conn.remote_address());
+            conn.close(0u32.into(), b"punch ok");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            Ok(())
+        }
+        _ => {
+            println!("NO-INBOUND");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// #296: the dialing half -- from the socket its own reflexive was learned through, so the
+/// listener's punch (aimed at that reflexive) and this dial use the same mapping.
+async fn punch_dial(echo: SocketAddr, peer_file: &str) -> Result<(), BoxError> {
+    let (endpoint, _cert) = ct_agent::transport::build_channel_endpoint()?;
+    let reflexive = ct_agent::channel_run::whoami_via(&endpoint, echo, std::time::Duration::from_secs(5))
+        .await
+        .ok_or("no reflexive address reported")?;
+    announce(reflexive);
+    let peer = read_peer(peer_file).await?;
+    let deadline = tokio::time::Instant::now() + PUNCH_WINDOW;
+    while tokio::time::Instant::now() < deadline {
+        let attempt = tokio::time::timeout(std::time::Duration::from_secs(3), endpoint.connect(peer, "localhost")?).await;
+        if let Ok(Ok(conn)) = attempt {
+            println!("CONNECTED {peer}");
+            conn.close(0u32.into(), b"punch ok");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    println!("UNREACHABLE");
+    std::process::exit(1);
 }
 
 /// The exact wire protocol the real edge's `'W'` op speaks (CADS-Tunnel
