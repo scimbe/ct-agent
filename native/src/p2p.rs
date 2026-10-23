@@ -2440,6 +2440,16 @@ mod tests {
         assert!(gauge_settles_at(&GAUGE, 0).await, "a swarm driver outlived its session: {}", GAUGE.get());
     }
 
+    /// #310: the wall-clock limit of the two setup-bound tests below, now only a hang backstop.
+    /// They asserted that the call returned within 5 s, but their 500 ms bound is a tokio timer on
+    /// the test's single runtime thread, which also drives the relay and the swarms. On a loaded
+    /// CI runner that thread was unavailable for seconds (the one failure, on main: no output at
+    /// all, at least 5 s for a call that takes ~0.5 s, and a 2.3 s window in which no test of the
+    /// process finished), so the 5 s measured the runner, not the bound. The tests now assert that
+    /// the call ended BY ITS OWN BOUND -- only the timeout branch produces that error text -- and
+    /// print the time of each step, so a slow step shows in the log instead of failing the run.
+    const SETUP_HANG_BACKSTOP: Duration = Duration::from_secs(30);
+
     #[tokio::test]
     async fn a_relay_reservation_that_is_never_accepted_times_out_and_leaves_no_task() {
         static GAUGE: LiveGauge = LiveGauge::new();
@@ -2451,12 +2461,23 @@ mod tests {
             .unwrap()
             .with(Protocol::P2p(nobody))
             .with(Protocol::P2pCircuit);
+        let t = std::time::Instant::now();
         let client = build_dcutr_relay_client_swarm().unwrap();
-        let start = std::time::Instant::now();
-        let e = dcutr_reserve_and_accept_on(&GAUGE, client, relay_circuit, Duration::from_millis(500))
-            .await
-            .expect_err("no relay, no reservation");
-        assert!(start.elapsed() < Duration::from_secs(5), "bounded, not a hang ({e})");
+        let built = t.elapsed();
+        let t = std::time::Instant::now();
+        let e = tokio::time::timeout(
+            SETUP_HANG_BACKSTOP,
+            dcutr_reserve_and_accept_on(&GAUGE, client, relay_circuit, Duration::from_millis(500)),
+        )
+        .await
+        .expect("hang: the reservation wait did not return within 30 s")
+        .expect_err("no relay, no reservation");
+        let took = t.elapsed();
+        eprintln!("swarm build {built:?}, reservation wait {took:?}: {e}");
+        assert!(
+            e.to_string().contains("relay reservation not accepted within 500ms"),
+            "the wait must end by its own 500 ms bound, got: {e} (after {took:?})"
+        );
         assert!(gauge_settles_at(&GAUGE, 0).await, "the driver of a failed reservation is gone");
     }
 
@@ -2464,14 +2485,28 @@ mod tests {
     async fn a_relayed_dial_that_never_reaches_its_target_times_out_and_leaves_no_task() {
         static GAUGE: LiveGauge = LiveGauge::new();
         // A real relay, but the target never reserved on it: the circuit can't form.
+        let t = std::time::Instant::now();
         let (relay_addr, relay_peer) = loopback_relay().await;
+        let relay_up = t.elapsed();
         let nobody = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
         let via = relay_addr.with(Protocol::P2p(relay_peer)).with(Protocol::P2pCircuit).with(Protocol::P2p(nobody));
+        let t = std::time::Instant::now();
         let client = build_dcutr_relay_client_swarm().unwrap();
-        let start = std::time::Instant::now();
-        let r = dcutr_dial_via_relay_on(&GAUGE, client, via, nobody, Duration::from_millis(500)).await;
-        assert!(r.is_err(), "no target, no stream");
-        assert!(start.elapsed() < Duration::from_secs(5), "bounded, not a hang");
+        let built = t.elapsed();
+        let t = std::time::Instant::now();
+        let r = tokio::time::timeout(
+            SETUP_HANG_BACKSTOP,
+            dcutr_dial_via_relay_on(&GAUGE, client, via, nobody, Duration::from_millis(500)),
+        )
+        .await
+        .expect("hang: the relayed dial did not return within 30 s");
+        let took = t.elapsed();
+        let Err(e) = r else { panic!("no target, no stream") };
+        eprintln!("relay up {relay_up:?}, swarm build {built:?}, dial {took:?}: {e}");
+        assert!(
+            e.to_string().contains("not open within 500ms"),
+            "the dial must end by its own 500 ms bound, got: {e} (after {took:?})"
+        );
         assert!(gauge_settles_at(&GAUGE, 0).await, "the driver of a failed dial is gone");
     }
 
