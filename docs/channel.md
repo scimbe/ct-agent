@@ -84,6 +84,15 @@ Broker and relay each get a ladder: **direct QUIC** (`CT_CHANNEL_BROKER` :4435 /
 
 - **`CT_CHANNEL_FRONT_DOOR_ONLY=1`** (v0.4.8, [#16]) drops the direct QUIC rung entirely.
   Refused at parse time without a configured front door.
+- **TLS session resumption** ([#290]): the `:443` rungs keep one TLS client configuration per
+  edge CA (`_CERT`) and ALPN offer for the life of the process, so every re-park after the
+  first resumes the TLS 1.3 session instead of repeating the full handshake (no certificate
+  exchange; the key exchange is still fresh; 0-RTT stays off). The tunnel's TLS-TCP fallback
+  and QUIC dials do the same. A resumed ClientHello carries the `pre_shared_key` extension, so
+  the edge's JA4 counter shows a second fingerprint for the same build. The log reports
+  `ct-agent: N TLS-TCP handshakes to the edge so far, M of them resumed (#290)` at 16, 32,
+  64, … handshakes; a tunnel agent also exports `ct_agent_tls_handshakes_total{kind}` on
+  `/metrics`.
 - **`CT_CHANNEL_RELAY_GATE` (+`_CERT`) — read this before using it** ([#330]): the gate is a
   `:443`-multiplexed **Circuit-Relay v2** path for the NAT-to-NAT hole punch. **Its
   channel-join admission still runs over plain QUIC to the relay port** — the `:443` gate leg
@@ -536,5 +545,6 @@ needed exactly once, at `sign`, so an operator can review the unsigned skeleton 
 [CADS-Tunnel#799]: https://github.com/scimbe/CADS-Tunnel/issues/799
 [#231]: https://github.com/scimbe/ct-agent/issues/15
 [#250]: https://github.com/scimbe/ct-agent/issues/15
+[#290]: https://github.com/scimbe/ct-agent/issues/290
 [#330]: https://github.com/scimbe/ct-agent/issues/16
 [#47]: https://github.com/scimbe/ct-agent/issues/47

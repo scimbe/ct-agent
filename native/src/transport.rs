@@ -9,6 +9,7 @@
 //! (`run_agent_tcp_fallback_until_quic_recovers`).
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -115,6 +116,96 @@ pub(crate) fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// #290: how many client configs each memo below keeps. A process dials one edge with a
+/// handful of ALPN offers (tunnel `ct-edge`, channel `-ka`/legacy, boring `h2`, relay) and one
+/// QUIC posture, so only a few entries are ever live; the bound only stops an endless stream
+/// of distinct trust anchors from growing a memo forever. Past it the least recently used
+/// entry goes, and what that costs is one full handshake -- the behaviour before #290.
+const CLIENT_CONFIG_MEMO_CAP: usize = 64;
+
+/// #290: a small least-recently-used memo of client configs.
+///
+/// Why configs are kept at all: rustls holds its TLS 1.3 session tickets in the
+/// `ClientConfig` (`resumption`, one in-memory store per config). A config built per dial
+/// never has a ticket to offer, so every redial to the same edge -- each `:443` re-park, each
+/// TLS-TCP fallback re-registration, each QUIC reconnect -- paid a full handshake, and the
+/// edge's JA4 counter saw no PSK offer in ~145k parked legs. Configs own no task and no
+/// socket, so unlike a quinn `Endpoint` (runtime-bound, `channel_quic.rs` caches only its
+/// config for that reason) they can be shared process-wide.
+///
+/// Why every key carries the trust anchor: a resumed handshake carries no certificate, so a
+/// session is only as good as the anchor it was verified under. One config per anchor means
+/// one session store per anchor; rustls on top refuses to resume under a different verifier.
+/// The SNI is not part of any key -- it is chosen per dial, and the store is keyed by it.
+struct ClientConfigMemo<K, V> {
+    entries: std::sync::Mutex<Vec<(K, V)>>,
+}
+
+impl<K: PartialEq, V: Clone> ClientConfigMemo<K, V> {
+    const fn new() -> Self {
+        Self { entries: std::sync::Mutex::new(Vec::new()) }
+    }
+
+    /// The config kept for `key`, or the one `build` makes, which is kept from then on. A
+    /// failed build is returned as is and keeps nothing.
+    fn get_or_build(&self, key: K, build: impl FnOnce() -> Result<V, BoxError>) -> Result<V, BoxError> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = entries.iter().position(|(k, _)| *k == key) {
+            // The most recently used entry goes last, so the front is always the one to evict.
+            let hit = entries.remove(at);
+            let config = hit.1.clone();
+            entries.push(hit);
+            return Ok(config);
+        }
+        let config = build()?;
+        if entries.len() >= CLIENT_CONFIG_MEMO_CAP {
+            entries.remove(0);
+        }
+        entries.push((key, config.clone()));
+        Ok(config)
+    }
+}
+
+/// #290: SHA-256 of a trust anchor's DER, the part of every memo key that keeps sessions from
+/// crossing anchors.
+fn anchor_digest(anchor: &CertificateDer<'_>) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(anchor.as_ref()).into()
+}
+
+/// The rustls client config of an edge dial: `edge_cert` as the only trust anchor, `alpns` as
+/// the offer. #290: built on a memo miss only ([`edge_tls_client_config`],
+/// [`quic_client_config`]).
+fn build_edge_rustls_config(
+    edge_cert: CertificateDer<'static>,
+    alpns: &[&[u8]],
+) -> Result<rustls::ClientConfig, BoxError> {
+    install_crypto_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(edge_cert)?;
+    let mut cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.alpn_protocols = alpns.iter().map(|a| a.to_vec()).collect();
+    // #290: resumption yes, 0-RTT never. Early data can be replayed and would let the edge act
+    // on a join or a registration before the handshake has authenticated it -- and the edge's
+    // QUIC listeners accept it (quinn's server default). The builder default is already off;
+    // this pins it, because a kept config now outlives the dial that built it.
+    cfg.enable_early_data = false;
+    Ok(cfg)
+}
+
+/// #290: what makes two QUIC client configs interchangeable: the trust anchor and the
+/// transport posture.
+#[derive(PartialEq)]
+struct QuicConfigKey {
+    anchor: [u8; 32],
+    keep_alive: Option<Duration>,
+    max_idle: Duration,
+}
+
+static QUIC_CLIENT_CONFIGS: ClientConfigMemo<QuicConfigKey, quinn::ClientConfig> = ClientConfigMemo::new();
+
 /// QUIC keepalive on the Agent's control connection to the Edge (issue #2).
 /// Without it, quinn's idle timeout tears down the registered connection, the
 /// Edge evicts the tunnel, and a Client arriving seconds later gets "no relay".
@@ -146,17 +237,28 @@ pub(crate) fn unspecified_for(peer: SocketAddr) -> SocketAddr {
 /// this logic -- the two paths differ only in what socket the resulting
 /// `quinn::Endpoint` is bound to (a real kernel UDP socket here, an
 /// `AsyncUdpSocket` bridging to the CONNECT-UDP tunnel there).
+///
+/// #290: memoized per (trust anchor, keepalive, idle timeout). A clone shares the rustls
+/// config and with it the session store, so the next connection to the same edge resumes
+/// instead of repeating the full handshake. The endpoint (the UDP socket) stays per dial: the
+/// edge pays per connection, not per socket, so reusing it would take no load off the edge.
 pub(crate) fn quic_client_config(
     edge_cert: CertificateDer<'static>,
     keep_alive: Option<Duration>,
     max_idle: Duration,
 ) -> Result<quinn::ClientConfig, BoxError> {
-    install_crypto_provider();
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(edge_cert)?;
-    let crypto = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let key = QuicConfigKey { anchor: anchor_digest(&edge_cert), keep_alive, max_idle };
+    QUIC_CLIENT_CONFIGS.get_or_build(key, || build_quic_client_config(edge_cert, keep_alive, max_idle))
+}
+
+/// The body of [`quic_client_config`] on a memo miss: no ALPN (the edge's QUIC listener
+/// carries none), the issue-#2 keepalive and idle bounds.
+fn build_quic_client_config(
+    edge_cert: CertificateDer<'static>,
+    keep_alive: Option<Duration>,
+    max_idle: Duration,
+) -> Result<quinn::ClientConfig, BoxError> {
+    let crypto = build_edge_rustls_config(edge_cert, &[])?;
     let mut cfg = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
@@ -855,22 +957,19 @@ const TCP_TLS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// [`tcp_tls_connect_with_alpn_sni`] offering an ordered LIST of ALPN ids (#500 K2): the
 /// server's preference over this list is the capability negotiation -- see the channel
 /// dialers above for the two concrete offer tables. Single-id callers use the thin wrapper.
+///
+/// #290: the rustls config comes from [`edge_tls_client_config`], kept per (trust anchor,
+/// ALPN offer), so a redial to the same edge resumes the TLS 1.3 session. The SNI, the ALPN
+/// offer and with them the edge's routing and KA negotiation are unchanged on a resumed dial.
 pub async fn tcp_tls_connect_with_alpns_sni(
     addr: SocketAddr,
     edge_cert: CertificateDer<'static>,
     alpns: &[&[u8]],
     sni: &str,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
-    install_crypto_provider();
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(edge_cert)?;
-    let mut cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    cfg.alpn_protocols = alpns.iter().map(|a| a.to_vec()).collect();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+    let connector = tokio_rustls::TlsConnector::from(edge_tls_client_config(edge_cert, alpns)?);
     let server_name = rustls::pki_types::ServerName::try_from(sni)?.to_owned();
-    tokio::time::timeout(TCP_TLS_CONNECT_TIMEOUT, async {
+    let tls = tokio::time::timeout(TCP_TLS_CONNECT_TIMEOUT, async {
         let tcp = TcpStream::connect(addr).await?;
         apply_tcp_keepalive(&tcp);
         connector.connect(server_name, tcp).await.map_err(BoxError::from)
@@ -878,7 +977,74 @@ pub async fn tcp_tls_connect_with_alpns_sni(
     .await
     .map_err(|_| -> BoxError {
         format!("TLS-TCP connect to {addr} stalled after {TCP_TLS_CONNECT_TIMEOUT:?} (ct-agent#57)").into()
-    })?
+    })??;
+    note_tls_tcp_handshake(tls.get_ref().1.handshake_kind());
+    Ok(tls)
+}
+
+/// #290: what makes two TLS-TCP client configs interchangeable: the trust anchor and the
+/// ALPN offer (a field of the config itself, so each offer needs its own).
+#[derive(PartialEq)]
+struct TlsTcpConfigKey {
+    anchor: [u8; 32],
+    alpns: Vec<Vec<u8>>,
+}
+
+static TLS_TCP_CLIENT_CONFIGS: ClientConfigMemo<TlsTcpConfigKey, Arc<rustls::ClientConfig>> =
+    ClientConfigMemo::new();
+
+/// #290: the kept rustls config for a TLS-TCP dial that trusts `edge_cert` and offers `alpns`.
+fn edge_tls_client_config(
+    edge_cert: CertificateDer<'static>,
+    alpns: &[&[u8]],
+) -> Result<Arc<rustls::ClientConfig>, BoxError> {
+    let key = TlsTcpConfigKey {
+        anchor: anchor_digest(&edge_cert),
+        alpns: alpns.iter().map(|a| a.to_vec()).collect(),
+    };
+    TLS_TCP_CLIENT_CONFIGS.get_or_build(key, || Ok(Arc::new(build_edge_rustls_config(edge_cert, alpns)?)))
+}
+
+/// #290: completed TLS-TCP handshakes to the edge by kind, process-wide like the other agent
+/// series (`/metrics`, [`render_tls_handshakes_prometheus`]). A failed dial counts nowhere.
+static TLS_TCP_HANDSHAKES_FULL: AtomicU64 = AtomicU64::new(0);
+static TLS_TCP_HANDSHAKES_RESUMED: AtomicU64 = AtomicU64::new(0);
+/// Sequence number of the handshake being counted, so exactly one dial logs each summary.
+static TLS_TCP_HANDSHAKES_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// #290: the first handshake count that gets a summary line; below it every process would
+/// log its startup dials.
+const TLS_TCP_HANDSHAKE_LOG_FLOOR: u64 = 16;
+
+/// #290: count one completed TLS-TCP handshake. `channel run` serves no `/metrics`, so a
+/// summary line goes to stderr at 16, 32, 64, ... handshakes: enough to read off a member's
+/// log whether its re-parks resume, without a line per park.
+fn note_tls_tcp_handshake(kind: Option<rustls::HandshakeKind>) {
+    let counter = match kind {
+        Some(rustls::HandshakeKind::Resumed) => &TLS_TCP_HANDSHAKES_RESUMED,
+        _ => &TLS_TCP_HANDSHAKES_FULL,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    let seen = TLS_TCP_HANDSHAKES_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if seen >= TLS_TCP_HANDSHAKE_LOG_FLOOR && seen.is_power_of_two() {
+        eprintln!(
+            "ct-agent: {seen} TLS-TCP handshakes to the edge so far, {} of them resumed (#290)",
+            TLS_TCP_HANDSHAKES_RESUMED.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// #290: the `/metrics` block for the TLS-TCP handshake counters ([`note_tls_tcp_handshake`]).
+pub(crate) fn render_tls_handshakes_prometheus() -> String {
+    format!(
+        "# HELP ct_agent_tls_handshakes_total Completed TLS-over-TCP handshakes to the edge, by kind \
+         (resumed = TLS 1.3 session resumption, #290).\n\
+         # TYPE ct_agent_tls_handshakes_total counter\n\
+         ct_agent_tls_handshakes_total{{kind=\"full\"}} {}\n\
+         ct_agent_tls_handshakes_total{{kind=\"resumed\"}} {}\n",
+        TLS_TCP_HANDSHAKES_FULL.load(Ordering::Relaxed),
+        TLS_TCP_HANDSHAKES_RESUMED.load(Ordering::Relaxed),
+    )
 }
 
 /// Load an Edge certificate (DER) the Edge published to a shared path.
@@ -2086,5 +2252,418 @@ mod tests {
         assert!(err.to_string().contains("rejected hostname"), "{err}");
         conn2.close(0u32.into(), b"done");
         let _ = edge2.await;
+    }
+
+    // ---- #290: TLS session resumption across redials -------------------------------------
+
+    use rustls::server::StoresServerSessions;
+    use rustls::HandshakeKind;
+
+    /// #290: rustls's own server-side session cache, counting what clients present. Stateful
+    /// TLS 1.3 tickets are single use, so the server calls `take` once per ticket a client
+    /// offers: `offered` counts PSK offers, `resumed` the ones the server still knew.
+    #[derive(Debug)]
+    struct CountingSessions {
+        inner: Arc<rustls::server::ServerSessionMemoryCache>,
+        offered: std::sync::atomic::AtomicUsize,
+        resumed: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingSessions {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: rustls::server::ServerSessionMemoryCache::new(64),
+                offered: Default::default(),
+                resumed: Default::default(),
+            })
+        }
+
+        fn offered(&self) -> usize {
+            self.offered.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn resumed(&self) -> usize {
+            self.resumed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl StoresServerSessions for CountingSessions {
+        fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+            self.inner.put(key, value)
+        }
+
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.inner.get(key)
+        }
+
+        fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.offered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let hit = self.inner.take(key);
+            if hit.is_some() {
+                self.resumed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            hit
+        }
+
+        fn can_cache(&self) -> bool {
+            self.inner.can_cache()
+        }
+    }
+
+    /// #290: a TLS-TCP stand-in for an edge acceptor. The edge builds its acceptors once, so
+    /// ONE session cache serves every connection -- this one does the same. Each accepted
+    /// connection reports its handshake kind (`None`: the handshake failed), writes `ok` --
+    /// the client reads it, and with it the NewSessionTicket records the server sends right
+    /// after the handshake -- and is held until the client closes. No ALPN list, like the
+    /// edge's shared acceptor the `ct-edge` fallback lands on.
+    struct ResumptionEdge {
+        addr: SocketAddr,
+        sessions: Arc<CountingSessions>,
+        kinds: tokio::sync::mpsc::UnboundedReceiver<Option<HandshakeKind>>,
+    }
+
+    impl ResumptionEdge {
+        async fn start(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> Self {
+            install_crypto_provider();
+            let sessions = CountingSessions::new();
+            let mut sc = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .unwrap();
+            sc.session_storage = sessions.clone();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(sc));
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, kinds) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Ok((tcp, _)) = listener.accept().await {
+                    let (acceptor, tx) = (acceptor.clone(), tx.clone());
+                    tokio::spawn(async move {
+                        let Ok(mut tls) = acceptor.accept(tcp).await else {
+                            let _ = tx.send(None);
+                            return;
+                        };
+                        let _ = tx.send(tls.get_ref().1.handshake_kind());
+                        let _ = tls.write_all(b"ok").await;
+                        let _ = tls.flush().await;
+                        let _ = tls.read(&mut [0u8; 1]).await;
+                    });
+                }
+            });
+            Self { addr, sessions, kinds }
+        }
+
+        /// The handshake kind of the next connection this edge saw.
+        async fn next_kind(&mut self) -> Option<HandshakeKind> {
+            tokio::time::timeout(Duration::from_secs(10), self.kinds.recv())
+                .await
+                .expect("the edge saw the dial")
+                .expect("the edge task is alive")
+        }
+    }
+
+    /// #290: one TLS-TCP fallback dial through the production path ([`tcp_tls_connect`]),
+    /// trusting `anchor`, that reads the edge's `ok`.
+    async fn dial_and_read_ok(
+        edge: SocketAddr,
+        anchor: CertificateDer<'static>,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
+        let mut tls = tcp_tls_connect(edge, anchor).await?;
+        let mut ok = [0u8; 2];
+        tls.read_exact(&mut ok).await?;
+        assert_eq!(&ok, b"ok");
+        Ok(tls)
+    }
+
+    #[tokio::test]
+    async fn tls_tcp_redial_resumes_the_session_290() {
+        // #290: every :443 re-park and every TLS-TCP fallback re-registration is a fresh dial
+        // to the same edge. With a new rustls ClientConfig per dial there was never a session
+        // to offer, so every one of them paid a full handshake (key exchange, certificate,
+        // CertificateVerify) -- the edge's JA4 counter saw no PSK offer in ~145k parked legs.
+        // Two dials through the production path: the second must resume, seen from both ends.
+        let (cert, key) = self_signed().unwrap();
+        let mut edge = ResumptionEdge::start(cert.clone(), key).await;
+
+        let first = dial_and_read_ok(edge.addr, cert.clone()).await.expect("first dial");
+        assert_eq!(first.get_ref().1.handshake_kind(), Some(HandshakeKind::Full), "nothing to resume yet");
+        assert_eq!(edge.next_kind().await, Some(HandshakeKind::Full));
+        drop(first);
+
+        let second = dial_and_read_ok(edge.addr, cert).await.expect("redial");
+        assert_eq!(
+            second.get_ref().1.handshake_kind(),
+            Some(HandshakeKind::Resumed),
+            "the redial resumes the session the first dial left behind"
+        );
+        assert_eq!(edge.next_kind().await, Some(HandshakeKind::Resumed), "and the edge agrees");
+        assert_eq!((edge.sessions.offered(), edge.sessions.resumed()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn dial_quic_redial_offers_a_ticket_290() {
+        // #290, QUIC half: the tunnel's reconnect loop, the fallback pool's QUIC re-probe and
+        // the MASQUE inner handshake all go through `quic_client_config`. A redial to the same
+        // edge must present the ticket the first connection received, and the edge must take
+        // it. The echo round trip matters: the edge's NewSessionTicket CRYPTO frames reach the
+        // client no later than the echoed bytes do.
+        install_crypto_provider();
+        let (cert, key) = self_signed().unwrap();
+        let sessions = CountingSessions::new();
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        tls.session_storage = sessions.clone();
+        let sc = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
+        ));
+        let server = Endpoint::server(sc, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            for _ in 0..2 {
+                let conn = server.accept().await.unwrap().await.unwrap();
+                let (mut s, mut r) = conn.accept_bi().await.unwrap();
+                let data = r.read_to_end(64).await.unwrap();
+                s.write_all(&data).await.unwrap();
+                s.finish().unwrap();
+                conn.closed().await;
+            }
+        });
+
+        for round in 0..2 {
+            let conn = dial_quic(addr, cert.clone()).await.expect("dial");
+            let (mut s, mut r) = conn.open_bi().await.unwrap();
+            s.write_all(b"park").await.unwrap();
+            s.finish().unwrap();
+            assert_eq!(r.read_to_end(64).await.unwrap(), b"park");
+            conn.close(0u32.into(), b"done");
+            if round == 0 {
+                assert_eq!(sessions.offered(), 0, "the first dial has nothing to offer");
+            }
+        }
+        srv.await.unwrap();
+        assert_eq!(sessions.offered(), 1, "the redial presented exactly one ticket");
+        assert_eq!(sessions.resumed(), 1, "and the edge resumed with it");
+    }
+
+    #[tokio::test]
+    async fn resumption_never_crosses_trust_anchors_290() {
+        // #290: a resumed handshake carries no certificate, so a session is only as good as
+        // the trust anchor it was verified under. One edge, one SNI, one ALPN offer -- but a
+        // caller that now trusts only B must get B's verification, never A's session (that
+        // would skip the certificate check outright) and never A's config.
+        let (cert_a, key_a) = self_signed().unwrap();
+        let (cert_b, key_b) = self_signed().unwrap();
+        let mut edge_a = ResumptionEdge::start(cert_a.clone(), key_a).await;
+
+        drop(dial_and_read_ok(edge_a.addr, cert_a.clone()).await.expect("dial under A"));
+        assert_eq!(edge_a.next_kind().await, Some(HandshakeKind::Full));
+
+        let err = dial_and_read_ok(edge_a.addr, cert_b.clone())
+            .await
+            .expect_err("an edge that B does not vouch for must be refused under B");
+        assert_eq!(edge_a.next_kind().await, None, "the edge saw the handshake fail too: {err}");
+        assert_eq!(edge_a.sessions.offered(), 0, "no session of A's was offered under B");
+
+        // An edge B does vouch for: a full handshake, since nothing was ever kept under B.
+        let mut edge_b = ResumptionEdge::start(cert_b.clone(), key_b).await;
+        drop(dial_and_read_ok(edge_b.addr, cert_b).await.expect("dial under B"));
+        assert_eq!(edge_b.next_kind().await, Some(HandshakeKind::Full));
+        assert_eq!(edge_b.sessions.offered(), 0, "no ticket from A's edge was offered to B's");
+
+        // A's sessions survived all of that: the next dial under A still resumes.
+        let again = dial_and_read_ok(edge_a.addr, cert_a).await.expect("redial under A");
+        assert_eq!(again.get_ref().1.handshake_kind(), Some(HandshakeKind::Resumed));
+        assert_eq!(edge_a.next_kind().await, Some(HandshakeKind::Resumed));
+    }
+
+    #[tokio::test]
+    async fn the_front_door_dial_keeps_its_alpn_and_sni_with_a_cached_config_290() {
+        // The edge routes a :443 connection on its plaintext ClientHello (SNI + ALPN) and
+        // negotiates the KA generation over ALPN (#500 K2). A resumed hello must offer both
+        // unchanged, and the resumed dial must still classify KA -- ALPN is negotiated on
+        // every handshake, resumed or not.
+        install_crypto_provider();
+        let (cert, key) = self_signed().unwrap();
+        let mut sc = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        sc.alpn_protocols = vec![b"ct-edge-channel-ka".to_vec(), b"ct-edge-channel".to_vec()];
+        let sc = Arc::new(sc);
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let (sc, tx) = (sc.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let start = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp)
+                        .await
+                        .expect("read ClientHello");
+                    let hello = start.client_hello();
+                    let sni = hello.server_name().map(|s| s.to_string());
+                    let alpn: Vec<Vec<u8>> =
+                        hello.alpn().map(|it| it.map(|p| p.to_vec()).collect()).unwrap_or_default();
+                    let mut tls = start.into_stream(sc).await.expect("handshake");
+                    let _ = tx.send((sni, alpn, tls.get_ref().1.handshake_kind()));
+                    let _ = tls.write_all(b"ok").await;
+                    let _ = tls.flush().await;
+                    let _ = tls.read(&mut [0u8; 1]).await;
+                });
+            }
+        });
+
+        for expect in [HandshakeKind::Full, HandshakeKind::Resumed] {
+            let mut tls = tcp_tls_connect_channel_sni(addr, cert.clone(), None).await.expect("channel dial");
+            let mut ok = [0u8; 2];
+            tls.read_exact(&mut ok).await.unwrap();
+            let (sni, alpn, kind) = tokio::time::timeout(Duration::from_secs(10), seen.recv())
+                .await
+                .expect("the edge reported the handshake")
+                .unwrap();
+            assert_eq!(sni.as_deref(), Some(DEFAULT_SNI), "{expect:?}: unchanged SNI");
+            assert_eq!(
+                alpn,
+                vec![b"ct-edge-channel-ka".to_vec(), b"ct-edge-channel".to_vec()],
+                "{expect:?}: unchanged [ka, legacy] offer"
+            );
+            assert_eq!(kind, Some(expect), "edge side");
+            assert_eq!(tls.get_ref().1.handshake_kind(), Some(expect), "client side");
+            assert!(ka_negotiated(&tls), "{expect:?}: the KA generation is negotiated on this handshake too");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resumed_hello_passes_the_edges_443_front_door_290() {
+        // #290 against the edge's own code (`serve_front_door`): the front door reads the
+        // ClientHello to route it and replays those bytes into its acceptor. A resumed hello
+        // carries a pre_shared_key extension whose binder covers the hello itself, so the
+        // routing must take it and the replay must be byte-exact. Two TLS-TCP fallback
+        // registrations through the front door: the second resumes and registers like the
+        // first, and the edge's JA4 counter -- the field signal for this change -- sees two
+        // fingerprints that differ only in the extension hash.
+        use ct_common::pow::Challenge;
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use ct_edge::serve::serve_front_door;
+        use ct_edge::state::EdgeState;
+
+        let ca = Ca::new("test-ca").expect("ca");
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .expect("dual edge");
+        let fd_addr = tcp_listener.local_addr().unwrap();
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let state_e = state.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = tcp_listener.accept().await {
+                let (state, acceptor) = (state_e.clone(), acceptor.clone());
+                tokio::spawn(async move {
+                    let proxies: std::collections::HashMap<String, ct_edge::serve::ProxyTarget> =
+                        std::collections::HashMap::new();
+                    let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+                    let _ = serve_front_door(tcp, &state, &acceptor, &proxies, None, &challenge, None, None, None, None, None, None, None).await;
+                });
+            }
+        });
+
+        let mut parked = Vec::new();
+        for (byte, expect) in [(0x91u8, HandshakeKind::Full), (0x92, HandshakeKind::Resumed)] {
+            let token = RoutingToken([byte; 32]);
+            let mut stream = tcp_tls_connect(fd_addr, ca_root.clone()).await.expect("TLS-TCP via the front door");
+            register_tunnel_stream(&mut stream, &token).await.expect("register through the front door");
+            assert_eq!(stream.get_ref().1.handshake_kind(), Some(expect));
+            for _ in 0..100 {
+                if state.has_tcp_agent(&token) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(state.has_tcp_agent(&token), "{expect:?}: the edge parked the registration");
+            parked.push(stream);
+        }
+
+        let mut seen = state.ja4_observations().snapshot();
+        seen.sort();
+        assert_eq!(seen.len(), 2, "a full and a resumed hello fingerprint differently: {seen:?}");
+        assert!(seen.iter().all(|(_, n)| *n == 1), "{seen:?}");
+        let (full_ab, full_ext) = seen[0].0.rsplit_once('_').unwrap();
+        let (resumed_ab, resumed_ext) = seen[1].0.rsplit_once('_').unwrap();
+        assert_eq!(full_ab, resumed_ab, "same version, extension count, ALPN and ciphers: {seen:?}");
+        assert_ne!(full_ext, resumed_ext, "only the extension hash moves (session_ticket -> pre_shared_key)");
+    }
+
+    #[test]
+    fn one_kept_tls_config_per_trust_anchor_and_alpn_offer_and_none_sends_early_data_290() {
+        // #290: the memo key is (anchor, ALPN offer). The same pair must hand back the very
+        // same config (its session store is the point); another anchor or another offer
+        // must not. No kept config may ever send 0-RTT.
+        let (a, _) = self_signed().unwrap();
+        let (b, _) = self_signed().unwrap();
+        let channel: &[&[u8]] = &[b"ct-edge-channel-ka", b"ct-edge-channel"];
+        let first = edge_tls_client_config(a.clone(), channel).unwrap();
+        let again = edge_tls_client_config(a.clone(), channel).unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "same anchor, same offer: the same config");
+        let relay = edge_tls_client_config(a.clone(), &[b"ct-edge-relay"]).unwrap();
+        assert!(!Arc::ptr_eq(&first, &relay), "another offer gets its own config");
+        let other_anchor = edge_tls_client_config(b, channel).unwrap();
+        assert!(!Arc::ptr_eq(&first, &other_anchor), "another anchor gets its own config");
+        assert_eq!(first.alpn_protocols, vec![b"ct-edge-channel-ka".to_vec(), b"ct-edge-channel".to_vec()]);
+        for cfg in [&first, &relay, &other_anchor] {
+            assert!(!cfg.enable_early_data, "#290: resumption, never 0-RTT");
+        }
+        assert!(!build_edge_rustls_config(a, &[]).unwrap().enable_early_data, "the QUIC configs' rustls half too");
+    }
+
+    #[test]
+    fn the_config_memo_evicts_the_least_recently_used_entry_past_its_cap_290() {
+        // #290: bounded, and an entry in use is not the one that goes.
+        let memo: ClientConfigMemo<usize, Arc<usize>> = ClientConfigMemo::new();
+        let keep = |memo: &ClientConfigMemo<usize, Arc<usize>>, key: usize| {
+            memo.get_or_build(key, || Ok(Arc::new(key))).unwrap()
+        };
+        let zero = keep(&memo, 0);
+        for key in 1..CLIENT_CONFIG_MEMO_CAP {
+            keep(&memo, key);
+        }
+        assert!(Arc::ptr_eq(&zero, &keep(&memo, 0)), "a hit returns the kept value and refreshes it");
+        keep(&memo, CLIENT_CONFIG_MEMO_CAP); // one past the cap: evicts the least recently used, key 1
+        let entries = memo.entries.lock().unwrap();
+        assert_eq!(entries.len(), CLIENT_CONFIG_MEMO_CAP, "never more than the cap");
+        assert!(entries.iter().any(|(k, _)| *k == 0), "the refreshed entry stayed");
+        assert!(!entries.iter().any(|(k, _)| *k == 1), "the least recently used one went");
+        drop(entries);
+        let failed: Result<Arc<usize>, BoxError> = memo.get_or_build(usize::MAX, || Err("no".into()));
+        assert!(failed.is_err());
+        assert!(!memo.entries.lock().unwrap().iter().any(|(k, _)| *k == usize::MAX), "a failed build keeps nothing");
+    }
+
+    #[tokio::test]
+    async fn tls_tcp_handshakes_are_counted_by_kind_290() {
+        // #290: `/metrics` (and the log summary) count full and resumed handshakes. Other
+        // tests dial in parallel against the same process-wide counters, so the two dials
+        // here are bracketed rather than pinned.
+        let (cert, key) = self_signed().unwrap();
+        let mut edge = ResumptionEdge::start(cert.clone(), key).await;
+        let full_before = TLS_TCP_HANDSHAKES_FULL.load(Ordering::Relaxed);
+        let resumed_before = TLS_TCP_HANDSHAKES_RESUMED.load(Ordering::Relaxed);
+        drop(dial_and_read_ok(edge.addr, cert.clone()).await.expect("first dial"));
+        assert_eq!(edge.next_kind().await, Some(HandshakeKind::Full));
+        drop(dial_and_read_ok(edge.addr, cert).await.expect("redial"));
+        assert_eq!(edge.next_kind().await, Some(HandshakeKind::Resumed));
+        assert!(TLS_TCP_HANDSHAKES_FULL.load(Ordering::Relaxed) > full_before, "the first dial counted as full");
+        assert!(TLS_TCP_HANDSHAKES_RESUMED.load(Ordering::Relaxed) > resumed_before, "the redial counted as resumed");
+        let text = render_tls_handshakes_prometheus();
+        assert!(text.starts_with("# HELP ct_agent_tls_handshakes_total "), "{text}");
+        assert!(text.contains("\n# TYPE ct_agent_tls_handshakes_total counter\n"), "{text}");
+        assert!(text.contains("\nct_agent_tls_handshakes_total{kind=\"full\"} "), "{text}");
+        assert!(text.contains("\nct_agent_tls_handshakes_total{kind=\"resumed\"} "), "{text}");
+        assert!(text.ends_with('\n'), "the next series starts on its own line");
     }
 }

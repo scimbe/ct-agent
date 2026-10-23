@@ -228,6 +228,18 @@ async fn dial_quic_via_masque_rejects_a_proxy_cert_the_public_ca_set_does_not_tr
     );
 }
 
+#[test]
+fn the_public_front_door_config_is_built_once_and_never_sends_early_data_290() {
+    // #290: the production outer config is kept for the process (its session store is
+    // what lets a MASQUE redial resume with the front door), offers h2 as before, and
+    // never sends 0-RTT.
+    let first = public_front_door_tls();
+    let again = public_front_door_tls();
+    assert!(Arc::ptr_eq(&first, &again), "one config per process, not one per dial");
+    assert_eq!(first.alpn_protocols, vec![b"h2".to_vec()]);
+    assert!(!first.enable_early_data);
+}
+
 // ADR-0024 M4: the real regression that caused a live outage on
 // kali.bunsenbrenner.org -- `dial_quic_via_masque_with_proxy_roots`'s connection-
 // driving task was fire-and-forget `tokio::spawn`ed, so every failure AFTER the h2
@@ -415,7 +427,7 @@ async fn a_proxy_that_accepts_tcp_and_stays_silent_times_out() {
         "127.0.0.1:9".parse().unwrap(),
         edge_cert,
         TEST_TOKEN,
-        rustls::RootCertStore::empty(),
+        super::outer_tls_config(rustls::RootCertStore::empty()),
     )
     .await
     .expect_err("a silent proxy must not hang the dial");
