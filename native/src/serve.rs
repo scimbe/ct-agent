@@ -1089,11 +1089,12 @@ fn trim_trailing_line_ending(bytes: &[u8]) -> &[u8] {
 // revocation list (`GET /internal/revoked-tokens`) is gated by the edge<->plane
 // admin token, which an agent does not hold. The agent DOES already receive the
 // revocation from the one place that enforces it: the Edge. `revoke_token`
-// (CADS-Tunnel #27/#421/#554) tears the live registration down and then refuses
-// every re-registration of that token with a wire `NO` -- and this agent's
-// reconnect loop re-registers on every drop. So the cached status is fed by the
+// (CADS-Tunnel #27/#421/#554) removes the registration and then refuses every
+// re-registration of that token with a wire `NO` -- and this agent's reconnect
+// loop re-registers on every drop. So the cached status is fed by the
 // registration path (`RevocationTracker`), with no new wire contract and no new
-// credential.
+// credential. #291: on QUIC the revoke does not drop the agent's connection, so
+// no re-registration follows it -- see `RevocationView` for what that leaves open.
 
 /// The payload's version tag and v1 length are shared with the client side
 /// (`ct_common::noise::direct_handshake_payload`, CADS-Tunnel#770), so both halves
@@ -1239,9 +1240,17 @@ pub const REVOCATION_LOG_RESTORED: &str = "ct-agent: this tunnel's routing token
 /// revocation list, but the Edge refuses a revoked token's registration with a
 /// wire `NO` on every reconnect (see the module note above), so the freshest
 /// status the agent can have is "what the last registration attempt said".
-/// Staleness is therefore bounded by the reconnect loop: a live registration
-/// is cut by the Edge at revoke time (#554), the very next attempt is refused,
-/// and the flag is set -- one dial+register round trip after the cut.
+/// Staleness is therefore bounded by the NEXT registration attempt, and on
+/// QUIC that comes only when the registration connection ends (#291, measured
+/// against ct-edge v0.4.20; `revoke_token` is the same on CADS-Tunnel main): the
+/// Edge's revoke removes the registration from its routing table and cuts live
+/// relays (#554), but leaves the agent's QUIC connection open. A QUIC-registered
+/// agent therefore keeps a clear flag -- and keeps serving direct clients that
+/// present the revoked token -- until that connection drops for another reason
+/// (edge restart, network loss, agent restart). A TLS-TCP fallback registration
+/// is a parked one-shot that the revoke drops (read, not measured), so that path
+/// re-registers and flips after [`AMBIGUOUS_REFUSALS_BEFORE_REVOKED`] refusals.
+/// Closing the gap needs the Edge to close the agent connection on revoke.
 #[derive(Debug, Default)]
 pub struct RevocationView {
     revoked: AtomicBool,
