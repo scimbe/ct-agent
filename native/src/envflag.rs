@@ -102,8 +102,12 @@ mod tests {
         for quiet in [None, Some(""), Some("  "), Some("yes"), Some("OFF")] {
             assert_eq!(unrecognised("CT_X", quiet, false), None, "{quiet:?}");
         }
-        let w = unrecognised("CT_DIRECT_REQUIRE_TOKEN", Some("enforce"), false).unwrap();
-        assert!(w.contains("CT_DIRECT_REQUIRE_TOKEN=\"enforce\"") && w.contains("default (off)"), "{w}");
+        let w = unrecognised("CT_AGENT_FALLBACK_443", Some("enforce"), false).unwrap();
+        assert!(w.contains("CT_AGENT_FALLBACK_443=\"enforce\"") && w.contains("default (off)"), "{w}");
         assert!(unrecognised("CT_CHANNEL_PHASE_MARKER", Some("disable"), true).unwrap().contains("default (on)"));
+        // #291: a default-on security check names its default in the warning, so a mistyped
+        // opt-out reads as what it is -- still on.
+        let w = unrecognised("CT_DIRECT_REQUIRE_TOKEN", Some("disable"), true).unwrap();
+        assert!(w.contains("CT_DIRECT_REQUIRE_TOKEN=\"disable\"") && w.contains("default (on)"), "{w}");
     }
 }
