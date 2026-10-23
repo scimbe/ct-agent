@@ -8413,13 +8413,14 @@ const TRANSFER_BACKSTOP: Duration = Duration::from_secs(600);
 /// budget for the whole transfer; and on a corrupted byte or a short or long stream. The error
 /// carries the bytes received and a report with the elapsed time and the average rate. For
 /// `slow_phase` it first reads 4 KiB every 10 ms (a slow receiver), then up to 64 KiB at once.
-/// Returns how long the download took.
+/// Returns how long the download took and the longest wait for a single read, i.e. how close
+/// the download came to `stall`.
 async fn read_pattern_with_stall_watchdog<R: tokio::io::AsyncRead + Unpin>(
     r: &mut R,
     len: usize,
     stall: Duration,
     slow_phase: Duration,
-) -> Result<Duration, (usize, String)> {
+) -> Result<(Duration, Duration), (usize, String)> {
     // tokio's clock: wall time here, virtual time in a paused-time test.
     let started = tokio::time::Instant::now();
     let report = |got: usize| {
@@ -8430,17 +8431,21 @@ async fn read_pattern_with_stall_watchdog<R: tokio::io::AsyncRead + Unpin>(
     let mut buf = vec![0u8; FLOW_CHUNK];
     let mut got = 0usize;
     let mut next_progress = 16 << 20;
+    let mut longest_wait = Duration::ZERO;
     loop {
         let slow = started.elapsed() < slow_phase;
         let want = if slow { 4096 } else { buf.len() };
+        // A fresh bound for every read: the watchdog measures progress, not the whole download.
+        let asked = tokio::time::Instant::now();
         let n = match tokio::time::timeout(stall, r.read(&mut buf[..want])).await {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err((got, format!("read failed ({e}) {}", report(got)))),
             Err(_) => return Err((got, format!("stalled: no byte for {stall:?} {}", report(got)))),
         };
+        longest_wait = longest_wait.max(asked.elapsed());
         if n == 0 {
             if got == len {
-                return Ok(started.elapsed());
+                return Ok((started.elapsed(), longest_wait));
             }
             return Err((got, format!("ended early: end of stream {}", report(got))));
         }
@@ -8477,12 +8482,21 @@ async fn channel_forward_large_transfer_arrives_complete() {
         let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
         c.write_all(b"B").await.unwrap();
         // First 2 s: a slow reader (4 KiB every 10 ms), then full speed.
-        let took = read_pattern_with_stall_watchdog(&mut c, LEN, TRANSFER_STALL, Duration::from_secs(2))
-            .await
-            .unwrap_or_else(|(_, e)| panic!("the transfer must arrive complete: {e}"));
-        // A slower forward no longer fails this test, so keep the rate visible (--nocapture).
+        let (took, longest_wait) =
+            read_pattern_with_stall_watchdog(&mut c, LEN, TRANSFER_STALL, Duration::from_secs(2))
+                .await
+                .unwrap_or_else(|(_, e)| panic!("the transfer must arrive complete: {e}"));
+        // A slower forward no longer fails this test, so every run logs its rate and its headroom
+        // to TRANSFER_STALL. Written past libtest's capture, which shows `eprintln!` only for a
+        // failing test (CI runs plain `cargo test`), as one write so the line stays whole.
+        let mib = LEN as f64 / f64::from(1u32 << 20);
         let secs = took.as_secs_f64();
-        eprintln!("64 MiB through the forward pair in {secs:.1} s ({:.2} MiB/s)", 64.0 / secs);
+        let line = format!(
+            "T2 (#304): {mib:.0} MiB through the forward pair in {secs:.1} s ({:.2} MiB/s), \
+             longest wait for a byte {longest_wait:.1?} (stall bound {TRANSFER_STALL:?})\n",
+            mib / secs
+        );
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
         a_task.abort();
         b_task.abort();
     })
@@ -8492,9 +8506,11 @@ async fn channel_forward_large_transfer_arrives_complete() {
 
 /// #304: the stall watchdog of T2 fires through the forward. The target sends 1 MiB, then goes
 /// silent with the connection open -- a download stuck mid-way -- and the reader must give up
-/// after its bound with a stall report, neither hang nor pass. (The exact byte count of such a
-/// report is pinned by the in-memory test below; here a runtime stall on a loaded runner during
-/// the first MiB could legitimately trip the 2 s watchdog early, so only `<=` is asserted.)
+/// after its bound with a stall report, neither hang nor pass. The watchdog starts once the first
+/// byte is through, so a forward that delivers nothing fails here instead of passing as a "stall
+/// after 0 bytes". (The exact byte count of a report is pinned by the in-memory test below; here
+/// a runtime stall on a loaded runner during the first MiB could legitimately trip the 2 s
+/// watchdog early, so the count is only bounded: more than 0, at most the 1 MiB sent.)
 #[tokio::test]
 async fn channel_forward_stall_watchdog_reports_a_silent_target_304() {
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -8503,12 +8519,18 @@ async fn channel_forward_stall_watchdog_reports_a_silent_target_304() {
         let (bound, a_task, b_task) = spawn_forward_pair(target.to_string(), 16, Duration::from_secs(60));
         let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
         c.write_all(b"S").await.unwrap();
+        // `peek` returns only once a byte is there (or at end of stream), and leaves it unread.
+        let peeked = tokio::time::timeout(TRANSFER_STALL, c.peek(&mut [0u8; 1]))
+            .await
+            .expect("no byte through the forward within TRANSFER_STALL")
+            .unwrap();
+        assert_eq!(peeked, 1, "the forward ended the download before its first byte");
         let t = std::time::Instant::now();
         let (got, e) = read_pattern_with_stall_watchdog(&mut c, 4 * SENT, Duration::from_secs(2), Duration::ZERO)
             .await
             .expect_err("a target that goes silent must trip the stall watchdog");
         assert!(e.starts_with("stalled: no byte for 2s after "), "{e}");
-        assert!(got <= SENT && e.contains(&format!("after {got} of {} bytes", 4 * SENT)), "{e}");
+        assert!(got > 0 && got <= SENT && e.contains(&format!("after {got} of {} bytes", 4 * SENT)), "{e}");
         assert!(e.contains(" s in, ") && e.ends_with(" MiB/s"), "the report carries time and rate: {e}");
         assert!(t.elapsed() >= Duration::from_secs(2), "fired before its bound: {e}");
         a_task.abort();
@@ -8520,10 +8542,10 @@ async fn channel_forward_stall_watchdog_reports_a_silent_target_304() {
 
 /// #304: the reader's pattern check is not vacuous (one memcmp per read replaced a per-byte
 /// assertion) and its reports are exact: a stall, a corrupted byte, a short and a long stream
-/// each fail with the right byte count. In memory and on paused time, so the 20 s stall is free.
+/// each fail with the right byte count. In memory and on paused time, so the stall bound is free.
 #[tokio::test(start_paused = true)]
 async fn pattern_reader_reports_a_stall_a_corrupted_byte_and_a_wrong_length_304() {
-    async fn read(data: &[u8], len: usize) -> Result<Duration, (usize, String)> {
+    async fn read(data: &[u8], len: usize) -> Result<(Duration, Duration), (usize, String)> {
         let mut rest = data;
         read_pattern_with_stall_watchdog(&mut rest, len, TRANSFER_STALL, Duration::ZERO).await
     }
@@ -8544,20 +8566,58 @@ async fn pattern_reader_reports_a_stall_a_corrupted_byte_and_a_wrong_length_304(
     let (_, e) = read(&data, len - 1).await.expect_err("one byte too many fails");
     assert!(e.starts_with(&format!("more bytes than sent: {len}")), "{e}");
 
-    // A stall: the first chunk, then silence with the writer still open.
+    // A stall: the first chunk, then silence with the writer still open. With a bound other than
+    // TRANSFER_STALL, so a reader that ignores its `stall` argument fails here.
+    let stall = Duration::from_secs(7);
     let (mut w, mut r) = tokio::io::duplex(FLOW_CHUNK);
     let head = data[..FLOW_CHUNK].to_vec();
     tokio::spawn(async move {
         w.write_all(&head).await.unwrap();
         std::future::pending::<()>().await; // keeps `w` open: silence, not end of stream
     });
-    let (got, e) = read_pattern_with_stall_watchdog(&mut r, len, TRANSFER_STALL, Duration::ZERO)
-        .await
-        .expect_err("silence trips the watchdog");
+    // Without a working watchdog no timer is left and paused time parks for good; the hour (free
+    // on paused time) turns that hang into a failure.
+    let (got, e) = tokio::time::timeout(
+        Duration::from_secs(3600),
+        read_pattern_with_stall_watchdog(&mut r, len, stall, Duration::ZERO),
+    )
+    .await
+    .expect("no stall report within an hour: the reader has no working watchdog")
+    .expect_err("silence trips the watchdog");
     assert_eq!(got, FLOW_CHUNK, "{e}");
     assert_eq!(
         e,
-        format!("stalled: no byte for 20s after {FLOW_CHUNK} of {len} bytes (0.1 MiB), 20.0 s in, 0.00 MiB/s")
+        format!("stalled: no byte for 7s after {FLOW_CHUNK} of {len} bytes (0.1 MiB), 7.0 s in, 0.01 MiB/s")
+    );
+}
+
+/// #304/#309: the bound is on PROGRESS, not on the whole download -- the point of the change. A
+/// download that takes three times TRANSFER_STALL in all, but never waits that long for a byte,
+/// must pass; a bound on the total time (the old fixed 60 s under another name) fails it. With
+/// the crypto optimized, T2 itself ends far below TRANSFER_STALL and could not tell the two apart.
+/// Paused time, so the minute is free.
+#[tokio::test(start_paused = true)]
+async fn pattern_reader_passes_a_slow_download_that_never_stalls_304() {
+    let len = 3 * FLOW_CHUNK + 1000;
+    let gap = TRANSFER_STALL - Duration::from_secs(5);
+    let (mut w, mut r) = tokio::io::duplex(FLOW_CHUNK);
+    tokio::spawn(async move {
+        let mut sent = 0;
+        while sent < len {
+            let n = FLOW_CHUNK.min(len - sent);
+            tokio::time::sleep(gap).await;
+            w.write_all(flow_pattern_at(sent, n)).await.unwrap();
+            sent += n;
+        }
+        // `w` drops here: end of stream.
+    });
+    let (took, longest_wait) = read_pattern_with_stall_watchdog(&mut r, len, TRANSFER_STALL, Duration::ZERO)
+        .await
+        .unwrap_or_else(|(_, e)| panic!("a slow download that never stalls must pass: {e}"));
+    assert!(took >= 3 * TRANSFER_STALL, "four gaps of {gap:?}, yet the download took only {took:?}");
+    assert!(
+        longest_wait >= gap && longest_wait < TRANSFER_STALL,
+        "the longest wait for a byte is one gap of {gap:?}, not {longest_wait:?}"
     );
 }
 

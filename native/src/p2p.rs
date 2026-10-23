@@ -2447,8 +2447,15 @@ mod tests {
     /// all, at least 5 s for a call that takes ~0.5 s, and a 2.3 s window in which no test of the
     /// process finished), so the 5 s measured the runner, not the bound. The tests now assert that
     /// the call ended BY ITS OWN BOUND -- only the timeout branch produces that error text -- and
-    /// print the time of each step, so a slow step shows in the log instead of failing the run.
+    /// log the time of each step, so a slow step shows in the log instead of failing the run.
     const SETUP_HANG_BACKSTOP: Duration = Duration::from_secs(30);
+
+    /// #310: the step times of a PASSING run belong in the CI log too, but libtest shows
+    /// `eprintln!` output only for a failing test, and CI runs plain `cargo test`. This writes
+    /// past that capture, as one write so a parallel test cannot split the line.
+    fn log_step_times(line: &str) {
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("{line}\n").as_bytes());
+    }
 
     #[tokio::test]
     async fn a_relay_reservation_that_is_never_accepted_times_out_and_leaves_no_task() {
@@ -2470,10 +2477,10 @@ mod tests {
             dcutr_reserve_and_accept_on(&GAUGE, client, relay_circuit, Duration::from_millis(500)),
         )
         .await
-        .expect("hang: the reservation wait did not return within 30 s")
+        .unwrap_or_else(|_| panic!("hang: the reservation wait did not return within 30 s (swarm build {built:?})"))
         .expect_err("no relay, no reservation");
         let took = t.elapsed();
-        eprintln!("swarm build {built:?}, reservation wait {took:?}: {e}");
+        log_step_times(&format!("#310 relay reservation: swarm build {built:?}, reservation wait {took:?}: {e}"));
         assert!(
             e.to_string().contains("relay reservation not accepted within 500ms"),
             "the wait must end by its own 500 ms bound, got: {e} (after {took:?})"
@@ -2499,10 +2506,12 @@ mod tests {
             dcutr_dial_via_relay_on(&GAUGE, client, via, nobody, Duration::from_millis(500)),
         )
         .await
-        .expect("hang: the relayed dial did not return within 30 s");
+        .unwrap_or_else(|_| {
+            panic!("hang: the relayed dial did not return within 30 s (relay up {relay_up:?}, swarm build {built:?})")
+        });
         let took = t.elapsed();
         let Err(e) = r else { panic!("no target, no stream") };
-        eprintln!("relay up {relay_up:?}, swarm build {built:?}, dial {took:?}: {e}");
+        log_step_times(&format!("#310 relayed dial: relay up {relay_up:?}, swarm build {built:?}, dial {took:?}: {e}"));
         assert!(
             e.to_string().contains("not open within 500ms"),
             "the dial must end by its own 500 ms bound, got: {e} (after {took:?})"
