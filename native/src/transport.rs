@@ -84,6 +84,20 @@ pub fn build_direct_listener() -> Result<(Endpoint, CertificateDer<'static>), Bo
 /// `dial_quic`) is a different thing and stays in this crate.
 pub use ct_common::channel_quic::build_channel_dialer;
 
+/// #296/#104: ONE UDP socket that is both the accept-any channel dialer
+/// ([`build_channel_dialer`]) and a self-signed direct listener. A reflexive address learned
+/// THROUGH it (the edge's `'W'` echo, `channel_run::whoami_via`) is this listener's own NAT
+/// mapping, so a peer that dials it reaches this socket. [`build_direct_listener`] binds a
+/// second socket instead: whatever reflexive a member learned before (a throwaway `'W'` query,
+/// the admission connection's `r=`) then names a port nothing listens on -- the #296 failure.
+pub fn build_channel_endpoint() -> Result<(Endpoint, CertificateDer<'static>), BoxError> {
+    let endpoint = build_channel_dialer()?;
+    install_crypto_provider();
+    let (cert, key) = self_signed()?;
+    endpoint.set_server_config(Some(quinn::ServerConfig::with_single_cert(vec![cert.clone()], key)?));
+    Ok((endpoint, cert))
+}
+
 /// Advertise the Agent's direct-path listener to the Edge (M11.4b-ii): send a
 /// `'D'` message — `token(32) | addr_len(1) | addr | cert_len(2 BE) | cert` — so
 /// Clients querying with `'P'` can discover and connect to it directly.

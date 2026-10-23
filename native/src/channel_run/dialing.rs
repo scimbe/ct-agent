@@ -17,16 +17,78 @@ use super::*;
 /// handshake's retransmits.
 pub const DIRECT_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// #104: build this member's in-band relay->direct upgrade candidate from its own
-/// edge-observed reflexive address (learned during THIS admission — the edge tells a
-/// member its own address as part of `ChannelJoinOutcome::Admitted`, over the same
-/// already-authenticated broker/relay connection, never a new open port). Binds a fresh
-/// ephemeral direct listener (`0.0.0.0:0`) purely for this upgrade attempt — a listener
-/// distinct from `CT_CHANNEL_LISTEN`'s, never advertised to the broker or to anyone but
-/// this one already-Noise-verified peer. `None` when the edge reported no reflexive
-/// address for this admission (e.g. the `:443` front-door leg doesn't observe one), the
-/// reflexive address isn't global-unicast, or the listener fails to bind — the session
-/// then simply stays on the relay, unaffected.
+/// #104/#296: what one relay-leg session needs for the in-band relay->direct upgrade: ONE
+/// endpoint ([`crate::transport::build_channel_endpoint`]) that is the direct listener AND the
+/// socket the offered address is learned through, plus where to ask (`CT_CHANNEL_REFLEXIVE_EDGE`,
+/// else the relay leg's host on the edge's `'W'` port, see [`reflexive_query_addr`]).
+///
+/// #296: before, the offer was this admission's edge-observed `r=` and the listener a second,
+/// fresh `0.0.0.0:0` socket. `r=` belongs to the admission dialer (closed by then, or a TCP
+/// source port when admission ran over `:443`), so the offered port never matched the
+/// listener -- not even for a host with a public address and no NAT.
+pub struct DirectUpgrade {
+    endpoint: Endpoint,
+    /// `CT_CHANNEL_REFLEXIVE_EDGE` as read when the session started (unset/empty = the relay
+    /// leg's host on port 4433, the same rule the relay-gate path uses).
+    reflexive_edge: Option<String>,
+}
+
+/// #296: bound on the `'W'` query right before the Offer. The relay session runs meanwhile;
+/// no answer only means there is nothing to offer.
+pub(crate) const UPGRADE_REFLEXIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+impl DirectUpgrade {
+    /// The direct listener: a cheap handle onto the shared socket.
+    pub(crate) fn listener(&self) -> Endpoint {
+        self.endpoint.clone()
+    }
+
+    /// #296: this endpoint's own reflexive address, asked THROUGH it at the edge's `'W'` echo
+    /// next to `relay` (the relay leg's remote address). Unfiltered, so a loopback test can see
+    /// it; [`Self::offer`] applies the global-unicast filter.
+    pub(crate) async fn own_reflexive(&self, relay: SocketAddr, timeout: std::time::Duration) -> Option<SocketAddr> {
+        let edge_w = match reflexive_query_addr(relay, self.reflexive_edge.as_deref()) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("ct-agent channel: #104 upgrade — CT_CHANNEL_REFLEXIVE_EDGE unusable ({e}) — nothing to offer, staying on relay (#296)");
+                return None;
+            }
+        };
+        let found = whoami_via(&self.endpoint, edge_w, timeout).await;
+        if found.is_none() {
+            eprintln!(
+                "ct-agent channel: #104 upgrade — no 'W' answer from {edge_w} within {timeout:?} — nothing to offer, staying on relay (#296)"
+            );
+        }
+        found
+    }
+
+    /// #296: the Offer: [`Self::own_reflexive`] as ONE `ip:port`, only when global-unicast
+    /// (#248). One address, never the former `reflexive\0local` pair: the pinned ct-common
+    /// responder (CADS-Tunnel#480) refuses an offer that does not parse as one global-unicast
+    /// address, so any appended LAN half made the WHOLE offer fail for every initiator whose
+    /// own egress address is private (that is, every NAT'd one).
+    pub(crate) async fn offer(&self, relay: SocketAddr) -> Option<String> {
+        let reflexive = self.own_reflexive(relay, UPGRADE_REFLEXIVE_TIMEOUT).await?;
+        if !ct_common::channel::is_global_unicast(reflexive) {
+            eprintln!(
+                "ct-agent channel: #104 upgrade — own reflexive address {reflexive} is not global-unicast (#248) — nothing to offer, staying on relay"
+            );
+            return None;
+        }
+        Some(reflexive.to_string())
+    }
+}
+
+/// #104: decide whether this member runs the in-band upgradable relay session at all, and if
+/// so bind its shared direct endpoint (#296, [`DirectUpgrade`]). The decision is unchanged:
+/// only a member the edge observed on a global-unicast address (this admission's `r=`) takes
+/// part. That keeps both members of a pair on the same framing when one of them is an older
+/// release -- the upgradable session's pump tags every frame, a plain session does not -- so
+/// `r=` stays the gate, but it is no longer what gets offered: the offer is learned through
+/// the endpoint itself right before it is sent ([`DirectUpgrade::offer`]). `None` when the
+/// edge reported no reflexive address, it is not global-unicast, or the endpoint fails to
+/// bind -- the session then simply stays on the relay, unaffected.
 ///
 /// Found live (#248, 2026-08-01): a member co-located with the edge on the same Docker
 /// host (e.g. a demo bridge container) has an edge-observed reflexive address on the
@@ -50,7 +112,10 @@ pub const DIRECT_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// skip the direct attempt — a strictly safe trade: that pairing was never a
 /// representative test of real cross-network direct-P2P reachability anyway, and it
 /// still relays correctly.
-pub(crate) async fn build_upgrade_candidate(observed_reflexive: Option<SocketAddr>) -> Option<(Endpoint, String)> {
+pub(crate) fn build_upgrade_candidate(
+    observed_reflexive: Option<SocketAddr>,
+    reflexive_edge: Option<String>,
+) -> Option<DirectUpgrade> {
     let addr = observed_reflexive?;
     if !ct_common::channel::is_global_unicast(addr) {
         eprintln!(
@@ -59,29 +124,16 @@ pub(crate) async fn build_upgrade_candidate(observed_reflexive: Option<SocketAdd
         );
         return None;
     }
-    let (listener, _cert) = crate::transport::build_direct_listener().ok()?;
-    // #276 piece 1: also offer a LAN-local candidate, when this host has one -- the same
-    // ephemeral port `listener` bound on 0.0.0.0 accepts on every interface, including the
-    // local one, so pairing the offered local IP with that port is a real, dialable target.
-    // Encoded as `reflexive\0local` (see `split_offered_candidates`) so `ct_common::upgrade`'s
-    // wire format and generic signatures stay completely untouched -- this is purely how
-    // ct-agent packs/unpacks the one `String` field `UpgradeMsg::Offer` already carries. The
-    // offering side announces its own real local address truthfully, same as it already does
-    // for its reflexive address; the RESPONDER is the one that must not trust it outright
-    // (`select_upgrade_candidate`'s `same_local_subnet` gate).
-    let endpoint = match (local_egress_ip(), listener.local_addr().ok()) {
-        (Some(local_ip), Some(bound)) if is_lan_candidate(local_ip) => {
-            format!("{addr}\0{}", SocketAddr::new(local_ip, bound.port()))
-        }
-        _ => addr.to_string(),
-    };
-    Some((listener, endpoint))
+    let (endpoint, _cert) = crate::transport::build_channel_endpoint().ok()?;
+    Some(DirectUpgrade { endpoint, reflexive_edge })
 }
 
 /// #276: whether `ip` is the kind of address worth offering as a LAN-local direct-upgrade
 /// candidate at all (private RFC1918 or IPv6 ULA) -- loopback/link-local/multicast/global
 /// addresses are never useful here (a global address already goes through the reflexive
 /// candidate; loopback/link-local/multicast can never be a peer's real LAN address).
+/// #296: no longer offered (see [`DirectUpgrade::offer`]); kept for the #276 selection tests.
+#[cfg(test)]
 pub(crate) fn is_lan_candidate(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_private(),
@@ -108,6 +160,9 @@ pub(crate) fn local_egress_ip() -> Option<std::net::IpAddr> {
 /// `reflexive\0local` encoding. An empty or malformed local segment degrades to "no local
 /// candidate" rather than a parse error -- the reflexive candidate alone is always a
 /// complete, valid offer on its own (unchanged pre-#276 behavior).
+/// #296: this release offers one address only, and the pinned ct-common responder refuses an
+/// offer carrying a `\0` half before this ever runs (CADS-Tunnel#480), so in practice only
+/// the plain, single-address form reaches here.
 pub(crate) fn split_offered_candidates(ep: &str) -> (&str, Option<&str>) {
     match ep.split_once('\0') {
         Some((reflexive, local)) if !local.is_empty() => (reflexive, Some(local)),
