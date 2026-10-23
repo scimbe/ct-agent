@@ -6685,6 +6685,111 @@ async fn accept_race_direct_wins_and_closes_the_parked_relay_leg_22() {
     let _ = b.await;
 }
 
+#[test]
+fn relay_pair_bound_parses_the_env_with_floor_and_ceiling_22() {
+    // CT_CHANNEL_RELAY_PAIR_SECS: unset, empty, 0 and garbage keep the 45 s default; a value is
+    // clamped to 35-300 s (never below the edge's 30 s base relay lease, never unbounded again).
+    let s = Duration::from_secs;
+    assert_eq!(RELAY_PAIR_BOUND_DEFAULT, s(45));
+    for keep in [None, Some(""), Some("0"), Some("abc")] {
+        assert_eq!(relay_pair_bound_from_env(keep), s(45), "{keep:?} keeps the default");
+    }
+    assert_eq!(relay_pair_bound_from_env(Some("10")), s(35), "clamped up to the floor");
+    assert_eq!(relay_pair_bound_from_env(Some("900")), s(300), "clamped down to the ceiling");
+    assert_eq!(relay_pair_bound_from_env(Some("60")), s(60), "in range: taken as is");
+    assert_eq!(relay_pair_bound_from_env(Some(" 60 ")), s(60), "trimmed");
+}
+
+#[tokio::test]
+async fn relay_leg_gives_up_and_closes_when_the_partner_never_arrives_22() {
+    // A `:443` relay leg used to wait for its partner without any bound of its own (ct-common's
+    // relay join has none), i.e. as long as the edge kept the park -- with a raised keepalive
+    // park TTL up to 10 min per stale pairing, holding a serve slot all along. It now gives up at
+    // its bound, as a typed transient error, and closes the leg EXPLICITLY: the mock edge must
+    // read a clean close_notify EOF (`Ok(0)`), which its park pump takes as the park's death at
+    // once (#22), not a reset and not a bare drop. The leg is admitted by the PRODUCTION `:443`
+    // admission gate and then never acked -- a rendezvous partner that never presented its leg.
+    use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+    use ct_edge::channel_broker::admit_channel_join_on_duplex;
+    use ct_edge::transport::build_tcp_tls_listener_at;
+    use ed25519_dalek::Signer;
+
+    let op = SigningKey::from_bytes(&[9u8; 32]);
+    let op_pub = op.verifying_key().to_bytes();
+    let holder = SigningKey::from_bytes(&[0x2Eu8; 32]);
+    let channel = [0x2Eu8; 32];
+    let g = ChannelGrant {
+        channel: ChannelId(channel),
+        holder: holder.verifying_key().to_bytes(),
+        direction: Direction::Accept,
+        rights: Rights::ReadWrite,
+        delegable: false,
+        expires_at: 1_000,
+    };
+    let grant = SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() };
+    let request = ChannelJoinRequest { grant, endpoint: "203.0.113.2:7002".to_string() };
+
+    // Mock `:443` relay edge: admit the leg with the production gate, park it (no ack, no
+    // partner, ever), then report its next read.
+    let (fd_listener, acceptor, edge_cert) =
+        build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap()).await.expect("tls-tcp listener");
+    let fd_addr = fd_listener.local_addr().expect("front-door addr");
+    let edge = tokio::spawn(async move {
+        let (tcp, peer) = fd_listener.accept().await.expect("the relay leg connects");
+        let tls = acceptor.accept(tcp).await.expect("tls accept");
+        let (mut stream, ..) = admit_channel_join_on_duplex(
+            tls,
+            peer,
+            500u64, // now < expires_at (1_000)
+            Duration::from_secs(5),
+            &move |c: ChannelId, _h: [u8; 32]| {
+                let ok = c.0 == channel;
+                async move { ok.then_some((op_pub, None, None)) }
+            },
+        )
+        .await
+        .expect("admit the relay leg over :443");
+        let mut buf = [0u8; 64];
+        stream.read(&mut buf).await
+    });
+
+    let rungs = vec![ChannelDialRung { endpoint: fd_addr, kind: ChannelDialKind::FrontDoor }];
+    let pair_bound = Duration::from_millis(300);
+    let mut never_abandoned = std::future::pending::<()>();
+    let started = std::time::Instant::now();
+    let parked = tokio::time::timeout(
+        Duration::from_secs(1),
+        park_relay_leg_via_ladder(
+            &rungs,
+            edge_cert,
+            Duration::from_millis(400),
+            &request,
+            &holder,
+            &mut never_abandoned,
+            pair_bound,
+        ),
+    )
+    .await
+    .expect("the leg gives up at its own bound, not at the edge's park TTL");
+    let took = started.elapsed();
+    let err = match parked {
+        Ok(_) => panic!("no partner ever arrived, yet the relay leg was not given up"),
+        Err(e) => e,
+    };
+    assert!(err.downcast_ref::<RelayPairTimeout>().is_some(), "typed, so callers can tell it apart: {err}");
+    assert!(
+        !is_definitive_admission_refusal(&err) && !is_park_expired(&err),
+        "transient: neither the refusal backoff nor the re-park path: {err}"
+    );
+    assert!(took >= pair_bound, "waited for the bound before giving up: {took:?}");
+
+    let read = tokio::time::timeout(Duration::from_secs(2), edge)
+        .await
+        .expect("the edge sees the leg end at once")
+        .expect("edge task");
+    assert!(matches!(read, Ok(0)), "a clean close_notify EOF (explicit shutdown), not a reset: {read:?}");
+}
+
 #[tokio::test]
 async fn accept_race_relay_wins_far_below_the_accept_window_when_no_direct_dial_arrives_22() {
     // ct-agent#22 (b) (frozen): the payoff. The acceptor advertises a listener nobody can

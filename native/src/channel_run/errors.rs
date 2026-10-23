@@ -313,6 +313,28 @@ pub(crate) fn is_park_expired(e: &BoxError) -> bool {
     crate::channel::error_names_park_expiry(e.as_ref())
 }
 
+/// #22: a `:443` relay leg that found no partner within its own bound
+/// (`CT_CHANNEL_RELAY_PAIR_SECS`) and was closed by this member. The relay join has no wait
+/// bound in ct-common, so before this the leg -- and the serve slot behind it -- waited as long
+/// as the edge kept the park. Deliberately neither an [`AdmissionRefused`] nor a [`ParkExpired`]:
+/// it is transient, so the refusal backoff and the re-park path stay untouched.
+#[derive(Debug)]
+pub(crate) struct RelayPairTimeout(pub(crate) std::time::Duration);
+
+impl std::fmt::Display for RelayPairTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "relay leg found no partner within {}s -- closed it (CT_CHANNEL_RELAY_PAIR_SECS)", self.0.as_secs())
+    }
+}
+
+impl std::error::Error for RelayPairTimeout {}
+
+impl RelayPairTimeout {
+    pub(crate) fn boxed(bound: std::time::Duration) -> BoxError {
+        Box::new(RelayPairTimeout(bound))
+    }
+}
+
 /// #231: how long to wait before the next admission attempt. A definitive refusal (see
 /// [`is_definitive_admission_refusal`]) will never resolve itself without operator action — a
 /// holder that isn't a channel member stays that way until someone adds it — so retrying at the
