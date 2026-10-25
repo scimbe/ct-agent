@@ -7632,6 +7632,154 @@ mod tests {
         origin.abort();
     }
 
+    /// #329: the agent dials ONE edge address for both transports -- its pool
+    /// workers over TLS-TCP, its QUIC reprobe over UDP. The dual edge with its
+    /// QUIC endpoint and its TLS-TCP listener on the same loopback port, so the
+    /// probe is answered by the edge the workers are parked at.
+    async fn dual_edge_on_one_port(
+        ca: &ct_edge::pki::Ca,
+    ) -> (Endpoint, TcpListener, tokio_rustls::TlsAcceptor, CertificateDer<'static>) {
+        use std::net::Ipv4Addr;
+        for _ in 0..20 {
+            let (quic, _, acceptor, ca_root) = ct_edge::pki::build_dual_edge_from_ca(
+                ca,
+                (Ipv4Addr::LOCALHOST, 0).into(),
+                (Ipv4Addr::LOCALHOST, 0).into(),
+                vec!["localhost".to_string()],
+            )
+            .await
+            .unwrap();
+            // The OS picked a free UDP port; that number is almost always free for TCP too.
+            if let Ok(tcp_listener) = TcpListener::bind(quic.local_addr().unwrap()).await {
+                return (quic, tcp_listener, acceptor, ca_root);
+            }
+        }
+        panic!("no loopback port was free for both UDP and TCP");
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_pool_hands_over_to_an_answered_reprobe_make_before_break_329() {
+        // #329 moves the QUIC reprobe out of the pool loop's arm; the hand-over it
+        // ends in must stay as CADS-Tunnel#799 built it. With two confirmations the
+        // first answered probe is closed again without a registration; the second
+        // registers over its connection while every TCP slot is still parked
+        // (make-before-break); only then are the parked slots closed, and that very
+        // connection is what the pool hands to its caller.
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        const POOL: usize = 2;
+        let ca = ct_edge::pki::Ca::new("handover-329-ca").unwrap();
+        let (quic, tcp_listener, acceptor, ca_root) = dual_edge_on_one_port(&ca).await;
+        let edge_addr = tcp_listener.local_addr().unwrap();
+
+        // TLS-TCP side: park every registration and count the slots still parked.
+        let parked = Arc::new(AtomicUsize::new(0));
+        let parked_e = Arc::clone(&parked);
+        let tcp_edge = tokio::spawn(async move {
+            loop {
+                let (tcp, _) = tcp_listener.accept().await.unwrap();
+                let Ok(mut tls) = acceptor.accept(tcp).await else { continue };
+                let mut hdr = [0u8; 33];
+                if tls.read_exact(&mut hdr).await.is_err()
+                    || tls.write_all(b"OK").await.is_err()
+                    || tls.flush().await.is_err()
+                {
+                    continue;
+                }
+                parked_e.fetch_add(1, SeqCst);
+                let parked_w = Arc::clone(&parked_e);
+                tokio::spawn(async move {
+                    // A parked agent writes nothing unless pinged: this read ends
+                    // only when the agent closes the slot.
+                    let _ = tls.read(&mut [0u8; 1]).await;
+                    parked_w.fetch_sub(1, SeqCst);
+                });
+            }
+        });
+
+        // QUIC side: the close reason of every probe the agent closed again, then
+        // the registration -- acked only after a pause, with the slots still parked
+        // counted at its end.
+        let parked_q = Arc::clone(&parked);
+        let endpoint = quic.clone();
+        let quic_edge = tokio::spawn(async move {
+            let reason = |e: quinn::ConnectionError| match e {
+                quinn::ConnectionError::ApplicationClosed(close) => String::from_utf8_lossy(&close.reason).into_owned(),
+                other => other.to_string(),
+            };
+            let mut closed_probes = Vec::new();
+            while let Some(incoming) = endpoint.accept().await {
+                let conn = match incoming.await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        closed_probes.push(reason(e));
+                        continue;
+                    }
+                };
+                let (mut send, mut recv) = match conn.accept_bi().await {
+                    Ok(streams) => streams,
+                    Err(e) => {
+                        closed_probes.push(reason(e));
+                        continue;
+                    }
+                };
+                let hdr = recv.read_to_end(33).await.unwrap();
+                assert_eq!(hdr[0], b'A', "a QUIC tunnel registration");
+                // The agent must hold its parked slots until this ack; one it closed
+                // before registering has long shown by the end of the pause.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let parked_while_pending = parked_q.load(SeqCst);
+                send.write_all(b"OK").await.unwrap();
+                send.finish().unwrap();
+                return (conn, parked_while_pending, closed_probes);
+            }
+            panic!("the QUIC endpoint closed before the agent registered");
+        });
+
+        let mut cfg = AgentConfig::parse(&edge_addr.to_string(), "127.0.0.1:9").unwrap();
+        cfg.tcp_fallback_pool_size = POOL;
+        let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+        let ctx = FallbackCtx::for_test(&cfg, ca_root, RoutingToken([0x2bu8; 32]), Arc::new(vec![[0u8; 32]]), Arc::new(gate));
+        // The registering probe is the second one, two intervals in: the pool has
+        // long parked both slots by then.
+        let reprobe = ReprobePolicy { interval: Duration::from_millis(500), confirmations: 2 };
+        let budget = FallbackBudget { base: Duration::from_secs(10), max: Duration::from_secs(20), attempts: 5 };
+        let exit = tokio::time::timeout(Duration::from_secs(20), run_tcp_fallback_pool(&ctx, budget, Some(reprobe)))
+            .await
+            .expect("two answered probes hand the pool over to QUIC");
+        let FallbackExit::QuicRecovered(conn) = exit else {
+            panic!("expected the hand-over to QUIC, got {exit:?}");
+        };
+        let (edge_conn, parked_while_pending, closed_probes) = quic_edge.await.unwrap();
+        assert_eq!(
+            closed_probes,
+            ["quic probe answered - confirming before leaving the tcp fallback"],
+            "the first answer only counts toward the confirmations: closed again, nothing registered over it"
+        );
+        assert_eq!(
+            parked_while_pending, POOL,
+            "make-before-break: every TCP slot stays parked while the QUIC registration is pending"
+        );
+        // Only the hand-over lets the parked slots go.
+        for _ in 0..300 {
+            if parked.load(SeqCst) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(parked.load(SeqCst), 0, "the parked TCP slots are closed once QUIC carries the tunnel");
+        // And the connection handed over is the one the edge registered.
+        conn.close(0u32.into(), b"handed over");
+        match tokio::time::timeout(Duration::from_secs(5), edge_conn.closed())
+            .await
+            .expect("the edge sees the agent close the registered connection")
+        {
+            quinn::ConnectionError::ApplicationClosed(close) => assert_eq!(&close.reason[..], b"handed over"),
+            other => panic!("expected the agent's close on the registered connection, got {other:?}"),
+        }
+        tcp_edge.abort();
+    }
+
     #[tokio::test]
     async fn run_agent_registers_and_serves_relayed_streams() {
         use ct_common::noise::{client_handshake_for, frame, generate_static_keypair};
