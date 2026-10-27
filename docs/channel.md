@@ -303,6 +303,7 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_CHANNEL_SERVE` / `CT_CHANNEL_SERVE_CONCURRENCY` | accept-side persistent serve, session cap (default 8) |
 | `CT_CHANNEL_DIRECT_UPGRADE=1` | opt-in in-band relay→direct upgrade (#104) |
 | `CT_CHANNEL_REQUIRE_PEER_GRANT` / `CT_CHANNEL_OPERATOR_PUBKEY` | **Opt-in end-to-end check of the peer's grant** (default off). Admission attests the peer's Noise key with the peer's holder key, but all of that comes from the broker; nothing binds the holder to an operator-signed grant, so a compromised broker could present an identity it minted itself. With `CT_CHANNEL_REQUIRE_PEER_GRANT=1` both members send their own grant as the first bytes inside the Noise session, and each checks the other's before any application byte flows: the signature against `CT_CHANNEL_OPERATOR_PUBKEY` (64 hex, required when on), expiry, same channel, holder = the attested peer holder, and the complementary direction. **Switch it on for every member of a channel together**: a member that sends the grant to one that does not expect it breaks that session. On but without an operator key, the join fails. **A TCP forward runs this check on both sides whatever the switch says** (`CT_CHANNEL_FORWARD` set, or `CT_CHANNEL_FORWARD_ALLOW` non-empty), the sessions of a persistent serve accept member included; setting it on a forward member changes nothing and does not fix a forward that is refused with "did not present its grant" ([#314], see [Failure semantics](#failure-semantics-and-timers-what-an-error-actually-means)). |
+| `CT_CHANNEL_PEER_PIN` | **Opt-in binding of this endpoint to its partner** (default unset = every member of the channel may be paired with it, ADR-0020). `link`, or `holder:<64 hex>[,noise:<64 hex>]`, several entries separated by `;`. Checked against the admitted peer; a peer it does not name is refused before the Noise handshake (the transport leg its session would have used is taken and closed). A malformed value stops the start. Brokered joins only. See [Binding an endpoint to its partner](#binding-an-endpoint-to-its-partner-ct_channel_peer_pin) |
 | `CT_AGENT_SERVICE_HANDLER_CMD` / `CT_AGENT_SERVICES` | the handler command + offered service slugs on the serve side |
 | `CT_SERVICE_TYPE` | not read by `ct-agent` itself — set **in the handler child's own environment** by `CT_AGENT_SERVICE_HANDLER_CMD` (#149-A.1) so one handler script can branch on which of several registered `service/<slug>` calls was actually invoked |
 | `CT_CHANNEL_REFLEXIVE_EDGE` | `host:port` of the edge's QUIC "whoami" listener (its `'W'` reflexive-address echo, #248/#238). Defaults to the relay-gate host on port `4433`; override only when the edge's QUIC listener is somewhere else. |
@@ -320,6 +321,109 @@ ack-reader fix. Markers are on by default, and only an explicit off spelling (`o
 disables them, so a typo cannot silently drop the marker (it is reported at start). **Do not set it in production:** an unmarked member
 cannot pair phase-deterministically and hits an N×10 s retry staircase on a large share of
 pairings (field-measured 2026-08-14, p=0.013).
+
+## Binding an endpoint to its partner (`CT_CHANNEL_PEER_PIN`)
+
+Opt-in, default off. A channel is a hub of pairwise sessions (ADR-0020): the edge pairs a parked
+member with the oldest parked *other* member of the same channel, whoever that is. What each member
+checks is membership. The peer's Noise key is attested by its holder for this channel (#101), the
+Noise_IK handshake binds the session to that key, and the peer-grant check (opt-in, always on for a
+forward) binds the holder to an operator-signed grant with the complementary direction. Inside one
+session no other source gets a message in. Across sessions nothing binds an endpoint to **one** peer:
+
+- any other member holding a grant for the channel is served by a persistent acceptor, next to the
+  intended partner; on a forward channel it reaches the forward targets;
+- a second accept-side member can receive an initiator's sessions, its forwarded connections included;
+- a holder can come back with any Noise key it ever attested ([CADS-Tunnel#574]).
+
+`CT_CHANNEL_PEER_PIN` binds the endpoint to the partner you name. Each side pins on its own; nothing
+changes on the wire, and the peer needs no upgrade.
+
+| Value | Accepts | Notes |
+|---|---|---|
+| unset or empty | every member (hub semantics, unchanged) | the default |
+| `link` | only the other end of this member's **link** channel: `channel_id_for_link(operator, own holder, peer holder)` must be the channel of this member's grant | needs `CT_CHANNEL_OPERATOR_PUBKEY` (64 hex, the local value, never one from the edge), and it must be the key that signed this member's grant (checked at start). Nothing to copy, and the peer may rotate its Noise key. Fits only a channel id derived as a link (`ct-agent channel member-material`), and only under the operator key it was derived with; on any other channel it refuses every peer. After an operator-key rotation ([CADS-Tunnel#747]) the channel id keeps the old derivation while the grants are re-signed with the new key, so `link` refuses every peer there: pin the holder instead |
+| `holder:<64 hex>` | that holder, with any Noise key it attests | the peer's holder **public** key (`CT_CHANNEL_HOLDER_PUBKEY` from its `ct-agent channel init`); survives a Noise-key rotation |
+| `holder:<64 hex>,noise:<64 hex>` | that holder with exactly that Noise key | also refuses a rotated or rolled-back key ([CADS-Tunnel#574]); a re-key needs a new pin (below) |
+| several entries separated by `;` | any listed entry | e.g. both keys during a planned re-key |
+
+A value that does not parse stops the process at start; it never means "off". That covers a value
+that is not 64 hex, an unknown field, a `holder:` key that is no ed25519 public key (this catches
+about half of all single mistyped digits), and `link` without `CT_CHANNEL_OPERATOR_PUBKEY`. A
+mistyped digit that still gives a valid key is not caught at start; it locks the partner out at the
+first session, so compare the start line with the partner's key (both are printed in full). `link`
+under an operator key that did not sign this member's grant stops the start too, since it would
+refuse every peer, the partner included. The direct-address mode (`CT_CHANNEL_ADDR`, no broker)
+refuses the variable: that mode pins the peer by `CT_CHANNEL_PEER_NOISE_KEY` already.
+
+**What is compared.** Once per session, right after the peer's attestation is verified: on the
+one-shot join, the serve loop, the forward initiator, the persistent call and both DCUtR joins. The
+key it compares is the key the session would run with. The initiator's Noise_IK pins exactly the
+attested key, and the acceptor refuses any other live static key, on the direct, relay, upgraded and
+hole-punched legs alike; the peer-grant check refuses a grant for another holder. So the pin refuses
+the same peers a check after the handshake would.
+
+**A refusal still takes its transport leg.** The refused member does not know it was refused: it
+dials this endpoint, or parks its relay leg, as for any session. The edge pairs relay legs on their
+own: a relay leg is spliced with the oldest waiting relay leg of another holder of the channel, not
+with the member the rendezvous paired. If the refusing side opened no leg, the refused member's leg
+would wait at the edge (up to its park TTL) and be spliced with this endpoint's *next* relay leg,
+which belongs to the partner's session. That session would then fail its handshake. So a refused
+pairing takes exactly the leg its session would have taken (the direct dial or accept, otherwise the
+relay leg) and closes it at once, before the Noise handshake. The refused member's leg is used up, and
+it gets no handshake message and no byte inside a session; on a direct leg it sees the QUIC close
+reason `peer not pinned (#292)`. The leg is chosen as for a session, with two simplifications: the
+accept window comes before the relay leg (no accept-vs-relay race), and no direct-upgrade candidate
+is built. On the DCUtR joins the admission itself is the relay leg; it is closed right
+after the refusal, before the relay stream is opened and before the relay gate is dialed. A persistent
+acceptor builds no local side (handler process, forward engine) for a pairing the pin refuses.
+
+**What a refusal looks like.** The session ends with
+`peer not pinned: holder <64 hex> is not pinned -- session refused before the Noise handshake` (with a
+`noise:` pin, `... is pinned with Noise key <64 hex>, but admission attested <64 hex> ...`), and one
+`channel_session` event with `state=refused`, that reason and `peer_holder` (the full key),
+rate-limited like every other event a peer can trigger. It is **not** a grant end
+([#267](https://github.com/scimbe/ct-agent/issues/267)). The persistent serve loop admits the next
+peer; the refusal neither feeds nor resets its flap backoff ([#250]), and the loop prints no extra
+error line for it. The initiator-side loops treat a refusal like any failed session: a forward
+initiator reconnects after its usual backoff (1 s, doubling up to 30 s), and a persistent
+`--call-service` after its flap backoff (up to 10 s).
+
+What the pin cannot do:
+
+- It cannot stop the edge from pairing that member with this endpoint again. Pairing is first come,
+  first served, so the partner may wait for one more pairing, and a refused pairing holds a serve slot
+  until its leg is taken: at most the accept window plus the edge's relay park window.
+- It cannot stop the edge from splicing two relay legs of this endpoint that wait at the same time
+  with each other's partners. That happens with or without a pin, and both sessions then fail their
+  handshake. The relay's ack names the member it spliced; checking that against the admission would
+  make such a splice visible at once, but no version does that yet.
+
+At start the agent prints which identity is pinned. A forward (`CT_CHANNEL_FORWARD` or
+`CT_CHANNEL_FORWARD_ALLOW`) without a pin prints a `WARNING` instead.
+
+**Rolling it out.** First check who else holds a grant on the channel (its member list and the
+grants issued for it). Every refused pairing still costs the refusing endpoint one leg and the partner
+possibly one more pairing. Revoke or remove any member that shows up in refusal events and is not
+meant to be there; the pin protects the partner, but it does not make the extra member go away. Then
+set the pin on one side, check its start line and its `channel_session` events, and set it on the
+other side. A wrong pin locks the real partner out. The refusal names the holder it saw in full, so
+compare that with the pin.
+
+**Re-keying under a `noise:` pin.** Add the new key as a second entry
+(`holder:<H>,noise:<old>;holder:<H>,noise:<new>`), let the peer switch keys, then drop the old entry.
+Every step is a configuration change (on Kubernetes: the Secret plus a pod restart), so it leaves an
+audit trail; the agent never re-pins by itself.
+
+**Limitation: a pin names an identity, not a process.** Two processes that run with the same holder
+key (and the same Noise key) pass the same pin, and the edge pairs them like any two parks of that
+identity. Neither the pin nor the attestation, the Noise handshake or the peer grant can tell them
+apart. The operational rule: **one process per identity on a channel**. Where several processes must
+share one identity (replicas), the identity is the unit the pin protects, and every process holding it
+has to front the same targets.
+
+[CADS-Tunnel#574]: https://github.com/scimbe/CADS-Tunnel/issues/574
+[CADS-Tunnel#747]: https://github.com/scimbe/CADS-Tunnel/issues/747
 
 ## TCP forward over a paired channel ([#255](https://github.com/scimbe/ct-agent/issues/255)) — opt-in, default **off**
 
@@ -415,6 +519,12 @@ stays exact under a flood.
 Any name other than `localhost` counts as non-loopback even if it happens to resolve to `127.0.0.1`:
 the gate refuses to resolve a name in order to judge it, because the name may resolve differently a
 moment later, between the check and the dial.
+
+The allowlist decides *where* a forward may go, not *who* may open one: without a pin every member of
+the channel holding a valid grant can be paired with this endpoint. Set `CT_CHANNEL_PEER_PIN` on both
+sides to bind a forward to one partner ([Binding an endpoint to its
+partner](#binding-an-endpoint-to-its-partner-ct_channel_peer_pin)); a forward without a pin warns at
+start.
 
 ### Flow control on a forward session -- control messages and the session window
 

@@ -4635,6 +4635,7 @@ async fn run_channel_join_with_admission_runs_the_direct_session_from_a_443_ladd
             a_local_run,
             false,
             false, // ct-agent#22 (b): accept_race off (serial)
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -5420,6 +5421,7 @@ async fn quic_lazy_relay_dials_only_on_fallback_and_forms_the_tunnel() {
             a_local_run,
             false,
             false, // ct-agent#22 (b): accept_race off (serial)
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -6054,6 +6056,7 @@ async fn two_relay_only_members_join_without_a_dialable_address_and_relay_splice
             a_local,
             false,
             false, // ct-agent#22 (b): accept_race off (serial)
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -6085,6 +6088,7 @@ async fn two_relay_only_members_join_without_a_dialable_address_and_relay_splice
             b_local,
             false,
             false, // ct-agent#22 (b): accept_race off (serial)
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -6198,6 +6202,7 @@ async fn direct_upgrade_opt_in_still_completes_over_the_relay_when_the_candidate
             a_local,
             true, // #104 direct_upgrade opt-in
             false, // ct-agent#22 (b): accept_race off (serial)
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -6228,6 +6233,7 @@ async fn direct_upgrade_opt_in_still_completes_over_the_relay_when_the_candidate
             b_local,
             true, // #104 direct_upgrade opt-in
             false, // ct-agent#22 (b): accept_race off (serial)
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -6750,6 +6756,7 @@ async fn accept_race_direct_wins_and_closes_the_parked_relay_leg_22() {
             b_local,
             false,
             true, // ct-agent#22 (b): accept-vs-relay race ON
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -6869,6 +6876,7 @@ async fn accept_race_relay_wins_far_below_the_accept_window_when_no_direct_dial_
             b_local,
             false,
             true, // ct-agent#22 (b): accept-vs-relay race ON
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -6977,6 +6985,7 @@ async fn accept_race_off_does_not_dial_the_relay_before_the_accept_window_expire
             b_local,
             false,
             false, // ct-agent#22 (b): race OFF -- the default, today's serial order
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -11291,4 +11300,839 @@ async fn channel_forward_new_connection_is_answered_while_uploads_fill_a_slow_re
         .await
         .expect("a new connection waited more than 15 s behind sixteen uploads");
     eprintln!("new connection behind sixteen uploads over a 62 500 B/s relay: {took:?}");
+}
+
+// --- #292: CT_CHANNEL_PEER_PIN, binding an endpoint to its partner --------------------------------
+//
+// A channel is a hub (ADR-0020): admission pairs a member with any other member holding a grant,
+// and nothing compared that peer with an expected partner. These drive the real join paths with an
+// admission that names the partner, another member, or the partner under another Noise key, and
+// check what the pin lets through -- and that a refusal takes the leg its session would have taken
+// and closes it before the Noise handshake, is no grant end (#267) and no flap (#250).
+
+/// The operator signing key of the pin tests; its public key also derives the link channel.
+fn pin_operator() -> SigningKey {
+    SigningKey::from_bytes(&[0x0Au8; 32])
+}
+
+/// One member of a pin test channel: its holder key, its Noise keypair (copied out:
+/// `StaticKeypair` is not `Clone`) and its holder-signed attestation for that channel.
+struct PinMember {
+    holder: SigningKey,
+    noise_private: [u8; 32],
+    noise_public: [u8; 32],
+    attestation: [u8; 64],
+}
+
+impl PinMember {
+    fn new(channel: [u8; 32], seed: u8) -> Self {
+        Self::with_noise(channel, seed, generate_static_keypair())
+    }
+
+    /// The member with holder seed `seed` under the given Noise key -- the same holder with a
+    /// rotated (or rolled-back) key when `seed` is reused.
+    fn with_noise(channel: [u8; 32], seed: u8, noise: ct_common::noise::StaticKeypair) -> Self {
+        use ed25519_dalek::Signer as _;
+        let holder = SigningKey::from_bytes(&[seed; 32]);
+        let holder_pub = holder.verifying_key().to_bytes();
+        let attestation = holder
+            .sign(&ct_common::channel::member_noise_attest_bytes(
+                &ct_common::channel::ChannelId(channel),
+                &holder_pub,
+                &noise.public,
+            ))
+            .to_bytes();
+        Self { holder, noise_private: noise.private, noise_public: noise.public, attestation }
+    }
+
+    fn holder_pub(&self) -> [u8; 32] {
+        self.holder.verifying_key().to_bytes()
+    }
+
+    /// What the edge hands the OTHER member when it pairs it with this one.
+    fn admitted_as_peer(&self, endpoint: &str) -> ChannelJoinOutcome {
+        ChannelJoinOutcome::Admitted {
+            peer_endpoint: endpoint.to_string(),
+            peer_noise_pubkey: Some(self.noise_public),
+            peer_holder: Some(self.holder_pub()),
+            peer_attestation: Some(self.attestation),
+            observed_reflexive: None,
+        }
+    }
+
+    /// This member's operator-signed grant on `channel` for `role`.
+    fn grant(&self, channel: [u8; 32], role: ChannelRole) -> ct_common::channel::SignedChannelGrant {
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ed25519_dalek::Signer as _;
+        let g = ChannelGrant {
+            channel: ChannelId(channel),
+            holder: self.holder_pub(),
+            direction: match role {
+                ChannelRole::Initiate => Direction::Initiate,
+                ChannelRole::Accept => Direction::Accept,
+            },
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: crate::codec::now_unix() + 3600,
+        };
+        SignedChannelGrant { signature: pin_operator().sign(&g.signing_bytes()).to_bytes(), grant: g }
+    }
+
+    fn request(&self, channel: [u8; 32], role: ChannelRole) -> ChannelJoinRequest {
+        ChannelJoinRequest {
+            grant: self.grant(channel, role),
+            endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+        }
+    }
+}
+
+/// The members of one link-derived pin test channel: `me`, my `partner` (the other end of the
+/// link), `other` (a third member holding a grant) and `rotated` (the partner's holder under
+/// another Noise key).
+struct PinChannel {
+    channel: [u8; 32],
+    me: PinMember,
+    partner: PinMember,
+    other: PinMember,
+    rotated: PinMember,
+}
+
+fn pin_channel() -> PinChannel {
+    let (me_seed, partner_seed) = (0x31u8, 0x32u8);
+    let channel = ct_common::channel::channel_id_for_link(
+        &pin_operator().verifying_key().to_bytes(),
+        &SigningKey::from_bytes(&[me_seed; 32]).verifying_key().to_bytes(),
+        &SigningKey::from_bytes(&[partner_seed; 32]).verifying_key().to_bytes(),
+    )
+    .0;
+    PinChannel {
+        channel,
+        me: PinMember::new(channel, me_seed),
+        partner: PinMember::new(channel, partner_seed),
+        other: PinMember::new(channel, 0x33),
+        rotated: PinMember::new(channel, partner_seed),
+    }
+}
+
+fn pin_on(member: &PinMember, noise: Option<[u8; 32]>) -> PeerPin {
+    PeerPin::Peers(vec![PinnedPeer { holder: member.holder_pub(), noise }])
+}
+
+fn pin_link() -> PeerPin {
+    PeerPin::Link { operator: pin_operator().verifying_key().to_bytes() }
+}
+
+/// A UDP address nothing listens on: a relay leg that must never be needed.
+fn pin_dead_addr() -> SocketAddr {
+    let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    s.local_addr().unwrap()
+}
+
+/// A relay address that refuses every QUIC connection at once: a relay leg that is tried fails
+/// fast (a dead address would hold it for the dialer's whole idle timeout).
+fn pin_refusing_relay() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let (ep, _) = build_server_endpoint_with_cert().expect("refusing relay");
+    let addr = ep.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        while let Some(incoming) = ep.accept().await {
+            incoming.refuse();
+        }
+    });
+    (addr, task)
+}
+
+/// One leg as the endpoint it was opened to saw it (a peer's direct listener, or the relay):
+/// whether the member connected, whether it opened a stream (a Noise handshake message needs one;
+/// on the relay, so does the join presentation), and whether it closed the connection with the
+/// pin's close reason.
+#[derive(Debug, Default, Clone, Copy)]
+struct LegSeen {
+    connected: bool,
+    stream: bool,
+    pin_close: bool,
+}
+
+/// Accept one connection on `server` within `timeout` and watch it for two seconds (see
+/// [`LegSeen`]); dropping `server` at the end closes whatever is still open.
+async fn watch_one_leg(server: Endpoint, timeout: Duration) -> LegSeen {
+    let incoming = match tokio::time::timeout(timeout, server.accept()).await {
+        Ok(Some(incoming)) => incoming,
+        _ => return LegSeen::default(),
+    };
+    let Ok(conn) = incoming.await else {
+        return LegSeen::default();
+    };
+    let stream = matches!(tokio::time::timeout(Duration::from_secs(2), conn.accept_bi()).await, Ok(Ok(_)));
+    let pin_close = match tokio::time::timeout(Duration::from_secs(2), conn.closed()).await {
+        Ok(quinn::ConnectionError::ApplicationClosed(close)) => close.reason.as_ref() == b"peer not pinned (#292)",
+        _ => false,
+    };
+    LegSeen { connected: true, stream, pin_close }
+}
+
+/// What one admitted session did: its result, what the peer's advertised address and the relay
+/// saw of it, and the grant end it recorded (#267).
+struct PinJoinWatch {
+    result: Result<(), BoxError>,
+    peer: LegSeen,
+    relay: LegSeen,
+    grant_end: Option<String>,
+}
+
+/// Runs `c.me` through `run_channel_join_with_admission` in `role`, admitted with `peer`, against
+/// two live endpoints that watch what reaches them: the peer's advertised address (an initiator
+/// dials it) and the relay (an acceptor without a listener goes there).
+async fn join_and_watch(c: &PinChannel, role: ChannelRole, peer: &PinMember, pin: Option<&PeerPin>) -> PinJoinWatch {
+    let (peer_ep, _) = build_server_endpoint_with_cert().expect("peer endpoint");
+    let (relay_ep, _) = build_server_endpoint_with_cert().expect("relay endpoint");
+    let peer_addr = peer_ep.local_addr().unwrap();
+    let relay_addr = relay_ep.local_addr().unwrap();
+    let seen_peer = tokio::spawn(watch_one_leg(peer_ep, Duration::from_millis(1500)));
+    let seen_relay = tokio::spawn(watch_one_leg(relay_ep, Duration::from_millis(1500)));
+    let record = super::peer_grant::GrantEndRecord::default();
+    let (_app, local) = tokio::io::duplex(1024);
+    let request = c.me.request(c.channel, role);
+    let joined = tokio::time::timeout(
+        Duration::from_secs(20),
+        super::peer_grant::with_grant_end_record(
+            record.clone(),
+            run_channel_join_with_admission(
+                peer.admitted_as_peer(&peer_addr.to_string()),
+                RelayFallback::QuicLazy(relay_addr),
+                &request,
+                &c.me.holder,
+                role,
+                &c.me.noise_private,
+                None, // no listener: an acceptor goes straight to the relay leg
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                local,
+                false,
+                false,
+                pin,
+            ),
+        ),
+    )
+    .await;
+    PinJoinWatch {
+        result: joined.unwrap_or_else(|_| Err("the join did not end within 20 s".into())),
+        peer: seen_peer.await.unwrap(),
+        relay: seen_relay.await.unwrap(),
+        grant_end: record.ended(),
+    }
+}
+
+#[tokio::test]
+async fn an_unpinned_peer_is_refused_and_its_leg_closed_before_the_handshake_in_both_roles_292() {
+    let c = pin_channel();
+    let cases = [
+        ("another member of the channel", pin_on(&c.partner, None), &c.other),
+        ("the partner under another Noise key", pin_on(&c.partner, Some(c.partner.noise_public)), &c.rotated),
+        ("a member that is not the other end of the link", pin_link(), &c.other),
+    ];
+    for role in [ChannelRole::Initiate, ChannelRole::Accept] {
+        // Control: unpinned, the same admission takes its leg -- an initiator dials the peer and
+        // sends its Noise handshake message on a stream, a listener-less acceptor goes to the relay.
+        let control = join_and_watch(&c, role, &c.other, None).await;
+        match role {
+            ChannelRole::Initiate => {
+                assert!(control.peer.connected && control.peer.stream, "control: the initiator dials and handshakes");
+                assert!(!control.peer.pin_close, "control: no pin, no pin close");
+            }
+            ChannelRole::Accept => assert!(control.relay.connected, "control: the acceptor opens a relay leg"),
+        }
+        for (what, pin, peer) in &cases {
+            let seen = join_and_watch(&c, role, peer, Some(pin)).await;
+            let Err(err) = seen.result else { panic!("{what} ({role:?}): not refused") };
+            assert!(super::peer_pin::is_peer_not_pinned(&err), "{what} ({role:?}): {err}");
+            assert!(
+                !is_definitive_admission_refusal(&err) && !is_park_expired(&err),
+                "{what} ({role:?}): not an edge refusal or a park expiry, so no refusal backoff: {err}"
+            );
+            assert_eq!(seen.grant_end, None, "{what} ({role:?}): a pin refusal is not a grant end (#267)");
+            // The refusal takes the leg the session would have taken, so the refused member's own
+            // leg is not left for this endpoint's next session -- but nothing of the session on it.
+            match role {
+                ChannelRole::Initiate => {
+                    assert!(seen.peer.connected, "{what}: the refusal dials the admitted address like a session");
+                    assert!(!seen.peer.stream, "{what}: no stream, so no Noise handshake message");
+                    assert!(seen.peer.pin_close, "{what}: closed at once with the pin's close reason");
+                    assert!(!seen.relay.connected, "{what}: the direct leg was the leg; no relay leg");
+                }
+                ChannelRole::Accept => {
+                    assert!(seen.relay.connected, "{what}: the refusal takes its relay leg like a session");
+                    assert!(!seen.peer.connected, "{what}: an acceptor dials nobody");
+                }
+            }
+        }
+    }
+}
+
+/// A member's relay leg driven by hand, without a Noise session: present the join to the relay
+/// and, once the edge has spliced the leg, send a few bytes when initiating (the edge forwards an
+/// initiator's stream once it carries data), then count what arrives from the other end until
+/// the leg ends.
+async fn raw_relay_leg(
+    relay_addr: SocketAddr,
+    request: ChannelJoinRequest,
+    holder: SigningKey,
+    role: ChannelRole,
+) -> Result<usize, BoxError> {
+    let conn = crate::transport::build_channel_dialer()?.connect(relay_addr, "localhost")?.await?;
+    match present_channel_join_marked(&conn, &request, &holder, PHASE_MARKER_RELAY).await? {
+        ChannelJoinOutcome::Admitted { .. } => {}
+        other => return Err(format!("the relay did not admit the raw leg: {other:?}").into()),
+    }
+    let Ok((mut send, mut recv)) = open_relay_channel_streams(&conn, role).await else {
+        return Ok(0);
+    };
+    if role == ChannelRole::Initiate {
+        let _ = send.write_all(b"not a noise message").await;
+    }
+    let mut got = Vec::new();
+    let _ = AsyncReadExt::read_to_end(&mut recv, &mut got).await;
+    Ok(got.len())
+}
+
+#[tokio::test]
+async fn a_refused_pairing_uses_up_its_relay_leg_so_the_partner_is_spliced_next_292() {
+    // Review finding on the first version, which refused before any I/O: the edge pairs relay
+    // legs on their own (the next arrivals here, the oldest waiting leg of another holder in the
+    // field), not by the rendezvous pairing. The refused member does not know it was refused and
+    // parks its relay leg as for any session; with no leg of this endpoint to meet, that leg
+    // waited -- and the edge spliced it with this endpoint's NEXT leg, the partner's session.
+    // Driven over the production relay completer (`broker_channel_relay`), in both roles.
+    use ct_edge::channel_broker::broker_channel_relay;
+    let c = pin_channel();
+    let pin = pin_on(&c.partner, None);
+    let op_pub = pin_operator().verifying_key().to_bytes();
+    for role in [ChannelRole::Initiate, ChannelRole::Accept] {
+        let peer_role = match role {
+            ChannelRole::Initiate => ChannelRole::Accept,
+            ChannelRole::Accept => ChannelRole::Initiate,
+        };
+        let channel = c.channel;
+        let (relay_ep, _) = build_server_endpoint_with_cert().expect("relay");
+        let relay_addr = relay_ep.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            loop {
+                let _ = broker_channel_relay(&relay_ep, 500, move |ch, _h| async move {
+                    (ch.0 == channel).then_some((op_pub, None, None))
+                })
+                .await;
+            }
+        });
+
+        // 1. The other member parks its relay leg first, as it does after any rendezvous pairing
+        //    with a relay-only member.
+        let other_leg = tokio::spawn(raw_relay_leg(
+            relay_addr,
+            c.other.request(c.channel, peer_role),
+            c.other.holder.clone(),
+            peer_role,
+        ));
+        // 2. This endpoint, paired with that member by the rendezvous, is pinned to the partner.
+        let (_app, local) = tokio::io::duplex(1024);
+        let request = c.me.request(c.channel, role);
+        let refused = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_channel_join_with_admission(
+                c.other.admitted_as_peer(ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY),
+                RelayFallback::QuicLazy(relay_addr),
+                &request,
+                &c.me.holder,
+                role,
+                &c.me.noise_private,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                local,
+                false,
+                false,
+                Some(&pin),
+            ),
+        )
+        .await
+        .expect("the refusal ends");
+        let Err(err) = refused else { panic!("{role:?}: the other member was not refused") };
+        assert!(super::peer_pin::is_peer_not_pinned(&err), "{role:?}: {err}");
+        let got = tokio::time::timeout(Duration::from_secs(15), other_leg)
+            .await
+            .unwrap_or_else(|_| panic!("{role:?}: the other member's relay leg was left waiting at the relay"))
+            .unwrap()
+            .expect("the other member's leg was admitted");
+        assert_eq!(got, 0, "{role:?}: not one byte -- no Noise handshake message -- from the refusing endpoint");
+
+        // 3. The partner's session: its leg and this endpoint's next one are spliced together.
+        let payload = b"the partner, spliced next".to_vec();
+        let (mut my_app, my_local) = tokio::io::duplex(8192);
+        let (mut partner_app, partner_local) = tokio::io::duplex(8192);
+        let (me_holder, me_priv, me_admitted) = (
+            c.me.holder.clone(),
+            c.me.noise_private,
+            c.me.admitted_as_peer(ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY),
+        );
+        let (partner_holder, partner_priv, partner_admitted) = (
+            c.partner.holder.clone(),
+            c.partner.noise_private,
+            c.partner.admitted_as_peer(ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY),
+        );
+        let (my_request, partner_request) = (c.me.request(c.channel, role), c.partner.request(c.channel, peer_role));
+        let pin_mine = pin.clone();
+        let mine = tokio::spawn(async move {
+            run_channel_join_with_admission(
+                partner_admitted,
+                RelayFallback::QuicLazy(relay_addr),
+                &my_request,
+                &me_holder,
+                role,
+                &me_priv,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                my_local,
+                false,
+                false,
+                Some(&pin_mine),
+            )
+            .await
+        });
+        let theirs = tokio::spawn(async move {
+            run_channel_join_with_admission(
+                me_admitted,
+                RelayFallback::QuicLazy(relay_addr),
+                &partner_request,
+                &partner_holder,
+                peer_role,
+                &partner_priv,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                partner_local,
+                false,
+                false,
+                None,
+            )
+            .await
+        });
+        partner_app.write_all(&payload).await.expect("the partner writes");
+        let mut got = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(15), my_app.read_exact(&mut got))
+            .await
+            .unwrap_or_else(|_| panic!("{role:?}: the partner's session carried nothing"))
+            .expect("read");
+        assert_eq!(got, payload, "{role:?}: the partner's bytes arrive over its spliced session");
+        mine.abort();
+        theirs.abort();
+        relay.abort();
+    }
+}
+
+/// Runs `me` through `run_channel_join_with_admission` in `role`, paired (by the admission) with
+/// `peer`, which runs a real direct Noise session on the other side; whether a payload crossed it.
+async fn pinned_session_carries_data(me: &PinMember, peer: &PinMember, channel: [u8; 32], role: ChannelRole, pin: Option<PeerPin>) -> bool {
+    let payload = b"only the pinned partner".to_vec();
+    let request = me.request(channel, role);
+    let (holder, my_priv, my_pub) = (me.holder.clone(), me.noise_private, me.noise_public);
+    let peer_priv = peer.noise_private;
+    let (mut my_app, my_local) = tokio::io::duplex(8192);
+    let (mut peer_app, peer_local) = tokio::io::duplex(8192);
+    let relay = pin_dead_addr();
+    let (mine, theirs) = match role {
+        ChannelRole::Initiate => {
+            // The peer accepts on a direct listener; this member dials the admitted address.
+            let (listener, _cert) =
+                crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("listener");
+            let admission = peer.admitted_as_peer(&listener.local_addr().unwrap().to_string());
+            let theirs = tokio::spawn(async move {
+                let conn = listener.accept().await.expect("incoming").await.expect("conn");
+                run_channel_session(&conn, ChannelRole::Accept, &peer_priv, &my_pub, peer_local).await.map_err(BoxError::from)
+            });
+            let mine = tokio::spawn(async move {
+                run_channel_join_with_admission(
+                    admission,
+                    RelayFallback::QuicLazy(relay),
+                    &request,
+                    &holder,
+                    ChannelRole::Initiate,
+                    &my_priv,
+                    None,
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                    my_local,
+                    false,
+                    false,
+                    pin.as_ref(),
+                )
+                .await
+            });
+            (mine, theirs)
+        }
+        ChannelRole::Accept => {
+            // This member accepts on its direct listener; the peer dials it.
+            let (listener, _cert) =
+                crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("listener");
+            let my_addr = listener.local_addr().unwrap();
+            let admission = peer.admitted_as_peer("203.0.113.7:7000");
+            let mine = tokio::spawn(async move {
+                run_channel_join_with_admission(
+                    admission,
+                    RelayFallback::QuicLazy(relay),
+                    &request,
+                    &holder,
+                    ChannelRole::Accept,
+                    &my_priv,
+                    Some(listener),
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                    my_local,
+                    false,
+                    false,
+                    pin.as_ref(),
+                )
+                .await
+            });
+            let theirs = tokio::spawn(async move {
+                let conn = dial_peer_direct(my_addr, Duration::from_secs(5))
+                    .await
+                    .map_err(|e| BoxError::from(format!("{e:?}")))?;
+                run_channel_session(&conn, ChannelRole::Initiate, &peer_priv, &my_pub, peer_local)
+                    .await
+                    .map_err(BoxError::from)
+            });
+            (mine, theirs)
+        }
+    };
+    // The peer writes, this member reads: a refused session never delivers it.
+    let _ = peer_app.write_all(&payload).await;
+    let mut got = vec![0u8; payload.len()];
+    let carried = matches!(
+        tokio::time::timeout(Duration::from_secs(10), my_app.read_exact(&mut got)).await,
+        Ok(Ok(_))
+    ) && got == payload;
+    mine.abort();
+    theirs.abort();
+    carried
+}
+
+#[tokio::test]
+async fn the_pinned_partner_gets_its_session_and_without_a_pin_any_member_still_does_292() {
+    let c = pin_channel();
+    for role in [ChannelRole::Initiate, ChannelRole::Accept] {
+        assert!(
+            pinned_session_carries_data(&c.me, &c.other, c.channel, role, None).await,
+            "{role:?}: unset is the hub semantics, unchanged -- any member holding a grant gets a session"
+        );
+        for pin in [pin_on(&c.partner, None), pin_on(&c.partner, Some(c.partner.noise_public)), pin_link()] {
+            assert!(
+                pinned_session_carries_data(&c.me, &c.partner, c.channel, role, Some(pin.clone())).await,
+                "{role:?}: the partner named by {pin:?} gets its session"
+            );
+        }
+        assert!(
+            pinned_session_carries_data(&c.me, &c.rotated, c.channel, role, Some(pin_on(&c.partner, None))).await,
+            "{role:?}: a holder-only pin lets the partner rotate its Noise key"
+        );
+        assert!(
+            !pinned_session_carries_data(&c.me, &c.other, c.channel, role, Some(pin_on(&c.partner, None))).await,
+            "{role:?}: another member of the channel gets nothing"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pin_refusal_neither_feeds_nor_resets_the_serve_loops_flap_streak_292() {
+    // Two sessions die at once (a #250 streak of 2), then the edge pairs a member the pin does
+    // not name, three times in a row. Each backoff before the next admit stays the streak-of-2
+    // one: 50 ms * 2^2 = 200 ms, jittered into [100 ms, 200 ms] (plus up to 1 ms of timer
+    // rounding). Fed by the refusals the streak would reach 5 and the last backoff 800-1600 ms;
+    // reset by them, there would be none.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let c = pin_channel();
+    let pin = pin_on(&c.partner, None);
+    let (channel, me, other, other_noise) =
+        (ct_common::channel::ChannelId(c.channel), c.me.holder_pub(), c.other.holder_pub(), c.other.noise_public);
+    let admitted_at = std::sync::Arc::new(std::sync::Mutex::new(Vec::<tokio::time::Instant>::new()));
+    let log = admitted_at.clone();
+    let admit = move || {
+        log.lock().unwrap().push(tokio::time::Instant::now());
+        async { Ok::<(), BoxError>(()) }
+    };
+    let served = std::sync::Arc::new(AtomicUsize::new(0));
+    let serve = move |_: ()| {
+        let n = served.fetch_add(1, Ordering::SeqCst);
+        let refused = (2..=4).contains(&n).then(|| pin.check(&channel, &me, &other, &other_noise));
+        async move {
+            match (n, refused) {
+                (0 | 1, _) => Err::<(), BoxError>("session died near-instantly".into()),
+                (_, Some(Err(refused))) => Err(Box::new(refused) as BoxError),
+                (_, Some(Ok(()))) => Err("the other member passed the pin".into()),
+                _ => {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    Ok(())
+                }
+            }
+        }
+    };
+    let driver = tokio::spawn(serve_loop_concurrent(1, Duration::from_millis(50), admit, serve));
+    for _ in 0..1000 {
+        if admitted_at.lock().unwrap().len() >= 6 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let at = admitted_at.lock().unwrap().clone();
+    assert!(at.len() >= 6, "the loop admitted again after each pin refusal: {} admits", at.len());
+    for i in 3..=5 {
+        let gap = at[i] - at[i - 1];
+        assert!(
+            gap >= Duration::from_millis(100) && gap <= Duration::from_millis(201),
+            "after pin refusal {}: the flap streak stayed at 2, backoff {gap:?}",
+            i - 2
+        );
+    }
+    driver.abort();
+}
+
+/// A brokered member's config for the pin wiring tests: `role`, relay-only, the given broker and
+/// relay, plus `extra` (e.g. `CT_CHANNEL_PEER_PIN`).
+fn pin_cfg(
+    me: &PinMember,
+    channel: [u8; 32],
+    role: ChannelRole,
+    broker: SocketAddr,
+    relay: SocketAddr,
+    extra: &[(&str, String)],
+) -> Result<ChannelJoinCliConfig, String> {
+    let mut m: HashMap<String, String> = HashMap::new();
+    for (k, v) in [
+        ("CT_CHANNEL_ROLE", if role == ChannelRole::Initiate { "initiate" } else { "accept" }.to_string()),
+        ("CT_CHANNEL_BROKER", broker.to_string()),
+        ("CT_CHANNEL_RELAY", relay.to_string()),
+        ("CT_CHANNEL_RELAY_ONLY", "1".to_string()),
+        ("CT_CHANNEL_GRANT", hex_encode(&me.grant(channel, role).encode())),
+        ("CT_CHANNEL_HOLDER_KEY", hex_encode(&me.holder.to_bytes())),
+        ("CT_CHANNEL_NOISE_KEY", hex_encode(&me.noise_private)),
+    ] {
+        m.insert(k.to_string(), v);
+    }
+    for (k, v) in extra {
+        m.insert(k.to_string(), v.clone());
+    }
+    ChannelJoinCliConfig::from_lookup(move |k| m.get(k).cloned())
+}
+
+#[test]
+fn the_pin_is_parsed_at_start_and_refused_where_it_cannot_apply_292() {
+    let c = pin_channel();
+    let edge: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let with = |pin: String| pin_cfg(&c.me, c.channel, ChannelRole::Accept, edge, edge, &[(PEER_PIN_ENV, pin)]);
+    let cfg = with(format!("holder:{}", hex_encode(&c.partner.holder_pub()))).expect("a valid pin parses");
+    assert_eq!(cfg.peer_pin, Some(pin_on(&c.partner, None)));
+    assert_eq!(with(" ".to_string()).expect("blank parses").peer_pin, None, "blank is unset");
+    let err = with("holder:nothex".to_string()).err().expect("a malformed pin stops the start");
+    assert!(err.contains(PEER_PIN_ENV), "{err}");
+    let err = with("link".to_string()).err().expect("link needs the operator key");
+    assert!(err.contains("CT_CHANNEL_OPERATOR_PUBKEY"), "{err}");
+    let op = hex_encode(&pin_operator().verifying_key().to_bytes());
+    let cfg = pin_cfg(&c.me, c.channel, ChannelRole::Accept, edge, edge, &[
+        (PEER_PIN_ENV, "link".to_string()),
+        ("CT_CHANNEL_OPERATOR_PUBKEY", op),
+    ])
+    .expect("link with the operator key parses");
+    assert_eq!(cfg.peer_pin, Some(pin_link()));
+    let not_the_operator = hex_encode(&SigningKey::from_bytes(&[0x0Bu8; 32]).verifying_key().to_bytes());
+    let err = pin_cfg(&c.me, c.channel, ChannelRole::Accept, edge, edge, &[
+        (PEER_PIN_ENV, "link".to_string()),
+        ("CT_CHANNEL_OPERATOR_PUBKEY", not_the_operator),
+    ])
+    .err()
+    .expect("link under a key that did not sign this grant stops the start");
+    assert!(err.contains("not signed by"), "{err}");
+
+    // The direct-address mode has no admission to pin: set there, the pin is refused, not ignored.
+    let direct = |pin: &str| {
+        cfg_from(&[
+            ("CT_CHANNEL_ROLE", "accept"),
+            ("CT_CHANNEL_ADDR", "127.0.0.1:7000"),
+            ("CT_CHANNEL_NOISE_KEY", K64),
+            ("CT_CHANNEL_PEER_NOISE_KEY", K64),
+            (PEER_PIN_ENV, pin),
+        ])
+    };
+    let err = direct("link").expect_err("a pin in the direct-address mode");
+    assert!(err.contains(PEER_PIN_ENV) && err.contains("CT_CHANNEL_PEER_NOISE_KEY"), "{err}");
+    assert!(direct("").is_ok(), "empty is unset there too");
+}
+
+#[tokio::test]
+async fn the_configured_pin_reaches_the_serve_and_the_one_shot_join_paths_292() {
+    let c = pin_channel();
+    let pin = [(PEER_PIN_ENV, format!("holder:{}", hex_encode(&c.partner.holder_pub())))];
+
+    // Persistent serve: config -> ServeSessionCtx -> serve_admitted_session. Relay-only, so the
+    // refused session takes its relay leg (here a relay that drops it) before it returns.
+    let (relay_ep, _) = build_server_endpoint_with_cert().expect("relay");
+    let relay_addr = relay_ep.local_addr().unwrap();
+    let dialed_relay = tokio::spawn(accept_one_and_hold(relay_ep, Duration::from_secs(2), Duration::ZERO));
+    let cfg = pin_cfg(&c.me, c.channel, ChannelRole::Accept, pin_dead_addr(), relay_addr, &pin)
+        .expect("serve config");
+    let ctx = std::sync::Arc::new(ServeSessionCtx::from_cfg(&cfg, c.me.request(c.channel, ChannelRole::Accept), None));
+    let Err(err) =
+        serve_admitted_session(ctx, c.other.admitted_as_peer(ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY)).await
+    else {
+        panic!("the serve session with an unpinned member was not refused")
+    };
+    assert!(super::peer_pin::is_peer_not_pinned(&err), "{err}");
+    assert!(dialed_relay.await.unwrap(), "the refused serve session took its relay leg");
+
+    // One-shot initiate (the forward initiator and the persistent call run this too): config ->
+    // run_one_admission_session_with_local, admitted by a stub broker that pairs the other member.
+    let (broker_ep, _) = build_server_endpoint_with_cert().expect("broker");
+    let broker_addr = broker_ep.local_addr().unwrap();
+    let (peer_ep, _) = build_server_endpoint_with_cert().expect("peer endpoint");
+    let peer_addr = peer_ep.local_addr().unwrap();
+    let seen_peer = tokio::spawn(watch_one_leg(peer_ep, Duration::from_secs(5)));
+    let (noise, holder, att) = (c.other.noise_public, c.other.holder_pub(), c.other.attestation);
+    let broker = tokio::spawn(async move { stub_broker_admit(&broker_ep, peer_addr, noise, holder, att).await });
+    let cfg = pin_cfg(&c.me, c.channel, ChannelRole::Initiate, broker_addr, pin_dead_addr(), &pin)
+        .expect("initiate config");
+    let request = ChannelJoinRequest {
+        grant: cfg.grant.clone(),
+        endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+    };
+    let (_app, local) = tokio::io::duplex(1024);
+    let joined = tokio::time::timeout(
+        Duration::from_secs(20),
+        run_one_admission_session_with_local(&cfg, &request, &cfg.broker_ladder(), &cfg.relay_ladder(), &None, local),
+    )
+    .await
+    .expect("the one-shot join ends");
+    let Err(err) = joined else { panic!("the one-shot join with an unpinned member was not refused") };
+    assert!(super::peer_pin::is_peer_not_pinned(&err), "{err}");
+    let seen = seen_peer.await.unwrap();
+    assert!(
+        seen.connected && !seen.stream && seen.pin_close,
+        "the refusal dialed the admitted address, sent no handshake message and closed the leg: {seen:?}"
+    );
+    broker.abort();
+}
+
+#[tokio::test]
+async fn both_dcutr_joins_check_the_pin_before_the_relay_stream_and_the_gate_dial_292() {
+    use ct_edge::transport::build_client_endpoint;
+    let c = pin_channel();
+    let pin = pin_on(&c.partner, None);
+    let request = c.me.request(c.channel, ChannelRole::Accept);
+    let circuit: libp2p::Multiaddr = "/ip4/127.0.0.1/udp/9/quic-v1".parse().unwrap();
+    // A gate address that keeps a TCP connection in its backlog: the relay-gate join must never
+    // dial it.
+    let gate = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gate_addr = gate.local_addr().unwrap();
+    for gated in [false, true] {
+        // The relay admission pairs the other member (the edge relays its attested identity).
+        let (relay_ep, cert) = build_server_endpoint_with_cert().expect("relay");
+        let relay_addr = relay_ep.local_addr().unwrap();
+        let (noise, holder, att) = (c.other.noise_public, c.other.holder_pub(), c.other.attestation);
+        let relay = tokio::spawn(async move { stub_broker_admit(&relay_ep, relay_addr, noise, holder, att).await });
+        let client = build_client_endpoint(cert.clone()).expect("client");
+        let relay_conn = client.connect(relay_addr, "localhost").expect("cfg").await.expect("relay conn");
+        let (_app, local) = tokio::io::duplex(1024);
+        let joined = tokio::time::timeout(Duration::from_secs(10), async {
+            if gated {
+                join_via_relay_gate_dcutr(
+                    &relay_conn,
+                    &request,
+                    &c.me.holder,
+                    ChannelRole::Accept,
+                    &c.me.noise_private,
+                    local,
+                    gate_addr,
+                    cert,
+                    &request.grant,
+                    Some(&pin),
+                )
+                .await
+            } else {
+                join_via_relay_dcutr(
+                    &relay_conn,
+                    &request,
+                    &c.me.holder,
+                    ChannelRole::Accept,
+                    &c.me.noise_private,
+                    local,
+                    circuit.clone(),
+                    Some(&pin),
+                )
+                .await
+            }
+        })
+        .await
+        .expect("the join ends at the pin, not at a stream or dial timeout");
+        let Err(err) = joined else { panic!("gated={gated}: the unpinned member was not refused") };
+        assert!(super::peer_pin::is_peer_not_pinned(&err), "gated={gated}: {err}");
+        relay.abort();
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), gate.accept()).await.is_err(),
+        "the relay-gate leg was never dialed"
+    );
+}
+
+#[tokio::test]
+async fn a_forward_initiator_reconnects_after_a_pin_refusal_292() {
+    // The forward initiator's loop ends only on a grant end or a revoked grant; a pin refusal is
+    // neither, so it asks again (with backoff) until the edge pairs the partner.
+    let c = pin_channel();
+    let (listener, _bound) =
+        bind_forward_listener("127.0.0.1:0".parse().unwrap()).expect("the loopback listener binds");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    let request = c.me.request(c.channel, ChannelRole::Initiate);
+    let (holder, my_priv) = (c.me.holder.clone(), c.me.noise_private);
+    let (noise, peer_holder, att) = (c.other.noise_public, c.other.holder_pub(), c.other.attestation);
+    let pin = pin_on(&c.partner, None);
+    // The refusal takes the relay leg its session would have taken; this relay refuses it at once.
+    let (relay, _refusing) = pin_refusing_relay();
+    let looping = tokio::spawn(run_forward_initiate_reconnect_loop(
+        listener,
+        "127.0.0.1:9".to_string(),
+        forward_stream::DEFAULT_MAX_STREAMS,
+        Duration::from_secs(forward_stream::DEFAULT_IDLE_SECS),
+        crate::codec::now_unix() + 3600,
+        move |local: LocalDuplex| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (request, holder, pin) = (request.clone(), holder.clone(), pin.clone());
+            let admission = ChannelJoinOutcome::Admitted {
+                peer_endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+                peer_noise_pubkey: Some(noise),
+                peer_holder: Some(peer_holder),
+                peer_attestation: Some(att),
+                observed_reflexive: None,
+            };
+            async move {
+                run_channel_join_with_admission(
+                    admission,
+                    RelayFallback::QuicLazy(relay),
+                    &request,
+                    &holder,
+                    ChannelRole::Initiate,
+                    &my_priv,
+                    None,
+                    Duration::from_secs(2),
+                    Duration::from_secs(2),
+                    local,
+                    false,
+                    false,
+                    Some(&pin),
+                )
+                .await
+            }
+        },
+        is_revoked_grant_refusal,
+    ));
+    tokio::time::sleep(FORWARD_RECONNECT_MIN * 3).await;
+    assert!(!looping.is_finished(), "a pin refusal does not end the forward");
+    assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2, "it admitted again after the refusal");
+    looping.abort();
 }
