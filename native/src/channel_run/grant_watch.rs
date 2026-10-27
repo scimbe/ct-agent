@@ -31,6 +31,8 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::oneshot;
 
+use super::peer_grant::GrantEnd;
+
 /// Seconds between two re-checks (default 30, floor 5).
 pub const RECHECK_SECS_ENV: &str = "CT_CHANNEL_GRANT_RECHECK_SECS";
 /// Seconds without a `valid` answer after which the session ends (default 90).
@@ -52,10 +54,6 @@ pub struct WatchConfig {
 }
 
 impl WatchConfig {
-    pub fn from_env() -> Result<Self, String> {
-        Self::from_lookup(|k| std::env::var(k).ok())
-    }
-
     /// A malformed value is an error (the operator asked for something we cannot honour);
     /// an interval below the floor is raised to it, a grace shorter than one interval is
     /// raised to one interval (it could not otherwise ever see a second attempt).
@@ -109,6 +107,9 @@ pub enum GrantState {
     Valid,
     Revoked,
     NotMember,
+    /// ct-agent#308: the control plane no longer counts THIS member (the asker) as a member --
+    /// an end of this member's own standing, not the peer's.
+    AskerNotMember,
 }
 
 /// Why no state could be read.
@@ -239,7 +240,7 @@ pub fn classify_answer(code: u16, body: &str) -> Result<GrantState, StatusError>
         // The control plane no longer counts this member as one: nothing about the peer can be
         // asked, and nothing this member does on the channel is authorized. Only when the control
         // plane said so itself; a bare 403 is unreadable (see above).
-        403 if state.as_deref() == Some("asker-not-member") => Ok(GrantState::NotMember),
+        403 if state.as_deref() == Some("asker-not-member") => Ok(GrantState::AskerNotMember),
         200..=299 => match state.as_deref() {
             Some("valid") => Ok(GrantState::Valid),
             Some("revoked") => Ok(GrantState::Revoked),
@@ -257,8 +258,9 @@ impl GrantStatusSource for CpStatusSource {
 }
 
 /// Run the watch until the grant ends or the session does. `end` is the session's way of
-/// hearing about it; when its receiver is dropped (the session is over) the loop stops.
-pub async fn watch_peer_grant(setup: WatchSetup, mut end: oneshot::Sender<String>) {
+/// hearing about it -- and whose standing ended (ct-agent#308); when its receiver is dropped (the
+/// session is over) the loop stops.
+pub async fn watch_peer_grant(setup: WatchSetup, mut end: oneshot::Sender<GrantEnd>) {
     let mut last_valid = tokio::time::Instant::now();
     let mut warned = false;
     let mut first = true;
@@ -285,8 +287,11 @@ pub async fn watch_peer_grant(setup: WatchSetup, mut end: oneshot::Sender<String
                 last_valid = tokio::time::Instant::now();
                 continue;
             }
-            Ok(GrantState::Revoked) => "the peer's grant was revoked".to_string(),
-            Ok(GrantState::NotMember) => "the peer is no longer a member of the channel".to_string(),
+            Ok(GrantState::Revoked) => GrantEnd::peer("the peer's grant was revoked"),
+            Ok(GrantState::NotMember) => GrantEnd::peer("the peer is no longer a member of the channel"),
+            Ok(GrantState::AskerNotMember) => GrantEnd::own(
+                "this member is no longer a member of the channel (the control plane answered asker-not-member)",
+            ),
             Err(StatusError::Unsupported) => {
                 // The control plane answered, so it is reachable: nothing to fail closed on.
                 last_valid = tokio::time::Instant::now();
@@ -310,10 +315,10 @@ pub async fn watch_peer_grant(setup: WatchSetup, mut end: oneshot::Sender<String
                     );
                     continue;
                 }
-                format!(
+                GrantEnd::peer(format!(
                     "the peer's grant could not be re-checked for {}s ({why}); failing closed",
                     silent.as_secs()
-                )
+                ))
             }
         };
         let _ = end.send(reason);
@@ -388,6 +393,11 @@ mod tests {
     }
 
     async fn run(src: Arc<Script>) -> (Option<String>, Duration) {
+        let (end, after) = run_to_end(src).await;
+        (end.map(|e| e.reason), after)
+    }
+
+    async fn run_to_end(src: Arc<Script>) -> (Option<GrantEnd>, Duration) {
         let (tx, rx) = oneshot::channel();
         let started = tokio::time::Instant::now();
         let h = tokio::spawn(watch_peer_grant(setup(src), tx));
@@ -412,6 +422,22 @@ mod tests {
     async fn removal_from_the_channel_ends_the_session() {
         let (why, _) = run(Script::new(vec![Ok(GrantState::NotMember)])).await;
         assert!(why.unwrap().contains("no longer a member"));
+    }
+
+    /// ct-agent#308: the re-check ends a session for the peer's grant -- except when the control
+    /// plane says the ASKER, this member, is no longer a member: that end is this member's own,
+    /// and the `channel_session state=grant_ended` event says `whose=own`.
+    #[tokio::test(start_paused = true)]
+    async fn an_asker_not_member_answer_is_this_members_own_end_308() {
+        use crate::channel_run::peer_grant::GrantEndScope;
+        let (end, _) = run_to_end(Script::new(vec![Ok(GrantState::AskerNotMember)])).await;
+        let end = end.expect("the session ends");
+        assert_eq!(end.scope, GrantEndScope::Own, "{end:?}");
+        assert!(end.reason.contains("this member is no longer a member"), "{}", end.reason);
+        for peer_side in [GrantState::Revoked, GrantState::NotMember] {
+            let (end, _) = run_to_end(Script::new(vec![Ok(peer_side)])).await;
+            assert_eq!(end.expect("ends").scope, GrantEndScope::Peer, "{peer_side:?}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -449,7 +475,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let started = tokio::time::Instant::now();
         tokio::spawn(watch_peer_grant(s, tx));
-        let why = rx.await.unwrap();
+        let why = rx.await.unwrap().reason;
         assert!(why.contains("revoked"), "an upgraded control plane takes effect on a running session: {why}");
         assert_eq!(started.elapsed(), Duration::from_secs(90), "three unsupported checks did not end it");
         let got = notices.lock().unwrap();
@@ -476,7 +502,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let started = tokio::time::Instant::now();
         tokio::spawn(watch_peer_grant(s, tx));
-        let why = rx.await.unwrap();
+        let why = rx.await.unwrap().reason;
         assert!(why.contains("failing closed") && why.contains("grant-status"), "{why}");
         assert_eq!(started.elapsed(), Duration::from_secs(90), "one grace after the watch started");
     }
@@ -555,7 +581,7 @@ mod tests {
         );
         assert_eq!(
             classify_answer(403, r#"{"state":"asker-not-member"}"#),
-            Ok(NotMember),
+            Ok(AskerNotMember),
             "the control plane itself says the asker is no longer a member"
         );
         assert_eq!(classify_answer(200, r#"{"state":"valid","checked_at":1}"#), Ok(Valid));
@@ -571,7 +597,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_watch_stops_when_the_session_is_gone() {
-        let (tx, rx) = oneshot::channel::<String>();
+        let (tx, rx) = oneshot::channel::<GrantEnd>();
         let h = tokio::spawn(watch_peer_grant(setup(Script::new(vec![])), tx));
         drop(rx);
         tokio::time::timeout(Duration::from_secs(1), h).await.expect("watch must stop").unwrap();

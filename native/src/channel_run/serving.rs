@@ -43,6 +43,8 @@ pub(crate) struct ServeSessionCtx {
     pub(crate) direct_upgrade: bool,
     /// ct-agent#22 (b), mirrors [`ChannelJoinCliConfig::accept_race`] (`CT_CHANNEL_ACCEPT_RACE`).
     pub(crate) accept_race: bool,
+    /// #292, mirrors [`ChannelJoinCliConfig::peer_pin`] (`CT_CHANNEL_PEER_PIN`).
+    pub(crate) peer_pin: Option<PeerPin>,
 }
 
 impl ServeSessionCtx {
@@ -81,6 +83,7 @@ impl ServeSessionCtx {
             listener,
             direct_upgrade: cfg.direct_upgrade,
             accept_race: cfg.accept_race,
+            peer_pin: cfg.peer_pin.clone(),
         }
     }
 
@@ -133,7 +136,10 @@ pub(crate) async fn admit_one_peer(ctx: &ServeSessionCtx) -> Result<ChannelJoinO
                 .connect(ctx.broker_addr, "localhost")?
                 .await?;
             // CADS-Tunnel#495 U2 (a'): broker_conn is admission-only -- PHASE_MARKER_RENDEZVOUS.
-            present_channel_join_marked(&broker_conn, &ctx.request, &ctx.holder, PHASE_MARKER_RENDEZVOUS).await?
+            // Parked from here on, for `/readyz` (health.rs) -- the ladder counts its legs alike.
+            super::health::health()
+                .parked(present_channel_join_marked(&broker_conn, &ctx.request, &ctx.holder, PHASE_MARKER_RENDEZVOUS))
+                .await?
         }
     };
     reject_refused_outcome(outcome)
@@ -154,13 +160,21 @@ pub(crate) fn reject_refused_outcome(outcome: ChannelJoinOutcome) -> Result<Chan
             ))
         }
         // #21: a park expiry becomes the DISTINCT typed error so [`serve_loop_concurrent`]
-        // routes it through its immediate-re-park path (no refusal backoff, no ladder advance)
-        // instead of spawning it as a session or backing off as if refused.
+        // routes it through its re-park path (a short jittered pause, no refusal backoff, no
+        // ladder advance) instead of spawning it as a session or backing off as if refused.
         ChannelJoinOutcome::ParkExpired => Err(ParkExpired::boxed(
             "channel park expired with no partner within the edge park window (#21) -- re-parking",
         )),
         admitted => Ok(admitted),
     }
+}
+
+/// #21: the serve loop's park-expiry line -- the error's text unchanged as its prefix (the #21
+/// measurement greps for it) plus how long the park was held, from the start of the admission to
+/// the `EX`. That is about the lease the edge gave the park, now readable from client logs: 30 s
+/// base, longer for a persistent acceptor on an edge with adaptive park leases.
+pub(crate) fn park_expired_line(e: &BoxError, held: std::time::Duration) -> String {
+    format!("{e} (held {:.1}s)", held.as_secs_f64())
 }
 
 /// #200: run one already-admitted peer's session to completion — the SPAWNED part of the serve loop.
@@ -193,7 +207,14 @@ pub(crate) async fn serve_admitted_session(
         ChannelJoinOutcome::Admitted { peer_noise_pubkey, .. } => *peer_noise_pubkey,
         _ => None,
     };
-    let local = channel_local(peer);
+    // #292: a pairing the pin refuses gets no local side -- no handler process, no forward engine
+    // (and no "accepting TCP forward requests" line) for a member that is refused anyway. Its
+    // session still takes and closes its leg; an inert duplex stands in for the local side.
+    let local = if pin_refuses_admission(ctx.peer_pin.as_ref(), &ctx.request, &admission) {
+        ChannelLocal::Serve(tokio::io::duplex(1).0.into())
+    } else {
+        channel_local(peer)
+    };
     run_channel_join_with_admission(
         admission,
         relay,
@@ -207,6 +228,7 @@ pub(crate) async fn serve_admitted_session(
         local,
         ctx.direct_upgrade,
         ctx.accept_race,
+        ctx.peer_pin.as_ref(),
     )
     .await
 }
@@ -222,6 +244,21 @@ pub(crate) const DEFAULT_SERVE_CONCURRENCY: usize = 8;
 pub(crate) const DEFAULT_INITIATE_RETRY_SECS: u64 = 75;
 /// How long between retry attempts within the window above.
 const INITIATE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// ct-agent#95: how long ONE admission attempt of an initiator may stay parked. The window above
+/// is checked only between attempts, and a keepalive `:443` attempt has no total bound of its own
+/// (35 s per read, refreshed by the edge's ticks): it waits until the edge ends the park -- 30 s
+/// by default, up to the edge's keepalive park TTL where an operator raised it (CADS-Tunnel#506),
+/// so a one-shot call could wait about 115 s, or that TTL, instead of its window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitiateWait {
+    /// Pipe and `--call` callers were promised the window: an attempt still parked when it
+    /// closes is dropped, and the window's named error follows.
+    OneShot,
+    /// Forward (#267) and persistent CALL (#47) initiators: a long park is what they want (they
+    /// are paired the moment the acceptor parks), so an attempt waits as long as the edge holds it.
+    Persistent,
+}
 
 /// Parse `CT_CHANNEL_INITIATE_RETRY_SECS` into the retry window: a positive integer overrides the
 /// default; anything absent/blank/zero/malformed falls back to [`DEFAULT_INITIATE_RETRY_SECS`].
@@ -247,9 +284,14 @@ pub(crate) fn initiate_retry_window_from_env(value: Option<&str>) -> std::time::
 /// named timeout error (naming the channel, the window, and the attempt count) instead of
 /// whatever the last raw outcome/error happened to be -- the whole point being an actionable,
 /// distinguishable message instead of the prior silent-stall/silent-exit nondeterminism.
+///
+/// `wait` (see [`InitiateWait`]): a `OneShot` attempt is cut at the window itself, so a caller
+/// never waits past it however long the edge parks it, and no attempt is started that could only
+/// begin at the deadline.
 pub(crate) async fn admit_one_shot_with_retry<A, Fut>(
     window: std::time::Duration,
     channel: &ct_common::channel::ChannelId,
+    wait: InitiateWait,
     mut admit: A,
 ) -> Result<ChannelJoinOutcome, BoxError>
 where
@@ -258,9 +300,27 @@ where
 {
     let deadline = tokio::time::Instant::now() + window;
     let mut attempt: u32 = 0;
+    // The last finished attempt's result, named with a cut attempt's (see below).
+    let mut previous: Option<String> = None;
     loop {
         attempt += 1;
-        let result = admit().await;
+        // ct-agent#95: dropping a cut attempt drops its TLS stream; the edge's park pump reads
+        // that as the death of a keepalive park at once, so no stale park is left for a partner.
+        // The deadline check below then returns the named error. An attempt started shortly
+        // before the deadline may be cut while still connecting, so the previous attempt's
+        // result goes with the cut: a real cause (a refusal, an unreachable edge) stays visible.
+        let result = match wait {
+            InitiateWait::OneShot => match tokio::time::timeout_at(deadline, admit()).await {
+                Ok(r) => r,
+                Err(_) => Err(match previous.take() {
+                    None => "the attempt was still parked when the one-shot window closed".into(),
+                    Some(p) => {
+                        format!("the attempt was still parked when the one-shot window closed (previous attempt: {p})").into()
+                    }
+                }),
+            },
+            InitiateWait::Persistent => admit().await,
+        };
         if let Ok(outcome @ ChannelJoinOutcome::Admitted { .. }) = result {
             return Ok(outcome);
         }
@@ -270,7 +330,11 @@ where
             }
         }
         let now = tokio::time::Instant::now();
-        if now >= deadline {
+        // ct-agent#95: a one-shot attempt that could only start at the deadline would be cut on
+        // its first poll, before its first byte -- a dial thrown away, and a "still parked" in
+        // place of this attempt's real result. The window ends here instead.
+        let no_time_left = wait == InitiateWait::OneShot && now + INITIATE_RETRY_INTERVAL >= deadline;
+        if now >= deadline || no_time_left {
             let reason = match &result {
                 Ok(outcome) => format!("-- the peer may be between park windows (#21), offline, or parked at a different pairer (last outcome: {outcome:?})"),
                 Err(e) => format!("-- last error: {e}"),
@@ -299,6 +363,10 @@ where
                 next_check - now
             ),
         }
+        previous = Some(match &result {
+            Ok(outcome) => format!("{outcome:?}"),
+            Err(e) => e.to_string(),
+        });
         tokio::time::sleep_until(next_check).await;
     }
 }
@@ -328,19 +396,126 @@ pub(crate) fn record_flap_outcome(counter: &std::sync::atomic::AtomicU32, flappe
     }
 }
 
+/// #200: the serve loop's capacity line. With every serve slot busy the loop does not park
+/// (backpressure, by design), so the member is unreachable for new peers until a session ends
+/// -- and that used to happen without a word. Reported once when such an episode starts and once
+/// when it ends, never per iteration. Pure: the loop feeds it the semaphore's state.
+#[derive(Debug, Default)]
+pub(crate) struct SaturationLog {
+    logged: bool,
+}
+
+impl SaturationLog {
+    /// Before waiting for a slot: the line to print when all `slots` are busy and this episode
+    /// has not been reported yet.
+    pub(crate) fn before_acquire(&mut self, available: usize, slots: usize) -> Option<String> {
+        if available > 0 || self.logged {
+            return None;
+        }
+        self.logged = true;
+        Some(format!("ct-agent channel: all {slots} serve slots busy -- not parking until a session ends (#200)"))
+    }
+
+    /// After a slot was acquired: the line that ends a reported episode.
+    pub(crate) fn after_acquire(&mut self) -> Option<&'static str> {
+        if !std::mem::take(&mut self.logged) {
+            return None;
+        }
+        Some("ct-agent channel: a serve slot is free again -- parking (#200)")
+    }
+}
+
 /// #200: drive a persistent serve member as CONCURRENT sessions. `admit` parks at the broker and
 /// returns the next paired peer's session work `W` (called sequentially — only one admission is ever
 /// in flight); `serve` runs a session to completion and is SPAWNED, so the loop returns to `admit`
 /// the next peer immediately instead of blocking on the whole session. `max` bounds in-flight
 /// sessions via a semaphore whose permit is taken BEFORE parking (backpressure: we never admit a peer
 /// we have no capacity to serve) and released when the session ends. A transient `admit` error is
-/// logged and retried after `retry_backoff`; a **refused** (definitive, not-a-member) admission
+/// logged and retried after `retry_backoff`, doubling per consecutive transient up to 10 s
+/// ([`transient_admission_backoff`]); a **refused** (definitive, not-a-member) admission
 /// backs off exponentially instead — see [`admission_retry_backoff`]. A `serve` error is a single
-/// peer's problem, logged and dropped. Never returns under normal operation. Injectable so the
-/// concurrency contract is unit-testable without a real broker/relay.
+/// peer's problem, logged and dropped. Injectable so the concurrency contract is unit-testable
+/// without a real broker/relay.
+///
+/// ct-agent#308: `own_expires_at` is this member's own grant expiry (`None`: no own grant to
+/// watch, the tests' shape). The loop ends with [`OwnGrantEnded`] -- the process then exits with
+/// [`OWN_GRANT_ENDED_EXIT`] -- when that grant expires, wherever the loop is (parked at the edge,
+/// backing off, at capacity), and when an admission refusal says the same (`[grant-revoked]`, or
+/// `[grant-verify]` past the own expiry, see [`own_grant_refusal`]). The process holds that one
+/// grant for its whole life, so retrying either only loads the edge, for ever. Otherwise it
+/// never returns under normal operation.
+///
+/// The sessions belong to the loop (a `JoinSet`, as the #180 connection tasks do): before it
+/// returns an own grant end it winds them down ([`end_running_sessions`]), because the process
+/// exits right after (`std::process::exit` runs no destructor, and a stream handler's process
+/// group is only killed by its session's Drop, #183).
 pub(crate) async fn serve_loop_concurrent<A, Fa, S, Fs, W>(
     max: usize,
     retry_backoff: std::time::Duration,
+    own_expires_at: Option<u64>,
+    admit: A,
+    serve: S,
+) -> Result<(), BoxError>
+where
+    A: FnMut() -> Fa,
+    Fa: std::future::Future<Output = Result<W, BoxError>> + Send + 'static,
+    S: Fn(W) -> Fs,
+    Fs: std::future::Future<Output = Result<(), BoxError>> + Send + 'static,
+    W: Send + 'static,
+{
+    let mut sessions = tokio::task::JoinSet::new();
+    let expiry = async {
+        match own_expires_at {
+            Some(at) => {
+                grant_expiry_timer(at).await;
+                at
+            }
+            None => std::future::pending().await,
+        }
+    };
+    // `biased`: an own grant that is already over stops the loop before it parks once more.
+    let (served, expired) = tokio::select! {
+        biased;
+        at = expiry => {
+            let reason = format!("this member's channel grant expired (expires_at {at})");
+            eprintln!("ct-agent channel: {reason} -- stopping the persistent serve loop (#308)");
+            (Err(OwnGrantEnded::boxed(reason)), true)
+        }
+        served = serve_loop_admitting(max, retry_backoff, own_expires_at, &mut sessions, admit, serve) => (served, false),
+    };
+    if served.as_ref().is_err_and(|e| is_own_grant_end(e.as_ref())) {
+        end_running_sessions(&mut sessions, expired).await;
+    }
+    served
+}
+
+/// ct-agent#308: the sessions a serve loop still runs when it stops for its own grant end. After
+/// the own expiry (`expired`) every running session's gate holds the same expiry (R1) and fires
+/// within a second of the loop's timer, ending its session the regular way, close event included;
+/// they get [`GRANT_TEARDOWN_BUDGET`] for that. What still runs then -- and every session after a
+/// `[grant-revoked]` admission, which no gate learns about -- is aborted and awaited, so its
+/// future is dropped (and a stream handler's process group killed) before the process exits.
+async fn end_running_sessions(sessions: &mut tokio::task::JoinSet<()>, expired: bool) {
+    if expired {
+        let _ = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, async {
+            while sessions.join_next().await.is_some() {}
+        })
+        .await;
+    }
+    sessions.abort_all();
+    let _ = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, async {
+        while sessions.join_next().await.is_some() {}
+    })
+    .await;
+}
+
+/// The admit/serve cycle of [`serve_loop_concurrent`], without its own-expiry stop. Its sessions
+/// run in `sessions`, owned by the caller.
+async fn serve_loop_admitting<A, Fa, S, Fs, W>(
+    max: usize,
+    retry_backoff: std::time::Duration,
+    own_expires_at: Option<u64>,
+    sessions: &mut tokio::task::JoinSet<()>,
     mut admit: A,
     serve: S,
 ) -> Result<(), BoxError>
@@ -358,19 +533,33 @@ where
     // different cause and a different natural resolution time than a definitive refusal, so
     // its own streak must not affect, or be affected by, the refusal streak.
     let mut consecutive_handshake_eofs: u32 = 0;
+    // Independent from both streaks above: a TRANSIENT failure (connection refused while the edge
+    // restarts, a dropped leg, a stalled exchange) escalates on its own streak instead of
+    // retrying at a flat 100-200 ms for the whole outage. Any other outcome resets it.
+    let mut consecutive_transients: u32 = 0;
     // #250: shared across spawned sessions (all admissions on this loop are for the SAME
     // channel/holder -- an accept-side member has exactly one fixed remote grant, so there is
     // no "other peer" a global backoff could unfairly delay). Incremented by a session that
     // dies within FLAPPING_SESSION_THRESHOLD of being admitted; reset by any session that
     // either succeeds or simply lives long enough to not look like a flap.
     let consecutive_flaps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut saturation = SaturationLog::default();
     loop {
+        // Finished sessions leave their (empty) result in the set until it is read.
+        while sessions.try_join_next().is_some() {}
+        // #200: at capacity the loop waits here instead of parking -- say so, once per episode.
+        if let Some(line) = saturation.before_acquire(sem.available_permits(), max.max(1)) {
+            eprintln!("{line}");
+        }
         // `sem` is local and never closed, so `acquire_owned` cannot fail; if it ever
         // did, ending the loop with an error is the right answer, not a panic
         // (ct-agent#176).
         let Ok(permit) = sem.clone().acquire_owned().await else {
             return Err("serve concurrency semaphore closed".into());
         };
+        if let Some(line) = saturation.after_acquire() {
+            eprintln!("{line}");
+        }
         // #250: back off BEFORE the next admit if the last several sessions all died
         // near-instantly -- otherwise a flapping peer re-pairs and dies again at native RTT
         // speed forever, with no gap for the underlying interference (if transient) to clear
@@ -388,6 +577,8 @@ where
             );
             tokio::time::sleep(backoff).await;
         }
+        // #21: the park-expiry line below reports how long this admission's park was held.
+        let admit_started = tokio::time::Instant::now();
         // ct-agent#64: admit() is run inside its own spawned task (joined immediately below,
         // so this is NOT concurrency -- purely panic isolation). serve() has been isolated via
         // tokio::spawn since #200 ("A serve error is a single peer's problem, logged and
@@ -397,32 +588,49 @@ where
         // convergence.rs::drain_probe_round (#490) already isolates for its DNS probes) used to
         // propagate out of this whole function and crash the persistent serve process, tearing
         // down every concurrently-running session with it -- a far larger blast radius than one
-        // bad admission attempt.
-        match tokio::spawn(admit()).await {
+        // bad admission attempt. Guarded (ct-agent#308): when the loop is dropped mid-admission
+        // -- its own grant expired while parked -- the parked admission goes with it.
+        match crate::task_guard::TaskGuard::from_handle(tokio::spawn(admit())).await {
             Ok(Ok(work)) => {
                 consecutive_refusals = 0;
+                consecutive_transients = 0;
                 consecutive_handshake_eofs = 0;
-                let fut = serve(work);
+                // ct-agent#308: inside a grant-end record, so the session runner bounds its wait
+                // for a peer that never closes after a grant end, and reports such a session as
+                // not ok. Spawned into the loop's set (see `serve_loop_concurrent`).
+                let fut = with_grant_end_record(GrantEndRecord::default(), serve(work));
                 let flap_counter = consecutive_flaps.clone();
-                tokio::spawn(async move {
+                sessions.spawn(async move {
                     let _permit = permit; // held for the whole session; frees a slot on drop
                     let started = std::time::Instant::now();
                     let result = fut.await;
-                    let flapped = is_flapping_session(started.elapsed(), result.is_err());
-                    record_flap_outcome(&flap_counter, flapped);
+                    // #292: a pin refusal is a decision about that one peer, not a sign of
+                    // interference on the path -- it neither feeds nor resets the #250 streak, so
+                    // a member that keeps getting paired with this endpoint does not raise the
+                    // backoff before the pinned partner's next admission.
+                    let refused = matches!(&result, Err(e) if is_peer_not_pinned(e));
+                    if !refused {
+                        let flapped = is_flapping_session(started.elapsed(), result.is_err());
+                        record_flap_outcome(&flap_counter, flapped);
+                    }
+                    // A pin refusal is already reported by its rate-limited `channel_session`
+                    // event; this line is not rate-limited, and the refused member sets its pace.
                     if let Err(e) = result {
-                        eprintln!("ct-agent channel: serve session ended with error (#200): {e}");
+                        if !refused {
+                            eprintln!("ct-agent channel: serve session ended with error (#200): {e}");
+                        }
                     }
                 });
             }
             Err(join_err) => {
                 // A panic inside admit() itself -- see this match's own doc comment above.
-                // Not a refusal, not a handshake-EOF: fold it into the generic transient-error
-                // backoff path so a repeatedly-panicking admit still eventually backs off,
-                // exactly like any other admission error.
+                // Not a refusal, not a handshake-EOF, and not on the transient streak either: it
+                // is retried after the flat `retry_backoff`, as it always was, and every streak
+                // starts over -- a panic is a bug to fix, not an outage the backoff waits out.
                 drop(permit);
                 consecutive_handshake_eofs = 0;
                 consecutive_refusals = 0;
+                consecutive_transients = 0;
                 eprintln!(
                     "ct-agent channel: WARNING -- an admission attempt panicked ({join_err}); treating \
                      it as a transient admission error rather than crashing the persistent serve loop \
@@ -432,17 +640,27 @@ where
             }
             Ok(Err(e)) => {
                 drop(permit);
+                // ct-agent#308: the edge says this member's own grant is over. It never becomes
+                // valid again in this process, so the loop stops instead of backing off for ever.
+                if let Some(reason) = own_grant_refusal(&e, own_expires_at, crate::codec::now_unix()) {
+                    eprintln!("ct-agent channel: {reason} -- stopping the persistent serve loop (#308)");
+                    return Err(OwnGrantEnded::boxed(reason));
+                }
                 // #21: a park expiry re-parks IMMEDIATELY on the same transport -- it is neither
                 // a refusal (never counts toward the #231 backoff) nor a failure worth the
                 // generic "admission error" log line (the named line below is the field-visible
-                // contract the #21 measurement greps for). The single fast `retry_backoff` sleep
-                // (200ms in production) is only a tight-loop guard against a misbehaving edge
-                // that reaps instantly; a healthy edge parks for the full TTL between expiries.
+                // contract the #21 measurement greps for; its held-time suffix shows the lease).
+                // "Immediately" means without any backoff: only a short sleep ([`ex_repark_delay`],
+                // 100-500 ms in production), a tight-loop guard against a misbehaving edge that
+                // reaps instantly, jittered so the parks one sweep ended do not all return in the
+                // same instant. The re-park is a fresh admission and walks the ladder from rung 0
+                // again; a healthy edge parks for the full lease between expiries.
                 if is_park_expired(&e) {
                     consecutive_refusals = 0;
                     consecutive_handshake_eofs = 0;
-                    eprintln!("ct-agent channel: {e}");
-                    tokio::time::sleep(retry_backoff).await;
+                    consecutive_transients = 0;
+                    eprintln!("ct-agent channel: {}", park_expired_line(&e, admit_started.elapsed()));
+                    tokio::time::sleep(ex_repark_delay(retry_backoff, rand::random::<f64>())).await;
                     continue;
                 }
                 // #40 (CADS-Tunnel#335): checked before refusal classification -- a
@@ -452,6 +670,7 @@ where
                 // saturated cap (CADS-Tunnel#335's field-observed failure mode).
                 if is_transport_handshake_eof(&e) {
                     consecutive_refusals = 0;
+                    consecutive_transients = 0;
                     consecutive_handshake_eofs = consecutive_handshake_eofs.saturating_add(1);
                     let backoff = equal_jitter(
                         handshake_eof_backoff(retry_backoff, consecutive_handshake_eofs),
@@ -469,8 +688,19 @@ where
                 consecutive_handshake_eofs = 0;
                 let refused = is_definitive_admission_refusal(&e);
                 consecutive_refusals = if refused { consecutive_refusals.saturating_add(1) } else { 0 };
+                // A transient that ended a long attempt (a park a slow admission or a silent path
+                // ended after tens of seconds) already paced the loop by itself: it starts a new
+                // streak instead of stretching every re-park towards the cap.
+                if admit_started.elapsed() >= TRANSIENT_ADMISSION_BACKOFF_CAP {
+                    consecutive_transients = 0;
+                }
+                consecutive_transients = if refused { 0 } else { consecutive_transients.saturating_add(1) };
                 let backoff = equal_jitter(
-                    admission_retry_backoff(retry_backoff, refused, consecutive_refusals),
+                    if refused {
+                        admission_retry_backoff(retry_backoff, refused, consecutive_refusals)
+                    } else {
+                        transient_admission_backoff(retry_backoff, consecutive_transients)
+                    },
                     rand::random::<f64>(),
                 );
                 eprintln!("ct-agent channel: admission error, re-admitting (#200): {e}");
@@ -510,15 +740,37 @@ pub(crate) async fn run_one_admission_session(
     // `run_one_admission_session_with_local` below, after this `channel_local()` call --
     // the peer's Noise key isn't known yet at this call site.
     let local = channel_local(None);
-    run_one_admission_session_with_local(cfg, request, broker_ladder, relay_ladder, front_door_cert, local).await
+    run_one_admission_session_with_local(cfg, request, broker_ladder, relay_ladder, front_door_cert, local, InitiateWait::OneShot).await
+}
+
+/// ct-agent#308 (R1): a one-shot session that a grant end cut short -- this member's own expiry,
+/// or the peer's grant -- reaches its pump as a clean EOF and returns `Ok`: a pipe transfer cut
+/// at the expiry looked like a complete one, exit status 0. Run inside a grant-end record, such a
+/// session is an error (`PermissionDenied`, exit status 1 like every one-shot failure). The peer
+/// of an ungated session cannot tell: it only sees a clean close.
+pub(crate) async fn one_shot_session<F>(session: F) -> Result<(), BoxError>
+where
+    F: std::future::Future<Output = Result<(), BoxError>>,
+{
+    let record = GrantEndRecord::default();
+    let ran = with_grant_end_record(record.clone(), session).await;
+    match (ran, record.ended()) {
+        (Ok(()), Some(end)) => Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("the session was cut short: {}", end.reason),
+        ))),
+        (ran, _) => ran,
+    }
 }
 
 /// ct-agent#267: the plane-brokered one-shot path with `CT_CHANNEL_FORWARD`
 /// set. Binds the forward listener ONCE and keeps re-admitting sessions over it with backoff
 /// ([`super::forward_stream::run_forward_initiate_reconnect_loop`]) instead of running exactly
-/// one session: a peer restart or a relay/network drop no longer ends the forward, only a grant
-/// that expired or was revoked does. A bad spec or a listener that cannot bind still fails loudly
-/// before any admission, as `channel_local`'s forward branch does.
+/// one session: a peer restart, a relay/network drop or the end of the PEER's grant no longer
+/// ends the forward, only this member's own grant end does (ct-agent#308: exit status 77, or
+/// refusing for good with `CT_CHANNEL_FORWARD_ON_GRANT_END=refuse`). A bad spec, a bad
+/// `CT_CHANNEL_FORWARD_ON_GRANT_END` or a listener that cannot bind still fails loudly before any
+/// admission, as `channel_local`'s forward branch does.
 //
 pub(crate) async fn run_forward_initiate_sessions(
     raw_spec: &str,
@@ -530,19 +782,23 @@ pub(crate) async fn run_forward_initiate_sessions(
 ) -> Result<(), BoxError> {
     use super::forward_stream as fs;
     let spec = fs::parse_forward_spec(raw_spec)?;
+    let on_own_end = fs::on_own_grant_end_from(std::env::var(fs::FORWARD_ON_GRANT_END_ENV).ok().as_deref())?;
     let (max_streams, idle) = fs::forward_limits_from_env();
     let (listener, bound) = fs::bind_forward_listener(spec.listen)?;
     eprintln!(
         "ct-agent channel: CT_CHANNEL_FORWARD {bound} -> {} (max_streams={max_streams}, \
-         idle={idle:?}, scimbe/ct-agent#255; reconnects after a session end, #267)",
+         idle={idle:?}, scimbe/ct-agent#255; reconnects after a session end, #267; on its own \
+         grant end: {on_own_end:?}, #308)",
         spec.target
     );
+    let own_expires_at = request.grant.grant.expires_at;
     fs::run_forward_initiate_reconnect_loop(
         listener,
         spec.target,
         max_streams,
         idle,
-        request.grant.grant.expires_at,
+        own_expires_at,
+        on_own_end,
         |local| {
             run_one_admission_session_with_local(
                 cfg,
@@ -551,9 +807,10 @@ pub(crate) async fn run_forward_initiate_sessions(
                 relay_ladder,
                 front_door_cert,
                 ChannelLocal::Forward(Ok(local)),
+                InitiateWait::Persistent,
             )
         },
-        is_revoked_grant_refusal,
+        |e: &BoxError| own_grant_refusal(e, Some(own_expires_at), crate::codec::now_unix()).is_some(),
     )
     .await
 }
@@ -562,7 +819,7 @@ pub(crate) async fn run_forward_initiate_sessions(
 /// by the caller instead. Exists so a caller that must control the local app stream's lifecycle
 /// itself (ct-agent#47: redialing this admission cycle repeatedly while reusing ONE stdin feed
 /// across attempts) can drive the identical admission/relay/session logic without re-entering
-/// `channel_local()`.
+/// `channel_local()`. `wait` is how long one initiator attempt may stay parked ([`InitiateWait`]).
 pub(crate) async fn run_one_admission_session_with_local<L>(
     cfg: &ChannelJoinCliConfig,
     request: &ChannelJoinRequest,
@@ -570,6 +827,7 @@ pub(crate) async fn run_one_admission_session_with_local<L>(
     relay_ladder: &[ChannelDialRung],
     front_door_cert: &Option<CertificateDer<'static>>,
     local: L,
+    wait: InitiateWait,
 ) -> Result<(), BoxError>
 where
     L: AsyncRead + AsyncWrite + Unpin,
@@ -582,7 +840,10 @@ where
             None => {
                 let broker_conn = crate::transport::build_channel_dialer()?.connect(cfg.broker_addr, "localhost")?.await?;
                 // CADS-Tunnel#495 U2 (a'): broker_conn is admission-only -- PHASE_MARKER_RENDEZVOUS.
-                present_channel_join_marked(&broker_conn, request, &cfg.holder, PHASE_MARKER_RENDEZVOUS).await
+                // Parked from here on, for `/readyz` (health.rs).
+                super::health::health()
+                    .parked(present_channel_join_marked(&broker_conn, request, &cfg.holder, PHASE_MARKER_RENDEZVOUS))
+                    .await
             }
         }
     };
@@ -597,6 +858,7 @@ where
         admit_one_shot_with_retry(
             initiate_retry_window_from_env(std::env::var("CT_CHANNEL_INITIATE_RETRY_SECS").ok().as_deref()),
             &request.grant.grant.channel,
+            wait,
             admit_once,
         )
         .await?
@@ -634,6 +896,7 @@ where
         local,
         cfg.direct_upgrade,
         cfg.accept_race,
+        cfg.peer_pin.as_ref(),
     )
     .await
 }

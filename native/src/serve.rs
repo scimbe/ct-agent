@@ -1089,16 +1089,24 @@ fn trim_trailing_line_ending(bytes: &[u8]) -> &[u8] {
 // revocation list (`GET /internal/revoked-tokens`) is gated by the edge<->plane
 // admin token, which an agent does not hold. The agent DOES already receive the
 // revocation from the one place that enforces it: the Edge. `revoke_token`
-// (CADS-Tunnel #27/#421/#554) tears the live registration down and then refuses
-// every re-registration of that token with a wire `NO` -- and this agent's
-// reconnect loop re-registers on every drop. So the cached status is fed by the
+// (CADS-Tunnel #27/#421/#554) removes the registration and then refuses every
+// re-registration of that token with a wire `NO` -- and this agent's reconnect
+// loop re-registers on every drop. So the cached status is fed by the
 // registration path (`RevocationTracker`), with no new wire contract and no new
-// credential.
+// credential. #291: on QUIC the revoke does not drop the agent's connection, so
+// no re-registration follows it -- see `RevocationView` for what that leaves open.
 
 /// The payload's version tag and v1 length are shared with the client side
 /// (`ct_common::noise::direct_handshake_payload`, CADS-Tunnel#770), so both halves
 /// of the contract come from one definition.
 pub use ct_common::noise::{DIRECT_HS_PAYLOAD_TOKEN_V1, DIRECT_HS_PAYLOAD_TOKEN_V1_LEN};
+
+/// ct-agent#291: the first CADS-Tunnel release whose ct-client presents the routing token
+/// on the direct path (#770; the agent half is ct-agent v0.7.26). Since the token is
+/// required by default, a token-less direct handshake is a ct-client built before it -- or
+/// a peer leaving the token out on purpose. Named once, so the log lines that cite it
+/// cannot drift apart (the CADS-Tunnel#575 failure: a floor naming a release never cut).
+pub const DIRECT_TOKEN_MIN_CLIENT: &str = "CADS-Tunnel v0.4.20";
 
 /// What the initiator's Noise_IK **message-1 payload** said on the
 /// direct-connect path (ct-agent#45 slice 1).
@@ -1149,9 +1157,14 @@ pub fn parse_direct_handshake_payload(payload: &[u8]) -> DirectHandshakePayload 
 /// Named log line for a token mismatch (grep target, see ct-agent#45).
 pub const DIRECT_REFUSED_MISMATCH: &str =
     "ct-agent: direct-connect refused: routing token does not match this tunnel (#45)";
-/// Named log line for a token-less handshake under `CT_DIRECT_REQUIRE_TOKEN`.
+/// Named log line for a token-less handshake while the token is required -- the default
+/// since #291. The prefix up to "routing token" is unchanged, so existing greps still
+/// match; the tail names the likely cause and its fix instead of the variable, because
+/// the variable is no longer what turned the check on. Cites [`DIRECT_TOKEN_MIN_CLIENT`]
+/// (a test keeps the two equal).
 pub const DIRECT_REFUSED_MISSING: &str = "ct-agent: direct-connect refused: handshake carried no \
-     routing token and CT_DIRECT_REQUIRE_TOKEN is set (#45)";
+     routing token, which is required (default since #291; ct-clients built before CADS-Tunnel \
+     v0.4.20 send none -- update the client) (#45)";
 /// Named log line for a v1-tagged payload of the wrong length.
 pub const DIRECT_REFUSED_MALFORMED: &str =
     "ct-agent: direct-connect refused: malformed routing-token handshake payload (#45)";
@@ -1165,11 +1178,13 @@ pub const DIRECT_REFUSED_REVOKED: &str =
 pub enum DirectTokenDecision {
     /// The client presented this tunnel's token.
     Serve,
-    /// No token (pre-#45 client) and the policy tolerates that during rollout.
+    /// No token (pre-#45 client), and the operator opted out of requiring one
+    /// (`CT_DIRECT_REQUIRE_TOKEN` off, #291). Counted as `direct_legacy_served`.
     ServeLegacy,
     /// A token was presented, but it is not this tunnel's.
     RefuseMismatch,
-    /// No token, and the policy requires one (`CT_DIRECT_REQUIRE_TOKEN`).
+    /// No token, and the policy requires one (`CT_DIRECT_REQUIRE_TOKEN`, on by default
+    /// since #291).
     RefuseMissing,
     /// A v1-tagged payload that is not `0x01 ‖ token(32)`.
     RefuseMalformed,
@@ -1225,9 +1240,28 @@ pub const REVOCATION_LOG_RESTORED: &str = "ct-agent: this tunnel's routing token
 /// revocation list, but the Edge refuses a revoked token's registration with a
 /// wire `NO` on every reconnect (see the module note above), so the freshest
 /// status the agent can have is "what the last registration attempt said".
-/// Staleness is therefore bounded by the reconnect loop: a live registration
-/// is cut by the Edge at revoke time (#554), the very next attempt is refused,
-/// and the flag is set -- one dial+register round trip after the cut.
+/// Staleness is therefore bounded by the NEXT registration attempt, and on
+/// QUIC that comes only when the registration connection ends (#291, measured
+/// against ct-edge v0.4.20; `revoke_token` is the same on CADS-Tunnel main): the
+/// Edge's revoke removes the registration from its routing table and cuts live
+/// relays (#554), but leaves the agent's QUIC connection open. A QUIC-registered
+/// agent therefore keeps a clear flag -- and keeps serving direct clients that
+/// present the revoked token -- until that connection drops for another reason
+/// (edge restart, network loss, agent restart). A TLS-TCP fallback registration
+/// is a parked one-shot that the revoke drops (read, not measured), so that path
+/// re-registers and flips after [`AMBIGUOUS_REFUSALS_BEFORE_REVOKED`] refusals.
+///
+/// Two more limits (#291 review). The flag is read once per handshake, in
+/// [`DirectTokenPolicy::decide`]: a direct session admitted before it sets runs
+/// on until the client or the Origin ends it (measured for #291: still carried
+/// 12 s after the flip, while a new handshake with the same token was refused).
+/// And it starts clear in every process: [`run_agent`] serves the direct listener
+/// before the first registration verdict, and a transient failure never sets it,
+/// so a restarted agent serves a revoked token's direct clients until that
+/// verdict -- and for as long as it cannot reach the Edge, which the direct path
+/// is built not to depend on. Closing the revoke gap takes both halves: the Edge
+/// closing the agent connection on revoke, and this agent closing its open direct
+/// sessions when the flag sets.
 #[derive(Debug, Default)]
 pub struct RevocationView {
     revoked: AtomicBool,
@@ -1379,8 +1413,9 @@ pub struct DirectTokenPolicy {
     /// when the portal supplied it, otherwise the one minted into the
     /// capability file). A direct client presenting a token must present this one.
     pub own_token: RoutingToken,
-    /// `CT_DIRECT_REQUIRE_TOKEN` truthy ([`AgentConfig::direct_require_token`]):
-    /// a token-less (pre-#45) handshake is refused too. Default off = rollout mode.
+    /// [`AgentConfig::direct_require_token`]: a token-less (pre-#45) handshake is
+    /// refused too. On by default since #291; off only through the explicit
+    /// `CT_DIRECT_REQUIRE_TOKEN` opt-out (the old rollout mode).
     pub require_token: bool,
     /// `CT_DEBUG_DIRECT_TOKEN` set: log each accepted token-less handshake
     /// (once per connection). Off by default -- a fleet of pre-#45 clients
@@ -1411,17 +1446,27 @@ impl DirectTokenPolicy {
     }
 
     /// The one-line startup notice [`run_agent`] prints when the direct listener
-    /// comes up, stating which mode the check runs in.
+    /// comes up, stating which mode the check runs in. #291: the opt-out is the
+    /// line that has to speak loudest -- it is the state an operator must notice
+    /// and later undo, and the one a redeploy can carry along unnoticed.
     pub fn startup_line(&self) -> String {
         if self.require_token {
-            "ct-agent: direct-connect routing-token check: REQUIRED \
-             (CT_DIRECT_REQUIRE_TOKEN set) -- clients that send no token are refused (#45)"
-                .to_string()
+            format!(
+                "ct-agent: direct-connect routing-token check: REQUIRED (default since #291) -- \
+                 a direct client must present this tunnel's routing token; one that sends none \
+                 (a ct-client built before {DIRECT_TOKEN_MIN_CLIENT}) is refused on the direct \
+                 path. CT_DIRECT_REQUIRE_TOKEN=0 is the opt-out (#45)"
+            )
         } else {
-            "ct-agent: direct-connect routing-token check: rollout mode -- a presented token \
-             must match this tunnel, clients that send no token are still accepted; set \
-             CT_DIRECT_REQUIRE_TOKEN=1 to require it (#45)"
-                .to_string()
+            format!(
+                "ct-agent: WARNING: direct-connect routing-token check is OFF \
+                 (CT_DIRECT_REQUIRE_TOKEN opt-out, #291) -- a direct client that sends no token \
+                 is served (counted as direct_legacy_served), so knowing the Origin Identity \
+                 that every capability carries is enough: cutting off a former capability \
+                 holder takes an Origin-key rotation, not a token rotation. A presented token \
+                 must still match. Remove the opt-out once no ct-client built before \
+                 {DIRECT_TOKEN_MIN_CLIENT} is left (#45)"
+            )
         }
     }
 
@@ -1483,11 +1528,17 @@ fn check_direct_token(
         }
         return Err(DirectConnectRefused(decision));
     }
-    if decision == DirectTokenDecision::ServeLegacy && policy.debug {
-        eprintln!(
-            "ct-agent: direct-connect: handshake carried no routing token (pre-#45 client); \
-             accepted because CT_DIRECT_REQUIRE_TOKEN is off (#45)"
-        );
+    if decision == DirectTokenDecision::ServeLegacy {
+        // #291: the one outcome the token check lets through on the direct path, so it is
+        // counted. Always on the /metrics counter; the event line within the peer-triggered
+        // budget, since a peer can produce one per connection before it is authenticated.
+        crate::events::emit_limited(crate::events::DIRECT_LEGACY_SERVED, serde_json::json!({}));
+        if policy.debug {
+            eprintln!(
+                "ct-agent: direct-connect: handshake carried no routing token (pre-#45 client); \
+                 accepted because CT_DIRECT_REQUIRE_TOKEN is off (#45)"
+            );
+        }
     }
     Ok(())
 }
@@ -1653,9 +1704,10 @@ where
         }
     };
     // #45 slice 1: on the direct path the message-1 payload must name this
-    // tunnel's RoutingToken (a token-less pre-#45 client is accepted unless
-    // CT_DIRECT_REQUIRE_TOKEN is set). Decided before message 2 goes out, so a
-    // refused client gets no session and the Origin is never dialed.
+    // tunnel's RoutingToken (a token-less pre-#45 client is refused unless the
+    // operator opted out with CT_DIRECT_REQUIRE_TOKEN=0, #291). Decided before
+    // message 2 goes out, so a refused client gets no session and the Origin is
+    // never dialed.
     if let Err(refused) = check_direct_token(direct_policy, &hs_payload) {
         metrics.tunnels_failed.inc();
         return Err(refused.into());
@@ -2764,6 +2816,12 @@ const QUIC_LIVENESS_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 /// [`reprobe_policy_after`] for how it stretches once QUIC has proven flaky.
 const QUIC_REPROBE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How long one reprobe waits for the edge's QUIC handshake (#16). An open UDP
+/// path answers within a round trip; on a path that drops UDP the dial never
+/// completes, so every probe there runs this long -- beside the pool loop, not
+/// in it (#329).
+const QUIC_REPROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// CADS-Tunnel#799: a QUIC session that lasted shorter than this counts as a
 /// flap. On a path where UDP works for a few seconds and then blackholes again
 /// (a NAT that drops the mapping, a middlebox that rate-limits new flows) the
@@ -2809,6 +2867,56 @@ fn next_quic_flaps(flaps: u32, session: Duration) -> u32 {
         flaps.saturating_add(1)
     } else {
         0
+    }
+}
+
+/// How one QUIC reprobe of the TLS-TCP fallback pool ended (see [`quic_reprobe`]).
+enum ReprobeOutcome {
+    /// No QUIC handshake within [`QUIC_REPROBE_TIMEOUT`]: UDP is still blocked.
+    Unanswered,
+    /// The edge at this address answered; the probe connection was closed again
+    /// because the policy wants more consecutive answers (CADS-Tunnel#799).
+    Answered(SocketAddr),
+    /// The edge answered and accepted the registration over the probe connection:
+    /// the pool hands over to it (make-before-break, CADS-Tunnel#799).
+    Registered(SocketAddr, Connection),
+    /// The edge answered, but registering over the probe connection failed; the
+    /// connection was closed again.
+    RegisterFailed(SocketAddr, BoxError),
+}
+
+/// One QUIC reprobe (#16): resolve the edge, dial it, and -- when `register` is
+/// set, i.e. this answer completes the CADS-Tunnel#799 confirmation streak --
+/// register over the probe connection; an answer short of that is closed again.
+/// Everything is owned because the pool polls this as a future of its own beside
+/// its loop instead of awaiting it in one of the loop's arms (#329).
+async fn quic_reprobe(
+    config: AgentConfig,
+    edge_cert: CertificateDer<'static>,
+    token: RoutingToken,
+    register: bool,
+) -> ReprobeOutcome {
+    let edge = config.resolve_edge_or(config.edge).await;
+    let conn = match tokio::time::timeout(QUIC_REPROBE_TIMEOUT, dial_quic(edge, edge_cert)).await {
+        Ok(Ok(conn)) => conn,
+        _ => return ReprobeOutcome::Unanswered,
+    };
+    // ct-agent#178: a probe the edge answered is a liveness observation.
+    crate::status::note_keepalive();
+    if !register {
+        conn.close(0u32.into(), b"quic probe answered - confirming before leaving the tcp fallback");
+        return ReprobeOutcome::Answered(edge);
+    }
+    // Make-before-break (CADS-Tunnel#799): register over the probe connection
+    // while every TCP slot is still parked. Only once the edge has accepted that
+    // registration does the pool let the parked slots go.
+    crate::events::next_conn_id();
+    match register_tunnel(&conn, &token).await {
+        Ok(()) => ReprobeOutcome::Registered(edge, conn),
+        Err(e) => {
+            conn.close(0u32.into(), b"quic registration failed - staying on the tcp fallback");
+            ReprobeOutcome::RegisterFailed(edge, e)
+        }
     }
 }
 
@@ -2995,6 +3103,13 @@ pub(crate) async fn run_tcp_fallback_pool_on(
     // on every loop pass would restart on each worker join or consumed signal, so
     // a pool serving traffic more often than `interval` would never probe.
     let mut next_probe = reprobe.map(|p| tokio::time::Instant::now() + p.interval);
+    // #329: the probe in flight, polled by the `select!` below beside the worker
+    // joins and consumed signals. Awaited inside the reprobe arm instead, it
+    // stalled the pool's refill for its whole dial -- QUIC_REPROBE_TIMEOUT, every
+    // interval, where UDP is dropped -- and the Clients beyond the parked
+    // registrations ran out the edge's delivery wait. A future, not a task: it
+    // goes with the pool, however the pool ends.
+    let mut probe: Option<Pin<Box<dyn std::future::Future<Output = ReprobeOutcome> + Send>>> = None;
     loop {
         if handles.is_empty() {
             return FallbackExit::AllWorkersGaveUp;
@@ -3066,40 +3181,41 @@ pub(crate) async fn run_tcp_fallback_pool_on(
                 }
                 top_up!();
             }
-            _ = reprobe_due => {
+            // One probe at a time: the deadline counts again once the probe in
+            // flight has its outcome.
+            _ = reprobe_due, if probe.is_none() => {
                 let Some(policy) = reprobe else { continue };
                 next_probe = Some(tokio::time::Instant::now() + policy.interval);
-                let edge = config.resolve_edge_or(config.edge).await;
-                let conn = match tokio::time::timeout(
-                    Duration::from_secs(5),
-                    dial_quic(edge, ctx.edge_cert.clone()),
-                )
-                .await
-                {
-                    Ok(Ok(conn)) => conn,
-                    _ => {
-                        probe_ok_streak = 0;
-                        continue;
-                    }
-                };
-                // ct-agent#178: a probe the edge answered is a liveness observation.
-                crate::status::note_keepalive();
-                probe_ok_streak += 1;
-                if probe_ok_streak < policy.confirmations {
-                    conn.close(0u32.into(), b"quic probe answered - confirming before leaving the tcp fallback");
-                    eprintln!(
-                        "ct-agent: UDP/QUIC to {} answered a probe ({probe_ok_streak}/{}); staying on the \
-                         TLS-TCP fallback until it holds (CADS-Tunnel#799)",
-                        edge, policy.confirmations
-                    );
-                    continue;
+                // CADS-Tunnel#799: only the answer that completes the streak
+                // registers; the answers before it are closed again.
+                let register = probe_ok_streak + 1 >= policy.confirmations;
+                probe = Some(Box::pin(quic_reprobe(
+                    config.clone(),
+                    ctx.edge_cert.clone(),
+                    ctx.token.clone(),
+                    register,
+                )));
+            }
+            outcome = async {
+                match probe.as_mut() {
+                    Some(in_flight) => in_flight.await,
+                    None => std::future::pending().await,
                 }
-                // Make-before-break (CADS-Tunnel#799): register over the probe
-                // connection while every TCP slot is still parked. Only once the
-                // edge has accepted that registration do the parked slots go.
-                crate::events::next_conn_id();
-                match register_tunnel(&conn, &ctx.token).await {
-                    Ok(()) => {
+            } => {
+                // The probe is over; its finished future must not be polled again.
+                probe = None;
+                let Some(policy) = reprobe else { continue };
+                match outcome {
+                    ReprobeOutcome::Unanswered => probe_ok_streak = 0,
+                    ReprobeOutcome::Answered(edge) => {
+                        probe_ok_streak += 1;
+                        eprintln!(
+                            "ct-agent: UDP/QUIC to {} answered a probe ({probe_ok_streak}/{}); staying on the \
+                             TLS-TCP fallback until it holds (CADS-Tunnel#799)",
+                            edge, policy.confirmations
+                        );
+                    }
+                    ReprobeOutcome::Registered(edge, conn) => {
                         let parked = handles.len() - serving.len();
                         eprintln!(
                             "ct-agent: UDP/QUIC to {} recovered and the QUIC registration is up — leaving \
@@ -3125,13 +3241,12 @@ pub(crate) async fn run_tcp_fallback_pool_on(
                         workers.detach_all();
                         return FallbackExit::QuicRecovered(conn);
                     }
-                    Err(e) => {
+                    ReprobeOutcome::RegisterFailed(edge, e) => {
                         eprintln!(
                             "ct-agent: UDP/QUIC to {} answered a probe but registering over it failed ({e}); \
                              staying on the TLS-TCP fallback (CADS-Tunnel#799)",
                             edge
                         );
-                        conn.close(0u32.into(), b"quic registration failed - staying on the tcp fallback");
                         probe_ok_streak = 0;
                     }
                 }
@@ -5129,8 +5244,9 @@ mod tests {
 
     #[test]
     fn direct_token_policy_rollout_mode_accepts_missing_and_refuses_foreign_tokens() {
-        // Default (CT_DIRECT_REQUIRE_TOKEN unset): a token must match if present,
-        // a pre-#45 client without one is still served.
+        // Rollout mode -- the default before #291, now only the explicit opt-out
+        // (CT_DIRECT_REQUIRE_TOKEN=0): a token must match if present, a pre-#45 client
+        // without one is still served.
         let own = RoutingToken([0x45; 32]);
         let policy = DirectTokenPolicy::new(own.clone(), false);
         assert_eq!(
@@ -5149,7 +5265,7 @@ mod tests {
             policy.decide(&DirectHandshakePayload::Malformed),
             DirectTokenDecision::RefuseMalformed
         );
-        assert!(policy.startup_line().contains("rollout mode"), "{}", policy.startup_line());
+        assert!(policy.startup_line().contains("WARNING"), "{}", policy.startup_line());
         assert_eq!(DirectTokenDecision::Serve.refusal_line(), None);
         assert_eq!(DirectTokenDecision::ServeLegacy.refusal_line(), None);
         assert_eq!(
@@ -5483,6 +5599,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_served_tokenless_direct_client_is_counted_as_direct_legacy_served_291() {
+        // #291: a token-less handshake served because CT_DIRECT_REQUIRE_TOKEN is off is
+        // counted on /metrics (ct_agent_events_total{kind="direct_legacy_served"}). `>`, not
+        // `+ 1`: other tests in this binary serve token-less clients in parallel.
+        let before = crate::events::EVENT_COUNTS.get(crate::events::DIRECT_LEGACY_SERVED);
+        let policy = DirectTokenPolicy::new(RoutingToken([0x45; 32]), false);
+        let rig = direct_token_rig(Some(policy), Vec::new()).await;
+        let (dialed, _) = direct_token_rig_expect_served(rig, b"counted-legacy").await;
+        assert!(dialed, "served, not refused");
+        assert!(
+            crate::events::EVENT_COUNTS.get(crate::events::DIRECT_LEGACY_SERVED) > before,
+            "the served token-less handshake was counted"
+        );
+    }
+
+    #[tokio::test]
     async fn direct_client_presenting_the_tunnels_token_is_served() {
         // (b) a #45-aware client sends `0x01 ‖ token`, and it is this tunnel's token.
         let own = RoutingToken([0x45; 32]);
@@ -5739,6 +5871,241 @@ mod tests {
         assert_eq!(mcheck.tunnels_failed.get(), 1);
         assert_eq!(mcheck.tunnels_opened.get(), 0);
         srv.abort();
+    }
+
+    // ---- ct-agent#291: the token is required by default ----
+
+    /// The direct-connect policy exactly as `run_agent` builds it from the environment
+    /// (`AgentConfig::from_env_with`), with `CT_DIRECT_REQUIRE_TOKEN` as given.
+    fn direct_policy_from_env_291(require: Option<&str>) -> DirectTokenPolicy {
+        let cfg = AgentConfig::from_env_with(|k| match k {
+            "CT_DIRECT_REQUIRE_TOKEN" => require.map(str::to_string),
+            _ => None,
+        })
+        .unwrap();
+        DirectTokenPolicy::new(RoutingToken([0x45; 32]), cfg.direct_require_token)
+    }
+
+    #[test]
+    fn the_default_config_refuses_a_tokenless_handshake_and_only_an_explicit_off_serves_it_291() {
+        // Unset, Compose's empty `${VAR:-}` and a typo all mean REQUIRED: a token-less
+        // handshake is refused with the named line. Only an explicit off spelling brings
+        // the old rollout mode back, and then the startup line is a WARNING.
+        let own = DirectHandshakePayload::Token(RoutingToken([0x45; 32]));
+        let foreign = DirectHandshakePayload::Token(RoutingToken([0x99; 32]));
+        for unset in [None, Some(""), Some("enforce")] {
+            let policy = direct_policy_from_env_291(unset);
+            assert_eq!(
+                policy.decide(&DirectHandshakePayload::Legacy),
+                DirectTokenDecision::RefuseMissing,
+                "{unset:?}"
+            );
+            assert_eq!(policy.decide(&own), DirectTokenDecision::Serve, "{unset:?}");
+            assert_eq!(policy.decide(&foreign), DirectTokenDecision::RefuseMismatch, "{unset:?}");
+            let line = policy.startup_line();
+            assert!(line.contains("REQUIRED") && !line.contains("WARNING"), "{unset:?}: {line}");
+        }
+        for off in ["0", "false", "off", "no"] {
+            let policy = direct_policy_from_env_291(Some(off));
+            assert_eq!(
+                policy.decide(&DirectHandshakePayload::Legacy),
+                DirectTokenDecision::ServeLegacy,
+                "{off:?} restores the rollout mode"
+            );
+            assert_eq!(policy.decide(&own), DirectTokenDecision::Serve, "{off:?}");
+            assert_eq!(
+                policy.decide(&foreign),
+                DirectTokenDecision::RefuseMismatch,
+                "{off:?}: a presented token must still match"
+            );
+            let line = policy.startup_line();
+            assert!(line.starts_with("ct-agent: WARNING: "), "{off:?}: {line}");
+            assert!(line.contains("OFF") && line.contains("direct_legacy_served"), "{off:?}: {line}");
+        }
+    }
+
+    #[test]
+    fn every_token_line_names_the_same_first_client_release_291() {
+        // The client floor is one constant; the refusal line (a literal, so it can stay a
+        // `const`) and both startup lines must cite it, or they drift like CADS-Tunnel#575.
+        assert!(DIRECT_REFUSED_MISSING.contains(DIRECT_TOKEN_MIN_CLIENT), "{DIRECT_REFUSED_MISSING}");
+        assert!(
+            DIRECT_REFUSED_MISSING
+                .starts_with("ct-agent: direct-connect refused: handshake carried no routing token"),
+            "the grep prefix of the #45 line is unchanged"
+        );
+        for require in [true, false] {
+            let line = DirectTokenPolicy::new(RoutingToken([0u8; 32]), require).startup_line();
+            assert!(line.contains(DIRECT_TOKEN_MIN_CLIENT), "{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_opt_out_serves_a_tokenless_client_again_and_counts_it_291() {
+        // CT_DIRECT_REQUIRE_TOKEN=0 restores the pre-#291 behaviour end to end: the empty
+        // payload is served and reaches the origin -- and is counted, because that is the
+        // number that says when the opt-out can go. `>`, not `+ 1`: other tests in this
+        // binary serve token-less clients in parallel.
+        let before = crate::events::EVENT_COUNTS.get(crate::events::DIRECT_LEGACY_SERVED);
+        let rig = direct_token_rig(Some(direct_policy_from_env_291(Some("0"))), Vec::new()).await;
+        let (dialed, metrics) = direct_token_rig_expect_served(rig, b"opted-out").await;
+        assert!(dialed, "origin dialed for the token-less client under the opt-out");
+        assert_eq!(metrics.tunnels_opened.get(), 1);
+        assert!(crate::events::EVENT_COUNTS.get(crate::events::DIRECT_LEGACY_SERVED) > before);
+    }
+
+    #[tokio::test]
+    async fn by_default_a_tokenless_client_is_refused_direct_while_the_relay_still_serves_it_291() {
+        // ct-agent#291 end to end, nothing stubbed on the agent side: a REAL edge (ct-edge's
+        // per-connection handling exactly as its daemon runs it), the REAL agent loop with a
+        // direct listener and the DEFAULT configuration, and the two client generations:
+        //  1. the pre-#770 ct-client wire form (empty message-1 payload, byte for byte what
+        //     `client_noise_exchange` sends) on the direct path: refused before message 2,
+        //     the QUIC connection closed by the agent with code 1, the origin never dialed;
+        //  2. the same client over the relay, on its own edge connection: served -- the
+        //     relayed path does not read the flag. (ct-client's p2p mode retries the relay on
+        //     the connection it used for the 'P' query, and ct-edge serves no second stream
+        //     on a client connection, so THAT retry times out. A client-side defect older
+        //     than #291 that bites on any direct failure; not what this test asserts.)
+        //  3. the ct-client this crate is pinned to (CADS-Tunnel v0.4.20), which presents
+        //     the token: keeps the direct path under the new default.
+        // On the old default (off) step 1 is served instead, so this fails there.
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::pow::Challenge;
+        use ct_common::{Capability, OriginIdentity};
+        use ct_edge::state::EdgeState;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        // Origin: echoes every connection and counts the dials.
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin_dials = Arc::new(AtomicUsize::new(0));
+        let dials = Arc::clone(&origin_dials);
+        let origin = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = origin_listener.accept().await {
+                dials.fetch_add(1, SeqCst);
+                tokio::spawn(async move {
+                    let (mut r, mut w) = sock.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        // Edge: every connection is served the way ct-edge's own accept loop does it.
+        let (server, edge_cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
+        let edge_addr = server.local_addr().unwrap();
+        let state = Arc::new(EdgeState::<quinn::Connection>::new());
+        let st = Arc::clone(&state);
+        let edge = tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                let st = Arc::clone(&st);
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        // difficulty 0: the PoW gate is not what this test is about.
+                        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+                        let _ = ct_edge::serve::serve_agent_connection(&conn, &st, &challenge).await;
+                        conn.closed().await;
+                    }
+                });
+            }
+        });
+
+        // Agent: the DEFAULT configuration -- only the addresses and the direct listener set.
+        let (edge_s, origin_s) = (edge_addr.to_string(), origin_addr.to_string());
+        let cfg = AgentConfig::from_env_with(|k| match k {
+            "CT_AGENT_EDGE" => Some(edge_s.clone()),
+            "CT_AGENT_ORIGIN" => Some(origin_s.clone()),
+            "CT_AGENT_DIRECT_ADVERTISE" => Some("127.0.0.1".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(cfg.direct_require_token, "the default under test");
+        let token = RoutingToken([0x29; 32]);
+        let origin_kp = generate_static_keypair();
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: edge_addr.to_string(),
+        };
+        let (a_cert, a_token, a_key) = (edge_cert.clone(), token.clone(), origin_kp.private);
+        let agent = tokio::spawn(async move {
+            let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+            let _ = run_agent(&cfg, a_cert, a_token, Arc::new(vec![a_key]), Arc::new(gate), None).await;
+        });
+        for _ in 0..500 {
+            if state.is_known(&token) && state.direct_endpoint(&token).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(state.is_known(&token), "agent registered over QUIC");
+
+        // The client learns the direct endpoint from the edge ('P'), as ct-client does.
+        let q = ct_client::transport::dial_edge(edge_addr, edge_cert.clone()).await.unwrap();
+        let (direct_addr, agent_cert) = ct_client::transport::query_direct_endpoint(&q, &token)
+            .await
+            .unwrap()
+            .expect("the agent advertised its direct listener");
+        q.close(0u32.into(), b"done");
+        let client_priv = generate_static_keypair().private;
+
+        // 1. pre-#770 wire form on the direct path: refused, closed with code 1, no origin dial.
+        let conn = ct_client::transport::client_direct_connect(direct_addr, agent_cert.clone(), Duration::from_secs(5))
+            .await
+            .expect("the QUIC connection itself is accepted");
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let legacy = tokio::time::timeout(
+            Duration::from_secs(5),
+            ct_client::noise::client_noise_exchange(&mut send, &mut recv, &client_priv, &cap, b"legacy"),
+        )
+        .await
+        .expect("refused promptly, not left hanging");
+        assert!(legacy.is_err(), "a token-less direct handshake is refused by default");
+        let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("the agent closes a refused connection itself");
+        match closed {
+            quinn::ConnectionError::ApplicationClosed(c) => {
+                assert_eq!(c.error_code, quinn::VarInt::from(DIRECT_REFUSED_CLOSE_CODE), "the #45 refusal code")
+            }
+            other => panic!("expected the agent's application close, got {other:?}"),
+        }
+        assert_eq!(origin_dials.load(SeqCst), 0, "the origin is never dialed for a refused client");
+
+        // 2. the same client over the relay (a fresh edge connection): served.
+        let r = ct_client::transport::dial_edge(edge_addr, edge_cert.clone()).await.unwrap();
+        let relayed = ct_client::transport::client_tunnel_noise_timed(
+            &r,
+            &token,
+            &cap,
+            &client_priv,
+            b"via-relay",
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("the relayed path still serves the token-less client");
+        assert_eq!(relayed, b"via-relay");
+        r.close(0u32.into(), b"done");
+        assert_eq!(origin_dials.load(SeqCst), 1);
+
+        // 3. the pinned ct-client presents the token: served on the direct path.
+        let conn = ct_client::transport::client_direct_connect(direct_addr, agent_cert, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let direct = tokio::time::timeout(
+            Duration::from_secs(10),
+            ct_client::transport::client_tunnel_direct(&conn, &token, &cap, &client_priv, b"direct"),
+        )
+        .await
+        .expect("no hang")
+        .expect("a client that presents the token keeps the direct path");
+        assert_eq!(direct, b"direct");
+        conn.close(0u32.into(), b"done");
+        assert_eq!(origin_dials.load(SeqCst), 2);
+
+        agent.abort();
+        edge.abort();
+        origin.abort();
     }
 
     #[tokio::test]
@@ -7630,6 +7997,312 @@ mod tests {
         agent.abort();
         edge.abort();
         origin.abort();
+    }
+
+    /// #329: the agent dials ONE edge address for both transports -- its pool
+    /// workers over TLS-TCP, its QUIC reprobe over UDP. The dual edge with its
+    /// QUIC endpoint and its TLS-TCP listener on the same loopback port, so the
+    /// probe is answered by the edge the workers are parked at.
+    async fn dual_edge_on_one_port(
+        ca: &ct_edge::pki::Ca,
+    ) -> (Endpoint, TcpListener, tokio_rustls::TlsAcceptor, CertificateDer<'static>) {
+        use std::net::Ipv4Addr;
+        for _ in 0..20 {
+            let (quic, _, acceptor, ca_root) = ct_edge::pki::build_dual_edge_from_ca(
+                ca,
+                (Ipv4Addr::LOCALHOST, 0).into(),
+                (Ipv4Addr::LOCALHOST, 0).into(),
+                vec!["localhost".to_string()],
+            )
+            .await
+            .unwrap();
+            // The OS picked a free UDP port; that number is almost always free for TCP too.
+            if let Ok(tcp_listener) = TcpListener::bind(quic.local_addr().unwrap()).await {
+                return (quic, tcp_listener, acceptor, ca_root);
+            }
+        }
+        panic!("no loopback port was free for both UDP and TCP");
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_pool_hands_over_to_an_answered_reprobe_make_before_break_329() {
+        // #329 moves the QUIC reprobe out of the pool loop's arm; the hand-over it
+        // ends in must stay as CADS-Tunnel#799 built it. With two confirmations the
+        // first answered probe is closed again without a registration; the second
+        // registers over its connection while every TCP slot is still parked
+        // (make-before-break); only then are the parked slots closed, and that very
+        // connection is what the pool hands to its caller.
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        const POOL: usize = 2;
+        let ca = ct_edge::pki::Ca::new("handover-329-ca").unwrap();
+        let (quic, tcp_listener, acceptor, ca_root) = dual_edge_on_one_port(&ca).await;
+        let edge_addr = tcp_listener.local_addr().unwrap();
+
+        // TLS-TCP side: park every registration and count the slots still parked.
+        let parked = Arc::new(AtomicUsize::new(0));
+        let parked_e = Arc::clone(&parked);
+        let tcp_edge = tokio::spawn(async move {
+            loop {
+                let (tcp, _) = tcp_listener.accept().await.unwrap();
+                let Ok(mut tls) = acceptor.accept(tcp).await else { continue };
+                let mut hdr = [0u8; 33];
+                if tls.read_exact(&mut hdr).await.is_err()
+                    || tls.write_all(b"OK").await.is_err()
+                    || tls.flush().await.is_err()
+                {
+                    continue;
+                }
+                parked_e.fetch_add(1, SeqCst);
+                let parked_w = Arc::clone(&parked_e);
+                tokio::spawn(async move {
+                    // A parked agent writes nothing unless pinged: this read ends
+                    // only when the agent closes the slot.
+                    let _ = tls.read(&mut [0u8; 1]).await;
+                    parked_w.fetch_sub(1, SeqCst);
+                });
+            }
+        });
+
+        // QUIC side: the close reason of every probe the agent closed again, then
+        // the registration -- acked only after a pause, with the slots still parked
+        // counted at its end.
+        let parked_q = Arc::clone(&parked);
+        let endpoint = quic.clone();
+        let quic_edge = tokio::spawn(async move {
+            let reason = |e: quinn::ConnectionError| match e {
+                quinn::ConnectionError::ApplicationClosed(close) => String::from_utf8_lossy(&close.reason).into_owned(),
+                other => other.to_string(),
+            };
+            let mut closed_probes = Vec::new();
+            while let Some(incoming) = endpoint.accept().await {
+                let conn = match incoming.await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        closed_probes.push(reason(e));
+                        continue;
+                    }
+                };
+                let (mut send, mut recv) = match conn.accept_bi().await {
+                    Ok(streams) => streams,
+                    Err(e) => {
+                        closed_probes.push(reason(e));
+                        continue;
+                    }
+                };
+                let hdr = recv.read_to_end(33).await.unwrap();
+                assert_eq!(hdr[0], b'A', "a QUIC tunnel registration");
+                // The agent must hold its parked slots until this ack; one it closed
+                // before registering has long shown by the end of the pause.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let parked_while_pending = parked_q.load(SeqCst);
+                send.write_all(b"OK").await.unwrap();
+                send.finish().unwrap();
+                return (conn, parked_while_pending, closed_probes);
+            }
+            panic!("the QUIC endpoint closed before the agent registered");
+        });
+
+        let mut cfg = AgentConfig::parse(&edge_addr.to_string(), "127.0.0.1:9").unwrap();
+        cfg.tcp_fallback_pool_size = POOL;
+        let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+        let ctx = FallbackCtx::for_test(&cfg, ca_root, RoutingToken([0x2bu8; 32]), Arc::new(vec![[0u8; 32]]), Arc::new(gate));
+        // The registering probe is the second one, two intervals in: the pool has
+        // long parked both slots by then.
+        let reprobe = ReprobePolicy { interval: Duration::from_millis(500), confirmations: 2 };
+        let budget = FallbackBudget { base: Duration::from_secs(10), max: Duration::from_secs(20), attempts: 5 };
+        let exit = tokio::time::timeout(Duration::from_secs(20), run_tcp_fallback_pool(&ctx, budget, Some(reprobe)))
+            .await
+            .expect("two answered probes hand the pool over to QUIC");
+        let FallbackExit::QuicRecovered(conn) = exit else {
+            panic!("expected the hand-over to QUIC, got {exit:?}");
+        };
+        let (edge_conn, parked_while_pending, closed_probes) = quic_edge.await.unwrap();
+        assert_eq!(
+            closed_probes,
+            ["quic probe answered - confirming before leaving the tcp fallback"],
+            "the first answer only counts toward the confirmations: closed again, nothing registered over it"
+        );
+        assert_eq!(
+            parked_while_pending, POOL,
+            "make-before-break: every TCP slot stays parked while the QUIC registration is pending"
+        );
+        // Only the hand-over lets the parked slots go.
+        for _ in 0..300 {
+            if parked.load(SeqCst) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(parked.load(SeqCst), 0, "the parked TCP slots are closed once QUIC carries the tunnel");
+        // And the connection handed over is the one the edge registered.
+        conn.close(0u32.into(), b"handed over");
+        match tokio::time::timeout(Duration::from_secs(5), edge_conn.closed())
+            .await
+            .expect("the edge sees the agent close the registered connection")
+        {
+            quinn::ConnectionError::ApplicationClosed(close) => assert_eq!(&close.reason[..], b"handed over"),
+            other => panic!("expected the agent's close on the registered connection, got {other:?}"),
+        }
+        tcp_edge.abort();
+    }
+
+    /// #329: like [`dual_edge_on_one_port`], but the edge's UDP port is a socket
+    /// that takes the probe's QUIC packets and never answers -- UDP silently
+    /// dropped, as on the networks #329 was measured on. The first datagram it
+    /// reads tells a test that a probe is in flight.
+    async fn tls_tcp_edge_with_udp_black_hole(
+        ca: &ct_edge::pki::Ca,
+    ) -> (TcpListener, tokio_rustls::TlsAcceptor, CertificateDer<'static>, tokio::net::UdpSocket) {
+        use std::net::Ipv4Addr;
+        for _ in 0..20 {
+            let (_, tcp_listener, acceptor, ca_root) = ct_edge::pki::build_dual_edge_from_ca(
+                ca,
+                (Ipv4Addr::LOCALHOST, 0).into(),
+                (Ipv4Addr::LOCALHOST, 0).into(),
+                vec!["localhost".to_string()],
+            )
+            .await
+            .unwrap();
+            // The OS picked a free TCP port; that number is almost always free for UDP too.
+            if let Ok(black_hole) = tokio::net::UdpSocket::bind(tcp_listener.local_addr().unwrap()).await {
+                return (tcp_listener, acceptor, ca_root, black_hole);
+            }
+        }
+        panic!("no loopback port was free for both TCP and UDP");
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_pool_re_parks_while_a_quic_reprobe_hangs_329() {
+        // #329: since #231 the QUIC reprobe fires on a fixed schedule, and it ran
+        // INLINE in the pool loop's `select!` arm. Where UDP is dropped its dial
+        // held the loop for the whole QUIC_REPROBE_TIMEOUT on every probe, so a
+        // parked registration the edge consumed in that window was not replaced,
+        // and the Clients behind it ran out the edge's delivery wait: hangs of
+        // about 3 s every 30 s on agents in a network without UDP. Here the edge's
+        // UDP port swallows the probe; once it is in flight the edge consumes one
+        // parked registration, and its replacement must park while the probe
+        // still hangs.
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        const POOL: usize = 2;
+        let ca = ct_edge::pki::Ca::new("reprobe-329-ca").unwrap();
+        let (tcp_listener, acceptor, ca_root, black_hole) = tls_tcp_edge_with_udp_black_hole(&ca).await;
+        let edge_addr = tcp_listener.local_addr().unwrap();
+        let registered = Arc::new(AtomicUsize::new(0));
+        let consume = Arc::new(tokio::sync::Notify::new());
+
+        // TLS-TCP side: park every registration; on `consume` a Client arrives on
+        // the oldest parked one (STOP), and its tunnel stays open.
+        let registered_e = Arc::clone(&registered);
+        let consume_e = Arc::clone(&consume);
+        let edge = tokio::spawn(async move {
+            let mut parked = std::collections::VecDeque::new();
+            let mut relaying = Vec::new();
+            loop {
+                tokio::select! {
+                    accepted = tcp_listener.accept() => {
+                        let (tcp, _) = accepted.unwrap();
+                        let mut tls = acceptor.accept(tcp).await.unwrap();
+                        let mut hdr = [0u8; 33];
+                        tls.read_exact(&mut hdr).await.unwrap();
+                        assert_eq!(hdr[0], b'K', "agent prefers the ping-capable role");
+                        tls.write_all(b"OK").await.unwrap();
+                        tls.flush().await.unwrap();
+                        registered_e.fetch_add(1, SeqCst);
+                        parked.push_back(tls);
+                    }
+                    _ = consume_e.notified() => {
+                        let mut tls = parked.pop_front().expect("a parked registration to consume");
+                        tls.write_all(&[0xFB]).await.unwrap();
+                        tls.flush().await.unwrap();
+                        relaying.push(tls);
+                    }
+                }
+            }
+        });
+
+        let mut cfg = AgentConfig::parse(&edge_addr.to_string(), "127.0.0.1:9").unwrap();
+        cfg.tcp_fallback_pool_size = POOL;
+        let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+        let ctx = FallbackCtx::for_test(&cfg, ca_root, RoutingToken([0x29u8; 32]), Arc::new(vec![[0u8; 32]]), Arc::new(gate));
+        // Production probes every 30 s; all this needs is a probe in flight while
+        // the edge consumes a registration.
+        let reprobe = ReprobePolicy { interval: Duration::from_millis(300), confirmations: 1 };
+        let budget = FallbackBudget { base: Duration::from_secs(10), max: Duration::from_secs(20), attempts: 5 };
+        let pool = tokio::spawn(async move { run_tcp_fallback_pool(&ctx, budget, Some(reprobe)).await });
+
+        for _ in 0..300 {
+            if registered.load(SeqCst) >= POOL {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(registered.load(SeqCst), POOL, "the whole pool is parked");
+        // The probe is in flight once its first QUIC packet reaches the black hole.
+        let mut packet = [0u8; 1500];
+        tokio::time::timeout(Duration::from_secs(10), black_hole.recv_from(&mut packet))
+            .await
+            .expect("the pool sends its QUIC reprobe")
+            .unwrap();
+        let probe_started = Instant::now();
+        consume.notify_one();
+
+        // The probe cannot end before its own timeout; the replacement must not wait for it.
+        let bound = QUIC_REPROBE_TIMEOUT / 2;
+        while registered.load(SeqCst) == POOL && probe_started.elapsed() < bound {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            registered.load(SeqCst),
+            POOL + 1,
+            "the consumed registration was not replaced within {bound:?} while the QUIC reprobe hung (#329)"
+        );
+        pool.abort();
+        edge.abort();
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_pool_ends_without_waiting_out_a_hanging_reprobe_329() {
+        // #329: the probe in flight is a future the pool owns, not a task. A pool
+        // whose last worker gave up (ct-agent#180) returns at once and drops the
+        // probe with it; with the probe inline, the loop first sat out its dial.
+        let ca = ct_edge::pki::Ca::new("gave-up-329-ca").unwrap();
+        let (tcp_listener, _, ca_root, black_hole) = tls_tcp_edge_with_udp_black_hole(&ca).await;
+        let edge_addr = tcp_listener.local_addr().unwrap();
+        // TLS-TCP side: holds the worker's connection unanswered until told to refuse it.
+        let refuse = Arc::new(tokio::sync::Notify::new());
+        let refuse_e = Arc::clone(&refuse);
+        let edge = tokio::spawn(async move {
+            let (held, _) = tcp_listener.accept().await.unwrap();
+            refuse_e.notified().await;
+            drop(held);
+        });
+
+        let mut cfg = AgentConfig::parse(&edge_addr.to_string(), "127.0.0.1:9").unwrap();
+        cfg.tcp_fallback_pool_size = 1;
+        let (gate, _) = local_auth::LocalAuthGate::from_env(None, |_| None).unwrap();
+        let ctx = FallbackCtx::for_test(&cfg, ca_root, RoutingToken([0x2au8; 32]), Arc::new(vec![[0u8; 32]]), Arc::new(gate));
+        let reprobe = ReprobePolicy { interval: Duration::from_millis(100), confirmations: 1 };
+        // No retry: the worker's first failure ends it, and with it the pool.
+        let budget = FallbackBudget { base: Duration::from_millis(10), max: Duration::from_millis(10), attempts: 0 };
+        let pool = tokio::spawn(async move { run_tcp_fallback_pool(&ctx, budget, Some(reprobe)).await });
+
+        let mut packet = [0u8; 1500];
+        tokio::time::timeout(Duration::from_secs(10), black_hole.recv_from(&mut packet))
+            .await
+            .expect("the pool sends its QUIC reprobe")
+            .unwrap();
+        let probe_started = Instant::now();
+        refuse.notify_one();
+        let exit = tokio::time::timeout(Duration::from_secs(20), pool).await.expect("the pool ends").unwrap();
+        let waited = probe_started.elapsed();
+        assert!(matches!(exit, FallbackExit::AllWorkersGaveUp), "{exit:?}");
+        assert!(
+            waited < QUIC_REPROBE_TIMEOUT / 2,
+            "the pool ended {waited:?} into a probe that never answers: it sat the probe out (#329)"
+        );
+        edge.abort();
     }
 
     #[tokio::test]

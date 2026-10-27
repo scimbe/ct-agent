@@ -381,7 +381,9 @@ pub async fn present_channel_join_via_ladder(
                     // whole connection -- the parked member then waited out its park as a
                     // closing flow, and the edge's reap teardown RST'd the in-flight EX away
                     // (packet-capture-proven). The edge needs no EOF; keep the leg fully open.
-                    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT, false, phase_marker, ka_tick_wait)
+                    // The leg is up: parked from here on, for `/readyz` (health.rs).
+                    super::health::health()
+                        .parked(present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT, false, phase_marker, ka_tick_wait))
                         .await
                         .map_err(ChannelDialError::Failed)
                 }
@@ -392,7 +394,8 @@ pub async fn present_channel_join_via_ladder(
                     let conn = dial_peer_direct(endpoint, direct_timeout).await?;
                     // CADS-Tunnel#495 U2 (a'): this rung's twin :443 leg above marks
                     // PHASE_MARKER_RENDEZVOUS (admission-only, same as this direct-QUIC rung).
-                    present_channel_join_marked(&conn, request, holder, PHASE_MARKER_RENDEZVOUS)
+                    super::health::health()
+                        .parked(present_channel_join_marked(&conn, request, holder, PHASE_MARKER_RENDEZVOUS))
                         .await
                         .map_err(ChannelDialError::Failed)
                 }

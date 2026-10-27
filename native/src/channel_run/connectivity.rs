@@ -114,6 +114,9 @@ pub async fn join_via_relay_gate_dcutr<P>(
     relay_gate_addr: SocketAddr,
     relay_gate_cert: CertificateDer<'static>,
     own_grant: &ct_common::channel::SignedChannelGrant,
+    // #292: CT_CHANNEL_PEER_PIN, checked right after the relay admission, before the relay stream
+    // and the gate dial.
+    peer_pin: Option<&PeerPin>,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
@@ -151,6 +154,11 @@ where
             return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
         }
     };
+    // #292: this admission IS the relay leg (see `join_via_relay_dcutr`): a refusal closes it at once.
+    if let Err(refused) = check_peer_pin(peer_pin, request, &peer_holder, &peer_noise) {
+        close_refused_relay_conn(relay_conn);
+        return Err(refused);
+    }
     let local = gate_local(local, request, role, peer_holder, holder)?;
     let (relay_send, relay_recv) = open_relay_channel_streams(relay_conn, role).await?;
     let (gate_stream, relay_peer) =
@@ -610,6 +618,33 @@ async fn close_stream_relay_leg<W: AsyncWrite + Unpin>(send: &mut W) {
     let _ = tokio::time::timeout(RELAY_LEG_CLOSE_TIMEOUT, send.shutdown()).await;
 }
 
+/// How long a `:443` relay leg waits for its partner before it gives up and closes the leg
+/// (`CT_CHANNEL_RELAY_PAIR_SECS`). The relay join has no wait bound in ct-common, and the edge
+/// holds a relay-phase keepalive park like any other -- up to its keepalive park TTL where an
+/// operator raised it (CADS-Tunnel#506) -- so a partner that never came (a stale or dead
+/// rendezvous pairing) held this leg, and a serve slot, for that long. 45 s: the partner was
+/// paired seconds ago, and the QUIC relay leg already gives up after the same 45 s.
+pub(crate) const RELAY_PAIR_BOUND_DEFAULT: std::time::Duration = std::time::Duration::from_secs(45);
+/// The knob's floor: the edge parks a relay leg for its 30 s base lease, and a shorter client
+/// bound would abandon relay waits the edge can still pair.
+const RELAY_PAIR_BOUND_MIN_SECS: u64 = 35;
+const RELAY_PAIR_BOUND_MAX_SECS: u64 = 300;
+
+/// Parse `CT_CHANNEL_RELAY_PAIR_SECS`: a positive integer, clamped to 35-300 s; unset, empty,
+/// `0` or garbage give [`RELAY_PAIR_BOUND_DEFAULT`]. Pure.
+pub(crate) fn relay_pair_bound_from_env(value: Option<&str>) -> std::time::Duration {
+    match value.and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n >= 1) {
+        Some(n) => std::time::Duration::from_secs(n.clamp(RELAY_PAIR_BOUND_MIN_SECS, RELAY_PAIR_BOUND_MAX_SECS)),
+        None => RELAY_PAIR_BOUND_DEFAULT,
+    }
+}
+
+/// [`relay_pair_bound_from_env`] over the process environment, read once.
+pub(crate) fn relay_pair_bound() -> std::time::Duration {
+    static BOUND: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *BOUND.get_or_init(|| relay_pair_bound_from_env(std::env::var("CT_CHANNEL_RELAY_PAIR_SECS").ok().as_deref()))
+}
+
 /// What [`park_relay_leg_until`] resolved to.
 pub(crate) enum RelayLegPark {
     /// The edge paired and spliced this leg; the Noise session may start on it.
@@ -672,7 +707,8 @@ where
             park_relay_leg_on_quic(conn, request, holder, &mut abandon).await
         }
         RelayFallback::Ladder { rungs, edge_cert, direct_timeout } => {
-            park_relay_leg_via_ladder(rungs, edge_cert, direct_timeout, request, holder, &mut abandon).await
+            park_relay_leg_via_ladder(rungs, edge_cert, direct_timeout, request, holder, &mut abandon, relay_pair_bound())
+                .await
         }
     }
 }
@@ -721,14 +757,16 @@ where
 /// [`park_relay_leg_until`]; the walk order, fall-through rule, log lines and frozen error
 /// wording are those of the pre-split [`join_via_relay_ladder`], whose doc comment explains
 /// them). Only the *transport* connect of a rung may fall through to the next; once a rung
-/// connects, its admission outcome is terminal.
-async fn park_relay_leg_via_ladder<A>(
+/// connects, its admission outcome is terminal. `pair_bound` caps the wait of a `:443` leg for
+/// its partner ([`relay_pair_bound`]); a QUIC rung keeps its own 45 s bound.
+pub(crate) async fn park_relay_leg_via_ladder<A>(
     rungs: &[ChannelDialRung],
     edge_cert: CertificateDer<'static>,
     direct_timeout: std::time::Duration,
     request: &ChannelJoinRequest,
     holder: &SigningKey,
     abandon: &mut A,
+    pair_bound: std::time::Duration,
 ) -> Result<RelayLegPark, BoxError>
 where
     A: std::future::Future<Output = ()> + Unpin,
@@ -765,16 +803,36 @@ where
                     // early-eof class. An old edge negotiated a legacy id: no marker sent.
                     let phase_marker = crate::channel::phase_marker_for(&stream, crate::channel::PHASE_MARKER_RELAY);
                     let (mut recv, mut send) = tokio::io::split(stream);
-                    let outcome = tokio::select! {
+                    // Only a marker leaves the select: the presenting future borrows `send` until
+                    // the select ends, and both early ends close the leg through `send` (#22).
+                    enum RelayWait {
+                        Presented(Result<ChannelJoinOutcome, BoxError>),
+                        Abandoned,
+                        TimedOut,
+                    }
+                    let waited = tokio::select! {
                         biased;
-                        _ = &mut *abandon => None,
+                        _ = &mut *abandon => RelayWait::Abandoned,
+                        _ = tokio::time::sleep(pair_bound) => RelayWait::TimedOut,
                         presented = present_channel_relay_join_on_stream(&mut send, &mut recv, request, holder, phase_marker) => {
-                            Some(presented)
+                            RelayWait::Presented(presented)
                         }
                     };
-                    let Some(outcome) = outcome else {
-                        close_stream_relay_leg(&mut send).await;
-                        return Ok(RelayLegPark::Abandoned);
+                    let outcome = match waited {
+                        RelayWait::Abandoned => {
+                            close_stream_relay_leg(&mut send).await;
+                            return Ok(RelayLegPark::Abandoned);
+                        }
+                        RelayWait::TimedOut => {
+                            eprintln!(
+                                "ct-agent channel: relay leg found no partner within {}s -- closing it (CT_CHANNEL_RELAY_PAIR_SECS)",
+                                pair_bound.as_secs()
+                            );
+                            // close_notify, not a bare drop: the edge marks the park dead at once.
+                            close_stream_relay_leg(&mut send).await;
+                            return Err(RelayPairTimeout::boxed(pair_bound));
+                        }
+                        RelayWait::Presented(presented) => presented,
                     };
                     return match outcome? {
                         ChannelJoinOutcome::Admitted { .. } => {
@@ -1164,7 +1222,18 @@ pub(crate) fn dial_failure_action(consecutive: u32) -> Option<std::time::Duratio
 /// attempt; its **outer** `Err` is a dial/setup failure, terminal for a one-shot
 /// join and retried with [`dial_failure_action`]'s bounded backoff in serve mode, while the
 /// **inner** `Result` is the admission outcome, routed through [`dcutr_loop_action`].
-pub(crate) async fn run_dcutr_join_loop<T, F, Fut>(label: &str, serve_loop: bool, join: F) -> Result<T, BoxError>
+///
+/// ct-agent#308: `own_expires_at` (a persistent serve member's own grant expiry; `None` for a
+/// one-shot join) stops the loop with [`OwnGrantEnded`] -- exit status 77, as the plane-brokered
+/// serve loop -- once that grant expired, wherever the loop is, and on an admission refusal that
+/// says the same (see [`own_grant_refusal`]). Retrying with a grant that never becomes valid
+/// again only loads the edge, for ever.
+pub(crate) async fn run_dcutr_join_loop<T, F, Fut>(
+    label: &str,
+    serve_loop: bool,
+    own_expires_at: Option<u64>,
+    join: F,
+) -> Result<T, BoxError>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<Result<T, BoxError>, BoxError>>,
@@ -1173,12 +1242,31 @@ where
     let mut consecutive_refusals: u32 = 0;
     let mut consecutive_dial_failures: u32 = 0;
     loop {
+        let joined = match own_expires_at {
+            // Already over by this member's clock: no dial with a grant that cannot work.
+            Some(at) if crate::codec::now_unix() >= at => return Err(own_expiry_ends_dcutr_loop(label, at)),
+            Some(at) => {
+                let session = join();
+                tokio::pin!(session);
+                tokio::select! {
+                    biased;
+                    joined = &mut session => joined,
+                    () = grant_expiry_timer(at) => {
+                        // A running session's gate holds the same expiry (R1) and ends it the
+                        // regular way within the teardown budget; a parked join is dropped.
+                        let _ = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, &mut session).await;
+                        return Err(own_expiry_ends_dcutr_loop(label, at));
+                    }
+                }
+            }
+            None => join().await,
+        };
         // In serve mode a dial/setup failure (an edge restart, a network blip) is retried with
         // its own exponential backoff instead of ending the persistent serve process -- but not
         // forever: a failure that never clears (a misconfigured relay address fails at once,
         // every time) ends the loop after MAX_CONSECUTIVE_DCUTR_DIAL_FAILURES so the operator
         // or a supervisor sees it. One-shot callers keep the old `?`.
-        let result = match join().await {
+        let result = match joined {
             Ok(result) => {
                 consecutive_dial_failures = 0;
                 result
@@ -1191,7 +1279,7 @@ where
                             "ct-agent channel: {label} dial failed ({consecutive_dial_failures}/\
                              {MAX_CONSECUTIVE_DCUTR_DIAL_FAILURES}), retrying in {delay:?}: {e}"
                         );
-                        tokio::time::sleep(equal_jitter(delay, rand::random::<f64>())).await;
+                        backoff_within_grant(label, equal_jitter(delay, rand::random::<f64>()), own_expires_at).await?;
                         continue;
                     }
                     None => {
@@ -1204,6 +1292,14 @@ where
             }
             Err(e) => return Err(e),
         };
+        // ct-agent#308: the edge says this member's own grant is over; it never becomes valid
+        // again in this process.
+        if let (Some(_), Err(e)) = (own_expires_at, &result) {
+            if let Some(reason) = own_grant_refusal(e, own_expires_at, crate::codec::now_unix()) {
+                eprintln!("ct-agent channel: {reason} -- stopping the persistent {label} serve loop (#308)");
+                return Err(OwnGrantEnded::boxed(reason));
+            }
+        }
         match dcutr_loop_action(&result, serve_loop, attempt, ONE_SHOT_DCUTR_ADMISSION_RETRIES, consecutive_refusals) {
             DcutrLoopAction::RetryReset { delay, consecutive_refusals: refusals } => {
                 if let Err(e) = &result {
@@ -1214,7 +1310,7 @@ where
                 // #114-style jitter (see errors::equal_jitter): dcutr_loop_action stays pure/
                 // deterministic for testability, so jitter is applied here at the sleep site
                 // instead, same as the other four admission-layer backoff call sites.
-                tokio::time::sleep(equal_jitter(delay, rand::random::<f64>())).await;
+                backoff_within_grant(label, equal_jitter(delay, rand::random::<f64>()), own_expires_at).await?;
             }
             DcutrLoopAction::RetryBounded { next_attempt, delay } => {
                 attempt = next_attempt;
@@ -1226,6 +1322,29 @@ where
                 tokio::time::sleep(delay).await;
             }
             DcutrLoopAction::Stop => return result,
+        }
+    }
+}
+
+/// ct-agent#308: the end of a persistent DCUtR serve loop whose own grant expired at `at`.
+fn own_expiry_ends_dcutr_loop(label: &str, at: u64) -> BoxError {
+    let reason = format!("this member's channel grant expired (expires_at {at})");
+    eprintln!("ct-agent channel: {reason} -- stopping the persistent {label} serve loop (#308)");
+    OwnGrantEnded::boxed(reason)
+}
+
+/// ct-agent#308: a serve loop's backoff `delay`, unless this member's own grant (when the loop
+/// watches one) expires first -- then the loop's end. A refusal backoff lasts up to 30 s.
+pub(crate) async fn backoff_within_grant(label: &str, delay: std::time::Duration, own_expires_at: Option<u64>) -> Result<(), BoxError> {
+    match own_expires_at {
+        Some(at) => tokio::select! {
+            biased;
+            () = grant_expiry_timer(at) => Err(own_expiry_ends_dcutr_loop(label, at)),
+            () = tokio::time::sleep(delay) => Ok(()),
+        },
+        None => {
+            tokio::time::sleep(delay).await;
+            Ok(())
         }
     }
 }

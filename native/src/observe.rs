@@ -133,13 +133,15 @@ fn render_text(metrics: &TunnelMetrics) -> String {
 }
 
 /// The full `/metrics` body: ct_common's tunnel counters, then ct-agent's own
-/// series. Order: status gauges, event counters, MASQUE drops, live tasks -- the
-/// last two keep their pre-#178 tail position (a test pins it).
+/// series. Order: status gauges, event counters, direct refusals, TLS handshakes
+/// (#290), MASQUE drops, live tasks -- the last two keep their pre-#178 tail
+/// position (a test pins it).
 fn render_text_with(metrics: &TunnelMetrics, status: &AgentStatus, events: &EventCounters) -> String {
     let mut text = metrics.render_prometheus();
     text.push_str(&status.render_prometheus());
     text.push_str(&events.render_prometheus());
     text.push_str(&crate::serve::render_direct_refused_prometheus());
+    text.push_str(&crate::transport::render_tls_handshakes_prometheus());
     text.push_str(&crate::masque::render_dropped_datagrams_prometheus());
     text.push_str(&crate::task_guard::render_prometheus());
     text
@@ -197,16 +199,17 @@ pub async fn serve_metrics_on(
     serve_bounded(listener, guarded(metrics_router(metrics), loopback), ListenerLimits::DEFAULT).await
 }
 
-/// The listener's bounds (the module doc); a parameter so tests can use short ones.
+/// The listener's bounds (the module doc); a parameter so tests can use short ones. Also the
+/// bounds of the channel-mode health listener (`channel_run::health`).
 #[derive(Debug, Clone, Copy)]
-struct ListenerLimits {
+pub(crate) struct ListenerLimits {
     max_connections: usize,
     header_read_timeout: std::time::Duration,
     connection_lifetime: std::time::Duration,
 }
 
 impl ListenerLimits {
-    const DEFAULT: Self = Self {
+    pub(crate) const DEFAULT: Self = Self {
         max_connections: MAX_CONNECTIONS,
         header_read_timeout: HEADER_READ_TIMEOUT,
         connection_lifetime: CONNECTION_LIFETIME,
@@ -215,7 +218,7 @@ impl ListenerLimits {
 
 /// `router`, with the DNS-rebinding guard when the listener is on loopback. A non-loopback bind
 /// is reachable by address anyway, and scrapers there use service names in `Host`.
-fn guarded(router: Router, loopback: bool) -> Router {
+pub(crate) fn guarded(router: Router, loopback: bool) -> Router {
     if loopback {
         router.layer(axum::middleware::from_fn(require_local_host))
     } else {
@@ -246,7 +249,7 @@ fn is_local_host(host: &str) -> bool {
 
 /// Accept loop with the bounds from the module doc. Accept errors (EMFILE under fd pressure) are
 /// retried after a short pause instead of ending the listener.
-async fn serve_bounded(listener: tokio::net::TcpListener, app: Router, limits: ListenerLimits) -> Result<(), BoxError> {
+pub(crate) async fn serve_bounded(listener: tokio::net::TcpListener, app: Router, limits: ListenerLimits) -> Result<(), BoxError> {
     let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
     loop {
         let stream = match listener.accept().await {
@@ -327,6 +330,10 @@ mod tests {
         assert!(text.contains("# TYPE ct_agent_events_total counter\n"));
         assert!(text.contains("\nct_agent_events_total{kind=\"registered\"} "));
         assert!(text.contains("\nct_agent_events_total{kind=\"credential_degraded\"} "));
+        // #290: TLS-TCP handshakes by kind. Process-wide statics too, so shape only.
+        assert!(text.contains("# TYPE ct_agent_tls_handshakes_total counter\n"), "tls handshake counter header");
+        assert!(text.contains("\nct_agent_tls_handshakes_total{kind=\"full\"} "));
+        assert!(text.contains("\nct_agent_tls_handshakes_total{kind=\"resumed\"} "));
     }
 
     #[test]

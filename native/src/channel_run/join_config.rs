@@ -144,6 +144,10 @@ pub struct ChannelJoinCliConfig {
     /// fn pointer (not a closure) so the field stays `Copy`-free but trivially constructible in
     /// tests. Not yet read outside the tests (AUF-20261006-061).
     pub join_resolve: fn(&str) -> Result<SocketAddr, String>,
+    /// #292, `CT_CHANNEL_PEER_PIN` (opt-in; `None` = the hub semantics of ADR-0020): the partner
+    /// this endpoint is bound to. Every admitted peer it does not name is refused before any I/O
+    /// on every join path this config drives; see `channel_run::peer_pin`.
+    pub peer_pin: Option<PeerPin>,
 }
 
 /// Parse the optional `CT_CHANNEL_CIRCUIT_RELAY` libp2p circuit-relay multiaddr (#136 N-wire):
@@ -826,6 +830,13 @@ impl ChannelJoinCliConfig {
         // service_calls::call_persistent_enabled_from (only an explicit off value disables --
         // a typo can never silently reintroduce the exit(1)-on-death contract).
         let call_reconnect = crate::envflag::flag_named("CT_CHANNEL_CALL_RECONNECT", f("CT_CHANNEL_CALL_RECONNECT").as_deref(), true);
+        // #292: parsed here, at start -- a value that does not parse stops the process instead of
+        // leaving the endpoint unpinned, and a `link` pin whose operator key did not sign this
+        // grant stops it instead of refusing every peer later.
+        let peer_pin = PeerPin::from_lookup(&f)?;
+        if let Some(pin) = &peer_pin {
+            pin.check_own_grant(&grant)?;
+        }
         Ok(Self {
             role,
             broker_addr,
@@ -852,6 +863,7 @@ impl ChannelJoinCliConfig {
             front_door_only,
             call_reconnect,
             join_resolve: resolve_socket_addr,
+            peer_pin,
         })
     }
 }

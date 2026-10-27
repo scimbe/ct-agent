@@ -55,6 +55,10 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// `Accept` peer waits on its `listener` (bounded by `accept_timeout`; timeout →
 /// relay, since the initiator that can't reach it directly went to the relay too). The
 /// relay carries ciphertext only — the Noise_IK session stays end-to-end either way.
+///
+/// Runs without a peer pin: `CT_CHANNEL_PEER_PIN` is part of [`ChannelJoinCliConfig`], which this
+/// pre-dialed-broker entry point does not take. The CLI paths reach
+/// [`run_channel_join_with_admission`] with the configured pin.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_channel_join<P>(
     broker_conn: &Connection,
@@ -91,6 +95,7 @@ where
         local,
         false, // #104: this entry point predates the option and stays opt-out by default
         false, // ct-agent#22 (b): same -- the accept-vs-relay race is opt-in (CT_CHANNEL_ACCEPT_RACE)
+        None,  // #292: no peer pin on this entry point (see its doc)
     )
     .await
 }
@@ -109,6 +114,9 @@ where
 /// `accept_race` (ct-agent#22 (b), opt-in) makes an `Accept` member with a bound listener
 /// race its accept window against the relay leg (`race_accept_against_relay`) instead of
 /// serialising the two; off, the accept-then-relay order is byte-for-byte unchanged.
+/// `peer_pin` (#292, `CT_CHANNEL_PEER_PIN`): `Some` refuses an admitted peer the pin does not
+/// name with [`PeerNotPinned`]; the leg its session would have taken is still taken and closed
+/// before the Noise handshake ([`close_refused_pairing`]). `None` is unchanged.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_channel_join_with_admission<P>(
     admission: ChannelJoinOutcome,
@@ -130,6 +138,9 @@ pub async fn run_channel_join_with_admission<P>(
     // against the relay leg ([`race_accept_against_relay`]) instead of waiting the full
     // `accept_timeout` before it even dials the relay.
     accept_race: bool,
+    // #292, opt-in via CT_CHANNEL_PEER_PIN (None -> unchanged hub semantics): the partner this
+    // endpoint is bound to, checked against the attested peer below.
+    peer_pin: Option<&PeerPin>,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
@@ -169,6 +180,25 @@ where
             return Err(ParkExpired::boxed("channel park expired with no partner within the edge park window (#21) -- re-parking"))
         }
     };
+    // #292: the pin binds this endpoint to the partner it names. A refused pairing still takes the
+    // leg its session would have taken and closes it before the Noise handshake: the refused member
+    // dials this endpoint or parks its relay leg all the same, and a relay leg left waiting at the
+    // edge is spliced with this endpoint's NEXT relay leg -- the partner's session (see peer_pin).
+    if let Err(refused) = check_peer_pin(peer_pin, request, &peer_holder, &peer_noise) {
+        close_refused_pairing(
+            relay,
+            request,
+            holder,
+            role,
+            &peer_endpoint,
+            listener,
+            dial_timeout,
+            accept_timeout,
+            observed_reflexive,
+        )
+        .await;
+        return Err(refused);
+    }
     // The attestation binds the Noise key to `peer_holder` only; the peer's operator-signed grant
     // binds `peer_holder` to this channel (checked inside the session when enabled).
     let local = gate_local(local, request, role, peer_holder, holder)?;
@@ -350,7 +380,8 @@ where
 /// points would defeat that check too. Only the independently-signed attestation (which the
 /// edge cannot forge) closes it. Pure (no I/O), so unit-testable without a live relay.
 /// `local` behind the peer-grant check when [`REQUIRE_PEER_GRANT_ENV`] is on (see `peer_grant`),
-/// a pass-through otherwise. `peer_holder` is the holder admission attested the pinned Noise key
+/// a pass-through otherwise -- in both cases ended when this member's own grant expires
+/// (ct-agent#308). `peer_holder` is the holder admission attested the pinned Noise key
 /// with. Fails when the check is on but cannot run (no operator key configured).
 ///
 /// A TCP forward session (`CT_CHANNEL_FORWARD` / `CT_CHANNEL_FORWARD_ALLOW`) always runs the check,
@@ -366,13 +397,28 @@ pub(crate) fn gate_local<P>(
     peer_holder: [u8; 32],
     holder: &SigningKey,
 ) -> Result<PeerGrantGate<P>, BoxError> {
-    let forward = forward_session_configured();
+    gate_local_from(local, request, role, peer_holder, holder, &|k: &str| std::env::var(k).ok())
+}
+
+/// [`gate_local`] over a variable lookup (the testable seam). It is the one place every plane
+/// session decides whether it runs the peer-grant check -- the persistent serve loop's sessions
+/// included (`serve_admitted_session` -> `run_channel_join_with_admission`), which ct-agent#314
+/// suspected of skipping it.
+pub(crate) fn gate_local_from<P>(
+    local: P,
+    request: &ChannelJoinRequest,
+    role: ChannelRole,
+    peer_holder: [u8; 32],
+    holder: &SigningKey,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<PeerGrantGate<P>, BoxError> {
+    let forward = forward_session_configured_from(env);
     let watch = if forward && role == ChannelRole::Accept {
-        let cp_url = std::env::var("CT_AGENT_CP_URL").ok().filter(|s| !s.trim().is_empty());
-        let required = revocation_required(std::env::var(REVOCATION_ENV).ok().as_deref())?;
+        let cp_url = env("CT_AGENT_CP_URL").filter(|s| !s.trim().is_empty());
+        let required = revocation_required(env(REVOCATION_ENV).as_deref())?;
         match resolve_cp(cp_url, required)? {
             Some(cp_url) => {
-                let config = grant_watch::WatchConfig::from_env()?.requiring(required);
+                let config = grant_watch::WatchConfig::from_lookup(env)?.requiring(required);
                 Some(grant_watch::WatchPlan::control_plane(&cp_url, holder, &request.grant, config))
             }
             None => {
@@ -386,14 +432,15 @@ pub(crate) fn gate_local<P>(
     } else {
         None
     };
-    let check = PeerGrantPolicy::from_env_for(forward)?.map(|policy| PeerGrantCheck {
+    let check = PeerGrantPolicy::from_lookup_for(env, forward)?.map(|policy| PeerGrantCheck {
         policy,
         own_grant: request.grant.clone(),
         peer_holder,
         role,
         watch,
     });
-    Ok(PeerGrantGate::new(local, check))
+    // ct-agent#308 (R1): this member's own grant bounds every session it runs, checked peer or not.
+    Ok(PeerGrantGate::with_own_expiry(local, check, request.grant.grant.expires_at))
 }
 
 /// `CT_CHANNEL_REVOCATION=require` turns "no control-plane URL for the forward's grant re-check"
@@ -474,7 +521,14 @@ pub(crate) fn check_revocation_config_from(
 
 /// Whether this process runs a TCP forward session, on either side.
 fn forward_session_configured() -> bool {
-    std::env::var(forward_stream::FORWARD_ENV).is_ok() || forward::forward_allow_configured()
+    forward_session_configured_from(&|k: &str| std::env::var(k).ok())
+}
+
+/// [`forward_session_configured`] over a variable lookup: the same rule as `channel_local`'s two
+/// forward branches (`CT_CHANNEL_FORWARD` set, or a non-empty `CT_CHANNEL_FORWARD_ALLOW`).
+fn forward_session_configured_from(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    env(forward_stream::FORWARD_ENV).is_some()
+        || !forward::parse_forward_allowlist(env(forward::FORWARD_ALLOW_ENV).as_deref()).is_empty()
 }
 
 /// The peer's attested Noise key and the holder that attested it.
@@ -499,6 +553,8 @@ pub(crate) fn verify_relayed_dcutr_peer(
     Ok((noise, peer_holder))
 }
 
+// #292: the peer pin is the eighth argument, as on its relay-gate sibling.
+#[allow(clippy::too_many_arguments)]
 pub async fn join_via_relay_dcutr<P>(
     relay_conn: &Connection,
     request: &ChannelJoinRequest,
@@ -507,6 +563,8 @@ pub async fn join_via_relay_dcutr<P>(
     own_noise_private: &[u8; 32],
     local: P,
     circuit_relay: libp2p::Multiaddr,
+    // #292: CT_CHANNEL_PEER_PIN, checked right after the relay admission, before the relay stream.
+    peer_pin: Option<&PeerPin>,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
@@ -532,6 +590,12 @@ where
             return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
         }
     };
+    // #292: this admission IS the relay leg -- the edge spliced it with the peer's when it acked --
+    // so a refusal closes it at once, before the relay stream and the Noise handshake.
+    if let Err(refused) = check_peer_pin(peer_pin, request, &peer_holder, &peer_noise) {
+        close_refused_relay_conn(relay_conn);
+        return Err(refused);
+    }
     let local = gate_local(local, request, role, peer_holder, holder)?;
     // The DCUtR session runs the Noise_IK over the relay bi-stream as its base leg, punching to
     // direct in the background. Initiator opens the bi-stream; acceptor accepts the edge-opened one.
@@ -800,6 +864,11 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // `request` (a partial move would forbid the `cfg.broker_ladder()` `&self` call).
     // CT_CHANNEL_FRONT_DOOR_SNI: install before any front-door dial (None = unchanged).
     crate::transport::set_front_door_sni(cfg.front_door_sni.clone());
+    // #292: name the pin at start, or warn about a forward that has none (a hub member without a
+    // forward starts with the same output as before).
+    if let Some(line) = peer_pin_start_line(cfg.peer_pin.as_ref(), forward_session_configured()) {
+        eprintln!("{line}");
+    }
     let broker_ladder = cfg.broker_ladder();
     let relay_ladder = cfg.relay_ladder();
     let front_door_cert = cfg.front_door_cert.clone();
@@ -861,7 +930,10 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             let request = &request;
             let cfg = &cfg;
             let relay_gate_cert = &relay_gate_cert;
-            return run_dcutr_join_loop("relay-gate", serve_loop, move || async move {
+            // ct-agent#308: a persistent serve member stops (exit status 77) once its own grant
+            // is over; a one-shot join that a grant end cut short is an error, not a clean end.
+            let own_expires_at = serve_loop.then_some(request.grant.grant.expires_at);
+            let joined = run_dcutr_join_loop("relay-gate", serve_loop, own_expires_at, move || async move {
                 let relay_conn =
                     dial_relay_preferring_direct(cfg.relay_addr_direct, cfg.relay_addr, DIRECT_DIAL_TIMEOUT).await?;
                 // Admission via the relay gate happens below, after this call -- peer not yet known.
@@ -887,10 +959,11 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                     relay_gate_addr,
                     relay_gate_cert.clone(),
                     &cfg.grant,
+                    cfg.peer_pin.as_ref(),
                 )
                 .await)
-            })
-            .await;
+            });
+            return if serve_loop { joined.await } else { one_shot_session(joined).await };
         }
         if let (DcutrKnob::CircuitRelay { .. }, Some(circuit)) = (knob, cfg.circuit_relay.clone()) {
             eprintln!(
@@ -901,9 +974,11 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             let request = &request;
             let cfg = &cfg;
             let circuit = &circuit;
+            // ct-agent#308: as on the relay-gate path above.
+            let own_expires_at = serve_loop.then_some(request.grant.grant.expires_at);
             // #24: the label is a parameter now -- this branch used to print
             // "relay-gate admission error" from its copied loop body.
-            return run_dcutr_join_loop("circuit-relay", serve_loop, move || async move {
+            let joined = run_dcutr_join_loop("circuit-relay", serve_loop, own_expires_at, move || async move {
                 let relay_conn = crate::transport::build_channel_dialer()?
                     .connect(cfg.relay_addr, "localhost")?
                     .await?;
@@ -928,10 +1003,11 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                     &cfg.own_noise_private,
                     local,
                     circuit.clone(),
+                    cfg.peer_pin.as_ref(),
                 )
                 .await)
-            })
-            .await;
+            });
+            return if serve_loop { joined.await } else { one_shot_session(joined).await };
         }
     }
     // Broker admission (the grant + possession proof are the auth; Noise_IK authenticates
@@ -983,7 +1059,9 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             return run_forward_initiate_sessions(&raw, &cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert)
                 .await;
         }
-        return run_one_admission_session(&cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert).await;
+        // ct-agent#308: a one-shot session that a grant end cut short (R1) is an error, not exit 0.
+        return one_shot_session(run_one_admission_session(&cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert))
+            .await;
     }
     // #200: persistent serve is now CONCURRENT. The #179 loop admitted a peer, served it to
     // completion, and only THEN re-admitted the next — so two users clicking Build within the same
@@ -1020,13 +1098,17 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     serve_loop_concurrent(
         max,
         std::time::Duration::from_millis(200),
+        // ct-agent#308: the loop stops (exit status 77) once this member's own grant is over.
+        Some(request.grant.grant.expires_at),
         move || {
             let c = admit_ctx.clone();
-            async move { admit_one_peer(&c).await }
+            // SIGTERM/SIGINT: the park in flight closes and no new one opens (shutdown.rs).
+            async move { shutdown::admit_next_peer(&c, shutdown::process_stop()).await }
         },
         move |admission| {
             let c = ctx.clone();
-            async move { serve_admitted_session(c, admission).await }
+            // Counted from the pairing on, so the shutdown drain waits for it (health.rs).
+            health::health().serving(async move { serve_admitted_session(c, admission).await })
         },
     )
     .await
@@ -1081,6 +1163,15 @@ impl ChannelRunConfig {
             .as_deref()
             .and_then(hex32)
             .ok_or("CT_CHANNEL_PEER_NOISE_KEY required (64 hex chars)")?;
+        // #292: the pin binds a brokered admission's peer; this mode has no admission and already
+        // pins the peer's Noise key. Refused rather than ignored: a security setting that is set
+        // but enforced nowhere is worse than none.
+        if f(PEER_PIN_ENV).is_some_and(|v| !v.trim().is_empty()) {
+            return Err(format!(
+                "{PEER_PIN_ENV} applies to the brokered join (CT_CHANNEL_BROKER); the direct-address mode \
+                 pins the peer by CT_CHANNEL_PEER_NOISE_KEY already -- unset {PEER_PIN_ENV} here"
+            ));
+        }
         // Optional: pin the peer's transport cert. Omit it and the initiator dials
         // accept-any (Noise_IK authenticates), which keeps the one-liner self-contained.
         let peer_cert_der = match f("CT_CHANNEL_PEER_CERT").filter(|s| !s.trim().is_empty()) {
@@ -1164,6 +1255,11 @@ pub use session::*;
 mod peer_grant;
 pub use peer_grant::*;
 
+// #292: binding this endpoint to its partner (CT_CHANNEL_PEER_PIN, opt-in), checked on every
+// brokered admission right after its attestation.
+mod peer_pin;
+pub use peer_pin::*;
+
 // Control-plane re-check of the peer's grant while a forward session runs.
 pub(crate) mod grant_watch;
 
@@ -1173,6 +1269,8 @@ pub use grant_revoke::*;
 
 mod errors;
 pub(crate) use errors::*;
+// ct-agent#308: the own-grant-end exit contract, for `main` and `ct-agent-supervisor`.
+pub use errors::{is_own_grant_end, OwnGrantEnded, OWN_GRANT_ENDED_EXIT};
 
 mod serving;
 pub(crate) use serving::*;
@@ -1211,6 +1309,14 @@ pub(crate) use forward_stream::*;
 // ct-agent#169: secret-shape redaction for text that leaves this process towards a remote peer.
 mod redact;
 pub(crate) use redact::redact_secrets;
+
+// A long-running channel process: the opt-in health listener (CT_CHANNEL_HEALTH_LISTEN) with
+// the activity it reports, and the SIGTERM/SIGINT drain that ends the process (status 0 on
+// request; a one-shot transfer the stop cut keeps the signal's own status).
+mod health;
+pub use health::run_health_probe;
+mod shutdown;
+pub use shutdown::start_channel_lifecycle;
 
 #[cfg(test)]
 mod tests;

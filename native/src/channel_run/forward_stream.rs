@@ -43,16 +43,27 @@
 //! process neither exited nor reconnected: a peer restart or a relay drop killed the forward
 //! until a manual restart. Now the listener belongs to [`run_forward_initiate_reconnect_loop`],
 //! which hands it to one fresh engine per session. When a session ends for any reason other than
-//! a grant end (recorded as state by the gate, [`super::peer_grant::GrantEndRecord`], or this
-//! member's own grant past its expiry), the loop admits a new session after a backoff of
-//! [`FORWARD_RECONNECT_MIN`] doubling up to [`FORWARD_RECONNECT_MAX`]; connections made in the
-//! meantime wait in the listen backlog and are served by the next session. After a grant end the
-//! listener stays open but refuses every connection with a log line (#264), without reconnecting.
-//! An admission that the edge refuses because the grant is on the revocation list is final too:
-//! the grant is fixed for the life of the process and never becomes valid again, so the loop
-//! returns that error and the process ends with a failure status, as a one-shot dial does.
+//! this member's OWN grant end, the loop admits a new session after a backoff of
+//! [`FORWARD_RECONNECT_MIN`] doubling up to [`FORWARD_RECONNECT_MAX`], each wait jittered into the
+//! upper half of its step (ct-agent#314); connections made in the
+//! meantime wait in the listen backlog and are served by the next session. That includes a
+//! session that ended because the PEER's grant expired or was revoked (ct-agent#308): this
+//! member's grant is still good, the peer may come back with a new one, and the edge refuses it
+//! at admission until then.
+//!
+//! ## This member's own grant end is the forward's end (ct-agent#308)
+//!
+//! The grant is fixed for the life of the process (read once from the environment), so once it
+//! expired or was revoked nothing the loop does can make the forward work again. Own grant ends
+//! are: the expiry the gate records as this member's, this member's expiry by the clock (also
+//! while the loop waits for a peer at the edge), an admission refused with `[grant-revoked]`, and
+//! `[grant-verify]` once the own grant is past its expiry. By default the loop then returns
+//! [`super::errors::OwnGrantEnded`], which drops the listener and ends the process with
+//! [`super::errors::OWN_GRANT_ENDED_EXIT`] (77), so a supervisor sees it.
+//! [`FORWARD_ON_GRANT_END_ENV`]`=refuse` keeps the earlier end state instead: the listener stays
+//! bound and refuses every connection with a log line (#264), and the process keeps running.
 //
-// See ct-agent#255 and ct-agent#267.
+// See ct-agent#255, ct-agent#267 and ct-agent#308.
 
 use std::collections::HashMap;
 use std::io;
@@ -66,8 +77,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
+use super::errors::{OwnGrantEnded, OWN_GRANT_ENDED_EXIT};
 use super::forward::accept_forward_request_with;
 use super::forward_wire::Frame;
+use super::peer_grant::{
+    grant_expiry_timer, with_grant_end_record, GrantEnd, GrantEndRecord, GrantEndScope, GRANT_TEARDOWN_BUDGET,
+};
 use super::service_calls::LocalDuplex;
 use crate::events;
 use crate::task_guard::TaskGuard;
@@ -230,15 +245,21 @@ pub(crate) fn forward_initiate_on_with(
 ) -> LocalDuplex {
     let (session_side, engine_side) = tokio::io::duplex(ENGINE_DUPLEX_BUF);
     let (up_tx, session_up) = tokio::sync::oneshot::channel();
+    // The window this member grants (CT_CHANNEL_FORWARD_SESSION_WINDOW_KIB) and the process stop
+    // (SIGTERM/SIGINT, `shutdown`): the engine refuses new connections once the process stops.
+    let window = session_window_from_env();
+    let stop = super::shutdown::process_stop().clone();
     let pump = TaskGuard::spawn(async move {
-        run_forward_initiate_engine(
+        run_forward_initiate_engine_with(
             engine_side,
             listener,
             target,
             max_streams,
             idle,
             fc_enabled,
+            window,
             session_up,
+            stop,
         )
         .await;
     });
@@ -253,10 +274,11 @@ pub(crate) fn forward_limits_from_env() -> (usize, Duration) {
     )
 }
 
-/// The first wait before re-admitting a forward session that ended without a grant end.
+/// The first backoff step before re-admitting a forward session that ended without a grant end.
+/// Each actual wait is jittered into `[step/2, step]` (ct-agent#314).
 pub const FORWARD_RECONNECT_MIN: Duration = Duration::from_secs(1);
-/// The cap the wait doubles up to; a session that ran at least this long counts as healthy and
-/// resets the wait to [`FORWARD_RECONNECT_MIN`].
+/// The cap the step doubles up to; a session that ran at least this long counts as healthy and
+/// resets the step to [`FORWARD_RECONNECT_MIN`].
 pub const FORWARD_RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// The wait before the next admission (ct-agent#267): `prev` is the wait used before the session
@@ -268,19 +290,78 @@ pub(crate) fn next_forward_reconnect_delay(prev: Option<Duration>, lasted: Durat
     }
 }
 
-/// Why the session that just ended must not be replaced, decided from state only
-/// (ct-agent#267): the gate's recorded grant end, or this member's own grant past its expiry
-/// (`now >= expires_at`, the rule `verify_stateless` applies) -- the latter also covers a member
-/// running without the peer-grant check, whose gate records nothing. `None`: reconnect.
+/// The grant end of the session that just ended, decided from state only (ct-agent#267, #308):
+/// this member's own grant past its expiry (`now >= expires_at`, the rule `verify_stateless`
+/// applies; it also covers a session whose gate recorded nothing), else what the gate recorded --
+/// an own end, or a peer end that the loop reconnects after. `None`: no grant end at all.
 pub(crate) fn forward_grant_end(
-    recorded: Option<String>,
+    recorded: Option<GrantEnd>,
     own_expires_at: u64,
     now: u64,
-) -> Option<String> {
-    recorded.or_else(|| {
-        (now >= own_expires_at)
-            .then(|| format!("this member's channel grant expired (expires_at {own_expires_at})"))
-    })
+) -> Option<GrantEnd> {
+    match recorded {
+        Some(end) if end.scope == GrantEndScope::Own => Some(end),
+        _ if now >= own_expires_at => Some(GrantEnd::own(format!(
+            "this member's channel grant expired (expires_at {own_expires_at})"
+        ))),
+        other => other,
+    }
+}
+
+/// `CT_CHANNEL_FORWARD_ON_GRANT_END`: what a forward initiator does once its own grant ended
+/// (ct-agent#308). `exit` (the default) or `refuse`.
+pub const FORWARD_ON_GRANT_END_ENV: &str = "CT_CHANNEL_FORWARD_ON_GRANT_END";
+
+/// What a forward initiator does once its own grant ended (see the module doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnOwnGrantEnd {
+    /// Release the listener and end the process with exit status 77.
+    Exit,
+    /// Keep the listener bound and refuse every connection (#264); the process keeps running,
+    /// so no other local user can take the loopback port.
+    Refuse,
+}
+
+/// [`FORWARD_ON_GRANT_END_ENV`] parsed: unset, empty or `exit` is [`OnOwnGrantEnd::Exit`],
+/// `refuse` is [`OnOwnGrantEnd::Refuse`], anything else an error at start -- a typo must not
+/// silently pick a behaviour.
+pub(crate) fn on_own_grant_end_from(raw: Option<&str>) -> Result<OnOwnGrantEnd, String> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("exit") => Ok(OnOwnGrantEnd::Exit),
+        Some("refuse") => Ok(OnOwnGrantEnd::Refuse),
+        Some(other) => Err(format!(
+            "{FORWARD_ON_GRANT_END_ENV}={other:?} is not understood (use `exit` or `refuse`)"
+        )),
+    }
+}
+
+/// The forward's end after this member's own grant ended (ct-agent#308): the error that ends
+/// the process with exit status 77, or -- with `refuse` -- the #264 end state, which never returns.
+async fn end_forward_for_own_grant<E: From<OwnGrantEnded>>(
+    listener: &TcpListener,
+    on_own_end: OnOwnGrantEnd,
+    lasted: Duration,
+    reason: String,
+) -> Result<(), E> {
+    match on_own_end {
+        OnOwnGrantEnd::Exit => {
+            eprintln!(
+                "ct-agent channel: forward ended after {lasted:?}: {reason} -- this member's own grant \
+                 no longer authorizes it; releasing the forward listener, exit status \
+                 {OWN_GRANT_ENDED_EXIT} (#308)"
+            );
+            Err(E::from(OwnGrantEnded(reason)))
+        }
+        OnOwnGrantEnd::Refuse => {
+            eprintln!(
+                "ct-agent channel: forward ended after {lasted:?}: {reason} -- not reconnecting, the \
+                 forward listener refuses every new connection ({FORWARD_ON_GRANT_END_ENV}=refuse, \
+                 #264, #308)"
+            );
+            refuse_forward_connections(listener, &reason).await;
+            Ok(())
+        }
+    }
 }
 
 /// The #264 end state after a grant end: the listener stays bound and every connection is
@@ -302,66 +383,110 @@ async fn refuse_forward_connections(listener: &TcpListener, why: &str) {
 }
 
 /// The initiate side's session loop (ct-agent#267, see the module doc): one shared `listener`,
-/// one fresh engine and one `admit` call per session, reconnecting with backoff until a grant
-/// end, after which it refuses connections for good. `admit` runs one whole session (admission
-/// included) over the duplex it is given and returns when that session ends; it is the seam the
-/// tests drive without a broker.
+/// one fresh engine and one `admit` call per session, reconnecting with backoff until this
+/// member's own grant ended (ct-agent#308). `admit` runs one whole session (admission included)
+/// over the duplex it is given and returns when that session ends; it is the seam the tests drive
+/// without a broker.
 ///
-/// `is_final` names the admission errors that never clear on their own (a refusal because the
-/// grant is on the revocation list): the loop then stops and returns that error instead of
-/// asking again, so the process ends like a one-shot dial does. Otherwise it returns only if
-/// the listener's refusing loop ever could.
+/// `is_own_grant_refusal` names the admission errors that say this member's own grant ended (a
+/// refusal because the grant is on the revocation list). What happens then is `on_own_end`:
+/// return [`OwnGrantEnded`] (the process exits with 77), or refuse connections for good.
+#[allow(clippy::too_many_arguments)] // the six forward settings plus the two seams the tests drive
 pub(crate) async fn run_forward_initiate_reconnect_loop<A, Fut, E, F>(
     listener: Arc<TcpListener>,
     target: String,
     max_streams: usize,
     idle: Duration,
     own_expires_at: u64,
+    on_own_end: OnOwnGrantEnd,
     mut admit: A,
-    is_final: F,
+    is_own_grant_refusal: F,
 ) -> Result<(), E>
 where
     A: FnMut(LocalDuplex) -> Fut,
     Fut: std::future::Future<Output = Result<(), E>>,
-    E: std::fmt::Display,
+    E: std::fmt::Display + From<OwnGrantEnded>,
     F: Fn(&E) -> bool,
 {
     let mut delay: Option<Duration> = None;
+    let mut lasted = Duration::ZERO;
+    let expired = || format!("this member's channel grant expired (expires_at {own_expires_at})");
     loop {
-        let record = super::peer_grant::GrantEndRecord::default();
+        // ct-agent#308: an own grant that is already over by this member's clock ends the forward
+        // here -- before a fresh engine could take a connection from the listen backlog, and
+        // before the expired grant is presented to the edge once more.
+        if crate::codec::now_unix() >= own_expires_at {
+            return end_forward_for_own_grant(&listener, on_own_end, lasted, expired()).await;
+        }
+        let record = GrantEndRecord::default();
         let local = forward_initiate_on(listener.clone(), target.clone(), max_streams, idle);
         let started = std::time::Instant::now();
-        let outcome = super::peer_grant::with_grant_end_record(record.clone(), admit(local)).await;
-        let lasted = started.elapsed();
-        if let Some(why) =
-            forward_grant_end(record.ended(), own_expires_at, crate::codec::now_unix())
-        {
-            eprintln!(
-                "ct-agent channel: forward session ended after {lasted:?}: {why} -- not reconnecting, \
-                 the forward listener refuses every new connection (#264, #267)"
-            );
-            refuse_forward_connections(&listener, &why).await;
-            return Ok(());
-        }
-        if let Err(e) = &outcome {
-            if is_final(e) {
-                eprintln!("ct-agent channel: forward session failed after {lasted:?}: {e} -- not reconnecting");
-                return outcome;
+        // ct-agent#308: the own grant also runs out while this member waits at the edge for a
+        // peer (a park lasts as long as the edge allows); the forward ends then, not at the next
+        // session end. `biased`: a session that ends in the same instant reports its own end.
+        let outcome = {
+            let session = with_grant_end_record(record.clone(), admit(local));
+            tokio::pin!(session);
+            tokio::select! {
+                biased;
+                outcome = &mut session => Some(outcome),
+                () = grant_expiry_timer(own_expires_at) => {
+                    // A running session's gate holds the same expiry (R1) and fires within a
+                    // second of this timer: it ends the session the regular way, streams closed
+                    // within the teardown budget and its close event emitted. Only a session
+                    // still parked at the edge after that budget is dropped here.
+                    let _ = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, &mut session).await;
+                    None
+                }
             }
+        };
+        lasted = started.elapsed();
+        let Some(outcome) = outcome else {
+            return end_forward_for_own_grant(&listener, on_own_end, lasted, expired()).await;
+        };
+        let end = forward_grant_end(record.ended(), own_expires_at, crate::codec::now_unix()).or_else(|| {
+            match &outcome {
+                Err(e) if is_own_grant_refusal(e) => Some(GrantEnd::own(e.to_string())),
+                _ => None,
+            }
+        });
+        if let Some(GrantEnd { scope: GrantEndScope::Own, reason }) = end {
+            return end_forward_for_own_grant(&listener, on_own_end, lasted, reason).await;
         }
-        let wait = next_forward_reconnect_delay(delay, lasted);
-        delay = Some(wait);
-        match outcome {
-            Ok(()) => eprintln!(
+        let step = next_forward_reconnect_delay(delay, lasted);
+        delay = Some(step);
+        // ct-agent#314: the doubling keeps its deterministic steps; the wait itself is jittered
+        // into [step/2, step]. After an edge restart every forward initiator of a fleet ended its
+        // session in the same second and came back in lockstep (1, 2, 4 ... s).
+        let wait = super::errors::equal_jitter(step, rand::random::<f64>());
+        match (end, outcome) {
+            // ct-agent#308: until v0.7.40 a peer whose grant expired first stopped this member
+            // for good -- the session clock runs to the earlier expiry and was recorded as "the"
+            // grant end -- although this member's own grant was still valid.
+            (Some(peer_end), _) => eprintln!(
+                "ct-agent channel: forward session ended after {lasted:?}: {} -- the peer's grant, \
+                 not this member's: reconnecting in {wait:?}; the edge refuses the peer until it \
+                 holds a valid grant again (#308)",
+                peer_end.reason
+            ),
+            (None, Ok(())) => eprintln!(
                 "ct-agent channel: forward session ended after {lasted:?} without a grant end \
                  (peer restart or relay/network drop) -- reconnecting in {wait:?} (#267)"
             ),
-            Err(e) => eprintln!(
+            (None, Err(e)) => eprintln!(
                 "ct-agent channel: forward session failed after {lasted:?}: {e} -- reconnecting \
                  in {wait:?} (#267)"
             ),
         }
-        tokio::time::sleep(wait).await;
+        // ct-agent#308: the own grant can also run out during the backoff (up to 30 s); the
+        // forward ends then, with its listener, not when the wait is over.
+        tokio::select! {
+            biased;
+            () = grant_expiry_timer(own_expires_at) => {
+                return end_forward_for_own_grant(&listener, on_own_end, lasted, expired()).await;
+            }
+            () = tokio::time::sleep(wait) => {}
+        }
     }
 }
 
@@ -395,14 +520,16 @@ pub(crate) fn forward_accept_local_with(
     fc_enabled: bool,
 ) -> LocalDuplex {
     let (session_side, engine_side) = tokio::io::duplex(ENGINE_DUPLEX_BUF);
+    let window = session_window_from_env();
     let pump = TaskGuard::spawn(async move {
-        run_forward_accept_engine(
+        run_forward_accept_engine_with(
             engine_side,
             allow_raw,
             non_loopback_raw,
             max_streams,
             idle,
             fc_enabled,
+            window,
         )
         .await;
     });
@@ -525,12 +652,57 @@ const CTL_SWINDOW: u8 = 4;
 const HELLO_V2: u8 = 2;
 /// The session window this member grants a peer: how much stream data may be on its way to this
 /// engine without an acknowledgement. It bounds what waits ahead of a new stream's Open and first
-/// bytes on a slow path (measured: 3.8 MiB ahead of an Open at 62 500 B/s, 64 s).
+/// bytes on a slow path (measured: 3.8 MiB ahead of an Open at 62 500 B/s, 64 s). The default;
+/// [`FORWARD_SESSION_WINDOW_ENV`] sets another.
 pub(crate) const SESSION_WINDOW: usize = 256 * 1024;
 /// Smallest window a peer may grant (other than 0): four chunks.
 const SESSION_WINDOW_MIN: usize = 4 * DATA_CHUNK_LEN;
 /// Largest window this member uses, whatever the peer grants.
 const SESSION_WINDOW_MAX: usize = 16 * 1024 * 1024;
+
+/// `CT_CHANNEL_FORWARD_SESSION_WINDOW_KIB`: the session window this member GRANTS its peer, in KiB
+/// (default [`SESSION_WINDOW`], 256 KiB). It is all the stream data of one forward session -- every
+/// stream together -- that may travel towards this member unacknowledged, so on a path with a
+/// large bandwidth-delay product it caps what one session carries towards this member at roughly
+/// window / round trip (256 KiB over 40 ms: about 50 Mbit/s for all streams of the session). Set
+/// it on the member that RECEIVES the bulk; a larger window also lets more data wait ahead of a
+/// new stream's first bytes on a slow path, which is what the default guards.
+///
+/// The value is the receiver's alone, which is why it can be tuned on one member: the sender takes
+/// the window from this member's HELLO (capped at [`SESSION_WINDOW_MAX`]), and the acknowledgements
+/// stay this member's own (a quarter of its window, or [`SESSION_ACK_DELAY`]). A released v0.7.40
+/// sender honours any window from [`SESSION_WINDOW_MIN`] to [`SESSION_WINDOW_MAX`]; an older one
+/// reads the HELLO as version 1 and ignores the window. Values outside that range fail the start:
+/// below the minimum a v0.7.40 peer ends every session as a protocol violation. The credit per
+/// stream ([`FC_WINDOW`]) is deliberately NOT tunable: the sender assumes it without asking, so a
+/// receiver that changed it alone would reset streams.
+pub const FORWARD_SESSION_WINDOW_ENV: &str = "CT_CHANNEL_FORWARD_SESSION_WINDOW_KIB";
+
+/// [`FORWARD_SESSION_WINDOW_ENV`] parsed, in bytes: unset or empty is [`SESSION_WINDOW`]; a whole
+/// number of KiB from [`SESSION_WINDOW_MIN`] to [`SESSION_WINDOW_MAX`] is taken; anything else is
+/// an error (checked at start, see `shutdown::start_channel_lifecycle`).
+pub(crate) fn session_window_from(raw: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(SESSION_WINDOW);
+    };
+    let range = format!("{} to {} KiB", SESSION_WINDOW_MIN / 1024, SESSION_WINDOW_MAX / 1024);
+    let kib: usize = raw
+        .parse()
+        .map_err(|_| format!("{FORWARD_SESSION_WINDOW_ENV}={raw:?} is not a whole number of KiB ({range})"))?;
+    match kib.checked_mul(1024) {
+        Some(bytes) if (SESSION_WINDOW_MIN..=SESSION_WINDOW_MAX).contains(&bytes) => Ok(bytes),
+        _ => Err(format!(
+            "{FORWARD_SESSION_WINDOW_ENV}={kib} is outside {range}: a peer ends the session below the \
+             minimum and uses no more than the maximum"
+        )),
+    }
+}
+
+/// [`session_window_from`] on the process environment; the start already refused a bad value.
+fn session_window_from_env() -> usize {
+    session_window_from(std::env::var(FORWARD_SESSION_WINDOW_ENV).ok().as_deref()).unwrap_or(SESSION_WINDOW)
+}
+
 /// The receiver acknowledges at the latest this long after the first unacknowledged byte.
 const SESSION_ACK_DELAY: Duration = Duration::from_millis(100);
 /// Dead-peer detection of a session with a session window: stream data is
@@ -754,21 +926,32 @@ struct PumpFlow {
 /// Receive side of the session window: counts the stream data the engine reads and says when to
 /// acknowledge it. Off (nothing counted, no SWINDOW) until the peer's HELLO says version 2 -- the
 /// HELLO is the first frame either side sends, so both ends count from the same byte.
-#[derive(Default)]
 struct SessionRecv {
     on: bool,
     unacked: usize,
     flush_at: Option<tokio::time::Instant>,
+    /// The window this member granted in its HELLO: acknowledged at a quarter of it.
+    window: usize,
 }
 
 impl SessionRecv {
+    /// The receive side of a member that granted `window`.
+    fn granting(window: usize) -> Self {
+        Self {
+            on: false,
+            unacked: 0,
+            flush_at: None,
+            window,
+        }
+    }
+
     /// The engine read `bytes` of stream data; the SWINDOW to send now, if one is due.
     fn received(&mut self, bytes: usize) -> Option<Frame> {
         if !self.on || bytes == 0 {
             return None;
         }
         self.unacked += bytes;
-        if self.unacked >= SESSION_WINDOW / 4 {
+        if self.unacked >= self.window / 4 {
             return self.flush();
         }
         if self.flush_at.is_none() {
@@ -1270,8 +1453,8 @@ fn apply_control(
     }
 }
 
-/// The initiate side's engine (#255): every accepted local connection becomes one stream.
-/// Reads frames cancel-safe (frame_fut), never waits on a credited stream, never writes itself.
+/// The initiate engine as the tests drive it: the default session window, never stopped.
+#[cfg(test)]
 async fn run_forward_initiate_engine(
     engine_side: tokio::io::DuplexStream,
     listener: Arc<TcpListener>,
@@ -1280,6 +1463,37 @@ async fn run_forward_initiate_engine(
     idle: Duration,
     fc_enabled: bool,
     session_up: tokio::sync::oneshot::Receiver<()>,
+) {
+    run_forward_initiate_engine_with(
+        engine_side,
+        listener,
+        target,
+        max_streams,
+        idle,
+        fc_enabled,
+        SESSION_WINDOW,
+        session_up,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+/// The initiate side's engine (#255): every accepted local connection becomes one stream.
+/// Reads frames cancel-safe (frame_fut), never waits on a credited stream, never writes itself.
+/// `window` is the session window it grants the peer ([`FORWARD_SESSION_WINDOW_ENV`]). Once
+/// `stop` is cancelled (the process is shutting down, see `shutdown`) it closes every new local
+/// connection at once; the streams already running go on until they end or the process exits.
+#[allow(clippy::too_many_arguments)] // the session's settings plus the duplex, listener and both signals
+async fn run_forward_initiate_engine_with(
+    engine_side: tokio::io::DuplexStream,
+    listener: Arc<TcpListener>,
+    target: String,
+    max_streams: usize,
+    idle: Duration,
+    fc_enabled: bool,
+    window: usize,
+    session_up: tokio::sync::oneshot::Receiver<()>,
+    stop: tokio_util::sync::CancellationToken,
 ) {
     let (mux_read, mux_write) = tokio::io::split(engine_side);
     let (out_tx, out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
@@ -1294,9 +1508,13 @@ async fn run_forward_initiate_engine(
     ));
     tokio::pin!(writer);
     if fc_enabled {
-        let _ = ctrl_tx.send(hello_frame(SESSION_WINDOW as u32));
+        let _ = ctrl_tx.send(hello_frame(window as u32));
     }
-    let mut session_recv = SessionRecv::default();
+    let mut session_recv = SessionRecv::granting(window);
+    // The process is shutting down: no new local connection becomes a stream any more, each is
+    // closed at once (the accept branch checks the token itself, so a connection that races the
+    // stop is refused as well).
+    let mut stopping = false;
     let mut unacked_since: Option<tokio::time::Instant> = None;
     let mut dead_check = tokio::time::interval(SESSION_DEAD_AFTER / 4);
     let mut peer_speaks_fc = false;
@@ -1333,8 +1551,24 @@ async fn run_forward_initiate_engine(
                 accepting = true;
                 eprintln!("ct-agent channel: forward flow control off for this session -- the peer sent no HELLO within {} ms (older agent)", HELLO_WAIT.as_millis());
             }
-            accepted = listener.accept(), if accepting => {
+            () = stop.cancelled(), if !stopping => {
+                stopping = true;
+                eprintln!(
+                    "ct-agent channel: forward listener refuses new connections -- the process is shutting down \
+                     ({} stream(s) still running)",
+                    running.len()
+                );
+            }
+            // While stopping the listener is still polled, and every new connection is closed at
+            // once (#264's refusal): left in the backlog it would hang its client for the whole
+            // drain and then be reset at the exit, where a closed one is a fast failure the client
+            // (a relay, a browser behind a Service) can retry on another endpoint.
+            accepted = listener.accept(), if accepting || stopping => {
                 match accepted {
+                    Ok((tcp, peer_addr)) if stop.is_cancelled() => {
+                        drop(tcp);
+                        eprintln!("ct-agent channel: forward listener refused {peer_addr}: the process is shutting down");
+                    }
                     Ok((tcp, _peer_addr)) => {
                         if running.len() >= max_streams {
                             drop(tcp);
@@ -1364,7 +1598,8 @@ async fn run_forward_initiate_engine(
                             break;
                         }
                         let session = session_send.clone();
-                        let task = streams.spawn(WRITTEN.scope(written.clone(), async move {
+                        // Counted for the shutdown drain from here on, not from the task's first poll.
+                        let task = streams.spawn(super::health::health().forward_stream(WRITTEN.scope(written.clone(), async move {
                             // Without flow control the Open takes the pumps' queue and never waits
                             // forever on a peer that stopped reading.
                             if credited
@@ -1374,7 +1609,7 @@ async fn run_forward_initiate_engine(
                                 pump_forward_stream(id, tcp, out_tx2, rx, idle, flow).await;
                             }
                             id
-                        }));
+                        })));
                         running.insert(id, task.id());
                     }
                     Err(e) => eprintln!("ct-agent channel: forward listener accept error: {e}"),
@@ -1533,9 +1768,8 @@ async fn run_forward_initiate_engine(
     }
 }
 
-/// The accept side's engine (#255 slice 2): for every `Frame::Open` the peer sends, re-check the
-/// policy gate and, if allowed, dial `target` and pump it. A stream uses credit flow control when
-/// the initiate side announced it with FC_ON before the Open.
+/// The accept engine as the tests drive it: the default session window.
+#[cfg(test)]
 async fn run_forward_accept_engine(
     engine_side: tokio::io::DuplexStream,
     allow_raw: Option<String>,
@@ -1543,6 +1777,31 @@ async fn run_forward_accept_engine(
     max_streams: usize,
     idle: Duration,
     fc_enabled: bool,
+) {
+    run_forward_accept_engine_with(
+        engine_side,
+        allow_raw,
+        non_loopback_raw,
+        max_streams,
+        idle,
+        fc_enabled,
+        SESSION_WINDOW,
+    )
+    .await
+}
+
+/// The accept side's engine (#255 slice 2): for every `Frame::Open` the peer sends, re-check the
+/// policy gate and, if allowed, dial `target` and pump it. A stream uses credit flow control when
+/// the initiate side announced it with FC_ON before the Open. `window` is the session window it
+/// grants the peer ([`FORWARD_SESSION_WINDOW_ENV`]).
+async fn run_forward_accept_engine_with(
+    engine_side: tokio::io::DuplexStream,
+    allow_raw: Option<String>,
+    non_loopback_raw: Option<String>,
+    max_streams: usize,
+    idle: Duration,
+    fc_enabled: bool,
+    window: usize,
 ) {
     let (mux_read, mux_write) = tokio::io::split(engine_side);
     let (out_tx, out_rx) = mpsc::channel::<Frame>(CHANNEL_CAP);
@@ -1557,11 +1816,11 @@ async fn run_forward_accept_engine(
     ));
     tokio::pin!(writer);
     if fc_enabled {
-        let _ = ctrl_tx.send(hello_frame(SESSION_WINDOW as u32));
+        let _ = ctrl_tx.send(hello_frame(window as u32));
     } else {
         eprintln!("ct-agent channel: forward flow control off on this member ({FORWARD_FLOW_ENV})");
     }
-    let mut session_recv = SessionRecv::default();
+    let mut session_recv = SessionRecv::granting(window);
     // The peer's session window; set only by a HELLO that arrives before the first Open, so both
     // ends count the same bytes from the first one on.
     let mut session_send: Option<Arc<SessionSend>> = None;
@@ -1632,7 +1891,8 @@ async fn run_forward_accept_engine(
                                 // the peer acknowledges its bytes like any other.
                                 let session = session_send.clone();
                                 let flow = (credit.is_some() || session.is_some()).then_some(PumpFlow { credit, session });
-                                let task = streams.spawn(WRITTEN.scope(written.clone(), dial_and_pump_forward_target(id, target, out_tx.clone(), rx, idle, flow)));
+                                // Counted for the shutdown drain from here on, dial included.
+                                let task = streams.spawn(super::health::health().forward_stream(WRITTEN.scope(written.clone(), dial_and_pump_forward_target(id, target, out_tx.clone(), rx, idle, flow))));
                                 running.insert(id, task.id());
                             }
                         }
@@ -2153,21 +2413,34 @@ mod tests {
     }
 
     #[test]
-    fn only_a_recorded_grant_end_or_an_expired_own_grant_stops_the_reconnect() {
+    fn only_this_members_own_grant_end_stops_the_reconnect_308() {
+        let own = |end: Option<GrantEnd>| end.map(|e| e.scope) == Some(GrantEndScope::Own);
+        assert_eq!(forward_grant_end(None, 1_000, 999), None, "a valid grant reconnects");
+        assert!(own(forward_grant_end(None, 1_000, 1_000)), "now == expires_at is expired");
         assert_eq!(
-            forward_grant_end(None, 1_000, 999),
-            None,
-            "a valid grant reconnects"
+            forward_grant_end(Some(GrantEnd::own("revoked")), 1_000, 0),
+            Some(GrantEnd::own("revoked")),
+            "a recorded own end wins even while the own grant is still valid by the clock"
         );
-        assert!(
-            forward_grant_end(None, 1_000, 1_000).is_some(),
-            "now == expires_at is expired"
-        );
+        // ct-agent#308: the peer's end is reported as such -- the loop reconnects after it...
         assert_eq!(
-            forward_grant_end(Some("revoked".into()), 1_000, 0).as_deref(),
-            Some("revoked"),
-            "a recorded end wins even while the own grant is still valid"
+            forward_grant_end(Some(GrantEnd::peer("the peer's grant expired")), 1_000, 999),
+            Some(GrantEnd::peer("the peer's grant expired")),
         );
+        // ...unless this member's own grant is over too.
+        assert!(own(forward_grant_end(Some(GrantEnd::peer("the peer's grant expired")), 1_000, 1_000)));
+    }
+
+    #[test]
+    fn the_own_grant_end_mode_defaults_to_exit_and_refuses_a_typo_308() {
+        assert_eq!(on_own_grant_end_from(None), Ok(OnOwnGrantEnd::Exit));
+        assert_eq!(on_own_grant_end_from(Some("")), Ok(OnOwnGrantEnd::Exit), "compose passes unset as empty");
+        assert_eq!(on_own_grant_end_from(Some(" exit ")), Ok(OnOwnGrantEnd::Exit));
+        assert_eq!(on_own_grant_end_from(Some("refuse")), Ok(OnOwnGrantEnd::Refuse));
+        for typo in ["Refuse", "refused", "keep", "1"] {
+            let err = on_own_grant_end_from(Some(typo)).unwrap_err();
+            assert!(err.contains(FORWARD_ON_GRANT_END_ENV), "{typo}: {err}");
+        }
     }
 
     #[test]
@@ -4237,5 +4510,214 @@ mod tests {
             .await
             .expect("an FC_ON flood must end the session")
             .unwrap();
+    }
+
+    // ---- The window a member grants (CT_CHANNEL_FORWARD_SESSION_WINDOW_KIB) and the process
+    // ---- stop (SIGTERM/SIGINT, `shutdown`) ----
+
+    #[test]
+    fn the_session_window_setting_is_kib_within_what_a_released_peer_accepts() {
+        assert_eq!(session_window_from(None), Ok(SESSION_WINDOW));
+        assert_eq!(session_window_from(Some(" ")), Ok(SESSION_WINDOW), "compose passes unset as empty");
+        assert_eq!(session_window_from(Some("4096")), Ok(4 << 20));
+        assert_eq!(session_window_from(Some(" 64 ")), Ok(SESSION_WINDOW_MIN), "the least a peer accepts");
+        assert_eq!(session_window_from(Some("16384")), Ok(SESSION_WINDOW_MAX), "the most a peer uses");
+        for bad in ["63", "16385", "0", "4M", "-1", "1.5", "18446744073709551615"] {
+            let err = session_window_from(Some(bad)).unwrap_err();
+            assert!(err.contains(FORWARD_SESSION_WINDOW_ENV), "{bad}: {err}");
+        }
+        // Every value the setting takes is one the send side takes as is: not refused, not capped.
+        for kib in [64usize, 256, 4096, 16384] {
+            let window = session_window_from(Some(&kib.to_string())).unwrap();
+            let s = SessionSend::from_hello(window as u32).unwrap().unwrap();
+            assert_eq!(s.budget_cap + s.first_cap, window, "{kib} KiB");
+        }
+    }
+
+    /// An accept engine whose peer is the test, granting `window`.
+    fn accept_at_the_wire_granting(window: usize) -> Wire {
+        let (session_side, engine_side) = tokio::io::duplex(1 << 16);
+        let engine = tokio::spawn(run_forward_accept_engine_with(
+            engine_side,
+            Some("127.0.0.1:1".to_string()),
+            None,
+            64,
+            Duration::from_secs(60),
+            true,
+            window,
+        ));
+        let (r, w) = tokio::io::split(session_side);
+        (frames_of(r), w, engine)
+    }
+
+    fn granted_window(f: Option<Frame>) -> Option<u32> {
+        match f {
+            Some(Frame::Data { id: CONTROL_ID, payload }) => match parse_control(&payload) {
+                Some(Control::Hello { window }) => window,
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    // The receiving member's half of the setting: its HELLO grants the configured window, and it
+    // acknowledges at a quarter of THAT window -- with the default it would every 64 KiB.
+    #[tokio::test(start_paused = true)]
+    async fn a_member_grants_the_configured_session_window_and_acknowledges_at_a_quarter_of_it() {
+        const W: usize = 1 << 20;
+        let (mut frames, mut w, _engine) = accept_at_the_wire_granting(W);
+        assert_eq!(granted_window(frames.recv().await), Some(W as u32), "the HELLO grants the setting");
+        hello_frame(0).write(&mut w).await.unwrap();
+        for _ in 0..W / 4 / DATA_CHUNK_LEN {
+            Frame::Data {
+                id: 99,
+                payload: vec![0; DATA_CHUNK_LEN],
+            }
+            .write(&mut w)
+            .await
+            .unwrap();
+        }
+        // Paused time: the acknowledgement delay cannot fire while the engine is busy reading, so
+        // the first SWINDOW is the one the threshold sends.
+        let first = loop {
+            let f = frames.recv().await.expect("the engine ended");
+            if let Some(bytes) = swindow_bytes(&f) {
+                break bytes;
+            }
+        };
+        assert_eq!(first as usize, W / 4, "acknowledged at a quarter of the granted window");
+    }
+
+    #[tokio::test]
+    async fn an_initiate_member_grants_the_configured_session_window_too() {
+        const W: usize = 4 << 20;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (session_side, engine_side) = tokio::io::duplex(1 << 16);
+        let (r, _w) = tokio::io::split(session_side);
+        let (_up_tx, session_up) = tokio::sync::oneshot::channel();
+        let _engine = tokio::spawn(run_forward_initiate_engine_with(
+            engine_side,
+            Arc::new(listener),
+            "127.0.0.1:1".to_string(),
+            64,
+            Duration::from_secs(60),
+            true,
+            W,
+            session_up,
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let mut frames = frames_of(r);
+        let first = tokio::time::timeout(Duration::from_secs(5), frames.recv()).await.unwrap();
+        assert_eq!(granted_window(first), Some(W as u32));
+    }
+
+    // The sending member's half, which the setting does not touch (the code a released v0.7.40
+    // member runs): what the peer grants -- here 1 MiB, four times the default -- is what it keeps
+    // on its way, and it needs SWINDOW to go on. So a receiver can raise its window alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sender_uses_the_larger_window_its_peer_grants() {
+        const W: usize = 1 << 20;
+        let (mut frames, mut w, _engine) = accept_sending_at_the_wire(W as u32).await;
+        let mut unacked = 0usize;
+        // Stream credit is always returned, so only the session window holds the sender back:
+        // without an acknowledgement it stops within one chunk of the window's end, well past
+        // three quarters of it (three times the default window). Waited for by amount under a
+        // generous deadline, not by a pause, so a slow runner only makes this take longer.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while unacked < W * 3 / 4 {
+            match tokio::time::timeout_at(deadline, frames.recv()).await {
+                Ok(Some(Frame::Data { id: CONTROL_ID, .. })) => {}
+                Ok(Some(Frame::Data { id, payload })) => {
+                    unacked += payload.len();
+                    assert!(unacked <= W, "{unacked} bytes unacknowledged with a window of {W}");
+                    window_frame(id, payload.len() as u32).write(&mut w).await.unwrap();
+                }
+                Ok(Some(_)) => {}
+                // A sender that stands still short of it ends here: its unacknowledged data and
+                // our silence look like a dead peer after SESSION_DEAD_AFTER (3 s in tests).
+                Ok(None) => panic!("the engine ended after {unacked} bytes: the granted {W} was not used"),
+                Err(_) => panic!("only {unacked} bytes on their way after 10 s: the granted {W} was not used"),
+            }
+        }
+        // And never past the window: whatever still arrives stays within it.
+        let quiet = tokio::time::Instant::now() + Duration::from_millis(300);
+        while let Ok(Some(f)) = tokio::time::timeout_at(quiet, frames.recv()).await {
+            match f {
+                Frame::Data { id: CONTROL_ID, .. } => {}
+                Frame::Data { id, payload } => {
+                    unacked += payload.len();
+                    assert!(unacked <= W, "{unacked} bytes unacknowledged with a window of {W}");
+                    window_frame(id, payload.len() as u32).write(&mut w).await.unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // SIGTERM/SIGINT: once the process stops, the initiate engine closes every new local
+    // connection at once -- not left in the listen backlog, where its client would hang for the
+    // whole drain and then be reset -- while a stream that already runs keeps carrying data and
+    // counts as work in flight.
+    #[tokio::test]
+    async fn a_stopped_initiate_engine_refuses_new_connections_and_keeps_its_streams() {
+        use crate::channel_run::health::{with_health, ChannelHealth};
+        // Counts of this test's own (the engine's task counts in them), untouched by other tests.
+        let health: &'static ChannelHealth = Box::leak(Box::new(ChannelHealth::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (session_side, engine_side) = tokio::io::duplex(1 << 16);
+        let (r, mut w) = tokio::io::split(session_side);
+        hello_frame(SESSION_WINDOW as u32).write(&mut w).await.unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let (up_tx, session_up) = tokio::sync::oneshot::channel();
+        let engine = tokio::spawn(with_health(
+            health,
+            run_forward_initiate_engine_with(
+                engine_side,
+                Arc::new(listener),
+                "127.0.0.1:1".to_string(),
+                64,
+                Duration::from_secs(60),
+                true,
+                SESSION_WINDOW,
+                session_up,
+                stop.clone(),
+            ),
+        ));
+        let _ = up_tx.send(());
+        let mut frames = frames_of(r);
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        let id = loop {
+            match tokio::time::timeout(Duration::from_secs(5), frames.recv()).await {
+                Ok(Some(Frame::Open { id, .. })) => break id,
+                Ok(Some(_)) => {}
+                other => panic!("no Open for the first connection: {other:?}"),
+            }
+        };
+        assert_eq!(health.forward_streams(), 1, "a running stream is work in flight for the drain");
+        stop.cancel();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The kernel's backlog still completes the connect; the engine closes it at once.
+        let mut late = TcpStream::connect(addr).await.unwrap();
+        let _ = late.write_all(b"late").await;
+        let mut buf = [0u8; 16];
+        let closed = tokio::time::timeout(Duration::from_secs(2), late.read(&mut buf)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "the late connection must be closed at once, not left pending until the exit: {closed:?}"
+        );
+        first.write_all(b"still here").await.unwrap();
+        let mut carried = Vec::new();
+        let until = tokio::time::Instant::now() + Duration::from_secs(1);
+        while let Ok(Some(f)) = tokio::time::timeout_at(until, frames.recv()).await {
+            match f {
+                Frame::Open { id: opened, .. } => panic!("stream {opened} opened after the stop"),
+                Frame::Data { id: of, payload } if of == id => carried.extend_from_slice(&payload),
+                _ => {}
+            }
+        }
+        assert_eq!(carried, b"still here", "the running stream kept going");
+        assert_eq!(health.forward_streams(), 1, "the refused connection never became a stream");
+        assert!(!engine.is_finished(), "the session itself goes on until the process exits");
     }
 }
