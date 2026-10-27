@@ -649,6 +649,12 @@ where
         .await
 }
 
+/// #299: how long the persistent call client gives its session to end cleanly after stdin's EOF
+/// (see [`run_persistent_call_reconnect_loop_over`]). Every call has been answered by then, so the
+/// peer already has every byte and the end takes a round trip or two; the bound only keeps a path
+/// that died at that very moment from holding the process.
+const CALL_SESSION_END_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The reconnect loop's core, split out one layer further so a test can feed it lines through an
 /// `mpsc::Sender` it controls directly (no real stdin/process involved) and capture output via an
 /// in-memory `out` instead of real stdout.
@@ -730,9 +736,18 @@ where
         };
         // Whichever future didn't finish is dropped here, cancelling it -- the same
         // shutdown-by-drop idiom this codebase already relies on elsewhere (e.g. the
-        // shutdown-signal races in ct-edge's channel broker).
+        // shutdown-signal races in ct-edge's channel broker). Except the session after a clean
+        // EOF, which is let end first (below).
 
         if clean_eof {
+            // #299: let the session end the way its peer expects instead of dropping it. `calls`
+            // has dropped its halves of the duplex, an end of input towards the session: under
+            // protocol v2 the session sends its FIN, the serving peer's request loop ends, and
+            // both sides confirm (a legacy peer ends the same way through the half-close).
+            // Dropping the session here cut the transport mid-protocol instead, so every serving
+            // member reported `ok=false` for a normal call session and counted a short one as a
+            // #250 flap. Its outcome changes nothing for this process: every call was answered.
+            let _ = tokio::time::timeout(CALL_SESSION_END_GRACE, &mut pump).await;
             return Ok(());
         }
 

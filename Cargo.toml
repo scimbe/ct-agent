@@ -9,7 +9,7 @@ members = ["native", "wasm"]
 # drifting pins. Bump deliberately, in lockstep with native/Cargo.lock's own
 # ct-edge/ct-client dev-dependency pins (kept at the same tag by convention).
 [workspace.dependencies]
-ct-common = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.5.0" }
+ct-common = { git = "https://github.com/scimbe/CADS-Tunnel", tag = "v0.5.1" }
 
 # #304/#309/#310: the debug-build tests push tens of MiB through Noise (ChaCha20-Poly1305 from
 # RustCrypto, via snow) and run libp2p handshakes, one runtime thread per test. At opt-level 0

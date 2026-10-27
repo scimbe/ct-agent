@@ -13,9 +13,14 @@ use std::task::{Context, Poll};
 use quinn::Connection;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use ct_common::a2a::{a2a_initiate, a2a_respond_verified};
+use ct_common::a2a::{a2a_initiate_with_caps, a2a_respond_verified_with_caps};
 use ct_common::channel_quic::DIRECT_STREAM_SETUP_TIMEOUT;
+use ct_common::delivery::{noise_pump_v2, SessionCaps};
 use ct_common::noise::noise_pump;
+
+use super::delivery::{
+    delivery_offer, with_session_end_cause, SessionEndCause, FAILED_DELIVERY_DRAIN, FIN_ACK_IDLE,
+};
 
 /// Which side of the A2A session this agent drives. Selected from the channel
 /// grant's `Direction`: the initiator dials + opens the stream; the responder
@@ -324,6 +329,13 @@ where
 /// that error within [`LOCAL_FAILURE_GRACE`] plus [`LOCAL_FAILURE_DRAIN`], whether or not the peer
 /// ever sends another byte (ct-agent#314). The same bound holds once the session's grant ended,
 /// for a session run inside a grant-end record (ct-agent#308).
+///
+/// ct-agent#299: the session offers protocol v2 (end-to-end delivery confirmation, see
+/// `channel_run::delivery`) unless `CT_CHANNEL_DELIVERY_ACK=0`. With a v2 peer, `Ok` means the
+/// peer confirmed every byte sent and this side confirmed every byte received; anything short of
+/// that is an `Err` naming what is missing, so the `channel_session` close event says `ok=false`
+/// and a pipe-mode process exits non-zero. With an older peer the session is legacy, byte for
+/// byte, and `Ok` keeps meaning "the transport closed cleanly".
 pub async fn run_channel_session_on_stream<W, R, P>(
     send: W,
     recv: R,
@@ -331,6 +343,27 @@ pub async fn run_channel_session_on_stream<W, R, P>(
     own_noise_private: &[u8; 32],
     peer_noise_public: &[u8; 32],
     local: P,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    run_channel_session_on_stream_with(send, recv, role, own_noise_private, peer_noise_public, local, delivery_offer())
+        .await
+}
+
+/// [`run_channel_session_on_stream`] with the capability offer explicit (#299):
+/// `SessionCaps::NONE` sends and accepts empty handshake payloads, i.e. the legacy session byte
+/// for byte -- what the #104 upgradable relay path keeps.
+pub(crate) async fn run_channel_session_on_stream_with<W, R, P>(
+    send: W,
+    recv: R,
+    role: ChannelRole,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+    local: P,
+    offer: SessionCaps,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -349,10 +382,12 @@ where
     // a peer that admits then stalls) would block `read_frame` forever, hanging the session.
     const A2A_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     let handshake_started = std::time::Instant::now();
+    // #299: the capability offer rides in the handshake payloads; an empty offer is the
+    // pre-v2 handshake byte for byte, and a peer from before v2 answers with nothing.
     let handshake = async {
         match role {
             ChannelRole::Initiate => {
-                a2a_initiate(&mut send, &mut recv, own_noise_private, peer_noise_public).await
+                a2a_initiate_with_caps(&mut send, &mut recv, own_noise_private, peer_noise_public, offer).await
             }
             // ct-agent#35: was the plain, unverified `a2a_respond` -- the caller had already
             // attestation-verified `peer_noise_public` (run_channel_join_with_admission,
@@ -360,14 +395,16 @@ where
             // nothing about who it was talking to at the Noise layer. `a2a_respond_verified`
             // refuses the session if the live peer's static key doesn't match.
             ChannelRole::Accept => {
-                a2a_respond_verified(&mut send, &mut recv, own_noise_private, peer_noise_public).await
+                a2a_respond_verified_with_caps(&mut send, &mut recv, own_noise_private, peer_noise_public, offer)
+                    .await
             }
         }
     };
-    let session = tokio::time::timeout(A2A_HANDSHAKE_TIMEOUT, handshake)
+    let (session, caps) = tokio::time::timeout(A2A_HANDSHAKE_TIMEOUT, handshake)
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "a2a Noise_IK handshake timed out (#126)"))?
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let delivery = if caps.delivery_ack() { "ack" } else { "legacy" };
     if debug_timing_enabled() {
         eprintln!(
             "ct-agent channel: debug handshake completed in {}ms (role={role:?})",
@@ -381,7 +418,7 @@ where
     let peer_hex = super::cli_config::hex_encode(peer_noise_public);
     crate::events::emit(
         crate::events::CHANNEL_SESSION,
-        serde_json::json!({ "state": "open", "peer": peer_hex }),
+        serde_json::json!({ "state": "open", "peer": peer_hex, "delivery": delivery }),
     );
     // #248: unconditional (no debug flag) periodic status while this session's pump runs —
     // aborted the moment the pump finishes, one way or another, via the handle drop below.
@@ -423,8 +460,24 @@ where
             None => std::future::pending().await,
         }
     };
+    let v2 = caps.delivery_ack();
     let (pumped, gave_up) = {
-        let pump = noise_pump(session, BiStream { send: &mut send, recv: &mut recv }, local);
+        let stream = BiStream { send: &mut send, recv: &mut recv };
+        let pump = async move {
+            if v2 {
+                // #299: the gate records why it ends a session in this cell, and the pump turns
+                // that into the FIN reason the peer reads (see `channel_run::delivery`). The cell
+                // is scoped around the pump itself, since the gate is polled from inside it.
+                let cause = SessionEndCause::default();
+                let for_fin = cause.clone();
+                let pump = noise_pump_v2(session, stream, local, FIN_ACK_IDLE, move |err: Option<&io::Error>| {
+                    for_fin.fin_reason(err)
+                });
+                with_session_end_cause(cause, pump).await.map(Some)
+            } else {
+                noise_pump(session, stream, local).await.map(|()| None)
+            }
+        };
         tokio::pin!(pump);
         tokio::pin!(grant_end_signal);
         tokio::select! {
@@ -454,15 +507,36 @@ where
         }
     };
     drop(ticker);
-    let drain = if gave_up { LOCAL_FAILURE_DRAIN } else { RELAY_DRAIN_TIMEOUT };
+    // #299: a v2 session that failed on its own names what is missing; one given up on above has
+    // already said why (#314/#308).
+    if let (Err(e), true, false) = (&pumped, v2, gave_up) {
+        eprintln!("ct-agent channel: {e} (#299)");
+    }
+    // A failed v2 session is over: the transport ended, the peer ended it, or the peer made no
+    // progress on our bytes for FIN_ACK_IDLE. Only an abort record may still have to leave before
+    // the process may exit, which a short drain covers (see FAILED_DELIVERY_DRAIN) -- as after
+    // giving up on the peer above (LOCAL_FAILURE_DRAIN, #314/#308).
+    let drain = if gave_up {
+        LOCAL_FAILURE_DRAIN
+    } else if pumped.is_err() && v2 {
+        FAILED_DELIVERY_DRAIN
+    } else {
+        RELAY_DRAIN_TIMEOUT
+    };
     graceful_stream_drain(&mut send, &mut recv, drain).await;
     eprintln!("{}", traffic_status_line());
     // ct-agent#308: a session the grant ended was cut short, even when its pump saw only clean
     // EOFs -- not `ok`.
     let grant_ended = grant_end.as_ref().and_then(super::peer_grant::GrantEndRecord::ended);
-    crate::events::emit(
-        crate::events::CHANNEL_SESSION,
-        serde_json::json!({ "state": "close", "peer": peer_hex, "ok": pumped.is_ok() && grant_ended.is_none() }),
-    );
-    pumped
+    let ok = pumped.is_ok() && grant_ended.is_none();
+    let close = match &pumped {
+        // #299: what the peer confirmed, not just what was written to the transport.
+        Ok(Some(report)) if ok => serde_json::json!({
+            "state": "close", "peer": peer_hex, "ok": true, "delivery": delivery,
+            "confirmed_sent": report.sent, "confirmed_received": report.received,
+        }),
+        _ => serde_json::json!({ "state": "close", "peer": peer_hex, "ok": ok, "delivery": delivery }),
+    };
+    crate::events::emit(crate::events::CHANNEL_SESSION, close);
+    pumped.map(|_| ())
 }
