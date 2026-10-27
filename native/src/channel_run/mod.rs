@@ -372,7 +372,8 @@ where
 /// points would defeat that check too. Only the independently-signed attestation (which the
 /// edge cannot forge) closes it. Pure (no I/O), so unit-testable without a live relay.
 /// `local` behind the peer-grant check when [`REQUIRE_PEER_GRANT_ENV`] is on (see `peer_grant`),
-/// a pass-through otherwise. `peer_holder` is the holder admission attested the pinned Noise key
+/// a pass-through otherwise -- in both cases ended when this member's own grant expires
+/// (ct-agent#308). `peer_holder` is the holder admission attested the pinned Noise key
 /// with. Fails when the check is on but cannot run (no operator key configured).
 ///
 /// A TCP forward session (`CT_CHANNEL_FORWARD` / `CT_CHANNEL_FORWARD_ALLOW`) always runs the check,
@@ -430,7 +431,8 @@ pub(crate) fn gate_local_from<P>(
         role,
         watch,
     });
-    Ok(PeerGrantGate::new(local, check))
+    // ct-agent#308 (R1): this member's own grant bounds every session it runs, checked peer or not.
+    Ok(PeerGrantGate::with_own_expiry(local, check, request.grant.grant.expires_at))
 }
 
 /// `CT_CHANNEL_REVOCATION=require` turns "no control-plane URL for the forward's grant re-check"
@@ -751,7 +753,10 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             let request = &request;
             let cfg = &cfg;
             let relay_gate_cert = &relay_gate_cert;
-            return run_dcutr_join_loop("relay-gate", serve_loop, move || async move {
+            // ct-agent#308: a persistent serve member stops (exit status 77) once its own grant
+            // is over; a one-shot join that a grant end cut short is an error, not a clean end.
+            let own_expires_at = serve_loop.then_some(request.grant.grant.expires_at);
+            let joined = run_dcutr_join_loop("relay-gate", serve_loop, own_expires_at, move || async move {
                 let relay_conn =
                     dial_relay_preferring_direct(cfg.relay_addr_direct, cfg.relay_addr, DIRECT_DIAL_TIMEOUT).await?;
                 // Admission via the relay gate happens below, after this call -- peer not yet known.
@@ -769,8 +774,8 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                     cfg.peer_pin.as_ref(),
                 )
                 .await)
-            })
-            .await;
+            });
+            return if serve_loop { joined.await } else { one_shot_session(joined).await };
         }
         if let Some(circuit) = cfg.circuit_relay.clone() {
             eprintln!(
@@ -781,9 +786,11 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             let request = &request;
             let cfg = &cfg;
             let circuit = &circuit;
+            // ct-agent#308: as on the relay-gate path above.
+            let own_expires_at = serve_loop.then_some(request.grant.grant.expires_at);
             // #24: the label is a parameter now -- this branch used to print
             // "relay-gate admission error" from its copied loop body.
-            return run_dcutr_join_loop("circuit-relay", serve_loop, move || async move {
+            let joined = run_dcutr_join_loop("circuit-relay", serve_loop, own_expires_at, move || async move {
                 let relay_conn = crate::transport::build_channel_dialer()?
                     .connect(cfg.relay_addr, "localhost")?
                     .await?;
@@ -800,8 +807,8 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                     cfg.peer_pin.as_ref(),
                 )
                 .await)
-            })
-            .await;
+            });
+            return if serve_loop { joined.await } else { one_shot_session(joined).await };
         }
     }
     // Broker admission (the grant + possession proof are the auth; Noise_IK authenticates
@@ -853,7 +860,9 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             return run_forward_initiate_sessions(&raw, &cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert)
                 .await;
         }
-        return run_one_admission_session(&cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert).await;
+        // ct-agent#308: a one-shot session that a grant end cut short (R1) is an error, not exit 0.
+        return one_shot_session(run_one_admission_session(&cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert))
+            .await;
     }
     // #200: persistent serve is now CONCURRENT. The #179 loop admitted a peer, served it to
     // completion, and only THEN re-admitted the next — so two users clicking Build within the same
@@ -890,6 +899,8 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     serve_loop_concurrent(
         max,
         std::time::Duration::from_millis(200),
+        // ct-agent#308: the loop stops (exit status 77) once this member's own grant is over.
+        Some(request.grant.grant.expires_at),
         move || {
             let c = admit_ctx.clone();
             // SIGTERM/SIGINT: the park in flight closes and no new one opens (shutdown.rs).
@@ -1059,6 +1070,8 @@ pub use grant_revoke::*;
 
 mod errors;
 pub(crate) use errors::*;
+// ct-agent#308: the own-grant-end exit contract, for `main` and `ct-agent-supervisor`.
+pub use errors::{is_own_grant_end, OwnGrantEnded, OWN_GRANT_ENDED_EXIT};
 
 mod serving;
 pub(crate) use serving::*;
