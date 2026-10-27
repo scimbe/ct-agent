@@ -7280,7 +7280,7 @@ async fn relay_only_members_without_dcutr_pair_on_the_relay_port_and_stay_on_the
             direction: dir,
             rights: Rights::ReadWrite,
             delegable: false,
-            expires_at: 1_000,
+            expires_at: crate::codec::now_unix() + 3600, // #308 R1: an expired own grant ends the session
         };
         SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }
     };
