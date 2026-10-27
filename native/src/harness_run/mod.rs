@@ -335,8 +335,8 @@ fn run_harness_blocking(cfg: HarnessCliConfig) -> Result<HarnessRun, String> {
 }
 
 /// The installed CLI for an explicit kind, or (None = `auto`) the first installed supported one.
-/// Experimental CLIs (codex, gemini) are refused: they may only run wrapped in an OS sandbox
-/// backend, which does not exist yet. Pure over the detection result.
+/// Experimental CLIs (codex, gemini) are allowed only when named explicitly (never by `auto`); they
+/// run inside harness-core's OS sandbox, which fails closed. Pure over the detection result.
 fn select_cli(
     kind: Option<harness_core::BackendKind>,
     detected: &[harness_core::DetectedBackend],
@@ -356,11 +356,12 @@ fn select_cli(
         })?,
     };
     if chosen.maturity == harness_core::Maturity::Experimental {
-        return Err(format!(
-            "CT_HARNESS_BACKEND={}: refused -- experimental agent CLIs only run wrapped in an OS sandbox, which is not \
-             available yet; use claude",
+        // Safe to run: harness-core wraps every CLI in the OS sandbox and refuses when none exists.
+        eprintln!(
+            "warning: backend '{}' is experimental (flags not verified end to end, no turn limit); it runs inside the \
+             OS sandbox",
             chosen.kind.id()
-        ));
+        );
     }
     Ok(chosen)
 }
@@ -806,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn experimental_clis_are_refused_and_auto_never_picks_them() {
+    fn experimental_clis_need_an_explicit_choice_and_auto_never_picks_them() {
         let d = |kind: harness_core::BackendKind| harness_core::DetectedBackend {
             kind,
             binary: PathBuf::from("/x"),
@@ -818,8 +819,7 @@ mod tests {
         assert_eq!(select_cli(Some(ClaudeCode), &all).unwrap().kind, ClaudeCode);
         assert_eq!(select_cli(None, &all).unwrap().kind, ClaudeCode);
         for k in [Codex, Gemini] {
-            let err = select_cli(Some(k), &all).unwrap_err();
-            assert!(err.contains("refused") && err.contains("sandbox"), "{err}");
+            assert_eq!(select_cli(Some(k), &all).unwrap().kind, k, "explicit choice is allowed (sandboxed)");
         }
         let only_exp = [d(Codex), d(Gemini)];
         assert!(select_cli(None, &only_exp).unwrap_err().contains("no supported"));

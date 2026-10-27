@@ -251,8 +251,9 @@ Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
     above, unchanged) selects who runs the prompt. claude/codex/gemini launch the agent CLI the
     customer installed and logged in themselves (their own subscription; no credential is read,
     copied or sent -- only PATH lookup and `--version`; CT_HARNESS_LITELLM_* are then not needed,
-    and CT_HARNESS_ALLOWED_MODELS is optional); codex/gemini are experimental and REFUSED until
-    an OS sandbox wraps them. claude runs with --restricted and never rebuilds on the host. ollama talks to a
+    and CT_HARNESS_ALLOWED_MODELS is optional); codex/gemini are experimental (explicit choice only). Every CLI runs inside the OS sandbox
+    (Seatbelt/bwrap; refused when none is available) with a throw-away HOME holding only that CLI's
+    login, outbound tcp/443 only; claude additionally runs --restricted. No host-side rebuild. ollama talks to a
     loopback server (CT_HARNESS_OLLAMA_URL, default http://127.0.0.1:11434/v1; needs
     CT_HARNESS_ALLOWED_MODELS). auto = the first installed supported CLI. `harness backends`
     prints what is detected.

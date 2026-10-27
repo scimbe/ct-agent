@@ -1155,7 +1155,7 @@ dependencies = [
 [[package]]
 name = "harness-core"
 version = "0.1.1"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#20d0c8ef68f1441a5b6edd5364d14b06a3903ab5"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#2bdf8071842b4b8acc1d019637643957c82bfdb0"
 dependencies = [
  "installer-engine",
  "libc",
@@ -1164,6 +1164,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -1461,7 +1462,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tokio",
  "tower-service",
  "tracing",
@@ -1647,7 +1648,7 @@ dependencies = [
 [[package]]
 name = "installer-engine"
 version = "0.1.1"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#20d0c8ef68f1441a5b6edd5364d14b06a3903ab5"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#2bdf8071842b4b8acc1d019637643957c82bfdb0"
 dependencies = [
  "flate2",
  "libc",
@@ -2243,11 +2244,13 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "manifest-core"
 version = "0.1.1"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#20d0c8ef68f1441a5b6edd5364d14b06a3903ab5"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#2bdf8071842b4b8acc1d019637643957c82bfdb0"
 dependencies = [
  "ed25519-dalek",
  "serde",
  "serde_json",
+ "sha2",
+ "unicode-general-category",
 ]
 
 [[package]]
@@ -2810,7 +2813,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -2849,7 +2852,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -3920,6 +3923,12 @@ name = "unicase"
 version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
+
+[[package]]
+name = "unicode-general-category"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f"
 
 [[package]]
 name = "unicode-ident"
