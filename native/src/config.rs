@@ -195,9 +195,11 @@ pub struct AgentConfig {
     pub masque_fallback: Option<MasqueFallbackConfig>,
     /// ct-agent#45 slice 1: when true, a direct-connect handshake that carries
     /// **no** routing token (a pre-#45 client) is refused, not just one that
-    /// carries the wrong token. `CT_DIRECT_REQUIRE_TOKEN`; default `false`
-    /// (rollout mode: token-less clients are still served until every client
-    /// sends the token, see `serve::DirectTokenPolicy`). Only consulted when
+    /// carries the wrong token. `CT_DIRECT_REQUIRE_TOKEN`; default `true` since
+    /// ct-agent#291 ([`DIRECT_REQUIRE_TOKEN_DEFAULT`]). `CT_DIRECT_REQUIRE_TOKEN=0`
+    /// (or `false`/`no`/`off`) is the explicit opt-out back to the old rollout mode:
+    /// token-less clients are served again, each one counted as
+    /// `direct_legacy_served` (see `serve::DirectTokenPolicy`). Only consulted when
     /// `direct_advertise_ip` is set -- the relayed path never reads it.
     pub direct_require_token: bool,
     /// scimbe/ct-agent#204: whether a raw-forwarded stream's TLS is terminated here (with the
@@ -511,7 +513,7 @@ impl AgentConfig {
             framed_fallback: false,
             register_tcp_only: false,
             masque_fallback: None,
-            direct_require_token: false,
+            direct_require_token: DIRECT_REQUIRE_TOKEN_DEFAULT,
             origin_tls: OriginTls::Passthrough,
         })
     }
@@ -565,11 +567,19 @@ impl AgentConfig {
         // #528: CT_AGENT_FRAMED_FALLBACK truthy -> prefer the framed 'F' browser
         // registration over 'L'. Off by default, see the field's doc comment.
         cfg.framed_fallback = truthy(&get, "CT_AGENT_FRAMED_FALLBACK");
-        // ct-agent#45 slice 1: CT_DIRECT_REQUIRE_TOKEN truthy -> a direct-connect
-        // handshake without a routing token is refused. Off by default so that
-        // upgrading one agent never locks out the already-deployed clients that
-        // don't send the token yet.
-        cfg.direct_require_token = truthy(&get, "CT_DIRECT_REQUIRE_TOKEN");
+        // ct-agent#45 slice 1, default flipped by #291: a direct-connect handshake
+        // without a routing token is refused unless CT_DIRECT_REQUIRE_TOKEN is
+        // explicitly off. It was off while clients did not send the token yet; they
+        // do since CADS-Tunnel#770, so a token-less handshake now comes from an old
+        // ct-client or from someone leaving the token out on purpose -- the case the
+        // check exists for. The relayed path never reads this flag. An unrecognised
+        // spelling keeps the default (on) and is warned about: a typo must never
+        // switch a security check off.
+        cfg.direct_require_token = crate::envflag::flag_named(
+            "CT_DIRECT_REQUIRE_TOKEN",
+            get("CT_DIRECT_REQUIRE_TOKEN").as_deref(),
+            DIRECT_REQUIRE_TOKEN_DEFAULT,
+        );
         cfg.tcp_fallback_pool_size = match get("CT_AGENT_TCP_FALLBACK_POOL_SIZE") {
             Some(s) if !s.trim().is_empty() => s
                 .trim()
@@ -660,6 +670,12 @@ fn parse_masque_fallback(
 fn truthy(get: &impl Fn(&str) -> Option<String>, key: &str) -> bool {
     crate::envflag::flag_named(key, get(key).as_deref(), false)
 }
+
+/// ct-agent#291: the direct-connect routing token is required unless the operator
+/// opts out (`CT_DIRECT_REQUIRE_TOKEN=0`). The agent check exists since ct-agent
+/// v0.7.26 (#159/#162); ct-clients send the token since CADS-Tunnel v0.4.20 (#770,
+/// see `serve::DIRECT_TOKEN_MIN_CLIENT`). See [`AgentConfig::direct_require_token`].
+pub const DIRECT_REQUIRE_TOKEN_DEFAULT: bool = true;
 
 /// See [`AgentConfig::tcp_fallback_pool_size`].
 const DEFAULT_TCP_FALLBACK_POOL_SIZE: usize = 6;
@@ -782,6 +798,7 @@ mod tests {
         assert_eq!(c.origin.current(), "127.0.0.1:8080".parse().unwrap());
         assert_eq!(c.origin_proto, OriginProto::Tcp, "defaults to TCP");
         assert_eq!(c.direct_advertise_ip, None, "P2P disabled by default");
+        assert!(c.direct_require_token, "#291: parse() has the same default as the env path");
     }
 
     #[test]
@@ -873,10 +890,9 @@ mod tests {
     }
 
     #[test]
-    fn direct_require_token_reads_the_env_flag() {
-        // ct-agent#45 slice 1: off by default (rollout mode, pre-#45 clients keep
-        // working); truthy values switch the direct listener to token-required.
-        // Same truthiness contract as the other CT_AGENT_* boolean flags.
+    fn direct_require_token_is_on_by_default_and_an_explicit_off_opts_out_291() {
+        // ct-agent#291: required by default; only an explicit off spelling restores the
+        // old rollout mode. Same spelling contract as every other boolean flag.
         let base = |v: Option<&str>| {
             AgentConfig::from_env_with(|k| match k {
                 "CT_AGENT_EDGE" => Some("127.0.0.1:4433".into()),
@@ -887,16 +903,19 @@ mod tests {
             .unwrap()
             .direct_require_token
         };
-        assert!(!base(None), "default off (rollout-compatible)");
-        assert!(!base(Some("0")), "0 -> off");
-        assert!(!base(Some("false")), "false -> off");
-        assert!(!base(Some("")), "empty -> off");
+        assert!(base(None), "default on since #291");
+        // Compose passes `${VAR:-}`, so an unset variable arrives as "": that is unset, not off.
+        assert!(base(Some("")), "empty -> default (on)");
+        assert!(base(Some("  ")), "blank -> default (on)");
+        for off in ["0", "false", "no", "off", " OFF "] {
+            assert!(!base(Some(off)), "{off:?} -> the explicit opt-out");
+        }
         assert!(base(Some("1")), "1 -> on");
         assert!(base(Some("true")), "true -> on");
-        // Pinned on purpose: an unrecognised spelling falls back to the default (off) and is
-        // warned about at start -- it must not quietly become "on" either ("garbage = on is
-        // safer" would make every typo in every other flag switch a feature on).
-        assert!(!base(Some("enforce")), "unrecognised -> default (off), with a startup warning");
+        // Pinned on purpose: an unrecognised spelling keeps the default (on) and is warned
+        // about at start -- a typo in an opt-out must not switch the check off.
+        assert!(base(Some("enforce")), "unrecognised -> default (on), with a startup warning");
+        assert!(base(Some("disable")), "not an off spelling either -> still on");
     }
 
     #[test]
@@ -940,6 +959,7 @@ mod tests {
         assert_eq!(c.origin_proto, OriginProto::Tcp);
         assert_eq!(c.direct_advertise_ip, None);
         assert_eq!(c.metrics_listen, None);
+        assert!(c.direct_require_token, "#291: the direct-connect token is required by default");
     }
 
     #[test]
