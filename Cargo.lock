@@ -1155,7 +1155,7 @@ dependencies = [
 [[package]]
 name = "harness-core"
 version = "0.1.1"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#e8b0de82eaa02c80c81226edaefa95bfbbb89654"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#20d0c8ef68f1441a5b6edd5364d14b06a3903ab5"
 dependencies = [
  "installer-engine",
  "libc",
@@ -1461,7 +1461,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -1647,7 +1647,7 @@ dependencies = [
 [[package]]
 name = "installer-engine"
 version = "0.1.1"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#e8b0de82eaa02c80c81226edaefa95bfbbb89654"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#20d0c8ef68f1441a5b6edd5364d14b06a3903ab5"
 dependencies = [
  "flate2",
  "libc",
@@ -2243,7 +2243,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "manifest-core"
 version = "0.1.1"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#e8b0de82eaa02c80c81226edaefa95bfbbb89654"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#20d0c8ef68f1441a5b6edd5364d14b06a3903ab5"
 dependencies = [
  "ed25519-dalek",
  "serde",
@@ -2810,7 +2810,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -2849,7 +2849,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]

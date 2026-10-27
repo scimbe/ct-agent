@@ -335,27 +335,40 @@ fn run_harness_blocking(cfg: HarnessCliConfig) -> Result<HarnessRun, String> {
 }
 
 /// The installed CLI for an explicit kind, or (None = `auto`) the first installed supported one.
-/// Detection only looks at `PATH` and runs `--version`; no credential file is read.
-fn local_cli_backend(kind: Option<harness_core::BackendKind>) -> Result<harness_core::LocalCliBackend, String> {
-    let detected = harness_core::detect_backends();
+/// Experimental CLIs (codex, gemini) are refused: they may only run wrapped in an OS sandbox
+/// backend, which does not exist yet. Pure over the detection result.
+fn select_cli(
+    kind: Option<harness_core::BackendKind>,
+    detected: &[harness_core::DetectedBackend],
+) -> Result<&harness_core::DetectedBackend, String> {
     let chosen = match kind {
-        Some(k) => detected
-            .iter()
-            .find(|d| d.kind == k)
-            .ok_or_else(|| format!("CT_HARNESS_BACKEND={}: `{}` was not found on PATH (see `ct-agent harness backends`)", k.id(), k.id()))?,
-        None => harness_core::pick_auto(&detected).ok_or_else(|| {
-            "CT_HARNESS_BACKEND=auto: no supported agent CLI (claude) found on PATH; install and log in to one, or name \
-             an experimental backend explicitly (see `ct-agent harness backends`)"
+        Some(k) => detected.iter().find(|d| d.kind == k).ok_or_else(|| {
+            format!(
+                "CT_HARNESS_BACKEND={}: `{}` was not found on PATH (see `ct-agent harness backends`)",
+                k.id(),
+                k.id()
+            )
+        })?,
+        None => harness_core::pick_auto(detected).ok_or_else(|| {
+            "CT_HARNESS_BACKEND=auto: no supported agent CLI (claude) found on PATH; install and log in to it \
+             (see `ct-agent harness backends`)"
                 .to_string()
         })?,
     };
     if chosen.maturity == harness_core::Maturity::Experimental {
-        eprintln!(
-            "warning: backend '{}' is experimental (flags not verified end to end, no turn limit) -- see docs/byo-agent-backend.md in CADS-agent-marketplace",
+        return Err(format!(
+            "CT_HARNESS_BACKEND={}: refused -- experimental agent CLIs only run wrapped in an OS sandbox, which is not \
+             available yet; use claude",
             chosen.kind.id()
-        );
+        ));
     }
-    harness_core::LocalCliBackend::new(chosen)
+    Ok(chosen)
+}
+
+/// Detection only looks at `PATH` and runs `--version`; no credential file is read.
+fn local_cli_backend(kind: Option<harness_core::BackendKind>) -> Result<harness_core::LocalCliBackend, String> {
+    let detected = harness_core::detect_backends();
+    harness_core::LocalCliBackend::new(select_cli(kind, &detected)?)
 }
 
 /// `ct-agent harness backends`: the detected local agent CLIs as JSON. Only PATH lookup and
@@ -793,12 +806,24 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cli_backend_that_is_not_installed_fails_with_a_hint() {
-        // PATH lookups are process-global; only assert on the error for a kind that cannot be
-        // resolved when nothing matches -- use detection on an empty PATH directly.
-        let empty = harness_core::detect_backends_in(std::ffi::OsStr::new(""), None);
-        assert!(empty.is_empty());
-        assert!(harness_core::pick_auto(&empty).is_none());
+    fn experimental_clis_are_refused_and_auto_never_picks_them() {
+        let d = |kind: harness_core::BackendKind| harness_core::DetectedBackend {
+            kind,
+            binary: PathBuf::from("/x"),
+            version: None,
+            maturity: kind.maturity(),
+        };
+        use harness_core::BackendKind::*;
+        let all = [d(Codex), d(Gemini), d(ClaudeCode)];
+        assert_eq!(select_cli(Some(ClaudeCode), &all).unwrap().kind, ClaudeCode);
+        assert_eq!(select_cli(None, &all).unwrap().kind, ClaudeCode);
+        for k in [Codex, Gemini] {
+            let err = select_cli(Some(k), &all).unwrap_err();
+            assert!(err.contains("refused") && err.contains("sandbox"), "{err}");
+        }
+        let only_exp = [d(Codex), d(Gemini)];
+        assert!(select_cli(None, &only_exp).unwrap_err().contains("no supported"));
+        assert!(select_cli(Some(ClaudeCode), &only_exp).unwrap_err().contains("not found"));
     }
 
     #[test]
