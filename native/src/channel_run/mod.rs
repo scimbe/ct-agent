@@ -892,11 +892,13 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
         std::time::Duration::from_millis(200),
         move || {
             let c = admit_ctx.clone();
-            async move { admit_one_peer(&c).await }
+            // SIGTERM/SIGINT: the park in flight closes and no new one opens (shutdown.rs).
+            async move { shutdown::admit_next_peer(&c, shutdown::process_stop()).await }
         },
         move |admission| {
             let c = ctx.clone();
-            async move { serve_admitted_session(c, admission).await }
+            // Counted from the pairing on, so the shutdown drain waits for it (health.rs).
+            health::health().serving(async move { serve_admitted_session(c, admission).await })
         },
     )
     .await
@@ -1095,6 +1097,14 @@ pub(crate) use forward_stream::*;
 // ct-agent#169: secret-shape redaction for text that leaves this process towards a remote peer.
 mod redact;
 pub(crate) use redact::redact_secrets;
+
+// A long-running channel process: the opt-in health listener (CT_CHANNEL_HEALTH_LISTEN) with
+// the activity it reports, and the SIGTERM/SIGINT drain that ends the process (status 0 on
+// request; a one-shot transfer the stop cut keeps the signal's own status).
+mod health;
+pub use health::run_health_probe;
+mod shutdown;
+pub use shutdown::start_channel_lifecycle;
 
 #[cfg(test)]
 mod tests;

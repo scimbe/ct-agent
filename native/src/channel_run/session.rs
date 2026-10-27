@@ -269,6 +269,11 @@ where
     // caller can drop the connection / exit without truncating the tail. Bounded so a vanished
     // peer can never hang teardown; on timeout or a lost connection we've done our best.
     const SEND_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    // The SIGTERM drain must not exit under this wait either: the session stopped counting as
+    // established when the pump returned, so the tail counts on its own until the peer acked it
+    // (health.rs). No await lies between the two, so a drain look can catch at most a passing
+    // zero, never the two zero looks in a row it needs to end.
+    let _tail = super::health::health().quic_tail();
     let _ = send.finish(); // idempotent — the pump already FIN'd on EOF; ignore "already closed"
     let _ = tokio::time::timeout(SEND_DRAIN_TIMEOUT, send.stopped()).await;
     Ok(())
@@ -387,6 +392,9 @@ where
             eprintln!("{}", traffic_status_line());
         }
     });
+    // Readiness (`/readyz`) and the shutdown drain count this session as established until the
+    // function returns, the #150 drain below included (health.rs).
+    let _established = super::health::health().session_established();
 
     // Reborrow the halves so they survive the pump: after the session ends we must drain before
     // returning (#150), because a caller may exit immediately (a single-shot `ct-agent channel` as a

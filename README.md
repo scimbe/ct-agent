@@ -100,7 +100,7 @@ variables, and a mistyped subcommand fails instead of starting the agent.
 | Account | `login` (OIDC device grant), `signup <name>` (self-service tunnel creation) |
 | Operate | `status`, `update`, `doctor sandbox`, `local-auth set\|reset\|rotate\|link\|links\|link-revoke`, `relay-node` |
 | SSH | `ssh <hostname>`, `ssh-config <hostname>`, `ssh-owner show\|init` |
-| Channels | `channel` (join), `channel init`, `operator-init`, `member-material`, `join-pipeline-role`, `grant`, `invite`, `bind-topology`, `register [--rekey]`, `allowlist`, `agent-card`, `super-peer` |
+| Channels | `channel` (join), `channel init`, `operator-init`, `member-material`, `join-pipeline-role`, `grant`, `invite`, `bind-topology`, `register [--rekey]`, `allowlist`, `agent-card`, `super-peer`, `health [readyz\|healthz]` |
 | Marketplace | `manifest create\|sign\|publish\|activate\|plan`, `harness run [--plan]` |
 
 `ct-agent update` replaces the binary in place and checks every download against the release's

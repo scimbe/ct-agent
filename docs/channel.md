@@ -295,6 +295,83 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 [RFC 7540]: https://www.rfc-editor.org/rfc/rfc7540#section-6.7
 [CADS-Tunnel#528]: https://github.com/scimbe/CADS-Tunnel/issues/528
 
+## Stopping and probing a long-running member
+
+A `ct-agent channel` process that joins a channel -- a persistent serve member, a forward on either
+side, a stdio pipe -- handles **SIGTERM and SIGINT** (Ctrl-C on Windows):
+
+1. It takes no new work from that moment: a persistent serve member drops the admission it has
+   parked at the edge (the leg closes, so the edge drops the park -- a keepalive leg at once --
+   instead of pairing a peer with a process that is going away) and parks no more; a forward
+   initiator closes every new local connection at once (with a log line), so its client sees a
+   failure it can retry elsewhere instead of hanging in the listen backlog for the whole drain.
+   Sessions already running go on; `/readyz` (below) answers 503.
+2. It waits until nothing is in flight -- for a forward member the forwarded streams (an idle
+   forward session is not waited for), for every other member its sessions, including a QUIC
+   session's wait for the peer to acknowledge its last bytes -- for at most
+   `CT_CHANNEL_SHUTDOWN_DRAIN_SECS` (default **5**; `0`: no wait; at most 3600).
+3. It exits with status **0** when nothing was cut, and always for a member that runs for good (a
+   forward, a persistent serve member), also when the drain time ran out: "stopped on request". A
+   one-shot member (a pipe, a call) whose transfer the drain had to cut exits with the status the
+   signal itself gives a process -- **143** for SIGTERM, **130** for SIGINT and Ctrl-C -- so a
+   caller that checks `$?` does not take a cut transfer for a complete one.
+
+Another stop signal ends the drain at once, if it comes **1 s or more** after the first. A copy of
+the same stop comes sooner and is ignored (logged): under systemd's default
+`KillMode=control-group` every process of the unit gets SIGTERM at once, so a wrapper script or
+`ct-agent-supervisor` that passes SIGTERM on delivers it a second time a few milliseconds later.
+The reconnect loops (a forward initiator's, the relay-only DCUtR serve loop's, a persistent
+`--call`'s) are not stopped on their own: a session that ends during the drain leaves nothing in
+flight, so the process exits within about 100 ms -- before a forward initiator reconnects (1 s at
+the earliest); an admission one of the other loops starts in that window ends with the process.
+
+Without a handler a container's PID 1 ignores SIGTERM, so until this every pod stop waited out the
+whole termination grace period and ended in SIGKILL. Keep the drain below what the orchestrator
+allows between SIGTERM and SIGKILL: Kubernetes' `terminationGracePeriodSeconds` (30 s by default),
+`docker stop` (10 s), `ct-agent-supervisor` (forwards SIGTERM, then 10 s). A wrapper that runs as
+PID 1 in place of `ct-agent` must pass SIGTERM on (or `exec` it), or none of this happens. Status 0
+here means "stopped on request"; a member that stops on its own because its grant ended is a
+different case ([#308](https://github.com/scimbe/ct-agent/issues/308)).
+
+`CT_CHANNEL_HEALTH_LISTEN=<ip:port>` (opt-in, off by default) serves two routes for probes:
+
+| Route | Answer |
+|---|---|
+| `GET /healthz` | `200 ok` while the process runs its channel loop. It never depends on the edge or the peer, so a liveness probe on it cannot restart a pod whose peer is simply away |
+| `GET /readyz` | `200` while a session is established, while an **accept** member's admission is parked at the edge waiting for a peer, and for 15 s after either ended (a re-park or a forward's reconnect is not an outage); `503` with the reason otherwise, and from the moment a shutdown started. An initiator's own park does not count: its forward does not work while it waits for an acceptor |
+
+The listener has the bounds of the tunnel agent's metrics listener (32 connections, 10 s to send a
+request head, 60 s per connection) and, on a loopback address, refuses a `Host` that is not local
+(DNS rebinding). A Kubernetes `httpGet` probe connects to the pod IP and therefore needs a
+non-loopback bind; with a loopback bind use the exec form. `ct-agent channel health
+[readyz|healthz]` asks the listener `CT_CHANNEL_HEALTH_LISTEN` names (the same environment the
+member runs with) and exits **0** on 200, **1** otherwise, **2** on a usage error -- no curl or
+python needed. Each `ct-agent` process in a pod needs its own port:
+
+```yaml
+env:
+  - {name: CT_CHANNEL_HEALTH_LISTEN, value: "127.0.0.1:9480"}
+readinessProbe:
+  exec: {command: ["ct-agent", "channel", "health", "readyz"]}
+  periodSeconds: 10
+  timeoutSeconds: 3
+livenessProbe:
+  exec: {command: ["ct-agent", "channel", "health", "healthz"]}
+  periodSeconds: 20
+  timeoutSeconds: 3
+```
+
+Put the readiness probe only on a pod that **is** the tunnel endpoint (a Deployment of its own for
+the accept or initiate member). Readiness is per pod: on a sidecar it would take the whole pod --
+and the Service endpoints of its other containers -- out of service whenever the member cannot park
+or has had no session for 15 s (an edge outage, a refusal backoff). For a sidecar use the liveness
+probe on `healthz` alone.
+
+A bad value of `CT_CHANNEL_HEALTH_LISTEN`, `CT_CHANNEL_SHUTDOWN_DRAIN_SECS` or
+`CT_CHANNEL_FORWARD_SESSION_WINDOW_KIB` fails the start (exit 1). The relay-only DCUtR variants
+(`CT_CHANNEL_RELAY_GATE`, `CT_CHANNEL_CIRCUIT_RELAY`) report no park; their readiness follows their
+established sessions only.
+
 ## Environment variables (channel subsystem)
 
 | Variable | Meaning |
@@ -327,6 +404,9 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_OIDC_ISSUER` | `ct-agent login` only: the Keycloak realm URL (e.g. `https://auth.bunsenbrenner.org/realms/ct-demo`) — same knob CADS-Tunnel's own portal login already reads |
 | `CT_OIDC_CLI_CLIENT_ID` | `ct-agent login` only: overrides the realm's public device-grant CLI client id (default `ct-agent-cli`) |
 | `CT_AGENT_LOGIN_TOKEN_FILE` | overrides where `ct-agent login` stores (and `channel register`/`allowlist` read) the token; default `<CT_AGENT_STATE_DIR>/oidc-token.json`, else `$HOME/.ct-agent/oidc-token.json` |
+| `CT_CHANNEL_SHUTDOWN_DRAIN_SECS` | how long a channel process stopped by SIGTERM/SIGINT waits for its sessions (a forward member: its forwarded streams) before it exits -- status 0, or 143/130 for a one-shot transfer the drain cut; default 5, `0` = no wait, at most 3600. See [Stopping and probing a long-running member](#stopping-and-probing-a-long-running-member) |
+| `CT_CHANNEL_HEALTH_LISTEN` | opt-in `ip:port` serving `GET /healthz` and `GET /readyz`; `ct-agent channel health [readyz\|healthz]` probes it (exit 0 on 200, 1 otherwise, 2 on a usage error). Same section |
+| `CT_CHANNEL_FORWARD_SESSION_WINDOW_KIB` | the forward session window this member grants its peer, whole KiB from 64 to 16384 (default 256); set it on the member that receives the bulk. See "Tuning the window" under the forward's flow control below |
 
 **`CT_CHANNEL_PHASE_MARKER=off` (or `0`/`false`/`no`) is a measurement tool, not a tuning knob.** It
 suppresses the v0.4.14 phase preamble while keeping everything else identical — the only way
@@ -561,8 +641,9 @@ The session window bounds that queue for the whole session.
 
 **Rules.**
 
-1. *Negotiation.* A member announces its window in its `HELLO` (this version: 256 KiB,
-   `SESSION_WINDOW`). A sender uses the window the **peer** announced, capped at 16 MiB. A v1
+1. *Negotiation.* A member announces its window in its `HELLO` (256 KiB, `SESSION_WINDOW`, unless
+   `CT_CHANNEL_FORWARD_SESSION_WINDOW_KIB` sets another, see below). A sender uses the window the
+   **peer** announced, capped at 16 MiB. A v1
    `HELLO`, a v2 `HELLO` with window `0`, no `HELLO` within 500 ms (`HELLO_WAIT`) or
    `CT_CHANNEL_FORWARD_FLOW=off` on either side all mean: **no session window in that direction**,
    and the session behaves exactly as before this change. A member recognises "no v2" by the
@@ -618,6 +699,19 @@ The session window bounds that queue for the whole session.
    (the state of #276) dropped the `Close`/`Open` of streams whose peer was reading, only slowly.
    Limit: a path that passes less than one frame per 2 s (below about 8 KiB/s with full
    chunks) can still lose a `Close`; that stream then ends at the peer by its idle time.
+
+**Tuning the window: `CT_CHANNEL_FORWARD_SESSION_WINDOW_KIB`.** The window a member announces is
+the whole session's budget towards that member: with 256 KiB and a 40 ms round trip, one forward
+session carries at most about 50 Mbit/s towards it, all its streams together. On a path with a
+larger bandwidth-delay product set `CT_CHANNEL_FORWARD_SESSION_WINDOW_KIB` (whole KiB, 64 to 16384)
+on the member that **receives** the bulk -- for a forward to web desktops, the initiate side, which
+receives the screen streams. Only that member needs the new version: the sender takes the announced
+window as is (rule 1), a v0.7.40 sender honours every value in that range and an older one ignores
+the window. A value outside the range fails the start, because below 64 KiB a v0.7.40 peer ends the
+session (rule 1). The price: a larger window also lets more data wait ahead of a new stream's first
+bytes on a slow path, which is what the 256 KiB default guards against. The credit per stream (256
+KiB) is not tunable: the sender assumes it without negotiation, so it still caps each single stream
+at about 256 KiB per round trip. The effect on a real path is not measured yet.
 
 ## Environment variables (agent-card & marketplace-offer CLI, #144/#152)
 
