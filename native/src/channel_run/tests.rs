@@ -3354,6 +3354,25 @@ fn handshake_eof_backoff_is_exponential_and_capped_between_transient_and_refusal
     );
 }
 
+#[test]
+fn transient_admission_backoff_keeps_the_first_delay_then_doubles_to_the_cap_200() {
+    // A transient admission failure keeps today's fast first retry (a one-off blip, #140, must
+    // still recover at once); a streak of them -- an edge restart -- doubles up to a 10 s cap
+    // instead of retrying at 100-200 ms for the whole outage.
+    let base = Duration::from_millis(200);
+    assert_eq!(transient_admission_backoff(base, 0), base, "no streak yet: the fast retry");
+    assert_eq!(transient_admission_backoff(base, 1), base, "the first transient: today's delay");
+    assert_eq!(transient_admission_backoff(base, 2), base * 2);
+    assert_eq!(transient_admission_backoff(base, 3), base * 4);
+    assert_eq!(transient_admission_backoff(base, 100), TRANSIENT_ADMISSION_BACKOFF_CAP, "capped");
+    assert_eq!(transient_admission_backoff(base, u32::MAX), TRANSIENT_ADMISSION_BACKOFF_CAP, "never overflows");
+    assert_eq!(TRANSIENT_ADMISSION_BACKOFF_CAP, Duration::from_secs(10));
+    assert!(
+        TRANSIENT_ADMISSION_BACKOFF_CAP <= REFUSED_ADMISSION_BACKOFF_CAP,
+        "a transient clears on its own -- it never waits longer than a definitive refusal"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn serve_loop_concurrent_backs_off_after_repeated_handshake_eofs_without_touching_the_refusal_streak_40() {
     // #40 (CADS-Tunnel#335) end-to-end: the field incident was two peers hammering a
@@ -3389,6 +3408,200 @@ async fn serve_loop_concurrent_backs_off_after_repeated_handshake_eofs_without_t
 
     assert!(attempt.load(Ordering::SeqCst) >= 4, "the loop kept making progress through both failure classes");
     driver.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn serve_loop_backs_off_repeated_connection_refused_then_recovers_200() {
+    // An edge restart as the serve loop sees it: every admission fails with a refused TCP
+    // connect (the real shape, inside the dial error) until the edge listens again. The loop
+    // used to retry that at a flat 100-200 ms -- 5-7 attempts a second per agent for the whole
+    // restart. Now (a) the gaps grow, so the first 3 s see at most 6 attempts; (b) a park expiry
+    // resets the streak, so the next transient waits only the fast delay again; (c) the loop
+    // recovers and serves the next admission.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    let calls: Arc<Mutex<Vec<tokio::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    let c = calls.clone();
+    let admit = move || {
+        let n = {
+            let mut calls = c.lock().unwrap();
+            calls.push(tokio::time::Instant::now());
+            calls.len() - 1
+        };
+        async move {
+            let refused = || -> BoxError {
+                Box::new(ChannelDialError::ConnectFailed(Box::new(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionRefused,
+                ))))
+            };
+            match n {
+                0..=7 | 9 => Err(refused()),
+                8 => Err(ParkExpired::boxed(
+                    "channel park expired with no partner within the edge park window (#21) -- re-parking",
+                )),
+                10 => Ok(()),
+                _ => std::future::pending().await,
+            }
+        }
+    };
+    let served = Arc::new(AtomicUsize::new(0));
+    let s = served.clone();
+    let serve = move |_: ()| {
+        let s = s.clone();
+        async move {
+            s.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await; // holds the only slot: the loop stops admitting
+            Ok::<(), BoxError>(())
+        }
+    };
+    let driver = tokio::spawn(serve_loop_concurrent(1, Duration::from_millis(200), admit, serve));
+    // Paused clock: the runtime jumps from timer to timer, so the whole sequence (at most ~35 s
+    // of backoff) runs without being waited out.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    driver.abort();
+
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 11, "8 refused, the park expiry, 1 refused, the admission");
+    assert_eq!(served.load(Ordering::SeqCst), 1, "the loop recovered and served the admission");
+    let early = calls.iter().filter(|t| t.duration_since(calls[0]) < Duration::from_secs(3)).count();
+    assert!(early <= 6, "a refusing edge is not hammered: {early} attempts in the first 3 s");
+    let gaps: Vec<Duration> = calls.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(gaps.iter().all(|g| *g <= TRANSIENT_ADMISSION_BACKOFF_CAP), "never beyond the cap: {gaps:?}");
+    assert!(
+        gaps[9] <= Duration::from_millis(200),
+        "the park expiry reset the streak, the next transient waits the fast delay: {gaps:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn serve_loop_keeps_the_fast_retry_after_transients_that_end_long_parks_200() {
+    // A transient that ends a LONG attempt -- a QUIC park whose 45 s client bound fires before
+    // the edge's close after a slow admission, a path that silently kills an idle keepalive park
+    // -- already paced the loop by itself. It starts a new streak, so such parks do not stretch
+    // every re-park towards the 10 s cap (the member would be unparked a tenth of the time);
+    // only fast, repeating failures (an edge restart) escalate.
+    use std::sync::{Arc, Mutex};
+    let calls: Arc<Mutex<Vec<tokio::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    let c = calls.clone();
+    let admit = move || {
+        let n = {
+            let mut calls = c.lock().unwrap();
+            calls.push(tokio::time::Instant::now());
+            calls.len()
+        };
+        async move {
+            if n <= 4 {
+                tokio::time::sleep(Duration::from_secs(45)).await;
+                Err::<(), BoxError>("channel join admission exchange stalled (#140)".into())
+            } else {
+                std::future::pending().await // the fifth park stays
+            }
+        }
+    };
+    let serve = |_: ()| async { Ok::<(), BoxError>(()) };
+    let driver = tokio::spawn(serve_loop_concurrent(1, Duration::from_millis(200), admit, serve));
+    // Paused clock: the runtime jumps from timer to timer.
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    driver.abort();
+
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 5, "four long parks ended by a transient, then the fifth park");
+    let pauses: Vec<Duration> =
+        calls.windows(2).map(|w| (w[1] - w[0]).saturating_sub(Duration::from_secs(45))).collect();
+    assert!(
+        pauses.iter().all(|p| *p <= Duration::from_millis(200)),
+        "every re-park after a long attempt keeps the fast delay: {pauses:?}"
+    );
+}
+
+#[test]
+fn ex_repark_delay_stays_between_half_and_two_and_a_half_times_the_base_21() {
+    // #21: the re-park after a park expiry is spread over [b/2, 2.5 b] -- 100-500 ms for the
+    // production 200 ms -- instead of a flat b, so the parks one reaper sweep ended do not all
+    // come back in the same instant. The floor stays a tight-loop guard.
+    let b = Duration::from_millis(200);
+    assert_eq!(ex_repark_delay(b, 0.0), Duration::from_millis(100), "rand01 = 0: half the base");
+    assert_eq!(ex_repark_delay(b, 1.0), Duration::from_millis(500), "rand01 = 1: 2.5 times the base");
+    assert_eq!(ex_repark_delay(b, 0.25), b, "the old flat delay is one point of the range");
+    assert_eq!(ex_repark_delay(b, -1.0), Duration::from_millis(100), "clamped below");
+    assert_eq!(ex_repark_delay(b, 7.0), Duration::from_millis(500), "clamped above");
+    for _ in 0..1000 {
+        let d = ex_repark_delay(b, rand::random::<f64>());
+        assert!(d >= b / 2 && d <= b * 5 / 2, "{d:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn serve_loop_jitters_the_re_park_after_a_park_expiry_21() {
+    // #21: three park expiries in a row. Every re-park waits within [100 ms, 500 ms], and not
+    // the old flat 200 ms each time.
+    use std::sync::{Arc, Mutex};
+    let calls: Arc<Mutex<Vec<tokio::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    let c = calls.clone();
+    let admit = move || {
+        let n = {
+            let mut calls = c.lock().unwrap();
+            calls.push(tokio::time::Instant::now());
+            calls.len()
+        };
+        async move {
+            if n <= 3 {
+                Err::<(), BoxError>(ParkExpired::boxed(
+                    "channel park expired with no partner within the edge park window (#21) -- re-parking",
+                ))
+            } else {
+                std::future::pending().await // the fourth park stays
+            }
+        }
+    };
+    let serve = |_: ()| async { Ok::<(), BoxError>(()) };
+    let driver = tokio::spawn(serve_loop_concurrent(1, Duration::from_millis(200), admit, serve));
+    // Paused clock: the runtime jumps from timer to timer.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    driver.abort();
+
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 4, "three expiries, then the fourth park");
+    let gaps: Vec<Duration> = calls.windows(2).map(|w| w[1] - w[0]).collect();
+    for g in &gaps {
+        assert!(
+            *g >= Duration::from_millis(100) && *g <= Duration::from_millis(500),
+            "every re-park within [100, 500] ms: {gaps:?}"
+        );
+    }
+    assert!(gaps.iter().any(|g| *g != Duration::from_millis(200)), "jittered, not the old flat 200 ms: {gaps:?}");
+}
+
+#[test]
+fn park_expired_line_keeps_the_grep_prefix_and_appends_the_held_time_21() {
+    // #21: the serve loop's park-expiry line is a grep contract (the field measurement counts
+    // it). The held time is APPENDED, so the prefix stays byte-identical, and the line now shows
+    // the lease the edge gave the park.
+    const PREFIX: &str = "channel park expired with no partner within the edge park window (#21) -- re-parking";
+    let e = reject_refused_outcome(ChannelJoinOutcome::ParkExpired).expect_err("an EX is an error to the serve loop");
+    assert_eq!(e.to_string(), PREFIX, "the frozen text itself is unchanged");
+    let line = park_expired_line(&e, Duration::from_millis(600_400));
+    assert!(line.starts_with(PREFIX), "grep prefix unchanged: {line}");
+    assert_eq!(line, format!("{PREFIX} (held 600.4s)"));
+    assert_eq!(park_expired_line(&e, Duration::from_millis(30_040)), format!("{PREFIX} (held 30.0s)"));
+}
+
+#[test]
+fn serve_slot_saturation_is_logged_once_per_episode_200() {
+    // #200: with every serve slot busy the loop stops parking (backpressure) -- it used to do so
+    // without a word. One line when an episode starts, one when it ends, nothing in between.
+    let mut log = SaturationLog::default();
+    assert_eq!(log.before_acquire(3, 8), None, "free slots: nothing to say");
+    assert_eq!(log.after_acquire(), None, "no episode to end");
+    assert_eq!(
+        log.before_acquire(0, 8).as_deref(),
+        Some("ct-agent channel: all 8 serve slots busy -- not parking until a session ends (#200)")
+    );
+    assert_eq!(log.before_acquire(0, 8), None, "the same episode is reported once");
+    assert_eq!(log.after_acquire(), Some("ct-agent channel: a serve slot is free again -- parking (#200)"));
+    assert_eq!(log.after_acquire(), None, "its end is reported once");
+    assert_eq!(log.before_acquire(1, 8), None);
+    assert!(log.before_acquire(0, 8).is_some(), "the next episode is reported again");
 }
 
 #[test]
@@ -6625,7 +6838,7 @@ async fn admit_one_shot_with_retry_succeeds_after_park_expired_within_the_window
 
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        admit_one_shot_with_retry(std::time::Duration::from_secs(30), &channel, admit),
+        admit_one_shot_with_retry(std::time::Duration::from_secs(30), &channel, InitiateWait::OneShot, admit),
     )
     .await
     .expect("must not hang waiting out the whole window when a later attempt succeeds")
@@ -6647,7 +6860,7 @@ async fn admit_one_shot_with_retry_gives_a_named_error_when_the_window_closes_95
 
     let err = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        admit_one_shot_with_retry(std::time::Duration::from_millis(50), &channel, admit),
+        admit_one_shot_with_retry(std::time::Duration::from_millis(50), &channel, InitiateWait::OneShot, admit),
     )
     .await
     .expect("must not hang past the window")
@@ -6673,7 +6886,7 @@ async fn admit_one_shot_with_retry_stops_at_once_on_a_revoked_grant() {
         calls.fetch_add(1, Ordering::SeqCst);
         async { Err::<ChannelJoinOutcome, BoxError>(AdmissionRefused::boxed_with_category("edge broker refused the channel join", Some("grant-revoked"))) }
     };
-    let err = admit_one_shot_with_retry(std::time::Duration::from_secs(10), &channel, admit)
+    let err = admit_one_shot_with_retry(std::time::Duration::from_secs(10), &channel, InitiateWait::OneShot, admit)
         .await
         .expect_err("a revoked grant is refused");
     assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one attempt");
@@ -6684,14 +6897,152 @@ async fn admit_one_shot_with_retry_stops_at_once_on_a_revoked_grant() {
         calls.fetch_add(1, Ordering::SeqCst);
         async { Err::<ChannelJoinOutcome, BoxError>(AdmissionRefused::boxed_with_category("edge broker refused the channel join", Some("pairing"))) }
     };
-    // Same window, a refusal that can still clear up: tried at 0, 3, 6, 9 s and once more at the
-    // deadline, then the named timeout error.
-    let err = admit_one_shot_with_retry(std::time::Duration::from_secs(10), &channel, admit)
+    // Same window, a refusal that can still clear up: tried at 0, 3, 6 and 9 s, then the named
+    // timeout error (a fifth try could only start at the deadline, with no time left, #95).
+    let err = admit_one_shot_with_retry(std::time::Duration::from_secs(10), &channel, InitiateWait::OneShot, admit)
         .await
         .expect_err("the window closes without an acceptor");
-    assert_eq!(calls.load(Ordering::SeqCst), 5, "a pairing refusal is retried until the window closes");
+    assert_eq!(calls.load(Ordering::SeqCst), 4, "a pairing refusal is retried until the window closes");
     assert!(err.to_string().contains("no acceptor for channel"), "{err}");
     assert!(!is_revoked_grant_refusal(&AdmissionRefused::boxed_with_category("x", Some("pairing"))));
+}
+
+/// ct-agent#95: the window used to be checked only BETWEEN attempts, and a keepalive `:443`
+/// attempt waits as long as the edge parks it -- with a raised keepalive park TTL (600 s) a
+/// one-shot call to an absent acceptor failed after ~10 min instead of its 75 s. The attempt is
+/// now cut at the window itself, and dropped (its leg with it).
+#[tokio::test(start_paused = true)]
+async fn admit_one_shot_with_retry_cuts_a_single_long_park_at_the_window_95() {
+    use ct_common::channel::ChannelId;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    // Records when the parked attempt's future is dropped -- the stand-in for its TLS leg.
+    struct DropFlag(Arc<AtomicBool>, Arc<std::sync::Mutex<Option<tokio::time::Instant>>>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+            *self.1.lock().unwrap() = Some(tokio::time::Instant::now());
+        }
+    }
+    let dropped = Arc::new(AtomicBool::new(false));
+    let dropped_at = Arc::new(std::sync::Mutex::new(None));
+    let (flag, at) = (dropped.clone(), dropped_at.clone());
+    let admit = move || {
+        let guard = DropFlag(flag.clone(), at.clone());
+        async move {
+            let _guard = guard;
+            // One park the edge holds for 600 s, then ends with EX.
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            Ok::<_, BoxError>(ChannelJoinOutcome::ParkExpired)
+        }
+    };
+    let started = tokio::time::Instant::now();
+    let err = admit_one_shot_with_retry(Duration::from_secs(75), &ChannelId([0x44u8; 32]), InitiateWait::OneShot, admit)
+        .await
+        .expect_err("no acceptor arrived within the window");
+    let took = started.elapsed();
+    assert!(took <= Duration::from_secs(75) + Duration::from_millis(1), "cut at the window, not at the park's end: {took:?}");
+    let msg = err.to_string();
+    assert!(msg.contains("ct-agent#95"), "the window's named error: {msg}");
+    assert!(msg.contains("still parked"), "says the attempt was cut while parked: {msg}");
+    assert!(dropped.load(Ordering::SeqCst), "the cut attempt was dropped, and its leg with it");
+    // At the window, not when its park would have ended (where it is dropped either way).
+    let dropped_after = dropped_at.lock().unwrap().map(|t| t - started);
+    assert!(
+        dropped_after.is_some_and(|d| d <= Duration::from_secs(75) + Duration::from_millis(1)),
+        "dropped at the window: {dropped_after:?}"
+    );
+}
+
+/// ct-agent#95: a real attempt is still connecting on its first poll. One that could only start
+/// at the deadline would be cut right there, and its "still parked" would replace the real cause
+/// (an edge that refuses connects, a holder that is not a member) in the window's error -- that
+/// is exactly when an operator needs it. A one-shot caller starts no such attempt: the window
+/// ends with the last real result.
+#[tokio::test(start_paused = true)]
+async fn admit_one_shot_with_retry_starts_no_attempt_at_the_deadline_95() {
+    use ct_common::channel::ChannelId;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let window = Duration::from_secs(10);
+
+    // An edge that refuses every connect, after a 5 ms round trip.
+    let calls = AtomicU32::new(0);
+    let admit = || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Err::<ChannelJoinOutcome, BoxError>(Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "connect to edge: connection refused",
+            )))
+        }
+    };
+    let started = tokio::time::Instant::now();
+    let err = admit_one_shot_with_retry(window, &ChannelId([0x46u8; 32]), InitiateWait::OneShot, admit)
+        .await
+        .expect_err("the edge refuses every connect");
+    let msg = err.to_string();
+    assert!(msg.contains("ct-agent#95"), "the window's named error: {msg}");
+    assert!(msg.contains("connection refused"), "names the real cause: {msg}");
+    assert!(!msg.contains("still parked"), "no attempt was parked: {msg}");
+    // At 0, 3, 6 and 9 s; a fifth could only start at the deadline, with no time left to run.
+    assert_eq!(calls.load(Ordering::SeqCst), 4, "no attempt is started at the deadline");
+    assert!(started.elapsed() <= window, "still within the window: {:?}", started.elapsed());
+
+    // A holder that is not a member, refused as the direct-QUIC join reports it: a value.
+    let admit = || async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Ok::<_, BoxError>(ChannelJoinOutcome::Refused { category: Some("not-member".to_string()) })
+    };
+    let err = admit_one_shot_with_retry(window, &ChannelId([0x47u8; 32]), InitiateWait::OneShot, admit)
+        .await
+        .expect_err("the holder is refused every time");
+    let msg = err.to_string();
+    assert!(msg.contains("not-member"), "names the refusal: {msg}");
+    assert!(!msg.contains("still parked"), "no attempt was parked: {msg}");
+}
+
+/// ct-agent#95: an attempt that starts shortly before the window closes can still be cut before
+/// it finished connecting. Its cut then says so in the spec's words, and names the previous
+/// attempt's result with it, so the real cause is still in the error.
+#[tokio::test(start_paused = true)]
+async fn admit_one_shot_with_retry_names_the_previous_result_when_it_cuts_a_late_attempt_95() {
+    use ct_common::channel::ChannelId;
+    // Each attempt fails after 2 s: at 0, 5 and 10 s; the third has 1 s left of the 11 s window.
+    let admit = || async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        Err::<ChannelJoinOutcome, BoxError>("connect to edge: connection refused".into())
+    };
+    let err = admit_one_shot_with_retry(Duration::from_secs(11), &ChannelId([0x48u8; 32]), InitiateWait::OneShot, admit)
+        .await
+        .expect_err("the edge refuses every connect");
+    let msg = err.to_string();
+    assert!(msg.contains("(attempt 3, ct-agent#95)"), "the third attempt was cut: {msg}");
+    assert!(msg.contains("still parked"), "the cut in the spec's words: {msg}");
+    assert!(msg.contains("previous attempt: connect to edge: connection refused"), "the real cause stays: {msg}");
+}
+
+/// ct-agent#95: forward and persistent CALL initiators WANT a long park -- they are paired the
+/// moment the acceptor parks -- so their attempt is not cut at the window.
+#[tokio::test(start_paused = true)]
+async fn persistent_initiators_keep_an_unbounded_park_attempt_95() {
+    use ct_common::channel::ChannelId;
+    let admit = || async {
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        Ok::<_, BoxError>(ChannelJoinOutcome::Admitted {
+            peer_endpoint: "127.0.0.1:1".to_string(),
+            peer_noise_pubkey: None,
+            peer_holder: None,
+            peer_attestation: None,
+            observed_reflexive: None,
+        })
+    };
+    let started = tokio::time::Instant::now();
+    let outcome = admit_one_shot_with_retry(Duration::from_secs(75), &ChannelId([0x45u8; 32]), InitiateWait::Persistent, admit)
+        .await
+        .expect("the long park ends in an admission");
+    assert!(matches!(outcome, ChannelJoinOutcome::Admitted { .. }), "the admission is returned");
+    assert!(started.elapsed() >= Duration::from_secs(600), "the attempt was waited out, not cut at the window");
 }
 
 /// The refusal as it really reaches the initiator: an edge that answers the join with
@@ -6775,7 +7126,7 @@ async fn a_revoked_grant_refused_over_the_dial_path_is_final() {
     let before = joins.load(Ordering::SeqCst);
     let err = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        admit_one_shot_with_retry(std::time::Duration::from_secs(30), &ChannelId(channel), join),
+        admit_one_shot_with_retry(std::time::Duration::from_secs(30), &ChannelId(channel), InitiateWait::OneShot, join),
     )
     .await
     .expect("returns at once instead of retrying every 3 s")
@@ -6948,6 +7299,113 @@ async fn accept_race_direct_wins_and_closes_the_parked_relay_leg_22() {
     drop(b_app);
     let _ = a.await;
     let _ = b.await;
+}
+
+#[test]
+fn relay_pair_bound_parses_the_env_with_floor_and_ceiling_22() {
+    // CT_CHANNEL_RELAY_PAIR_SECS: unset, empty, 0 and garbage keep the 45 s default; a value is
+    // clamped to 35-300 s (never below the edge's 30 s base relay lease, never unbounded again).
+    let s = Duration::from_secs;
+    assert_eq!(RELAY_PAIR_BOUND_DEFAULT, s(45));
+    for keep in [None, Some(""), Some("0"), Some("abc")] {
+        assert_eq!(relay_pair_bound_from_env(keep), s(45), "{keep:?} keeps the default");
+    }
+    assert_eq!(relay_pair_bound_from_env(Some("10")), s(35), "clamped up to the floor");
+    assert_eq!(relay_pair_bound_from_env(Some("900")), s(300), "clamped down to the ceiling");
+    assert_eq!(relay_pair_bound_from_env(Some("60")), s(60), "in range: taken as is");
+    assert_eq!(relay_pair_bound_from_env(Some(" 60 ")), s(60), "trimmed");
+}
+
+#[tokio::test]
+async fn relay_leg_gives_up_and_closes_when_the_partner_never_arrives_22() {
+    // A `:443` relay leg used to wait for its partner without any bound of its own (ct-common's
+    // relay join has none), i.e. as long as the edge kept the park -- with a raised keepalive
+    // park TTL up to 10 min per stale pairing, holding a serve slot all along. It now gives up at
+    // its bound, as a typed transient error, and closes the leg EXPLICITLY: the mock edge must
+    // read a clean close_notify EOF (`Ok(0)`), which its park pump takes as the park's death at
+    // once (#22), not a reset and not a bare drop. The leg is admitted by the PRODUCTION `:443`
+    // admission gate and then never acked -- a rendezvous partner that never presented its leg.
+    use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+    use ct_edge::channel_broker::admit_channel_join_on_duplex;
+    use ct_edge::transport::build_tcp_tls_listener_at;
+    use ed25519_dalek::Signer;
+
+    let op = SigningKey::from_bytes(&[9u8; 32]);
+    let op_pub = op.verifying_key().to_bytes();
+    let holder = SigningKey::from_bytes(&[0x2Eu8; 32]);
+    let channel = [0x2Eu8; 32];
+    let g = ChannelGrant {
+        channel: ChannelId(channel),
+        holder: holder.verifying_key().to_bytes(),
+        direction: Direction::Accept,
+        rights: Rights::ReadWrite,
+        delegable: false,
+        expires_at: 1_000,
+    };
+    let grant = SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() };
+    let request = ChannelJoinRequest { grant, endpoint: "203.0.113.2:7002".to_string() };
+
+    // Mock `:443` relay edge: admit the leg with the production gate, park it (no ack, no
+    // partner, ever), then report its next read.
+    let (fd_listener, acceptor, edge_cert) =
+        build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap()).await.expect("tls-tcp listener");
+    let fd_addr = fd_listener.local_addr().expect("front-door addr");
+    // The 300 ms bound below also covers the leg's TLS handshake and admission (about 10 ms
+    // here); a runner too starved to finish them in time fails at these two expects.
+    let edge = tokio::spawn(async move {
+        let (tcp, peer) = fd_listener.accept().await.expect("the relay leg connects");
+        let tls = acceptor.accept(tcp).await.expect("tls accept, inside the 300 ms pair bound");
+        let (mut stream, ..) = admit_channel_join_on_duplex(
+            tls,
+            peer,
+            500u64, // now < expires_at (1_000)
+            Duration::from_secs(5),
+            &move |c: ChannelId, _h: [u8; 32]| {
+                let ok = c.0 == channel;
+                async move { ok.then_some((op_pub, None, None)) }
+            },
+        )
+        .await
+        .expect("admit the relay leg over :443, inside the 300 ms pair bound");
+        let mut buf = [0u8; 64];
+        stream.read(&mut buf).await
+    });
+
+    let rungs = vec![ChannelDialRung { endpoint: fd_addr, kind: ChannelDialKind::FrontDoor }];
+    let pair_bound = Duration::from_millis(300);
+    let mut never_abandoned = std::future::pending::<()>();
+    let started = std::time::Instant::now();
+    let parked = tokio::time::timeout(
+        Duration::from_secs(1),
+        park_relay_leg_via_ladder(
+            &rungs,
+            edge_cert,
+            Duration::from_millis(400),
+            &request,
+            &holder,
+            &mut never_abandoned,
+            pair_bound,
+        ),
+    )
+    .await
+    .expect("the leg gives up at its own bound, not at the edge's park TTL");
+    let took = started.elapsed();
+    let err = match parked {
+        Ok(_) => panic!("no partner ever arrived, yet the relay leg was not given up"),
+        Err(e) => e,
+    };
+    assert!(err.downcast_ref::<RelayPairTimeout>().is_some(), "typed, so callers can tell it apart: {err}");
+    assert!(
+        !is_definitive_admission_refusal(&err) && !is_park_expired(&err),
+        "transient: neither the refusal backoff nor the re-park path: {err}"
+    );
+    assert!(took >= pair_bound, "waited for the bound before giving up: {took:?}");
+
+    let read = tokio::time::timeout(Duration::from_secs(2), edge)
+        .await
+        .expect("the edge sees the leg end at once")
+        .expect("edge task");
+    assert!(matches!(read, Ok(0)), "a clean close_notify EOF (explicit shutdown), not a reset: {read:?}");
 }
 
 #[tokio::test]
@@ -12159,7 +12617,15 @@ async fn the_configured_pin_reaches_the_serve_and_the_one_shot_join_paths_292() 
     let (_app, local) = tokio::io::duplex(1024);
     let joined = tokio::time::timeout(
         Duration::from_secs(20),
-        run_one_admission_session_with_local(&cfg, &request, &cfg.broker_ladder(), &cfg.relay_ladder(), &None, local),
+        run_one_admission_session_with_local(
+            &cfg,
+            &request,
+            &cfg.broker_ladder(),
+            &cfg.relay_ladder(),
+            &None,
+            local,
+            InitiateWait::OneShot,
+        ),
     )
     .await
     .expect("the one-shot join ends");

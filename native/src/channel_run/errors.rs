@@ -6,7 +6,8 @@
 //! are the wire-outcome vocabulary the serve loop routes on; the backoff constants and
 //! pure functions are the policy for HOW each class retries. Keeping them in one module
 //! makes the contract reviewable at a glance: refusals back off exponentially, park
-//! expiries re-park immediately, flaps back off on a shorter cap, transients retry fast.
+//! expiries re-park after a short jittered pause, flaps back off on a shorter cap,
+//! transients retry fast once and then back off on the same shorter cap.
 
 use super::BoxError;
 
@@ -276,6 +277,28 @@ pub(crate) fn handshake_eof_backoff(
         .min(HANDSHAKE_EOF_BACKOFF_CAP)
 }
 
+/// Ceiling on the serve loop's backoff after consecutive TRANSIENT admission failures (see
+/// [`transient_admission_backoff`]) -- the same 10 s as [`HANDSHAKE_EOF_BACKOFF_CAP`], for the
+/// same reason: an edge restart or a dropped path clears on its own, so the loop keeps checking
+/// well before a definitive refusal's 30 s.
+pub(crate) const TRANSIENT_ADMISSION_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// #200: the serve loop's delay after `consecutive` transient admission failures in a row
+/// (connection refused while the edge restarts, a dropped leg, a stalled exchange, a DNS error).
+/// The first keeps today's fast `retry_backoff`, so a one-off blip (#140) still recovers at
+/// once; each further one doubles it, capped at [`TRANSIENT_ADMISSION_BACKOFF_CAP`]. Before
+/// this, such failures were retried at a flat 100-200 ms for as long as they lasted: two refused
+/// connects per attempt, 5-7 attempts a second per agent through a whole edge restart. Pure.
+pub(crate) fn transient_admission_backoff(
+    retry_backoff: std::time::Duration,
+    consecutive: u32,
+) -> std::time::Duration {
+    let shift = consecutive.saturating_sub(1).min(16);
+    retry_backoff
+        .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
+        .min(TRANSIENT_ADMISSION_BACKOFF_CAP)
+}
+
 /// #21: typed marker for a park expiry -- the edge reaped this member's park because no partner
 /// arrived within the park TTL, and SAID SO on the wire (the bare `EX` token / the named QUIC
 /// close reason). Deliberately a DISTINCT type from [`AdmissionRefused`]: a park expiry is
@@ -313,6 +336,37 @@ pub(crate) fn is_park_expired(e: &BoxError) -> bool {
     crate::channel::error_names_park_expiry(e.as_ref())
 }
 
+/// #21: the pause before re-parking after a park expiry, uniformly in `[base/2, 2.5 * base]`
+/// -- 100-500 ms for the production 200 ms `retry_backoff`. It was a flat `base`, so the parks
+/// one reaper sweep ended (all of a fleet's after an edge restart) came back in the same
+/// instant, every time; the spread de-phases them. The floor stays a tight-loop guard against an
+/// edge that reaps at once. Pure: the caller supplies `rand01`, as for [`equal_jitter`].
+pub(crate) fn ex_repark_delay(base: std::time::Duration, rand01: f64) -> std::time::Duration {
+    base / 2 + base.mul_f64(2.0 * rand01.clamp(0.0, 1.0))
+}
+
+/// #22: a `:443` relay leg that found no partner within its own bound
+/// (`CT_CHANNEL_RELAY_PAIR_SECS`) and was closed by this member. The relay join has no wait
+/// bound in ct-common, so before this the leg -- and the serve slot behind it -- waited as long
+/// as the edge kept the park. Deliberately neither an [`AdmissionRefused`] nor a [`ParkExpired`]:
+/// it is transient, so the refusal backoff and the re-park path stay untouched.
+#[derive(Debug)]
+pub(crate) struct RelayPairTimeout(pub(crate) std::time::Duration);
+
+impl std::fmt::Display for RelayPairTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "relay leg found no partner within {}s -- closed it (CT_CHANNEL_RELAY_PAIR_SECS)", self.0.as_secs())
+    }
+}
+
+impl std::error::Error for RelayPairTimeout {}
+
+impl RelayPairTimeout {
+    pub(crate) fn boxed(bound: std::time::Duration) -> BoxError {
+        Box::new(RelayPairTimeout(bound))
+    }
+}
+
 /// #231: how long to wait before the next admission attempt. A definitive refusal (see
 /// [`is_definitive_admission_refusal`]) will never resolve itself without operator action — a
 /// holder that isn't a channel member stays that way until someone adds it — so retrying at the
@@ -321,9 +375,11 @@ pub(crate) fn is_park_expired(e: &BoxError) -> bool {
 /// orphaned process retrying a not-member holder measured at ~24-47 admission attempts/second
 /// against the production edge, plausibly starving OTHER, genuinely valid joins of admission
 /// capacity (the exact symptom #231 describes). Backs off exponentially
-/// (`retry_backoff * 2^consecutive_refusals`), capped at [`REFUSED_ADMISSION_BACKOFF_CAP`]; a
-/// transient error always gets the fast, unchanged `retry_backoff` so a genuine brief CP/edge
-/// blip (#140) still recovers quickly. Pure — the loop supplies `consecutive_refusals`.
+/// (`retry_backoff * 2^consecutive_refusals`), capped at [`REFUSED_ADMISSION_BACKOFF_CAP`]; for a
+/// transient error it returns the fast, unchanged `retry_backoff`. The serve loop now takes a
+/// transient's delay from [`transient_admission_backoff`] instead, whose first retry is that same
+/// fast one, so a genuine brief CP/edge blip (#140) still recovers quickly. Pure — the loop
+/// supplies `consecutive_refusals`.
 pub(crate) fn admission_retry_backoff(
     retry_backoff: std::time::Duration,
     refused: bool,

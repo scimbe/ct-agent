@@ -606,8 +606,10 @@ pub(crate) async fn run_persistent_call_reconnect_loop(
     relay_ladder: &[ChannelDialRung],
     front_door_cert: &Option<CertificateDer<'static>>,
 ) -> Result<(), BoxError> {
+    // ct-agent#95: a persistent CALL wants to be parked when the acceptor arrives -- an
+    // unbounded attempt, unlike a one-shot call's.
     let admit = |local: ChannelLocal| {
-        run_one_admission_session_with_local(cfg, request, broker_ladder, relay_ladder, front_door_cert, local)
+        run_one_admission_session_with_local(cfg, request, broker_ladder, relay_ladder, front_door_cert, local, InitiateWait::Persistent)
     };
     run_persistent_call_reconnect_loop_with(slug, cfg.call_reconnect, admit).await
 }
