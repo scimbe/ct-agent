@@ -12617,7 +12617,15 @@ async fn the_configured_pin_reaches_the_serve_and_the_one_shot_join_paths_292() 
     let (_app, local) = tokio::io::duplex(1024);
     let joined = tokio::time::timeout(
         Duration::from_secs(20),
-        run_one_admission_session_with_local(&cfg, &request, &cfg.broker_ladder(), &cfg.relay_ladder(), &None, local),
+        run_one_admission_session_with_local(
+            &cfg,
+            &request,
+            &cfg.broker_ladder(),
+            &cfg.relay_ladder(),
+            &None,
+            local,
+            InitiateWait::OneShot,
+        ),
     )
     .await
     .expect("the one-shot join ends");
