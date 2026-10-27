@@ -1155,7 +1155,7 @@ dependencies = [
 [[package]]
 name = "harness-core"
 version = "0.1.1"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#2bdf8071842b4b8acc1d019637643957c82bfdb0"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#2ca0e8c565c61751825d8aff5863d7fceffb9f79"
 dependencies = [
  "installer-engine",
  "libc",
@@ -1648,7 +1648,7 @@ dependencies = [
 [[package]]
 name = "installer-engine"
 version = "0.1.1"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#2bdf8071842b4b8acc1d019637643957c82bfdb0"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#2ca0e8c565c61751825d8aff5863d7fceffb9f79"
 dependencies = [
  "flate2",
  "libc",
@@ -2244,7 +2244,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "manifest-core"
 version = "0.1.1"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#2bdf8071842b4b8acc1d019637643957c82bfdb0"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?branch=feat%2Fbyo-agent-backend#2ca0e8c565c61751825d8aff5863d7fceffb9f79"
 dependencies = [
  "ed25519-dalek",
  "serde",

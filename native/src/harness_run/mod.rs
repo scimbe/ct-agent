@@ -51,6 +51,10 @@ pub struct HarnessCliConfig {
     pub bundle_dir: PathBuf,
     /// `CT_HARNESS_BACKEND` (default `litellm`) with the settings that backend needs.
     pub backend: BackendChoice,
+    /// `CT_HARNESS_CLAUDE_TOKEN_FILE` -- file (mode 0600) holding the long-lived token printed by
+    /// `claude setup-token`; claude only. Read outside the sandbox and handed to the CLI over a file
+    /// descriptor. Never the keychain: a sandboxed agent must not be able to reach it.
+    pub claude_token_file: Option<PathBuf>,
     /// `CT_HARNESS_ALLOWED_MODELS` -- comma-separated harness-side model allowlist, separate from
     /// the publisher trust allowlist: even a trusted task naming an unexpected model is refused.
     pub allowed_models: Vec<String>,
@@ -192,6 +196,7 @@ impl HarnessCliConfig {
                 "the manifest's own activation directory, <CT_MANIFEST_WORK_DIR>/<project_name>",
             )?),
             backend,
+            claude_token_file: opt(&f, "CT_HARNESS_CLAUDE_TOKEN_FILE").map(PathBuf::from),
             allowed_models,
             allow_unmarked_bundle: opt(&f, "CT_HARNESS_ALLOW_UNMARKED_BUNDLE").as_deref() == Some("1"),
             state_dir,
@@ -311,8 +316,8 @@ fn run_harness_blocking(cfg: HarnessCliConfig) -> Result<HarnessRun, String> {
         other => {
             let backend: Box<dyn harness_core::AgentBackend> = match other {
                 BackendChoice::Ollama { base_url } => Box::new(harness_core::LiteLlmBackend::ollama_local(base_url)?),
-                BackendChoice::Cli(kind) => Box::new(local_cli_backend(Some(*kind))?),
-                _ => Box::new(local_cli_backend(None)?),
+                BackendChoice::Cli(kind) => Box::new(local_cli_backend(Some(*kind), cfg.claude_token_file.clone())?),
+                _ => Box::new(local_cli_backend(None, cfg.claude_token_file.clone())?),
             };
             let ctx = harness_core::RunContext {
                 bundle_dir: cfg.bundle_dir,
@@ -367,9 +372,14 @@ fn select_cli(
 }
 
 /// Detection only looks at `PATH` and runs `--version`; no credential file is read.
-fn local_cli_backend(kind: Option<harness_core::BackendKind>) -> Result<harness_core::LocalCliBackend, String> {
+fn local_cli_backend(
+    kind: Option<harness_core::BackendKind>,
+    claude_token_file: Option<PathBuf>,
+) -> Result<harness_core::LocalCliBackend, String> {
     let detected = harness_core::detect_backends();
-    harness_core::LocalCliBackend::new(select_cli(kind, &detected)?)
+    let mut backend = harness_core::LocalCliBackend::new(select_cli(kind, &detected)?)?;
+    backend.token_file = claude_token_file;
+    Ok(backend)
 }
 
 /// `ct-agent harness backends`: the detected local agent CLIs as JSON. Only PATH lookup and
@@ -542,6 +552,7 @@ mod tests {
             allowlist,
             bundle_dir: dir.to_path_buf(),
             backend: BackendChoice::LiteLlm { base_url: "http://127.0.0.1:1".to_string(), key_file: dir.join("key") },
+            claude_token_file: None,
             allowed_models: vec!["local-devstral-small2".to_string()],
             // Strict, as in production: the existing tests below all fail on an EARLIER check
             // (signature/expiry, allowlist, containment), so they never reach the marker
@@ -824,6 +835,16 @@ mod tests {
         let only_exp = [d(Codex), d(Gemini)];
         assert!(select_cli(None, &only_exp).unwrap_err().contains("no supported"));
         assert!(select_cli(Some(ClaudeCode), &only_exp).unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn claude_token_file_is_optional_and_read_from_the_environment() {
+        let cfg = HarnessCliConfig::from_lookup(lookup(&full_env())).unwrap();
+        assert_eq!(cfg.claude_token_file, None);
+        let mut env = full_env();
+        env.push(("CT_HARNESS_CLAUDE_TOKEN_FILE", "/secure/claude.token"));
+        let cfg = HarnessCliConfig::from_lookup(lookup(&env)).unwrap();
+        assert_eq!(cfg.claude_token_file, Some(PathBuf::from("/secure/claude.token")));
     }
 
     #[test]
