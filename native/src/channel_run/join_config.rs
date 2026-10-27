@@ -67,6 +67,13 @@ pub struct ChannelJoinCliConfig {
     /// (direct QUIC → the `:443` front door). Absent ⇒ direct-QUIC-only broker admission,
     /// even if `front_door` is set (a front door you have no root for is unusable).
     pub front_door_cert: Option<CertificateDer<'static>>,
+    /// Optional `CT_CHANNEL_FRONT_DOOR_SNI` (validated DNS hostname): the SNI every TLS-TCP
+    /// dial to the `:443` front door presents instead of `localhost`, for an edge behind an
+    /// SNI-routing ingress (ssl-passthrough). The edge still classifies by ALPN, so the
+    /// ALPN-carrying legs are unaffected; the h2 boring rung (no distinctive ALPN, routed by
+    /// its SNI `edge-cdn.invalid`) cannot work under a custom SNI and is dropped from the
+    /// ladders. `None` = today's behaviour, unchanged.
+    pub front_door_sni: Option<String>,
     /// Optional libp2p **Circuit-Relay v2** multiaddr (`CT_CHANNEL_CIRCUIT_RELAY`, #136 N-wire).
     /// When set for a **relay-only** member, the join starts on the edge relay and then
     /// opportunistically hole-punches to a **direct** NAT-to-NAT link via DCUtR through this
@@ -592,14 +599,24 @@ impl ChannelJoinCliConfig {
     /// (if `CT_CHANNEL_FRONT_DOOR` is configured) the `:443` front door — or the front
     /// door alone under `CT_CHANNEL_FRONT_DOOR_ONLY` (#16). Pure.
     pub fn broker_ladder(&self) -> Vec<ChannelDialRung> {
-        Self::ladder(self.broker_addr, self.front_door, self.front_door_only)
+        self.without_boring_under_sni(Self::ladder(self.broker_addr, self.front_door, self.front_door_only))
     }
 
     /// The ordered dial plan for the **relay** (used on direct-dial failure): the direct
     /// port first, then (if configured) the `:443` front door — or the front door alone
     /// under `CT_CHANNEL_FRONT_DOOR_ONLY` (#16). Pure.
     pub fn relay_ladder(&self) -> Vec<ChannelDialRung> {
-        Self::ladder(self.relay_addr, self.front_door, self.front_door_only)
+        self.without_boring_under_sni(Self::ladder(self.relay_addr, self.front_door, self.front_door_only))
+    }
+
+    /// With `CT_CHANNEL_FRONT_DOOR_SNI` set the boring (h2 + `edge-cdn.invalid`) rung is
+    /// skipped: the edge routes h2 to the channel broker by that exact SNI, so a custom SNI
+    /// would never reach it (and an SNI-routing ingress would not forward the fixed one).
+    fn without_boring_under_sni(&self, mut rungs: Vec<ChannelDialRung>) -> Vec<ChannelDialRung> {
+        if self.front_door_sni.is_some() {
+            rungs.retain(|r| r.kind != ChannelDialKind::FrontDoorBoring);
+        }
+        rungs
     }
 
     /// Direct QUIC first, then — if a front door is configured — the two `:443` rungs, the
@@ -785,6 +802,14 @@ impl ChannelJoinCliConfig {
                     .to_string(),
             );
         }
+        // Optional SNI override for the front-door dials; set-but-invalid is an error.
+        let front_door_sni = match f("CT_CHANNEL_FRONT_DOOR_SNI") {
+            Some(s) if !s.trim().is_empty() => Some(
+                crate::transport::validate_front_door_sni(&s)
+                    .map_err(|e| format!("CT_CHANNEL_FRONT_DOOR_SNI invalid: {e}"))?,
+            ),
+            _ => None,
+        };
         // ct-agent#47: default ON, same truthy-opt-out idiom as
         // service_calls::call_persistent_enabled_from (only an explicit off value disables --
         // a typo can never silently reintroduce the exit(1)-on-death contract).
@@ -804,6 +829,7 @@ impl ChannelJoinCliConfig {
             front_door,
             front_door_raw,
             front_door_cert,
+            front_door_sni,
             circuit_relay,
             relay_gate_addr,
             relay_gate_cert,

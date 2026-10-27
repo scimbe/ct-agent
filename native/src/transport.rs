@@ -658,18 +658,72 @@ pub async fn tcp_tls_connect_channel(
     // readers -- and treats a clean EOF as unambiguous member death, enabling instant
     // corpse detection); an older edge only knows the bare id and behaves exactly as
     // before. The whole capability handshake lives in this ALPN list.
+    tcp_tls_connect_channel_sni(addr, edge_cert, front_door_sni_override().as_deref()).await
+}
+
+/// [`tcp_tls_connect_channel`] with the SNI chosen explicitly: `None` keeps [`DEFAULT_SNI`]
+/// (byte-identical to the pre-`CT_CHANNEL_FRONT_DOOR_SNI` dial), `Some(host)` presents `host`.
+pub async fn tcp_tls_connect_channel_sni(
+    addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    sni: Option<&str>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
     tcp_tls_connect_with_alpns_sni(
         addr,
         edge_cert,
         &[b"ct-edge-channel-ka", b"ct-edge-channel"],
-        DEFAULT_SNI,
+        sni.unwrap_or(DEFAULT_SNI),
     )
     .await
 }
 
-/// The SNI every non-fallback TLS-TCP dial presents. The client pins the edge's raw
-/// certificate (`roots.add(edge_cert)`) instead of doing hostname-based CA validation, so
-/// this value is never checked against the certificate — it is pure ClientHello metadata.
+/// Dial the `:443` front door for the `ct-edge-relay` (relay-gate) leg, honouring
+/// `CT_CHANNEL_FRONT_DOOR_SNI` like the channel dial does.
+pub async fn tcp_tls_connect_relay(
+    addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
+    tcp_tls_connect_relay_sni(addr, edge_cert, front_door_sni_override().as_deref()).await
+}
+
+/// [`tcp_tls_connect_relay`] with the SNI chosen explicitly (`None` = [`DEFAULT_SNI`]).
+pub async fn tcp_tls_connect_relay_sni(
+    addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    sni: Option<&str>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
+    tcp_tls_connect_with_alpn_sni(addr, edge_cert, b"ct-edge-relay", sni.unwrap_or(DEFAULT_SNI)).await
+}
+
+/// Process-wide `CT_CHANNEL_FRONT_DOOR_SNI` (set once from the validated config by
+/// `run_channel_join_command`). `None` (the default) leaves every dial byte-identical.
+static FRONT_DOOR_SNI: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Install (or clear) the SNI the channel/relay front-door dials present.
+pub fn set_front_door_sni(sni: Option<String>) {
+    *FRONT_DOOR_SNI.lock().unwrap_or_else(|e| e.into_inner()) = sni;
+}
+
+fn front_door_sni_override() -> Option<String> {
+    FRONT_DOOR_SNI.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Validate a `CT_CHANNEL_FRONT_DOOR_SNI` value: a DNS hostname `ServerName::try_from`
+/// accepts (an IP literal is refused -- rustls sends no SNI for those, which would
+/// silently defeat the setting).
+pub fn validate_front_door_sni(raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    match rustls::pki_types::ServerName::try_from(v) {
+        Ok(rustls::pki_types::ServerName::DnsName(_)) => Ok(v.to_string()),
+        Ok(_) => Err(format!("{v:?} is an IP address; a DNS hostname is required")),
+        Err(e) => Err(format!("{v:?} is not a valid DNS hostname ({e})")),
+    }
+}
+
+/// The SNI every non-fallback TLS-TCP dial presents. The client pins the edge's certificate
+/// as its only trust anchor (`roots.add(edge_cert)`), but rustls still checks this name
+/// against the SAN of the leaf the edge presents. It works because the edge issues its
+/// leaves for "localhost"; any other SNI (`CT_CHANNEL_FRONT_DOOR_SNI`) needs a matching SAN.
 const DEFAULT_SNI: &str = "localhost";
 
 /// The synthetic SNI hostname of the DPI-resistant `:443` fallback route (#106
@@ -1206,6 +1260,39 @@ mod tests {
             vec![b"ct-edge-channel-ka".to_vec(), b"ct-edge-channel".to_vec()],
             "the channel offer is [ka, legacy] with the legacy id preserved"
         );
+    }
+
+    #[tokio::test]
+    async fn front_door_sni_override_reaches_the_wire_on_channel_and_relay_dials() {
+        // CT_CHANNEL_FRONT_DOOR_SNI: the channel dial keeps its ALPN offer but presents the
+        // custom SNI; the relay dial keeps `ct-edge-relay`; None stays DEFAULT_SNI.
+        install_crypto_provider();
+        let (cert, _key) = self_signed().unwrap();
+        for (sni, expect) in [(Some("core.cads.inf.haw-hamburg.de"), "core.cads.inf.haw-hamburg.de"), (None, DEFAULT_SNI)] {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(observe_client_hello(listener));
+            let _ = tcp_tls_connect_channel_sni(addr, cert.clone(), sni).await;
+            let (got, alpn) = server.await.unwrap();
+            assert_eq!(got.as_deref(), Some(expect));
+            assert_eq!(alpn, vec![b"ct-edge-channel-ka".to_vec(), b"ct-edge-channel".to_vec()]);
+
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(observe_client_hello(listener));
+            let _ = tcp_tls_connect_relay_sni(addr, cert.clone(), sni).await;
+            let (got, alpn) = server.await.unwrap();
+            assert_eq!(got.as_deref(), Some(expect));
+            assert_eq!(alpn, vec![b"ct-edge-relay".to_vec()]);
+        }
+    }
+
+    #[test]
+    fn validate_front_door_sni_accepts_dns_names_only() {
+        assert_eq!(validate_front_door_sni(" core.cads.inf.haw-hamburg.de ").unwrap(), "core.cads.inf.haw-hamburg.de");
+        for bad in ["", "192.0.2.1", "::1", "a b", "a..b", "-x.example"] {
+            assert!(validate_front_door_sni(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[tokio::test]
