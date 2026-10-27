@@ -89,6 +89,12 @@ pub struct ChannelJoinCliConfig {
     /// The trust anchor (DER) for the `:443` relay-gate TLS-TCP dial (`CT_CHANNEL_RELAY_GATE_CERT`,
     /// hex) — required alongside `relay_gate_addr`, same treatment as `front_door_cert`.
     pub relay_gate_cert: Option<CertificateDer<'static>>,
+    /// #296: `CT_CHANNEL_EXPERIMENTAL_DCUTR`, default off. Without it a relay-only member with
+    /// `relay_gate_addr` or `circuit_relay` set joins exactly as before (same relay port, same
+    /// pairer, same session framing) but never runs the libp2p DCUtR upgrade: an "upgraded"
+    /// session opens its stream on the relayed libp2p connection, and the relay-node's default
+    /// circuit limits (2 min / 128 KiB) then cut it. See [`join_via_relay_without_dcutr`].
+    pub experimental_dcutr: bool,
     /// **#104 in-band relay→direct upgrade**, opt-in (`CT_CHANNEL_DIRECT_UPGRADE=1`, default
     /// off — unset, nothing changes). When true and a relay-leg session forms (this member's
     /// own [`ChannelJoinOutcome::Admitted::observed_reflexive`] was learned during THIS
@@ -772,6 +778,12 @@ impl ChannelJoinCliConfig {
             }
             _ => None,
         };
+        // #296: the DCUtR upgrade of the two knobs above only with this explicit switch.
+        let experimental_dcutr = crate::envflag::flag_named(
+            "CT_CHANNEL_EXPERIMENTAL_DCUTR",
+            f("CT_CHANNEL_EXPERIMENTAL_DCUTR").as_deref(),
+            false,
+        );
         // #104 in-band relay->direct upgrade: opt-in, off by default (unset -> false,
         // identical truthy-string handling as CT_CHANNEL_RELAY_ONLY above).
         let direct_upgrade = f("CT_CHANNEL_DIRECT_UPGRADE")
@@ -844,6 +856,7 @@ impl ChannelJoinCliConfig {
             circuit_relay,
             relay_gate_addr,
             relay_gate_cert,
+            experimental_dcutr,
             direct_upgrade,
             accept_race,
             relay_addr_direct,

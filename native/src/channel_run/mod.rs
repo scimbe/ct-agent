@@ -24,7 +24,9 @@
 //!    not a failure.
 //! 3. **Relay-only DCUtR variants** (`CT_CHANNEL_RELAY_GATE`, preferred over
 //!    `CT_CHANNEL_CIRCUIT_RELAY`; both via [`run_dcutr_join_loop`]): the gated
-//!    relay leg for NAT-hostile networks and the nat-lab rig.
+//!    relay leg for NAT-hostile networks and the nat-lab rig. The libp2p upgrade itself
+//!    runs only with `CT_CHANNEL_EXPERIMENTAL_DCUTR=1` (#296); without it the same join
+//!    stays on the edge relay ([`join_via_relay_without_dcutr`]).
 
 use std::io;
 use std::net::SocketAddr;
@@ -203,7 +205,13 @@ where
     // #104: built once, moved into whichever single relay-fallback call site below
     // actually fires (they're mutually exclusive). `None` whenever direct_upgrade is off
     // (the default) or the edge reported no reflexive address for this admission.
-    let upgrade = if direct_upgrade { build_upgrade_candidate(observed_reflexive).await } else { None };
+    // #296: `r=` only decides whether to take part; the offered address is asked through the
+    // shared listener socket later, where CT_CHANNEL_REFLEXIVE_EDGE says (as on the relay-gate path).
+    let upgrade = if direct_upgrade {
+        build_upgrade_candidate(observed_reflexive, std::env::var("CT_CHANNEL_REFLEXIVE_EDGE").ok())
+    } else {
+        None
+    };
     match role {
         // #121: the paired peer advertised the relay-only sentinel — it has no dialable
         // address, so skip the wasted direct dial + timeout and go straight to the relay.
@@ -308,7 +316,7 @@ where
 /// reuses [`run_channel_session`] over the edge connection. Noise stays end-to-end —
 /// the edge only forwards ciphertext.
 ///
-/// `upgrade`, when `Some((listener, own_direct_endpoint))` (#104, opt-in via
+/// `upgrade`, when `Some(..)` (#104, opt-in via
 /// `CT_CHANNEL_DIRECT_UPGRADE`), runs [`run_channel_session_upgradable`] instead of the
 /// plain session: the two peers negotiate a direct-dial candidate **in-band, over this
 /// same already-admitted, already-Noise-authenticated relay stream** and opportunistically
@@ -324,7 +332,7 @@ pub async fn join_via_relay<P>(
     own_noise_private: &[u8; 32],
     peer_noise_public: &[u8; 32],
     local: P,
-    upgrade: Option<(Endpoint, String)>,
+    upgrade: Option<DirectUpgrade>,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
@@ -606,6 +614,165 @@ where
     .await
 }
 
+/// #296: the start-up line of a relay-only member whose DCUtR knob (`CT_CHANNEL_RELAY_GATE` or
+/// `CT_CHANNEL_CIRCUIT_RELAY`) is set without `CT_CHANNEL_EXPERIMENTAL_DCUTR`. It also says what
+/// switching it on brings back: this release fixes the candidate socket only for the
+/// `CT_CHANNEL_DIRECT_UPGRADE` path, the DCUtR swarm is still seeded from a throwaway socket.
+pub(crate) const DCUTR_FENCED_NOTICE: &str = "ct-agent channel: the libp2p DCUtR upgrade is experimental and OFF \
+     (#296): an upgraded session opens its stream on the relayed libp2p connection, which the \
+     relay-node cuts at 2 min / 128 KiB. This member joins on the same relay port as before and \
+     keeps every session on the edge relay; set CT_CHANNEL_EXPERIMENTAL_DCUTR=1 to try the upgrade \
+     -- its punch candidate is still learned on a throwaway socket (#296, not fixed on this path), \
+     so expect the hole punch itself to time out.";
+
+/// #296: what a relay-only member's DCUtR knob decides -- which join loop runs (the relay-gate one
+/// wins over the circuit-relay one) and whether that loop runs the libp2p upgrade (`upgrade`,
+/// `CT_CHANNEL_EXPERIMENTAL_DCUTR`) or the same relay-port join without it
+/// ([`join_via_relay_without_dcutr`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DcutrKnob {
+    /// `CT_CHANNEL_RELAY_GATE` set.
+    RelayGate { upgrade: bool },
+    /// `CT_CHANNEL_CIRCUIT_RELAY` set (and no relay-gate).
+    CircuitRelay { upgrade: bool },
+}
+
+impl DcutrKnob {
+    /// Whether the libp2p DCUtR upgrade runs.
+    pub(crate) fn upgrade(self) -> bool {
+        match self {
+            Self::RelayGate { upgrade } | Self::CircuitRelay { upgrade } => upgrade,
+        }
+    }
+}
+
+/// #296: the fence as one pure decision, so the table is tested rather than only the two joins it
+/// chooses between. `None`: not relay-only, or neither knob set -- the member takes the broker
+/// path of [`run_channel_join_command`].
+pub(crate) fn dcutr_knob(relay_only: bool, relay_gate: bool, circuit_relay: bool, experimental_dcutr: bool) -> Option<DcutrKnob> {
+    if !relay_only {
+        return None;
+    }
+    let upgrade = experimental_dcutr;
+    if relay_gate {
+        Some(DcutrKnob::RelayGate { upgrade })
+    } else if circuit_relay {
+        Some(DcutrKnob::CircuitRelay { upgrade })
+    } else {
+        None
+    }
+}
+
+/// #296 (finding D3): the relay-only join of a member with `CT_CHANNEL_RELAY_GATE` or
+/// `CT_CHANNEL_CIRCUIT_RELAY` set but without `CT_CHANNEL_EXPERIMENTAL_DCUTR`. Admission is the one
+/// [`join_via_relay_gate_dcutr`] / [`join_via_relay_dcutr`] run -- the join goes to `relay_conn`,
+/// the relay port, so the member parks in the same edge pairer as before and still meets a peer
+/// that keeps the experimental path on -- and the session uses the in-band upgrade framing those
+/// peers speak (every pump frame is tagged; a plain session would garble it). It just never
+/// offers and declines every offer, so the bytes stay on the edge relay.
+///
+/// Why fence it: an accepted DCUtR "upgrade" opens the channel stream as soon as the RELAYED
+/// libp2p connection exists (libp2p-stream picks a random existing connection, and that is the
+/// only one), so the session moves onto the relay-node's circuit, whose default limits (2 min,
+/// 128 KiB) then end it mid-transfer. Since the v0.4.20 pin (CADS-Tunnel#480) a responder of
+/// this release already refuses the circuit-address offer -- it does not parse as one socket
+/// address -- so between two current members the upgrade never happened anyway; the switch makes
+/// that explicit, spares the initiator its relay-gate dial, swarm and reservation, and keeps an
+/// older responder from accepting the offer.
+pub async fn join_via_relay_without_dcutr<P>(
+    relay_conn: &Connection,
+    request: &ChannelJoinRequest,
+    holder: &SigningKey,
+    role: ChannelRole,
+    own_noise_private: &[u8; 32],
+    local: P,
+) -> Result<(), BoxError>
+where
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    // CADS-Tunnel#495 U2 (a'): relay_conn's own bi-stream carries the session -- PHASE_MARKER_RELAY,
+    // as on both DCUtR joins.
+    let (peer_noise, peer_holder) = match present_channel_join_marked(relay_conn, request, holder, PHASE_MARKER_RELAY).await? {
+        ChannelJoinOutcome::Admitted { peer_noise_pubkey: Some(noise), peer_holder, peer_attestation, .. } => {
+            verify_relayed_dcutr_peer(request, noise, peer_holder, peer_attestation)?
+        }
+        ChannelJoinOutcome::Admitted { .. } => {
+            return Err("relay-only join needs the peer's relayed Noise key (register the member's key, #101)".into())
+        }
+        ChannelJoinOutcome::Refused { category } => {
+            // #524: base string frozen, category appended when present.
+            return Err(AdmissionRefused::boxed_with_category(
+                "edge relay refused the channel join",
+                category.as_deref(),
+            ));
+        }
+        // #21: the relay park was reaped before a partner arrived -- retryable, not a refusal.
+        ChannelJoinOutcome::ParkExpired => {
+            return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
+        }
+    };
+    let local = gate_local(local, request, role, peer_holder, holder)?;
+    let (relay_send, relay_recv) = open_relay_channel_streams(relay_conn, role).await?;
+    run_relay_session_declining_upgrades(relay_send, relay_recv, local, role, own_noise_private, &peer_noise).await
+}
+
+/// #296: the in-band upgradable relay session ([`ct_common::upgrade`]) with no upgrade in it:
+/// the initiator never offers, the responder answers every Offer with `Abort`. A DCUtR peer on
+/// the other end sees the framing it expects and stays on the relay with us.
+pub(crate) async fn run_relay_session_declining_upgrades<RW, RR, P>(
+    relay_send: RW,
+    relay_recv: RR,
+    local: P,
+    role: ChannelRole,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+) -> Result<(), BoxError>
+where
+    RW: AsyncWrite + Unpin,
+    RR: AsyncRead + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    use ct_common::upgrade::{
+        run_upgradable_session_initiator, run_upgradable_session_responder_verified, Role, UpgradeCoordinator,
+    };
+    // What an upgrade would hand to the pump; never built here, named only to fix the types.
+    type NoDirect = Option<(snow::TransportState, tokio::io::DuplexStream, tokio::io::DuplexStream)>;
+    match role {
+        ChannelRole::Initiate => run_upgradable_session_initiator(
+            relay_send,
+            relay_recv,
+            local,
+            own_noise_private,
+            peer_noise_public,
+            UpgradeCoordinator::with_backoff(Role::Initiator, 0, 1, 100),
+            1,
+            || async { None::<String> },
+            || async { NoDirect::None },
+        )
+        .await
+        .map_err(Into::into),
+        ChannelRole::Accept => run_upgradable_session_responder_verified(
+            relay_send,
+            relay_recv,
+            local,
+            own_noise_private,
+            peer_noise_public,
+            UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100),
+            1,
+            |offered: String| async move {
+                eprintln!(
+                    "ct-agent channel: peer offered a direct upgrade to {offered} -- declined, the session \
+                     stays on the edge relay (CT_CHANNEL_EXPERIMENTAL_DCUTR is off, #296)"
+                );
+                false
+            },
+            |_offered: String, _peer: [u8; 32]| async { NoDirect::None },
+        )
+        .await
+        .map_err(Into::into),
+    }
+}
+
 /// Dial the edge's `:443` **relay-gate** leg (`CT_EDGE_RELAY_GATE`) for a real NAT-to-NAT
 /// hole-punch, multiplexed onto the same front door every other `:443` leg uses — no new
 /// public port. TLS-connects with ALPN `ct-edge-relay`
@@ -736,17 +903,27 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // a2a-demo's plain "bob" scenario (previously thought stable, now exercising this same
     // path): the persistent --serve side eventually gets past a stall by retrying forever,
     // while the one-shot side had zero tolerance and failed the whole call on one hiccup.
-    if cfg.relay_only {
+    // #296: the knob picks the join loop below ([`dcutr_knob`]); without
+    // CT_CHANNEL_EXPERIMENTAL_DCUTR both loops keep their admission (relay port, same pairer,
+    // same session framing) but skip the libp2p upgrade.
+    if let Some(knob) =
+        dcutr_knob(cfg.relay_only, cfg.relay_gate_addr.is_some(), cfg.circuit_relay.is_some(), cfg.experimental_dcutr)
+    {
+        let dcutr = knob.upgrade();
+        if !dcutr {
+            eprintln!("{DCUTR_FENCED_NOTICE}");
+        }
+        let upgrade_label = if dcutr { "DCUtR-upgradable" } else { "edge-relay (DCUtR off, #296)" };
         // The real gated relay-gate leg (no new public port, grant+possession pre-auth) takes
         // priority when configured — `circuit_relay` (a directly-dialable relay multiaddr) is
         // kept for the nat-lab test rig, not the deployed path.
-        if let Some(relay_gate_addr) = cfg.relay_gate_addr {
+        if let (DcutrKnob::RelayGate { .. }, Some(relay_gate_addr)) = (knob, cfg.relay_gate_addr) {
             let relay_gate_cert = cfg
                 .relay_gate_cert
                 .clone()
                 .ok_or("CT_CHANNEL_RELAY_GATE set without CT_CHANNEL_RELAY_GATE_CERT")?;
             eprintln!(
-                "ct-agent channel: relay-only DCUtR-upgradable {:?} via relay-gate (relay {}, gate {}){}",
+                "ct-agent channel: relay-only {upgrade_label} {:?} via relay-gate (relay {}, gate {}){}",
                 cfg.role, cfg.relay_addr, relay_gate_addr,
                 if serve_loop { " — persistent serve: retries transient stalls (#248)" } else { "" }
             );
@@ -761,6 +938,17 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                     dial_relay_preferring_direct(cfg.relay_addr_direct, cfg.relay_addr, DIRECT_DIAL_TIMEOUT).await?;
                 // Admission via the relay gate happens below, after this call -- peer not yet known.
                 let local = channel_local(None);
+                if !dcutr {
+                    return Ok(join_via_relay_without_dcutr(
+                        &relay_conn,
+                        request,
+                        &cfg.holder,
+                        cfg.role,
+                        &cfg.own_noise_private,
+                        local,
+                    )
+                    .await);
+                }
                 Ok(join_via_relay_gate_dcutr(
                     &relay_conn,
                     request,
@@ -777,9 +965,9 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             });
             return if serve_loop { joined.await } else { one_shot_session(joined).await };
         }
-        if let Some(circuit) = cfg.circuit_relay.clone() {
+        if let (DcutrKnob::CircuitRelay { .. }, Some(circuit)) = (knob, cfg.circuit_relay.clone()) {
             eprintln!(
-                "ct-agent channel: relay-only DCUtR-upgradable {:?} (relay {}, circuit {}){}",
+                "ct-agent channel: relay-only {upgrade_label} {:?} (relay {}, circuit {}){}",
                 cfg.role, cfg.relay_addr, circuit,
                 if serve_loop { " — persistent serve: retries transient stalls (#248)" } else { "" }
             );
@@ -796,6 +984,17 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                     .await?;
                 // Admission via the circuit relay happens below, after this call -- peer not yet known.
                 let local = channel_local(None);
+                if !dcutr {
+                    return Ok(join_via_relay_without_dcutr(
+                        &relay_conn,
+                        request,
+                        &cfg.holder,
+                        cfg.role,
+                        &cfg.own_noise_private,
+                        local,
+                    )
+                    .await);
+                }
                 Ok(join_via_relay_dcutr(
                     &relay_conn,
                     request,
