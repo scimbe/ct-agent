@@ -45,7 +45,8 @@
 //! which hands it to one fresh engine per session. When a session ends for any reason other than
 //! a grant end (recorded as state by the gate, [`super::peer_grant::GrantEndRecord`], or this
 //! member's own grant past its expiry), the loop admits a new session after a backoff of
-//! [`FORWARD_RECONNECT_MIN`] doubling up to [`FORWARD_RECONNECT_MAX`]; connections made in the
+//! [`FORWARD_RECONNECT_MIN`] doubling up to [`FORWARD_RECONNECT_MAX`], each wait jittered into the
+//! upper half of its step (ct-agent#314); connections made in the
 //! meantime wait in the listen backlog and are served by the next session. After a grant end the
 //! listener stays open but refuses every connection with a log line (#264), without reconnecting.
 //! An admission that the edge refuses because the grant is on the revocation list is final too:
@@ -253,10 +254,11 @@ pub(crate) fn forward_limits_from_env() -> (usize, Duration) {
     )
 }
 
-/// The first wait before re-admitting a forward session that ended without a grant end.
+/// The first backoff step before re-admitting a forward session that ended without a grant end.
+/// Each actual wait is jittered into `[step/2, step]` (ct-agent#314).
 pub const FORWARD_RECONNECT_MIN: Duration = Duration::from_secs(1);
-/// The cap the wait doubles up to; a session that ran at least this long counts as healthy and
-/// resets the wait to [`FORWARD_RECONNECT_MIN`].
+/// The cap the step doubles up to; a session that ran at least this long counts as healthy and
+/// resets the step to [`FORWARD_RECONNECT_MIN`].
 pub const FORWARD_RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// The wait before the next admission (ct-agent#267): `prev` is the wait used before the session
@@ -349,8 +351,12 @@ where
                 return outcome;
             }
         }
-        let wait = next_forward_reconnect_delay(delay, lasted);
-        delay = Some(wait);
+        let step = next_forward_reconnect_delay(delay, lasted);
+        delay = Some(step);
+        // ct-agent#314: the doubling keeps its deterministic steps; the wait itself is jittered
+        // into [step/2, step]. After an edge restart every forward initiator of a fleet ended its
+        // session in the same second and came back in lockstep (1, 2, 4 ... s).
+        let wait = super::errors::equal_jitter(step, rand::random::<f64>());
         match outcome {
             Ok(()) => eprintln!(
                 "ct-agent channel: forward session ended after {lasted:?} without a grant end \

@@ -14,7 +14,7 @@ linked — those threads carry the full evidence.
 | One-shot service call (opt-out) | `CT_CHANNEL_CALL_SERVICE=<slug>` **+** `CT_CHANNEL_CALL_PERSISTENT=0` | The pre-v0.5.0 default: join → pair → Noise → **one** `service/<slug>` call (stdin = input, stdout = **bare** output) → exit. The historical crew-bridge `CREW_*_CMD` contract — **a caller still expecting bare one-shot output must set `=0` when upgrading to v0.5.0** (migration note in the release; only explicit `0`/`false`/`no` opts out). |
 | One-shot raw MCP call | `CT_CHANNEL_CALL=<method>` (+ `CT_CHANNEL_CALL_PARAMS`) | One JSON-RPC request/response, prints the whole envelope, exits. |
 | Persistent serve | `CT_CHANNEL_ROLE=accept` + `CT_CHANNEL_SERVE=1` | Parks at the broker, serves each paired peer's session **concurrently** (up to `CT_CHANNEL_SERVE_CONCURRENCY`, default 8, [#200]) — a JSON-RPC request loop per session, any number of calls per session. `CT_AGENT_SERVICE_HANDLER_CMD` spawns a fresh handler per request (the handler stays stateless even under a held session). |
-| Raw pipe | neither | stdin/stdout spliced over the channel. |
+| Raw pipe | neither | stdin/stdout spliced over the channel. stdin end-of-file is a **half-close**: it ends only the direction towards the peer, the peer's bytes keep arriving on stdout until the peer ends too. On the `:443` front door that needs an edge with CADS-Tunnel v0.5.0 or later; an older edge drops the receive direction as well ([#299]). **`ok=true` in the `channel_session` close event, and exit status 0, mean "the transport closed cleanly", not "the peer received everything"**: a relay that cuts the stream can produce the same clean close, and there is no end-to-end delivery acknowledgement. Check delivery in the application (a reply, a checksum) when it matters. |
 | **Direct address (no broker at all)** | `CT_CHANNEL_ADDR` + `CT_CHANNEL_PEER_NOISE_KEY` (+ `CT_CHANNEL_PEER_CERT` when initiating) | Dials the peer **directly**; the edge is not involved in pairing. This is the `first-channel` tutorial's path. Every other row in this table goes through the broker — this one is the reason not to read "channel" as "always via the edge". |
 
 **Every row above except Direct address needs the control plane, not just a valid grant.** Source-verified
@@ -225,6 +225,22 @@ picture first.
   drives a pair-and-die storm at native RTT speed. Any session that succeeds or simply lives
   ≥500 ms resets the streak (real arena rounds run ~85 ms *inside* an already-held session; a
   fresh session that does real work runs well past 500 ms).
+- **`channel_session state=refused reason=the peer did not present its grant within 10s`**
+  ([#314]) — the peer-grant check (always on for a TCP forward, opt-in otherwise) got no grant
+  from the peer. The 10 s count from the start of the session, right after the Noise handshake.
+  Through v0.7.40 they counted from admission, so a slow pairing (direct dial 5 s, accept window
+  8 s, a relay rung, the handshake) could use them up before the peer could answer: the refusal
+  then came milliseconds after `state=open`. When this side of a session fails like that (an
+  error reading its local side), the session ends within about 4 s (the peer gets 2 s to close it,
+  then at most 2 s of drain) even if the peer never sends another byte; before, a peer that had
+  finished the handshake and then stayed silent held the session for ever — a forward initiator
+  never reconnected and an accept member lost a serve slot. A local *write* error (a stream
+  handler that closed its stdin, a closed stdout) does not trigger this: the other direction keeps
+  delivering until the local side ends, as before. A refusal is **not a grant end**: a
+  forward initiator reconnects with backoff (1 s doubling up to 30 s, each wait jittered into the
+  upper half of its step), the serve loop parks again. A peer that never presents its grant is
+  usually not a forward member of this channel at all: a second process with the same identity
+  but without `CT_CHANNEL_FORWARD_ALLOW`, or a member older than the forward check.
 
 ## Registration (the Browser-Plane/mesh tunnel, not channels — but same binary)
 
@@ -286,7 +302,7 @@ predates `'F'` refuses it, costing one extra dial before the agent degrades to `
 | `CT_CHANNEL_RELAY_DIRECT` | dial the relay at this `host:port` instead of the one the grant names — an operator override, not a fallback |
 | `CT_CHANNEL_SERVE` / `CT_CHANNEL_SERVE_CONCURRENCY` | accept-side persistent serve, session cap (default 8) |
 | `CT_CHANNEL_DIRECT_UPGRADE=1` | opt-in in-band relay→direct upgrade (#104) |
-| `CT_CHANNEL_REQUIRE_PEER_GRANT` / `CT_CHANNEL_OPERATOR_PUBKEY` | **Opt-in end-to-end check of the peer's grant** (default off). Admission attests the peer's Noise key with the peer's holder key, but all of that comes from the broker; nothing binds the holder to an operator-signed grant, so a compromised broker could present an identity it minted itself. With `CT_CHANNEL_REQUIRE_PEER_GRANT=1` both members send their own grant as the first bytes inside the Noise session, and each checks the other's before any application byte flows: the signature against `CT_CHANNEL_OPERATOR_PUBKEY` (64 hex, required when on), expiry, same channel, holder = the attested peer holder, and the complementary direction. **Switch it on for every member of a channel together**: a member that sends the grant to one that does not expect it breaks that session. On but without an operator key, the join fails. |
+| `CT_CHANNEL_REQUIRE_PEER_GRANT` / `CT_CHANNEL_OPERATOR_PUBKEY` | **Opt-in end-to-end check of the peer's grant** (default off). Admission attests the peer's Noise key with the peer's holder key, but all of that comes from the broker; nothing binds the holder to an operator-signed grant, so a compromised broker could present an identity it minted itself. With `CT_CHANNEL_REQUIRE_PEER_GRANT=1` both members send their own grant as the first bytes inside the Noise session, and each checks the other's before any application byte flows: the signature against `CT_CHANNEL_OPERATOR_PUBKEY` (64 hex, required when on), expiry, same channel, holder = the attested peer holder, and the complementary direction. **Switch it on for every member of a channel together**: a member that sends the grant to one that does not expect it breaks that session. On but without an operator key, the join fails. **A TCP forward runs this check on both sides whatever the switch says** (`CT_CHANNEL_FORWARD` set, or `CT_CHANNEL_FORWARD_ALLOW` non-empty), the sessions of a persistent serve accept member included; setting it on a forward member changes nothing and does not fix a forward that is refused with "did not present its grant" ([#314], see [Failure semantics](#failure-semantics-and-timers-what-an-error-actually-means)). |
 | `CT_CHANNEL_PEER_PIN` | **Opt-in binding of this endpoint to its partner** (default unset = every member of the channel may be paired with it, ADR-0020). `link`, or `holder:<64 hex>[,noise:<64 hex>]`, several entries separated by `;`. Checked against the admitted peer; a peer it does not name is refused before the Noise handshake (the transport leg its session would have used is taken and closed). A malformed value stops the start. Brokered joins only. See [Binding an endpoint to its partner](#binding-an-endpoint-to-its-partner-ct_channel_peer_pin) |
 | `CT_AGENT_SERVICE_HANDLER_CMD` / `CT_AGENT_SERVICES` | the handler command + offered service slugs on the serve side |
 | `CT_SERVICE_TYPE` | not read by `ct-agent` itself — set **in the handler child's own environment** by `CT_AGENT_SERVICE_HANDLER_CMD` (#149-A.1) so one handler script can branch on which of several registered `service/<slug>` calls was actually invoked |
@@ -648,3 +664,5 @@ needed exactly once, at `sign`, so an operator can review the unsigned skeleton 
 [#250]: https://github.com/scimbe/ct-agent/issues/15
 [#330]: https://github.com/scimbe/ct-agent/issues/16
 [#47]: https://github.com/scimbe/ct-agent/issues/47
+[#299]: https://github.com/scimbe/ct-agent/issues/299
+[#314]: https://github.com/scimbe/ct-agent/issues/314
