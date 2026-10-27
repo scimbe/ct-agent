@@ -52,10 +52,6 @@ pub struct WatchConfig {
 }
 
 impl WatchConfig {
-    pub fn from_env() -> Result<Self, String> {
-        Self::from_lookup(|k| std::env::var(k).ok())
-    }
-
     /// A malformed value is an error (the operator asked for something we cannot honour);
     /// an interval below the floor is raised to it, a grace shorter than one interval is
     /// raised to one interval (it could not otherwise ever see a second attempt).
