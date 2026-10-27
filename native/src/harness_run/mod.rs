@@ -49,10 +49,8 @@ pub struct HarnessCliConfig {
     pub manifest_location: String,
     pub allowlist: TrustAllowlist,
     pub bundle_dir: PathBuf,
-    pub litellm_base_url: String,
-    /// `CT_HARNESS_LITELLM_KEY_FILE` -- a file, never an inline env var (mirrors `capability.rs`'s
-    /// own file-based-secret discipline, #31) so the key never lands in `ps`/process-env dumps.
-    pub litellm_key_file: PathBuf,
+    /// `CT_HARNESS_BACKEND` (default `litellm`) with the settings that backend needs.
+    pub backend: BackendChoice,
     /// `CT_HARNESS_ALLOWED_MODELS` -- comma-separated harness-side model allowlist, separate from
     /// the publisher trust allowlist: even a trusted task naming an unexpected model is refused.
     pub allowed_models: Vec<String>,
@@ -74,6 +72,30 @@ pub struct HarnessCliConfig {
     /// `docker compose build`, never a Binary entrypoint.
     pub require_binary_sandbox: bool,
 }
+
+/// `CT_HARNESS_BACKEND`: who executes the task prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendChoice {
+    /// The default and the only pre-BYO behaviour: the operator's LiteLLM.
+    LiteLlm {
+        /// `CT_HARNESS_LITELLM_URL`.
+        base_url: String,
+        /// `CT_HARNESS_LITELLM_KEY_FILE` -- a file, never an inline env var (mirrors
+        /// `capability.rs`'s own file-based-secret discipline, #31) so the key never lands in
+        /// `ps`/process-env dumps.
+        key_file: PathBuf,
+    },
+    /// An agent CLI the customer installed and logged in (`claude`, `codex`, `gemini`): their own
+    /// subscription, no credentials handled here.
+    Cli(harness_core::BackendKind),
+    /// Ollama / OpenAI-compatible server on loopback (`CT_HARNESS_OLLAMA_URL`, default
+    /// `http://127.0.0.1:11434/v1`).
+    Ollama { base_url: String },
+    /// First installed *supported* CLI (`harness backends` shows what is detected).
+    Auto,
+}
+
+pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434/v1";
 
 /// What `harness run` produced: the agent loop's report, or -- under `--plan` -- the plan it
 /// stopped at instead.
@@ -111,13 +133,44 @@ impl HarnessCliConfig {
                         every task; name at least one 64-hex publisher pubkey"
                 .to_string());
         }
-        let allowed_models = split_csv(&req(
-            &f,
-            "CT_HARNESS_ALLOWED_MODELS",
-            "comma-separated model_name values the harness may call -- no default, ever: this is \
-             the ceiling on what a signed task can actually spend against",
-        )?);
-        if allowed_models.is_empty() {
+        let backend = match opt(&f, "CT_HARNESS_BACKEND").map(|v| v.to_ascii_lowercase()).as_deref() {
+            None | Some("litellm") => BackendChoice::LiteLlm {
+                base_url: req(&f, "CT_HARNESS_LITELLM_URL", "base URL of the operator's own LiteLLM proxy")?,
+                key_file: PathBuf::from(req(
+                    &f,
+                    "CT_HARNESS_LITELLM_KEY_FILE",
+                    "path to a file holding a budget-capped LiteLLM virtual key -- never inline",
+                )?),
+            },
+            Some("auto") => BackendChoice::Auto,
+            Some("ollama") => BackendChoice::Ollama {
+                base_url: opt(&f, "CT_HARNESS_OLLAMA_URL").unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string()),
+            },
+            Some(other) => match harness_core::BackendKind::parse(other) {
+                Some(k @ (harness_core::BackendKind::ClaudeCode | harness_core::BackendKind::Codex | harness_core::BackendKind::Gemini)) => {
+                    BackendChoice::Cli(k)
+                }
+                _ => {
+                    return Err(format!(
+                        "CT_HARNESS_BACKEND='{other}' is not one of litellm|claude|codex|gemini|ollama|auto"
+                    ))
+                }
+            },
+        };
+        // The model allowlist guards what a task may spend against on infrastructure the operator
+        // pays for: required wherever the task's model name is sent to an endpoint (litellm,
+        // ollama). The agent CLIs pick the model of the customer's own login, so it does not apply.
+        let models_needed = matches!(backend, BackendChoice::LiteLlm { .. } | BackendChoice::Ollama { .. });
+        let allowed_models = match (models_needed, opt(&f, "CT_HARNESS_ALLOWED_MODELS")) {
+            (false, None) => Vec::new(),
+            _ => split_csv(&req(
+                &f,
+                "CT_HARNESS_ALLOWED_MODELS",
+                "comma-separated model_name values the harness may call -- no default, ever: this is \
+                 the ceiling on what a signed task can actually spend against",
+            )?),
+        };
+        if models_needed && allowed_models.is_empty() {
             return Err("CT_HARNESS_ALLOWED_MODELS resolved to an empty list -- name at least one model".to_string());
         }
         let state_dir = crate::events::state_dir_from(&f).ok_or_else(|| {
@@ -138,12 +191,7 @@ impl HarnessCliConfig {
                 "CT_HARNESS_BUNDLE_DIR",
                 "the manifest's own activation directory, <CT_MANIFEST_WORK_DIR>/<project_name>",
             )?),
-            litellm_base_url: req(&f, "CT_HARNESS_LITELLM_URL", "base URL of the operator's own LiteLLM proxy")?,
-            litellm_key_file: PathBuf::from(req(
-                &f,
-                "CT_HARNESS_LITELLM_KEY_FILE",
-                "path to a file holding a budget-capped LiteLLM virtual key -- never inline",
-            )?),
+            backend,
             allowed_models,
             allow_unmarked_bundle: opt(&f, "CT_HARNESS_ALLOW_UNMARKED_BUNDLE").as_deref() == Some("1"),
             state_dir,
@@ -240,23 +288,101 @@ fn run_harness_blocking(cfg: HarnessCliConfig) -> Result<HarnessRun, String> {
         return Ok(HarnessRun::Plan(plan_for_bundle(&cfg, &manifest, &expected_compose, now)?));
     }
 
-    let api_key = std::fs::read_to_string(&cfg.litellm_key_file)
-        .map_err(|e| format!("read CT_HARNESS_LITELLM_KEY_FILE {}: {e}", cfg.litellm_key_file.display()))?
-        .trim()
-        .to_string();
-    if api_key.is_empty() {
-        return Err(format!("{} is empty -- no LiteLLM key to use", cfg.litellm_key_file.display()));
-    }
-
-    let opts = harness_core::RunOptions {
-        bundle_dir: cfg.bundle_dir,
-        compose_file: manifest.bundle.compose_file,
-        litellm_base_url: cfg.litellm_base_url,
-        api_key,
-        allowed_models: cfg.allowed_models,
-        now,
+    let compose_file = manifest.bundle.compose_file;
+    let report = match &cfg.backend {
+        BackendChoice::LiteLlm { base_url, key_file } => {
+            let api_key = std::fs::read_to_string(key_file)
+                .map_err(|e| format!("read CT_HARNESS_LITELLM_KEY_FILE {}: {e}", key_file.display()))?
+                .trim()
+                .to_string();
+            if api_key.is_empty() {
+                return Err(format!("{} is empty -- no LiteLLM key to use", key_file.display()));
+            }
+            let opts = harness_core::RunOptions {
+                bundle_dir: cfg.bundle_dir,
+                compose_file,
+                litellm_base_url: base_url.clone(),
+                api_key,
+                allowed_models: cfg.allowed_models,
+                now,
+            };
+            harness_core::run_task_with_state_dir(&task, &cfg.allowlist, opts, &cfg.state_dir)
+        }
+        other => {
+            let backend: Box<dyn harness_core::AgentBackend> = match other {
+                BackendChoice::Ollama { base_url } => Box::new(harness_core::LiteLlmBackend::ollama_local(base_url)?),
+                BackendChoice::Cli(kind) => Box::new(local_cli_backend(Some(*kind))?),
+                _ => Box::new(local_cli_backend(None)?),
+            };
+            let ctx = harness_core::RunContext {
+                bundle_dir: cfg.bundle_dir,
+                compose_file,
+                allowed_models: cfg.allowed_models,
+                now,
+            };
+            harness_core::run_with_backend(
+                &task,
+                &cfg.allowlist,
+                &ctx,
+                backend.as_ref(),
+                &task.prompt,
+                &harness_core::PromptProvenance::signed_task(),
+                &cfg.state_dir,
+            )
+        }
     };
-    Ok(HarnessRun::Report(harness_core::run_task_with_state_dir(&task, &cfg.allowlist, opts, &cfg.state_dir)))
+    Ok(HarnessRun::Report(report))
+}
+
+/// The installed CLI for an explicit kind, or (None = `auto`) the first installed supported one.
+/// Detection only looks at `PATH` and runs `--version`; no credential file is read.
+fn local_cli_backend(kind: Option<harness_core::BackendKind>) -> Result<harness_core::LocalCliBackend, String> {
+    let detected = harness_core::detect_backends();
+    let chosen = match kind {
+        Some(k) => detected
+            .iter()
+            .find(|d| d.kind == k)
+            .ok_or_else(|| format!("CT_HARNESS_BACKEND={}: `{}` was not found on PATH (see `ct-agent harness backends`)", k.id(), k.id()))?,
+        None => harness_core::pick_auto(&detected).ok_or_else(|| {
+            "CT_HARNESS_BACKEND=auto: no supported agent CLI (claude) found on PATH; install and log in to one, or name \
+             an experimental backend explicitly (see `ct-agent harness backends`)"
+                .to_string()
+        })?,
+    };
+    if chosen.maturity == harness_core::Maturity::Experimental {
+        eprintln!(
+            "warning: backend '{}' is experimental (flags not verified end to end, no turn limit) -- see docs/byo-agent-backend.md in CADS-agent-marketplace",
+            chosen.kind.id()
+        );
+    }
+    harness_core::LocalCliBackend::new(chosen)
+}
+
+/// `ct-agent harness backends`: the detected local agent CLIs as JSON. Only PATH lookup and
+/// `--version`; credentials are neither read nor probed, and nothing leaves this machine.
+pub fn backends_json(detected: &[harness_core::DetectedBackend]) -> String {
+    let mut list = vec![serde_json::json!({
+        "id": "litellm", "installed": null, "maturity": "supported",
+        "note": "operator LiteLLM; configured via CT_HARNESS_LITELLM_URL / CT_HARNESS_LITELLM_KEY_FILE",
+    })];
+    for kind in harness_core::BackendKind::ALL {
+        let Some(bin) = kind.binary_name() else { continue };
+        let found = detected.iter().find(|d| d.kind == kind);
+        list.push(serde_json::json!({
+            "id": kind.id(),
+            "binary": bin,
+            "installed": found.is_some(),
+            "path": found.map(|d| d.binary.display().to_string()),
+            "version": found.and_then(|d| d.version.clone()),
+            "maturity": match kind.maturity() {
+                harness_core::Maturity::Supported => "supported",
+                harness_core::Maturity::Experimental => "experimental",
+            },
+        }));
+    }
+    let auto = harness_core::pick_auto(detected).map(|d| d.kind.id());
+    serde_json::to_string_pretty(&serde_json::json!({ "backends": list, "auto": auto }))
+        .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
 }
 
 /// The `--plan` hook: `manifest_run::plan_for_manifest` for an already-activated bundle. The
@@ -401,8 +527,7 @@ mod tests {
             manifest_location: dir.join("manifest.json").to_string_lossy().to_string(),
             allowlist,
             bundle_dir: dir.to_path_buf(),
-            litellm_base_url: "http://127.0.0.1:1".to_string(),
-            litellm_key_file: dir.join("key"),
+            backend: BackendChoice::LiteLlm { base_url: "http://127.0.0.1:1".to_string(), key_file: dir.join("key") },
             allowed_models: vec!["local-devstral-small2".to_string()],
             // Strict, as in production: the existing tests below all fail on an EARLIER check
             // (signature/expiry, allowlist, containment), so they never reach the marker
@@ -581,6 +706,99 @@ mod tests {
             ("CT_HARNESS_ALLOWED_MODELS", "local-devstral-small2"),
             ("CT_AGENT_STATE_DIR", "/local/state"),
         ]
+    }
+
+    fn env_without_litellm(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+        let mut env: Vec<_> = full_env()
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with("CT_HARNESS_LITELLM") && *k != "CT_HARNESS_ALLOWED_MODELS")
+            .collect();
+        env.extend_from_slice(extra);
+        env
+    }
+
+    #[test]
+    fn backend_defaults_to_litellm_and_explicit_litellm_is_identical() {
+        let default = HarnessCliConfig::from_lookup(lookup(&full_env())).unwrap();
+        let mut explicit_env = full_env();
+        explicit_env.push(("CT_HARNESS_BACKEND", "LiteLLM"));
+        let explicit = HarnessCliConfig::from_lookup(lookup(&explicit_env)).unwrap();
+        let expected = BackendChoice::LiteLlm {
+            base_url: "http://172.22.0.1:4103".to_string(),
+            key_file: PathBuf::from("/local/key"),
+        };
+        assert_eq!(default.backend, expected);
+        assert_eq!(explicit.backend, expected);
+    }
+
+    #[test]
+    fn litellm_backend_still_requires_its_url_key_file_and_models() {
+        for missing in ["CT_HARNESS_LITELLM_URL", "CT_HARNESS_LITELLM_KEY_FILE", "CT_HARNESS_ALLOWED_MODELS"] {
+            let env: Vec<_> = full_env().into_iter().filter(|(k, _)| *k != missing).collect();
+            let err = HarnessCliConfig::from_lookup(lookup(&env)).unwrap_err();
+            assert!(err.contains(missing), "{err}");
+        }
+    }
+
+    #[test]
+    fn cli_backends_need_no_litellm_settings_and_no_model_allowlist() {
+        for (name, kind) in [
+            ("claude", harness_core::BackendKind::ClaudeCode),
+            ("codex", harness_core::BackendKind::Codex),
+            ("gemini", harness_core::BackendKind::Gemini),
+        ] {
+            let cfg = HarnessCliConfig::from_lookup(lookup(&env_without_litellm(&[("CT_HARNESS_BACKEND", name)]))).unwrap();
+            assert_eq!(cfg.backend, BackendChoice::Cli(kind));
+            assert!(cfg.allowed_models.is_empty());
+        }
+        let cfg = HarnessCliConfig::from_lookup(lookup(&env_without_litellm(&[("CT_HARNESS_BACKEND", "auto")]))).unwrap();
+        assert_eq!(cfg.backend, BackendChoice::Auto);
+    }
+
+    #[test]
+    fn ollama_backend_defaults_to_loopback_and_still_requires_the_model_allowlist() {
+        let err = HarnessCliConfig::from_lookup(lookup(&env_without_litellm(&[("CT_HARNESS_BACKEND", "ollama")]))).unwrap_err();
+        assert!(err.contains("CT_HARNESS_ALLOWED_MODELS"), "{err}");
+        let cfg = HarnessCliConfig::from_lookup(lookup(&env_without_litellm(&[
+            ("CT_HARNESS_BACKEND", "ollama"),
+            ("CT_HARNESS_ALLOWED_MODELS", "qwen3.6:27b"),
+        ])))
+        .unwrap();
+        assert_eq!(cfg.backend, BackendChoice::Ollama { base_url: DEFAULT_OLLAMA_URL.to_string() });
+    }
+
+    #[test]
+    fn unknown_backend_is_refused_loudly() {
+        for bad in ["litelm", "openai", "gpt", "ClaudeCode"] {
+            let err = HarnessCliConfig::from_lookup(lookup(&env_without_litellm(&[("CT_HARNESS_BACKEND", bad)]))).unwrap_err();
+            assert!(err.contains("CT_HARNESS_BACKEND") && err.contains(&bad.to_ascii_lowercase()), "{err}");
+        }
+    }
+
+    #[test]
+    fn backends_json_lists_installed_and_missing_without_secrets() {
+        let detected = vec![harness_core::DetectedBackend {
+            kind: harness_core::BackendKind::ClaudeCode,
+            binary: PathBuf::from("/usr/bin/claude"),
+            version: Some("2.1.310".to_string()),
+            maturity: harness_core::Maturity::Supported,
+        }];
+        let v: serde_json::Value = serde_json::from_str(&backends_json(&detected)).unwrap();
+        let by = |id: &str| v["backends"].as_array().unwrap().iter().find(|b| b["id"] == id).unwrap().clone();
+        assert_eq!(by("claude")["installed"], true);
+        assert_eq!(by("claude")["version"], "2.1.310");
+        assert_eq!(by("codex")["installed"], false);
+        assert_eq!(by("codex")["maturity"], "experimental");
+        assert_eq!(v["auto"], "claude");
+    }
+
+    #[test]
+    fn explicit_cli_backend_that_is_not_installed_fails_with_a_hint() {
+        // PATH lookups are process-global; only assert on the error for a kind that cannot be
+        // resolved when nothing matches -- use detection on an empty PATH directly.
+        let empty = harness_core::detect_backends_in(std::ffi::OsStr::new(""), None);
+        assert!(empty.is_empty());
+        assert!(harness_core::pick_auto(&empty).is_none());
     }
 
     #[test]

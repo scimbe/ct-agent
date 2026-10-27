@@ -96,6 +96,7 @@ USAGE:
     ct-agent manifest plan                Dry-run: what `activate` would do on this host, and why it would refuse
     ct-agent harness run                  Run a signed task against an installed manifest's bundle
     ct-agent harness run --plan           Dry-run: the plan for the task's bundle, no model call
+    ct-agent harness backends             List installed agent CLIs usable via CT_HARNESS_BACKEND
     ct-agent doctor sandbox [--json]      Can THIS host run sandboxed Binary activations (bwrap)? If not, what to fix
     ct-agent ssh <hostname> [--port <n>] [--ca <pem-file>] [--connect-timeout <secs>] [--owner-key-file <file>]
                                 OpenSSH ProxyCommand: SSH over TLS through the tunnel (see below)
@@ -246,6 +247,14 @@ Phase 5 -- K8s remains a reserved, unexecuted schema slot) reads:
     `harness run --plan` (or CT_HARNESS_PLAN=1) performs every pre-flight check, then prints the
     plan for the bundle -- the same JSON as `manifest plan`, scanning the bundle's CURRENT
     compose file -- and exits 1 if it lists a refusal, without calling the model.
+    CT_HARNESS_BACKEND=litellm|claude|codex|gemini|ollama|auto (default litellm = everything
+    above, unchanged) selects who runs the prompt. claude/codex/gemini launch the agent CLI the
+    customer installed and logged in themselves (their own subscription; no credential is read,
+    copied or sent -- only PATH lookup and `--version`; CT_HARNESS_LITELLM_* are then not needed,
+    and CT_HARNESS_ALLOWED_MODELS is optional); codex/gemini are experimental. ollama talks to a
+    loopback server (CT_HARNESS_OLLAMA_URL, default http://127.0.0.1:11434/v1; needs
+    CT_HARNESS_ALLOWED_MODELS). auto = the first installed supported CLI. `harness backends`
+    prints what is detected.
 
 `doctor sandbox` (scimbe/ct-agent#183, decision C1) runs the same sandbox probe `manifest
     activate` runs for a Binary manifest (bwrap: `--version`, then a real sandboxed exec with
@@ -1164,13 +1173,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 return Ok(());
             }
+            Some("backends") => {
+                if let Some(arg) = std::env::args().nth(3) {
+                    eprintln!("ct-agent: unrecognized `harness backends` argument '{arg}'\n");
+                    eprint!("{USAGE}");
+                    std::process::exit(1);
+                }
+                println!("{}", ct_agent::harness_run::backends_json(&harness_core::detect_backends()));
+                return Ok(());
+            }
             Some(other) => {
                 eprintln!("ct-agent: unrecognized harness subcommand '{other}'\n");
                 eprint!("{USAGE}");
                 std::process::exit(1);
             }
             None => {
-                eprintln!("ct-agent: `harness` requires a subcommand (run)\n");
+                eprintln!("ct-agent: `harness` requires a subcommand (run, backends)\n");
                 eprint!("{USAGE}");
                 std::process::exit(1);
             }
