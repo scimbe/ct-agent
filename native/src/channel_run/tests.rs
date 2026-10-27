@@ -5889,7 +5889,7 @@ async fn persistent_call_loop_ends_the_serve_side_ok_under_delivery_ack_299() {
     drop(tx); // stdin EOF once the one line is answered
     tokio::time::timeout(
         Duration::from_secs(20),
-        run_persistent_call_reconnect_loop_over("text_generation".to_string(), true, admit, &mut rx, out_write),
+        run_persistent_call_reconnect_loop_over("text_generation".to_string(), true, None, admit, &mut rx, out_write),
     )
     .await
     .expect("the client ends after its stdin's end, bounded")
@@ -6600,6 +6600,12 @@ async fn a_quic_session_stays_in_flight_until_the_peer_acknowledged_its_tail() {
     let (freeze_tx, freeze_rx) = tokio::sync::oneshot::channel::<()>();
     let (frozen_tx, frozen_rx) = tokio::sync::oneshot::channel::<()>();
     let (thaw_tx, thaw_rx) = std::sync::mpsc::channel::<()>();
+    // #299: under protocol v2 both QUIC FINs leave only at the very end, and the peer's session
+    // returns as soon as ours acknowledged its FIN. A peer thread that then dropped its runtime at
+    // once took its QUIC stack with it before it acknowledged OUR FIN, and this side waited in
+    // `stopped()` for an ack nobody could send any more. The peer keeps its connection until this
+    // side is done, as a live peer does.
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
     let peer = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("peer runtime");
         rt.block_on(async move {
@@ -6620,7 +6626,9 @@ async fn a_quic_session_stays_in_flight_until_the_peer_acknowledged_its_tail() {
             let _ = frozen_tx.send(());
             // Blocks this runtime's only thread: no task of the peer runs, its QUIC stack included.
             let _ = thaw_rx.recv();
-            let _ = tokio::time::timeout(Duration::from_secs(10), session).await;
+            let conn = tokio::time::timeout(Duration::from_secs(10), session).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), done_rx).await;
+            drop(conn);
             drop(peer_test_r);
         });
     });
@@ -6658,6 +6666,7 @@ async fn a_quic_session_stays_in_flight_until_the_peer_acknowledged_its_tail() {
         .expect("session task");
     ended.expect("a clean session");
     assert_eq!(health.in_flight(false), 0);
+    let _ = done_tx.send(());
     peer.join().expect("peer thread");
 }
 
@@ -10006,18 +10015,26 @@ async fn a_local_write_error_does_not_cut_a_still_producing_read_side_314() {
     // still be streaming its answer. The peer then sends one more byte (a trailing newline), the
     // write fails -- and everything the handler produces afterwards, for longer than the grace and
     // the drain together, must still reach the peer, as it did in v0.7.40.
+    //
+    // #299: a LEGACY session. Under protocol v2, ct-common's pump aborts the whole session when
+    // delivering to the local side fails (it could not confirm those bytes), so there this case
+    // ends with an error on both sides by the protocol's design -- not through the #314 race,
+    // which is what this test is about.
+    use ct_common::delivery::SessionCaps;
     let (a, b) = (generate_static_keypair(), generate_static_keypair());
     let (a_priv, a_pub, b_priv, b_pub) = (a.private, a.public, b.private, b.public);
     let (a_transport, b_transport) = tokio::io::duplex(1 << 16);
     let (mut handler_out, handler_side) = tokio::io::duplex(4096);
     let member = tokio::spawn(async move {
         let (r, w) = tokio::io::split(a_transport);
-        run_channel_session_on_stream(w, r, ChannelRole::Initiate, &a_priv, &b_pub, WriteFailsLocal(handler_side)).await
+        let local = WriteFailsLocal(handler_side);
+        run_channel_session_on_stream_with(w, r, ChannelRole::Initiate, &a_priv, &b_pub, local, SessionCaps::NONE).await
     });
     let (mut peer_app, peer_local) = tokio::io::duplex(4096);
     let peer = tokio::spawn(async move {
         let (r, w) = tokio::io::split(b_transport);
-        run_channel_session_on_stream(w, r, ChannelRole::Accept, &b_priv, &a_pub, peer_local).await
+        run_channel_session_on_stream_with(w, r, ChannelRole::Accept, &b_priv, &a_pub, peer_local, SessionCaps::NONE)
+            .await
     });
     peer_app.write_all(b"\n").await.unwrap();
     let chunks = 6u8;
