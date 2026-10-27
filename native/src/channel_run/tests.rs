@@ -12316,7 +12316,7 @@ struct PinJoinWatch {
     result: Result<(), BoxError>,
     peer: LegSeen,
     relay: LegSeen,
-    grant_end: Option<String>,
+    grant_end: Option<super::peer_grant::GrantEnd>,
 }
 
 /// Runs `c.me` through `run_channel_join_with_admission` in `role`, admitted with `peer`, against
@@ -12714,7 +12714,7 @@ async fn a_pin_refusal_neither_feeds_nor_resets_the_serve_loops_flap_streak_292(
             }
         }
     };
-    let driver = tokio::spawn(serve_loop_concurrent(1, Duration::from_millis(50), admit, serve));
+    let driver = tokio::spawn(serve_loop_concurrent(1, Duration::from_millis(50), None, admit, serve));
     for _ in 0..1000 {
         if admitted_at.lock().unwrap().len() >= 6 {
             break;
@@ -12940,6 +12940,7 @@ async fn a_forward_initiator_reconnects_after_a_pin_refusal_292() {
         forward_stream::DEFAULT_MAX_STREAMS,
         Duration::from_secs(forward_stream::DEFAULT_IDLE_SECS),
         crate::codec::now_unix() + 3600,
+        forward_stream::OnOwnGrantEnd::Exit,
         move |local: LocalDuplex| {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let (request, holder, pin) = (request.clone(), holder.clone(), pin.clone());
