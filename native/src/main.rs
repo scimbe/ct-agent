@@ -97,10 +97,11 @@ USAGE:
     ct-agent harness run                  Run a signed task against an installed manifest's bundle
     ct-agent harness run --plan           Dry-run: the plan for the task's bundle, no model call
     ct-agent doctor sandbox [--json]      Can THIS host run sandboxed Binary activations (bwrap)? If not, what to fix
-    ct-agent ssh <hostname> [--port <n>] [--ca <pem-file>] [--connect-timeout <secs>]
+    ct-agent ssh <hostname> [--port <n>] [--ca <pem-file>] [--connect-timeout <secs>] [--owner-key-file <file>]
                                 OpenSSH ProxyCommand: SSH over TLS through the tunnel (see below)
-    ct-agent ssh-config <hostname> [--user <name>] [--port <n>] [--ca <pem-file>]
+    ct-agent ssh-config <hostname> [--user <name>] [--port <n>] [--ca <pem-file>] [--owner-key-file <file> | --owner-key <hex>]
                                 Print the ~/.ssh/config stanza that makes `ssh <hostname>` use it
+    ct-agent ssh-owner show|init  On the agent host: print / create the SSH owner key
 
 Every subcommand is configured entirely via CT_*/CT_AGENT_*/CT_CHANNEL_* environment
 variables, not flags -- see docs.bunsenbrenner.org for the full reference per command.
@@ -269,8 +270,16 @@ SSH through the tunnel (scimbe/ct-agent#204), like cloudflared's `access ssh`. T
         that starts with a TLS ClientHello is terminated; plain bytes (an Edge that already
         stripped TLS) are forwarded raw as before, so `passthrough` (the default) and an HTTPS
         Origin are unaffected. Any other CT_AGENT_ORIGIN_TLS value is an error.
-    Client: `ct-agent ssh-config <hostname> [--user <name>] >> ~/.ssh/config`, then plain
-        `ssh <hostname>`. ssh runs `ct-agent ssh <hostname>` as its ProxyCommand: TLS to
+    Owner authentication (scimbe/ct-agent#214) is ON by default: before any SSH byte reaches
+        sshd, the client must answer the agent's challenge with the owner key. The terminate-mode
+        agent keeps that key in <CT_AGENT_STATE_DIR>/ssh-owner.key, creating it on first start
+        (without a state dir it refuses to start); `ct-agent ssh-owner show` prints it, `init`
+        creates it if absent. CT_AGENT_SSH_OWNER_AUTH=off disables the check, leaving sshd's own
+        authentication as the only gate.
+    Client: `ct-agent ssh-config <hostname> [--user <name>] --owner-key <hex> >> ~/.ssh/config`
+        (the hex key from `ssh-owner show`; stored as ~/.ssh/ct-agent-<hostname>.owner, mode 0600;
+        or point at an existing file with --owner-key-file, or set CT_AGENT_SSH_OWNER_KEY), then
+        plain `ssh <hostname>`. ssh runs `ct-agent ssh <hostname>` as its ProxyCommand: TLS to
         <hostname>:443 (SNI = hostname, TLS 1.3/1.2, no ALPN) trusting the public roots plus
         every certificate in --ca, piping ssh's stdin/stdout through the session. Diagnostics go
         to stderr prefixed `ct-agent ssh:`; stdout is the SSH byte stream and carries nothing else.
@@ -1452,4 +1461,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         terminator,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::USAGE;
+
+    /// scimbe/ct-agent#300: `--help` drifted from the ssh subcommands' own usage text. Every
+    /// flag and subcommand named in `SSH_USAGE` must also appear in the top-level `USAGE`.
+    #[test]
+    fn help_names_every_ssh_flag_and_subcommand_300() {
+        let ssh_usage = ct_agent::ssh_access::SSH_USAGE;
+        let mut checked = 0;
+        for word in ssh_usage.split(|c: char| c.is_whitespace() || "[]|(),`".contains(c)) {
+            let word = word.trim_end_matches(':');
+            if word.starts_with("--") || word.starts_with("ssh-") {
+                checked += 1;
+                assert!(USAGE.contains(word), "`ct-agent --help` does not mention {word}");
+            }
+        }
+        assert!(checked >= 8, "SSH_USAGE parsing found only {checked} names");
+        assert!(USAGE.contains("CT_AGENT_SSH_OWNER_AUTH=off"));
+    }
 }
