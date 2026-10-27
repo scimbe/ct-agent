@@ -6407,31 +6407,257 @@ fn parse_circuit_relay_is_optional_and_rejects_a_malformed_multiaddr() {
 }
 
 #[tokio::test]
-async fn build_upgrade_candidate_binds_an_ephemeral_listener_only_when_reflexive_is_known() {
+async fn build_upgrade_candidate_takes_part_only_with_a_known_reflexive_and_binds_one_shared_endpoint_296() {
     // #104: no observed_reflexive (e.g. the edge reported none for this admission) ->
     // no candidate, no listener bound -- direct_upgrade being on is a no-op for this
     // session, exactly the same as before the option existed.
-    assert!(build_upgrade_candidate(None).await.is_none(), "no reflexive -> no candidate");
+    assert!(build_upgrade_candidate(None, None).is_none(), "no reflexive -> no candidate");
 
-    // A real reflexive address -> a real, freshly-bound ephemeral listener, and the
-    // offered string's reflexive half is exactly the edge-observed address, never
-    // anything self-selected (#276 piece 1 may additionally append a NUL-separated
-    // local candidate -- see `split_offered_candidates` -- when this host has a real
-    // local egress IP, which the test environment may or may not have).
+    // #296: a real reflexive address only decides that this member takes part. It is NOT the
+    // offer any more (that asserted `offered == r=` here before -- the bug: `r=` is another
+    // socket's mapping). The endpoint is bound on 0.0.0.0 and is both dialer and listener.
     let addr: SocketAddr = "203.0.113.7:4433".parse().unwrap();
-    let (listener, offered) = build_upgrade_candidate(Some(addr)).await.expect("candidate built");
-    let (reflexive, local) = split_offered_candidates(&offered);
-    assert_eq!(reflexive, "203.0.113.7:4433", "offers exactly the edge-observed address");
-    if let Some(local) = local {
-        let local_addr: SocketAddr = local.parse().expect("appended local candidate is a valid SocketAddr");
-        assert!(
-            is_lan_candidate(local_addr.ip()),
-            "an appended local candidate is always a real private/ULA address, never anything else"
-        );
-    }
-    let bound = listener.local_addr().expect("listener is actually bound");
+    let upgrade = build_upgrade_candidate(Some(addr), None).expect("candidate built");
+    let bound = upgrade.listener().local_addr().expect("endpoint is actually bound");
     assert_eq!(bound.ip(), std::net::Ipv4Addr::UNSPECIFIED, "binds 0.0.0.0, not the offered address");
     assert_ne!(bound.port(), 0, "the ephemeral port was actually assigned by the OS");
+}
+
+/// #296: [`serve_one_whoami_echo`] with a fixed answer -- an edge that "observes" a global
+/// address, which loopback never can.
+async fn serve_one_fixed_whoami_answer(server: Endpoint, answer: &'static str) {
+    let conn = server.accept().await.expect("one connection arrives").await.expect("handshake completes");
+    let (mut send, mut recv) = conn.accept_bi().await.expect("client opens a bi stream");
+    let mut role = [0u8; 1];
+    recv.read_exact(&mut role).await.expect("role byte");
+    assert_eq!(role[0], b'W');
+    send.write_all(&[answer.len() as u8]).await.expect("write len");
+    send.write_all(answer.as_bytes()).await.expect("write addr");
+    send.finish().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn build_channel_endpoint_asks_whoami_and_accepts_on_one_socket_296() {
+    // #296: the endpoint dials like the accept-any channel dialer AND listens like the direct
+    // listener, on ONE socket. The edge's 'W' echo therefore reports the listener's own port --
+    // on loopback (no NAT) that is the bound port itself -- and a peer dialing it is accepted.
+    let (ep, _cert) = crate::transport::build_channel_endpoint().expect("shared endpoint");
+    let port = ep.local_addr().unwrap().port();
+    let (edge, _) = build_server_endpoint_with_cert().expect("whoami edge");
+    let edge_addr = edge.local_addr().unwrap();
+    let edge_task = tokio::spawn(serve_one_whoami_echo(edge));
+    let seen = whoami_via(&ep, edge_addr, Duration::from_secs(2)).await.expect("the edge answered");
+    assert_eq!(seen.port(), port, "the query left from the listening socket, not a throwaway one");
+    edge_task.await.unwrap();
+
+    let accepted = tokio::spawn(async move { ep.accept().await.expect("incoming").await.is_ok() });
+    dial_peer_direct(seen, Duration::from_secs(2)).await.expect("a dial to the answer reaches the endpoint");
+    assert!(accepted.await.unwrap(), "and the endpoint completed the handshake as a server");
+}
+
+/// #296 test NAT: endpoint-independent mapping AND filtering ("full cone") on loopback, for one
+/// inside socket -- the friendliest NAT there is, so a direct dial that fails through it fails
+/// because of the offered candidate, not the NAT. The inside reaches destination `d` by sending to
+/// `inside_for[d]`; the NAT sends it on from its one public port `outside`, which maps to the
+/// FIRST inside socket it forwarded for. Anything any host sends to `outside` is delivered to
+/// that socket, from a per-remote inside-facing socket so the replies find their way back.
+struct FullConeNat {
+    outside: SocketAddr,
+    inside_for: HashMap<SocketAddr, SocketAddr>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for FullConeNat {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+type NatMapping = std::sync::Arc<std::sync::Mutex<Option<SocketAddr>>>;
+
+/// One inside-facing socket of [`FullConeNat`]: inside -> `remote`, sent from `outside`.
+fn spawn_nat_proxy(
+    remote: SocketAddr,
+    sock: std::sync::Arc<tokio::net::UdpSocket>,
+    outside: std::sync::Arc<tokio::net::UdpSocket>,
+    mapped: NatMapping,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+            let owner = *mapped.lock().unwrap().get_or_insert(from);
+            if owner == from {
+                let _ = outside.send_to(&buf[..n], remote).await;
+            }
+        }
+    })
+}
+
+impl FullConeNat {
+    async fn start(destinations: &[SocketAddr]) -> Self {
+        use std::sync::Arc;
+        use tokio::net::UdpSocket;
+        let outside = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let outside_addr = outside.local_addr().unwrap();
+        let mapped: NatMapping = Arc::default();
+        let proxies: Arc<std::sync::Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>> = Arc::default();
+        let mut tasks = Vec::new();
+        let mut inside_for = HashMap::new();
+        for &d in destinations {
+            let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            inside_for.insert(d, sock.local_addr().unwrap());
+            proxies.lock().unwrap().insert(d, sock.clone());
+            tasks.push(spawn_nat_proxy(d, sock, outside.clone(), mapped.clone()));
+        }
+        let (out, map) = (outside.clone(), mapped.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            let mut extra = Vec::new();
+            while let Ok((n, from)) = out.recv_from(&mut buf).await {
+                let Some(inside) = *map.lock().unwrap() else { continue }; // no mapping yet: dropped
+                let known = proxies.lock().unwrap().get(&from).cloned();
+                let sock = match known {
+                    Some(s) => s,
+                    None => {
+                        let s = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                        proxies.lock().unwrap().insert(from, s.clone());
+                        extra.push(spawn_nat_proxy(from, s.clone(), out.clone(), map.clone()));
+                        s
+                    }
+                };
+                let _ = sock.send_to(&buf[..n], inside).await;
+            }
+            for t in extra {
+                t.abort();
+            }
+        }));
+        Self { outside: outside_addr, inside_for, tasks }
+    }
+}
+
+#[tokio::test]
+async fn upgrade_offer_through_a_nat_reaches_the_listener_only_when_learned_on_its_socket_296() {
+    // #296, the red/green pair through a real (in-process) NAT. GREEN: the production path --
+    // build_upgrade_candidate + own_reflexive -- asks the 'W' echo THROUGH the listening endpoint,
+    // so the answer is the NAT port that maps to it, and a peer dialing that port is accepted.
+    let (edge, _) = build_server_endpoint_with_cert().expect("whoami edge");
+    let edge_addr = edge.local_addr().unwrap();
+    let edge_task = tokio::spawn(serve_one_whoami_echo(edge));
+    let nat = FullConeNat::start(&[edge_addr]).await;
+    let observed: SocketAddr = "203.0.113.7:4433".parse().unwrap(); // only decides "takes part"
+    let upgrade = build_upgrade_candidate(Some(observed), Some(nat.inside_for[&edge_addr].to_string()))
+        .expect("member takes part");
+    let relay: SocketAddr = "203.0.113.1:4436".parse().unwrap(); // unused: the override names the 'W' echo
+    let reflexive = upgrade.own_reflexive(relay, Duration::from_secs(3)).await.expect("the edge answered");
+    assert_eq!(reflexive, nat.outside, "the answer is the NAT's mapping for the endpoint");
+    assert_ne!(
+        reflexive.port(),
+        upgrade.listener().local_addr().unwrap().port(),
+        "the NAT really translated: offering the bound port would not work here"
+    );
+    let listener = upgrade.listener();
+    let accepted = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(3), async { listener.accept().await?.await.ok() }).await.ok().flatten()
+    });
+    let dialed = dial_peer_direct(reflexive, Duration::from_secs(3)).await;
+    assert!(dialed.is_ok(), "a peer dialing the offered address reaches the listener through the NAT: {dialed:?}");
+    assert!(accepted.await.unwrap().is_some(), "the shared endpoint accepted the direct connection");
+    edge_task.await.unwrap();
+
+    // RED: the composition main ran -- the reflexive learned on ANOTHER socket (a throwaway 'W'
+    // query here; the admission dialer's `r=` in #104), the listener bound separately. The NAT
+    // maps the answer to that other socket, so the dial goes nowhere: #296's HandshakeTimedOut.
+    let (edge2, _) = build_server_endpoint_with_cert().expect("whoami edge 2");
+    let edge2_addr = edge2.local_addr().unwrap();
+    let edge2_task = tokio::spawn(serve_one_whoami_echo(edge2));
+    let nat2 = FullConeNat::start(&[edge2_addr]).await;
+    let reported = discover_udp_reflexive(nat2.inside_for[&edge2_addr], Duration::from_secs(3))
+        .await
+        .expect("the edge answered the throwaway socket too");
+    assert_eq!(reported, nat2.outside);
+    let (separate_listener, _) = crate::transport::build_direct_listener().expect("separate listener");
+    let missed = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_millis(1500), async { separate_listener.accept().await?.await.ok() })
+            .await
+            .ok()
+            .flatten()
+    });
+    let dialed = dial_peer_direct(reported, Duration::from_millis(1500)).await;
+    assert!(dialed.is_err(), "the answer of a throwaway socket must not reach a separately bound listener");
+    assert!(missed.await.unwrap().is_none(), "the separately bound listener never sees the dial");
+    edge2_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn upgrade_offer_is_one_global_address_the_pinned_responder_accepts_296() {
+    // #296: the offer is the endpoint's own 'W' answer as ONE ip:port. The pinned ct-common
+    // responder (CADS-Tunnel#480) checks the whole string before the ct-agent probe ever sees it; the old
+    // `reflexive\0local` pair failed that check, so every NAT'd initiator (private egress
+    // address -> LAN half appended) had its whole offer refused.
+    use ct_common::noise::PumpControl;
+    use ct_common::upgrade::{drive_responder_upgrade, Role, UpgradeCoordinator, UpgradeMsg};
+
+    let (edge, _) = build_server_endpoint_with_cert().expect("whoami edge");
+    let edge_addr = edge.local_addr().unwrap();
+    let edge_task = tokio::spawn(serve_one_fixed_whoami_answer(edge, "203.0.113.7:40001"));
+    let upgrade = build_upgrade_candidate(Some("203.0.113.7:4433".parse().unwrap()), Some(edge_addr.to_string()))
+        .expect("member takes part");
+    let offer = upgrade.offer("203.0.113.1:4436".parse().unwrap()).await.expect("a global answer is offered");
+    assert_eq!(offer, "203.0.113.7:40001", "exactly the endpoint's own 'W' answer, nothing appended");
+    edge_task.await.unwrap();
+
+    // What the responder's probe gets to see, for the new offer and for the old pair.
+    async fn probed(offered: String) -> Option<String> {
+        let (ctl_tx, _ctl_rx) = tokio::sync::mpsc::unbounded_channel::<PumpControl>();
+        let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        in_tx.send(UpgradeMsg::Offer { direct_endpoint: offered }.encode()).await.unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let s = seen.clone();
+        let mut coord = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
+        let _ = drive_responder_upgrade(&mut coord, 1, &ctl_tx, &mut in_rx, |ep: String| async move {
+            *s.lock().unwrap() = Some(ep);
+            false
+        })
+        .await;
+        let got = seen.lock().unwrap().clone();
+        got
+    }
+    assert_eq!(probed(offer.clone()).await, Some(offer.clone()), "the pinned responder lets the offer through to the probe");
+    assert_eq!(
+        probed(format!("{offer}\x00192.168.1.42:40001")).await,
+        None,
+        "the old pair with a LAN half is refused before the probe (CADS-Tunnel#480) -- why it is no longer sent"
+    );
+}
+
+#[tokio::test]
+async fn upgrade_offer_is_none_without_a_usable_whoami_answer_296() {
+    // #296: nothing to offer -> no Offer at all; the session stays on the relay. Covers a 'W'
+    // port nobody answers on (bounded, no hang), an unusable CT_CHANNEL_REFLEXIVE_EDGE, and a
+    // non-global answer (#248: never offer an address an external peer cannot route to).
+    let observed: Option<SocketAddr> = Some("203.0.113.7:4433".parse().unwrap());
+    let relay: SocketAddr = "203.0.113.1:4436".parse().unwrap();
+
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead = probe.local_addr().unwrap();
+    drop(probe);
+    let upgrade = build_upgrade_candidate(observed, Some(dead.to_string())).expect("takes part");
+    let started = std::time::Instant::now();
+    assert!(upgrade.own_reflexive(relay, Duration::from_millis(300)).await.is_none(), "no answer -> None");
+    assert!(started.elapsed() < Duration::from_secs(2), "bounded by its timeout");
+
+    let upgrade = build_upgrade_candidate(observed, Some("not-an-addr".into())).expect("takes part");
+    assert!(upgrade.offer(relay).await.is_none(), "an unusable override offers nothing");
+
+    let (edge, _) = build_server_endpoint_with_cert().expect("whoami edge");
+    let edge_addr = edge.local_addr().unwrap();
+    let edge_task = tokio::spawn(serve_one_whoami_echo(edge));
+    let upgrade = build_upgrade_candidate(observed, Some(edge_addr.to_string())).expect("takes part");
+    assert!(upgrade.offer(relay).await.is_none(), "a loopback answer is not global-unicast -> not offered (#248)");
+    edge_task.await.unwrap();
 }
 
 #[test]
@@ -6509,13 +6735,13 @@ async fn build_upgrade_candidate_refuses_a_non_global_unicast_reflexive_248() {
     ] {
         let addr: SocketAddr = bad.parse().unwrap();
         assert!(
-            build_upgrade_candidate(Some(addr)).await.is_none(),
+            build_upgrade_candidate(Some(addr), None).is_none(),
             "{bad} is not global-unicast -- must not be offered as a direct candidate"
         );
     }
     // A genuinely global-unicast reflexive still works (unchanged from the test above).
     let addr: SocketAddr = "203.0.113.7:4433".parse().unwrap();
-    assert!(build_upgrade_candidate(Some(addr)).await.is_some());
+    assert!(build_upgrade_candidate(Some(addr), None).is_some());
 }
 
 #[test]
@@ -6838,6 +7064,388 @@ async fn direct_upgrade_opt_in_still_completes_over_the_relay_when_the_candidate
     a.abort();
     b.abort();
     relay_task.abort();
+}
+
+#[test]
+fn experimental_dcutr_is_off_unless_switched_on_296() {
+    // #296: the libp2p DCUtR upgrade of CT_CHANNEL_RELAY_GATE / CT_CHANNEL_CIRCUIT_RELAY needs an
+    // explicit switch, read with the shared on/off spellings (crate::envflag).
+    use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+    use ed25519_dalek::Signer;
+
+    let id = ChannelIdentity::generate();
+    let op = SigningKey::from_bytes(&[9u8; 32]);
+    let g = ChannelGrant {
+        channel: ChannelId([0xD1u8; 32]),
+        holder: id.holder.verifying_key().to_bytes(),
+        direction: Direction::Accept,
+        rights: Rights::ReadWrite,
+        delegable: false,
+        expires_at: 1_000,
+    };
+    let grant_hex = hex_encode(&SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }.encode());
+    let cfg_with = |switch: Option<&str>| {
+        let mut m: HashMap<String, String> = [
+            ("CT_CHANNEL_ROLE", "accept".to_string()),
+            ("CT_CHANNEL_BROKER", "203.0.113.5:4435".to_string()),
+            ("CT_CHANNEL_RELAY", "203.0.113.5:4436".to_string()),
+            ("CT_CHANNEL_RELAY_ONLY", "1".to_string()),
+            ("CT_CHANNEL_RELAY_GATE", "203.0.113.5:443".to_string()),
+            ("CT_CHANNEL_GRANT", grant_hex.clone()),
+            ("CT_CHANNEL_HOLDER_KEY", id.holder_key_hex()),
+            ("CT_CHANNEL_NOISE_KEY", id.noise_key_hex()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        if let Some(v) = switch {
+            m.insert("CT_CHANNEL_EXPERIMENTAL_DCUTR".to_string(), v.to_string());
+        }
+        ChannelJoinCliConfig::from_lookup(move |k| m.get(k).cloned()).expect("config parses")
+    };
+    assert!(!cfg_with(None).experimental_dcutr, "unset: the DCUtR upgrade stays off");
+    for off in ["", "0", "off", "maybe"] {
+        assert!(!cfg_with(Some(off)).experimental_dcutr, "{off:?} keeps it off");
+    }
+    for on in ["1", "true", "yes", "On"] {
+        assert!(cfg_with(Some(on)).experimental_dcutr, "{on:?} switches it on");
+    }
+    assert!(cfg_with(None).relay_gate_addr.is_some(), "the relay-gate knob itself is still read");
+}
+
+#[tokio::test]
+async fn a_relay_session_without_dcutr_declines_an_offer_and_keeps_the_upgrade_framing_296() {
+    // #296: a member without CT_CHANNEL_EXPERIMENTAL_DCUTR, accepting, against an initiator that
+    // runs the upgradable session the DCUtR path runs (ct_common's, tagged pump frames) and makes
+    // an offer: the offer is declined (Abort, no Ready, the peer never tries to accept a direct
+    // dial), and the bytes cross the relay byte-exact both ways -- the framing matches.
+    use ct_common::upgrade::{run_upgradable_session_initiator, Role, UpgradeCoordinator};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let a = generate_static_keypair(); // initiator, upgrade-capable peer
+    let b = generate_static_keypair(); // acceptor, DCUtR off
+    let (a2b_w, a2b_r) = tokio::io::duplex(1 << 16);
+    let (b2a_w, b2a_r) = tokio::io::duplex(1 << 16);
+    let (a_app, a_test) = tokio::io::duplex(1 << 16);
+    let (b_app, b_test) = tokio::io::duplex(1 << 16);
+    let ready = std::sync::Arc::new(AtomicBool::new(false));
+    let saw_ready = ready.clone();
+    let (a_priv, a_pub, b_priv, b_pub) = (a.private, a.public, b.private, b.public);
+    let initiator = tokio::spawn(async move {
+        run_upgradable_session_initiator(
+            a2b_w,
+            b2a_r,
+            a_app,
+            &a_priv,
+            &b_pub,
+            UpgradeCoordinator::with_backoff(Role::Initiator, 0, 1, 100),
+            1,
+            || async { Some("203.0.113.9:40001".to_string()) },
+            move || async move {
+                saw_ready.store(true, Ordering::SeqCst);
+                None::<(snow::TransportState, tokio::io::DuplexStream, tokio::io::DuplexStream)>
+            },
+        )
+        .await
+    });
+    let acceptor = tokio::spawn(async move {
+        run_relay_session_declining_upgrades(b2a_w, a2b_r, b_app, ChannelRole::Accept, &b_priv, &a_pub).await
+    });
+
+    let (mut a_read, mut a_write) = tokio::io::split(a_test);
+    let (mut b_read, mut b_write) = tokio::io::split(b_test);
+    a_write.write_all(b"ping-over-relay").await.unwrap();
+    let mut got = [0u8; 15];
+    tokio::time::timeout(Duration::from_secs(10), b_read.read_exact(&mut got)).await.expect("in time").unwrap();
+    assert_eq!(&got, b"ping-over-relay");
+    b_write.write_all(b"pong-over-relay").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), a_read.read_exact(&mut got)).await.expect("in time").unwrap();
+    assert_eq!(&got, b"pong-over-relay");
+    assert!(!ready.load(Ordering::SeqCst), "the offer was declined: the initiator never got Ready");
+    initiator.abort();
+    acceptor.abort();
+}
+
+#[tokio::test]
+async fn a_relay_initiator_without_dcutr_never_offers_and_keeps_the_upgrade_framing_296() {
+    // #296: the other direction -- the member without the switch initiates; the acceptor runs
+    // the upgradable responder the DCUtR path runs. No Offer ever reaches its probe, and the
+    // tagged framing matches both ways.
+    use ct_common::upgrade::{run_upgradable_session_responder_verified, Role, UpgradeCoordinator};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let a = generate_static_keypair(); // initiator, DCUtR off
+    let b = generate_static_keypair(); // acceptor, upgrade-capable peer
+    let (a2b_w, a2b_r) = tokio::io::duplex(1 << 16);
+    let (b2a_w, b2a_r) = tokio::io::duplex(1 << 16);
+    let (a_app, a_test) = tokio::io::duplex(1 << 16);
+    let (b_app, b_test) = tokio::io::duplex(1 << 16);
+    let offered = std::sync::Arc::new(AtomicBool::new(false));
+    let saw_offer = offered.clone();
+    let (a_priv, a_pub, b_priv, b_pub) = (a.private, a.public, b.private, b.public);
+    let initiator = tokio::spawn(async move {
+        run_relay_session_declining_upgrades(a2b_w, b2a_r, a_app, ChannelRole::Initiate, &a_priv, &b_pub).await
+    });
+    let acceptor = tokio::spawn(async move {
+        run_upgradable_session_responder_verified(
+            b2a_w,
+            a2b_r,
+            b_app,
+            &b_priv,
+            &a_pub,
+            UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100),
+            1,
+            move |_ep: String| async move {
+                saw_offer.store(true, Ordering::SeqCst);
+                false
+            },
+            |_ep: String, _peer: [u8; 32]| async {
+                None::<(snow::TransportState, tokio::io::DuplexStream, tokio::io::DuplexStream)>
+            },
+        )
+        .await
+    });
+
+    let (mut a_read, mut a_write) = tokio::io::split(a_test);
+    let (mut b_read, mut b_write) = tokio::io::split(b_test);
+    a_write.write_all(b"ping-over-relay").await.unwrap();
+    let mut got = [0u8; 15];
+    tokio::time::timeout(Duration::from_secs(10), b_read.read_exact(&mut got)).await.expect("in time").unwrap();
+    assert_eq!(&got, b"ping-over-relay");
+    b_write.write_all(b"pong-over-relay").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), a_read.read_exact(&mut got)).await.expect("in time").unwrap();
+    assert_eq!(&got, b"pong-over-relay");
+    assert!(!offered.load(Ordering::SeqCst), "the member without the switch never offered");
+    initiator.abort();
+    acceptor.abort();
+}
+
+#[tokio::test]
+async fn a_dcutr_circuit_offer_never_reaches_the_probe_of_a_responder_on_the_pinned_ct_common_296() {
+    // #296: why the switch changes no outcome between two members of this release. The DCUtR
+    // initiator offers its circuit address (a multiaddr, see p2p::run_channel_session_upgradable_dcutr);
+    // the pinned ct-common responder (CADS-Tunnel#480) refuses anything that is not one socket address
+    // BEFORE the probe, so the DCUtR upgrade never happens between current members anyway -- only
+    // an older responder could accept it and move the session onto the capped circuit.
+    use ct_common::noise::PumpControl;
+    use ct_common::upgrade::{drive_responder_upgrade, Role, UpgradeCoordinator, UpgradeMsg};
+    use libp2p::multiaddr::Protocol;
+
+    let circuit: libp2p::Multiaddr = "/ip4/203.0.113.1/tcp/4001".parse().unwrap();
+    let offer = circuit
+        .with(Protocol::P2p(libp2p::PeerId::random()))
+        .with(Protocol::P2pCircuit)
+        .with(Protocol::P2p(libp2p::PeerId::random()))
+        .to_string();
+    let (ctl_tx, _ctl_rx) = tokio::sync::mpsc::unbounded_channel::<PumpControl>();
+    let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    in_tx.send(UpgradeMsg::Offer { direct_endpoint: offer }.encode()).await.unwrap();
+    let probed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let p = probed.clone();
+    let mut coord = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
+    let upgraded = drive_responder_upgrade(&mut coord, 1, &ctl_tx, &mut in_rx, |_ep: String| async move {
+        p.store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    })
+    .await
+    .unwrap();
+    assert!(upgraded.is_none(), "the circuit offer is refused");
+    assert!(!probed.load(std::sync::atomic::Ordering::SeqCst), "...before the DCUtR probe ever sees it");
+}
+
+#[tokio::test]
+async fn relay_only_members_without_dcutr_pair_on_the_relay_port_and_stay_on_the_edge_relay_296() {
+    // #296: end to end through the in-process edge relay -- two relay-only members whose DCUtR
+    // knob is set but switched off join exactly where the DCUtR joins do (the relay port, the
+    // same pairer), learn and verify each other's relayed Noise key (#101), and talk over the
+    // edge relay. No relay-gate dial, no libp2p swarm.
+    use ct_common::channel::{
+        member_noise_attest_bytes, ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant,
+        CHANNEL_ENDPOINT_RELAY_ONLY,
+    };
+    use ct_edge::channel_broker::broker_channel_relay;
+    use ed25519_dalek::Signer;
+
+    let op = SigningKey::from_bytes(&[9u8; 32]);
+    let op_pub = op.verifying_key().to_bytes();
+    let holder_a = SigningKey::from_bytes(&[0x41u8; 32]);
+    let holder_b = SigningKey::from_bytes(&[0x42u8; 32]);
+    let channel = [0xE7u8; 32];
+    let noise_a = generate_static_keypair();
+    let noise_b = generate_static_keypair();
+    let signed = |h: &SigningKey, dir| {
+        let g = ChannelGrant {
+            channel: ChannelId(channel),
+            holder: SigningKey::verifying_key(h).to_bytes(),
+            direction: dir,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: crate::codec::now_unix() + 3600, // #308 R1: an expired own grant ends the session
+        };
+        SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }
+    };
+    let req_a = ChannelJoinRequest { grant: signed(&holder_a, Direction::Initiate), endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string() };
+    let req_b = ChannelJoinRequest { grant: signed(&holder_b, Direction::Accept), endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string() };
+    let ha_pub = holder_a.verifying_key().to_bytes();
+    let hb_pub = holder_b.verifying_key().to_bytes();
+    let a_att = holder_a.sign(&member_noise_attest_bytes(&ChannelId(channel), &ha_pub, &noise_a.public)).to_bytes();
+    let b_att = holder_b.sign(&member_noise_attest_bytes(&ChannelId(channel), &hb_pub, &noise_b.public)).to_bytes();
+    let (na_pub, nb_pub) = (noise_a.public, noise_b.public);
+
+    let (relay_ep, cert) = build_server_endpoint_with_cert().expect("relay ep");
+    let relay_addr = relay_ep.local_addr().expect("addr");
+    let relay_task = tokio::spawn(async move {
+        broker_channel_relay(&relay_ep, 500, move |c, h| async move {
+            // The relay conveys each member's registered Noise key + attestation (#101).
+            let member = if h == ha_pub { (na_pub, a_att) } else { (nb_pub, b_att) };
+            (c.0 == channel).then_some((op_pub, Some(member.0), Some(member.1)))
+        })
+        .await
+        .map(|_| ())
+    });
+
+    let (cert_a, cert_b) = (cert.clone(), cert);
+    let (mut a_app, a_local) = tokio::io::duplex(8192);
+    let (mut b_app, b_local) = tokio::io::duplex(8192);
+    let (na, nb) = (noise_a.private, noise_b.private);
+    let a = tokio::spawn(async move {
+        let relay_conn = build_client_endpoint(cert_a).expect("rc a").connect(relay_addr, "localhost").expect("cfg").await.expect("rconn a");
+        join_via_relay_without_dcutr(&relay_conn, &req_a, &holder_a, ChannelRole::Initiate, &na, a_local).await
+    });
+    let b = tokio::spawn(async move {
+        let relay_conn = build_client_endpoint(cert_b).expect("rc b").connect(relay_addr, "localhost").expect("cfg").await.expect("rconn b");
+        join_via_relay_without_dcutr(&relay_conn, &req_b, &holder_b, ChannelRole::Accept, &nb, b_local).await
+    });
+
+    a_app.write_all(b"ping-A-to-B").await.expect("a writes");
+    let mut got = [0u8; 11];
+    tokio::time::timeout(Duration::from_secs(10), b_app.read_exact(&mut got)).await.expect("in time").expect("b reads");
+    assert_eq!(&got, b"ping-A-to-B", "relay-only members without the switch talk over the edge relay");
+    b_app.write_all(b"pong-B-to-A").await.expect("b writes");
+    tokio::time::timeout(Duration::from_secs(10), a_app.read_exact(&mut got)).await.expect("in time").expect("a reads");
+    assert_eq!(&got, b"pong-B-to-A", "full duplex");
+
+    a.abort();
+    b.abort();
+    relay_task.abort();
+}
+
+#[tokio::test]
+async fn own_reflexive_looks_up_a_host_name_override_in_the_endpoints_family_296() {
+    // #296 review: CT_CHANNEL_REFLEXIVE_EDGE may be a host name. It is looked up while the relay
+    // session pumps, so on tokio's pool instead of with std's blocking lookup, and of its answers
+    // the one the shared endpoint can reach: that endpoint is bound on 0.0.0.0, and resolvers
+    // commonly list ::1 / AAAA first. "localhost" names both families; the 'W' echo listens on
+    // 127.0.0.1 only.
+    let (edge, _) = build_server_endpoint_with_cert().expect("whoami edge");
+    let edge_port = edge.local_addr().unwrap().port();
+    let edge_task = tokio::spawn(serve_one_whoami_echo(edge));
+    let upgrade =
+        build_upgrade_candidate(Some("203.0.113.7:4433".parse().unwrap()), Some(format!("localhost:{edge_port}")))
+            .expect("takes part");
+    let relay: SocketAddr = "203.0.113.1:4436".parse().unwrap(); // unused: the override names the echo
+    let seen = upgrade.own_reflexive(relay, Duration::from_secs(3)).await;
+    assert_eq!(
+        seen.map(|a| a.port()),
+        Some(upgrade.listener().local_addr().unwrap().port()),
+        "the host name led to the IPv4 echo, which reported the listening socket's own port"
+    );
+    edge_task.await.unwrap();
+}
+
+#[test]
+fn the_dcutr_knob_runs_the_upgrade_only_with_the_switch_296() {
+    // #296 review: the fence as a table. Not relay-only, or no knob: the broker path (None). A knob
+    // picks the join loop -- the relay-gate wins over the circuit relay -- and only
+    // CT_CHANNEL_EXPERIMENTAL_DCUTR turns the libp2p upgrade in that loop on.
+    for gate in [false, true] {
+        for circuit in [false, true] {
+            for switch in [false, true] {
+                assert_eq!(dcutr_knob(false, gate, circuit, switch), None, "not relay-only: the broker path");
+            }
+        }
+    }
+    for switch in [false, true] {
+        assert_eq!(dcutr_knob(true, false, false, switch), None, "relay-only without a knob: the broker path");
+        assert_eq!(dcutr_knob(true, true, false, switch), Some(DcutrKnob::RelayGate { upgrade: switch }));
+        assert_eq!(
+            dcutr_knob(true, true, true, switch),
+            Some(DcutrKnob::RelayGate { upgrade: switch }),
+            "the relay-gate wins over the circuit relay"
+        );
+        assert_eq!(dcutr_knob(true, false, true, switch), Some(DcutrKnob::CircuitRelay { upgrade: switch }));
+    }
+    assert!(!DcutrKnob::RelayGate { upgrade: false }.upgrade(), "a knob alone never runs the upgrade");
+    assert!(DcutrKnob::CircuitRelay { upgrade: true }.upgrade());
+}
+
+#[tokio::test]
+async fn a_quic_relay_leg_offers_exactly_the_whoami_answer_of_its_listener_296() {
+    // #296 review: the wiring the DirectUpgrade unit tests do not reach. A QUIC relay leg with an
+    // upgrade (ParkedRelayLeg::run_session, what every relay fallback runs) asks the 'W' echo when
+    // its coordinator is about to offer, and the peer's probe sees exactly that answer -- not the
+    // admission's r=, no LAN half. The echo answers a fixed global address, as only a real edge can.
+    use ct_common::upgrade::{run_upgradable_session_responder_verified, Role, UpgradeCoordinator};
+
+    let a = generate_static_keypair(); // the member under test, initiating
+    let b = generate_static_keypair(); // the peer behind the relay
+    let (w, _) = build_server_endpoint_with_cert().expect("whoami edge");
+    let w_addr = w.local_addr().unwrap();
+    let w_task = tokio::spawn(serve_one_fixed_whoami_answer(w, "203.0.113.7:40001"));
+
+    // The relay leg is one QUIC connection; its far end runs the peer's upgradable responder.
+    let (relay_ep, relay_cert) = build_server_endpoint_with_cert().expect("relay ep");
+    let relay_addr = relay_ep.local_addr().unwrap();
+    let offered = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let seen = offered.clone();
+    let (b_priv, a_pub) = (b.private, a.public);
+    let peer = tokio::spawn(async move {
+        let conn = relay_ep.accept().await.expect("incoming").await.expect("relay leg");
+        let (send, recv) = open_channel_streams(&conn, ChannelRole::Accept, Duration::from_secs(5)).await.expect("streams");
+        let (b_app, _b_test) = tokio::io::duplex(1 << 16);
+        run_upgradable_session_responder_verified(
+            send,
+            recv,
+            b_app,
+            &b_priv,
+            &a_pub,
+            UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100),
+            1,
+            move |ep: String| async move {
+                *seen.lock().unwrap() = Some(ep);
+                false
+            },
+            |_ep: String, _peer: [u8; 32]| async {
+                None::<(snow::TransportState, tokio::io::DuplexStream, tokio::io::DuplexStream)>
+            },
+        )
+        .await
+    });
+    let conn = build_client_endpoint(relay_cert)
+        .expect("client ep")
+        .connect(relay_addr, "localhost")
+        .expect("cfg")
+        .await
+        .expect("relay leg");
+    let upgrade = build_upgrade_candidate(Some("203.0.113.7:4433".parse().unwrap()), Some(w_addr.to_string()))
+        .expect("takes part");
+    let (a_app, _a_test) = tokio::io::duplex(1 << 16);
+    let (a_priv, b_pub) = (a.private, b.public);
+    let member = tokio::spawn(async move {
+        ParkedRelayLeg::Quic(conn).run_session(ChannelRole::Initiate, &a_priv, &b_pub, a_app, Some(upgrade)).await
+    });
+    assert!(
+        warte_bis(Duration::from_secs(10), || offered.lock().unwrap().is_some()).await,
+        "the member made an offer over its relay leg"
+    );
+    assert_eq!(
+        offered.lock().unwrap().as_deref(),
+        Some("203.0.113.7:40001"),
+        "the peer's probe saw exactly the endpoint's own 'W' answer"
+    );
+    w_task.await.unwrap();
+    member.abort();
+    peer.abort();
 }
 
 #[test]

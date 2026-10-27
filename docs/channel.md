@@ -104,6 +104,18 @@ Broker and relay each get a ladder: **direct QUIC** (`CT_CHANNEL_BROKER` :4435 /
   (CADS-Tunnel#495 thread, 2026-08-13): a UDP-blocked host cannot use gate mode at all (its
   admission times out before the gate is ever relevant), and even a UDP-capable gate-mode
   member parks in the edge's **QUIC pairer**, where it can never meet a front-door-only peer.
+- **The DCUtR upgrade itself is experimental and off** ([#296]): with `CT_CHANNEL_RELAY_GATE` or
+  `CT_CHANNEL_CIRCUIT_RELAY` set, a relay-only member still joins on the relay port (same pairer,
+  same session framing, so it still meets a peer that runs the upgrade), but it never offers or
+  accepts the libp2p upgrade unless `CT_CHANNEL_EXPERIMENTAL_DCUTR=1`. An accepted upgrade opens
+  the channel stream on the *relayed* libp2p connection, and the relay-node's default circuit
+  limits (2 min, 128 KiB) then cut the session mid-transfer. Between two members on the
+  CADS-Tunnel v0.4.20 pin the upgrade never happened anyway: the responder refuses the circuit
+  address before probing it (ct-common's offer guard, CADS-Tunnel#480: it is not one socket
+  address). Switching it on also brings back the original [#296] failure: the DCUtR punch
+  candidate is still learned on a throwaway socket (fixed only for `CT_CHANNEL_DIRECT_UPGRADE`),
+  so the hole punch itself is expected to time out. The start-up log says which mode a member runs
+  (`relay-only edge-relay (DCUtR off, #296) …` vs. `relay-only DCUtR-upgradable …`).
 
 ### Pairing reality (until CADS-Tunnel#495 lands)
 
@@ -424,17 +436,18 @@ established sessions only.
 | `CT_CHANNEL_CALL_RECONNECT` | persistent call mode only, default **on** (v0.6.0, [#47]) — internal redial on a mid-run session death, with #250-style exponential backoff on repeated near-instant failures. `0`/`false`/`no` restores the pre-#47 contract (`exit(1)` on death, no internal retry) — set this if your integration already owns process-level respawn+backoff itself and would rather not have two retry layers stacked |
 | `CT_CHANNEL_ADDR` | direct-address mode: the peer's `host:port`. Selects the no-broker path above |
 | `CT_CHANNEL_PEER_NOISE_KEY` / `CT_CHANNEL_PEER_CERT` | the peer's Noise public key (64 hex) and, for the initiator, its transport cert (hex DER) — direct-address mode only |
-| `CT_CHANNEL_CIRCUIT_RELAY` | libp2p Circuit-Relay v2 multiaddr for the DCUtR upgrade path (#136). Absent: no hole-punch is attempted at all |
+| `CT_CHANNEL_CIRCUIT_RELAY` | libp2p Circuit-Relay v2 multiaddr for the DCUtR upgrade path (#136). Absent: no hole-punch is attempted at all. The upgrade itself also needs `CT_CHANNEL_EXPERIMENTAL_DCUTR=1` |
+| `CT_CHANNEL_EXPERIMENTAL_DCUTR=1` | (#296, default **off**) lets a relay-only member with `CT_CHANNEL_RELAY_GATE` or `CT_CHANNEL_CIRCUIT_RELAY` run the libp2p DCUtR upgrade. Off, the member joins exactly as before but keeps every session on the edge relay — an "upgraded" session would ride the relay-node's circuit (2 min / 128 KiB). On, the punch candidate still comes from a throwaway socket (#296 is fixed only for `CT_CHANNEL_DIRECT_UPGRADE`), so expect the hole punch to time out. See [Transport selection](#transport-selection-the-dial-ladders) |
 | `CT_CHANNEL_RELAY_DIRECT` | dial the relay at this `host:port` instead of the one the grant names — an operator override, not a fallback |
 | `CT_CHANNEL_INITIATE_RETRY_SECS` | initiator only: the admission retry window, default **75** s, 3 s between attempts (#95; `0`, empty or garbage keep 75). A one-shot caller (pipe, `--call`) gives up at the window even while parked or mid-attempt, so keep it well above one ladder walk (the direct QUIC rung alone may take 5 s); forward and persistent CALL initiators (`CT_CHANNEL_CALL_RECONNECT` on) check it only between attempts and stay parked as long as the edge holds them |
 | `CT_CHANNEL_RELAY_PAIR_SECS` | how long a `:443` relay leg waits for its partner before it closes the leg, default **45** s, clamped to 35–300 s (`0`, empty or garbage keep 45). QUIC relay legs keep their own 45 s bound |
 | `CT_CHANNEL_SERVE` / `CT_CHANNEL_SERVE_CONCURRENCY` | accept-side persistent serve, session cap (default 8) |
-| `CT_CHANNEL_DIRECT_UPGRADE=1` | opt-in in-band relay→direct upgrade (#104) |
+| `CT_CHANNEL_DIRECT_UPGRADE=1` | opt-in in-band relay→direct upgrade (#104), on a QUIC relay leg only. Since #296 the initiator offers the address the edge's `'W'` echo reports for its **listening** socket (one socket dials the query and accepts the direct dial), asked right before the offer; before, it offered the admission's `r=`, a different socket, so the port never matched. No `'W'` answer (UDP to the echo blocked) → no offer, the session stays on the relay. The responder dials without coordination, so this only goes direct when the initiator is public, port-forwarded or behind a NAT that lets any host in on an existing mapping |
 | `CT_CHANNEL_REQUIRE_PEER_GRANT` / `CT_CHANNEL_OPERATOR_PUBKEY` | **Opt-in end-to-end check of the peer's grant** (default off). Admission attests the peer's Noise key with the peer's holder key, but all of that comes from the broker; nothing binds the holder to an operator-signed grant, so a compromised broker could present an identity it minted itself. With `CT_CHANNEL_REQUIRE_PEER_GRANT=1` both members send their own grant as the first bytes inside the Noise session, and each checks the other's before any application byte flows: the signature against `CT_CHANNEL_OPERATOR_PUBKEY` (64 hex, required when on), expiry, same channel, holder = the attested peer holder, and the complementary direction. **Switch it on for every member of a channel together**: a member that sends the grant to one that does not expect it breaks that session. On but without an operator key, the join fails. **A TCP forward runs this check on both sides whatever the switch says** (`CT_CHANNEL_FORWARD` set, or `CT_CHANNEL_FORWARD_ALLOW` non-empty), the sessions of a persistent serve accept member included; setting it on a forward member changes nothing and does not fix a forward that is refused with "did not present its grant" ([#314], see [Failure semantics](#failure-semantics-and-timers-what-an-error-actually-means)). |
 | `CT_CHANNEL_PEER_PIN` | **Opt-in binding of this endpoint to its partner** (default unset = every member of the channel may be paired with it, ADR-0020). `link`, or `holder:<64 hex>[,noise:<64 hex>]`, several entries separated by `;`. Checked against the admitted peer; a peer it does not name is refused before the Noise handshake (the transport leg its session would have used is taken and closed). A malformed value stops the start. Brokered joins only. See [Binding an endpoint to its partner](#binding-an-endpoint-to-its-partner-ct_channel_peer_pin) |
 | `CT_AGENT_SERVICE_HANDLER_CMD` / `CT_AGENT_SERVICES` | the handler command + offered service slugs on the serve side |
 | `CT_SERVICE_TYPE` | not read by `ct-agent` itself — set **in the handler child's own environment** by `CT_AGENT_SERVICE_HANDLER_CMD` (#149-A.1) so one handler script can branch on which of several registered `service/<slug>` calls was actually invoked |
-| `CT_CHANNEL_REFLEXIVE_EDGE` | `host:port` of the edge's QUIC "whoami" listener (its `'W'` reflexive-address echo, #248/#238). Defaults to the relay-gate host on port `4433`; override only when the edge's QUIC listener is somewhere else. |
+| `CT_CHANNEL_REFLEXIVE_EDGE` | `host:port` of the edge's QUIC "whoami" listener (its `'W'` reflexive-address echo, #248/#238). Defaults to the relay-gate host on port `4433` (DCUtR path), or the relay leg's host on port `4433` (`CT_CHANNEL_DIRECT_UPGRADE`, #296); override only when the edge's QUIC listener is somewhere else. |
 | `CT_CHANNEL_SUPER_PEER_LISTEN` / `CT_CHANNEL_SUPER_PEER_UPSTREAM` | LAN super-peer mode (both required): `CT_CHANNEL_SUPER_PEER_LISTEN` is the `host:port` that LAN-local members point their own `CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY` at **instead of the real edge**; `CT_CHANNEL_SUPER_PEER_UPSTREAM` is this super-peer's real edge. One WAN hop plus N−1 local ones. |
 | `CT_OIDC_TOKEN` | `channel register`/`channel allowlist` only: the OIDC bearer token identifying the channel owner. Explicit env value always wins; unset ⇒ falls back to the token `ct-agent login` stored locally (see [Getting the OIDC bearer token](#getting-the-oidc-bearer-token-ct-agent-login) above) |
 | `CT_CHANNEL_REKEY` | `channel register` only: `1`/`true` confirms an operator-key **rotation** for a channel you already registered with a different key (otherwise the control plane refuses with 409, [CADS-Tunnel#747]); the env spelling of `--rekey`. Every grant signed by the previous operator stops verifying. |
@@ -878,6 +891,7 @@ needed exactly once, at `sign`, so an operator can review the unsigned skeleton 
 [#290]: https://github.com/scimbe/ct-agent/issues/290
 [#330]: https://github.com/scimbe/ct-agent/issues/16
 [#47]: https://github.com/scimbe/ct-agent/issues/47
+[#296]: https://github.com/scimbe/ct-agent/issues/296
 [#299]: https://github.com/scimbe/ct-agent/issues/299
 [#314]: https://github.com/scimbe/ct-agent/issues/314
 [#308]: https://github.com/scimbe/ct-agent/issues/308

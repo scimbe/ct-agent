@@ -59,18 +59,39 @@ pub fn reflexive_query_addr(relay_gate_addr: SocketAddr, override_raw: Option<&s
 /// Deliberately does NOT apply the `#137`/`is_global_unicast` safety filter itself — the
 /// caller does, exactly like `own_observed_reflexive` above, so this function stays testable
 /// against a real (loopback, in tests) server without the filter masking a wiring bug.
+///
+/// #296: this asks from a THROWAWAY socket, dropped on return -- the answer names a mapping
+/// nothing listens on afterwards. A caller that wants peers to reach it on the answer must ask
+/// through its own listening endpoint instead ([`whoami_via`]).
 pub async fn discover_udp_reflexive(edge_quic_addr: SocketAddr, timeout: std::time::Duration) -> Option<SocketAddr> {
+    let endpoint = crate::transport::build_channel_dialer().ok()?;
+    whoami_via(&endpoint, edge_quic_addr, timeout).await
+}
+
+/// #296: the `'W'` query of [`discover_udp_reflexive`], sent from `endpoint` itself, so the
+/// answer is THAT socket's reflexive address (its NAT mapping toward the edge). Used with
+/// [`crate::transport::build_channel_endpoint`], whose socket is also the direct listener: the
+/// address a member learns here is the address its listener is reachable on (behind a NAT
+/// with endpoint-independent mapping). Same contract otherwise: best-effort, bounded by
+/// `timeout`, `None` on any failure, no `is_global_unicast` filter (the caller applies it).
+/// The query's own connection is closed explicitly -- the endpoint outlives it, and the
+/// channel dialer's keepalive would otherwise hold it open toward the edge.
+pub async fn whoami_via(endpoint: &Endpoint, edge_quic_addr: SocketAddr, timeout: std::time::Duration) -> Option<SocketAddr> {
     let attempt = async {
-        let endpoint = crate::transport::build_channel_dialer().ok()?;
         let conn = endpoint.connect(edge_quic_addr, "localhost").ok()?.await.ok()?;
-        let (mut send, mut recv) = conn.open_bi().await.ok()?;
-        send.write_all(b"W").await.ok()?;
-        send.finish().ok()?;
-        let mut len = [0u8; 1];
-        recv.read_exact(&mut len).await.ok()?;
-        let mut buf = vec![0u8; len[0] as usize];
-        recv.read_exact(&mut buf).await.ok()?;
-        std::str::from_utf8(&buf).ok()?.parse::<SocketAddr>().ok()
+        let answer = async {
+            let (mut send, mut recv) = conn.open_bi().await.ok()?;
+            send.write_all(b"W").await.ok()?;
+            send.finish().ok()?;
+            let mut len = [0u8; 1];
+            recv.read_exact(&mut len).await.ok()?;
+            let mut buf = vec![0u8; len[0] as usize];
+            recv.read_exact(&mut buf).await.ok()?;
+            std::str::from_utf8(&buf).ok()?.parse::<SocketAddr>().ok()
+        }
+        .await;
+        conn.close(0u32.into(), b"whoami done");
+        answer
     };
     tokio::time::timeout(timeout, attempt).await.ok().flatten()
 }
@@ -237,6 +258,41 @@ pub async fn run_channel_session_upgradable<P>(
 where
     P: AsyncRead + AsyncWrite + Unpin,
 {
+    // A fixed offer. Without one the initiator runs the plain relay session, as before.
+    let direct_listener = direct_listener.filter(|_| own_direct_endpoint.is_some());
+    run_upgradable_relay_session(
+        relay_conn,
+        role,
+        own_noise_private,
+        peer_noise_public,
+        local,
+        direct_listener,
+        move || async move { own_direct_endpoint },
+        dial_timeout,
+    )
+    .await
+}
+
+/// The body of [`run_channel_session_upgradable`]. #296: the initiator's offer comes from
+/// `discover`, which the coordinator calls right before it sends the Offer (the relay session
+/// already runs by then), instead of a string fixed when the session starts; `None` from it
+/// sends no Offer and the session stays on the relay. The responder ignores both.
+#[allow(clippy::too_many_arguments)]
+async fn run_upgradable_relay_session<P, D, DFut>(
+    relay_conn: &Connection,
+    role: ChannelRole,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+    local: P,
+    direct_listener: Option<Endpoint>,
+    discover: D,
+    dial_timeout: std::time::Duration,
+) -> Result<(), BoxError>
+where
+    P: AsyncRead + AsyncWrite + Unpin,
+    D: FnOnce() -> DFut,
+    DFut: std::future::Future<Output = Option<String>>,
+{
     use ct_common::a2a::establish_direct_session;
     use ct_common::upgrade::{
         run_upgradable_session_initiator, run_upgradable_session_responder_verified, Role, UpgradeCoordinator,
@@ -249,10 +305,10 @@ where
 
     match role {
         ChannelRole::Initiate => {
-            let (listener, endpoint) = match (direct_listener, own_direct_endpoint) {
-                (Some(l), Some(e)) => (l, e),
+            let listener = match direct_listener {
+                Some(l) => l,
                 // Relay-only initiator (no dialable direct address): run the plain relay session.
-                _ => {
+                None => {
                     return run_channel_session_on_stream(
                         relay_send, relay_recv, ChannelRole::Initiate, &relay_priv, &relay_peer, local,
                     )
@@ -261,7 +317,6 @@ where
                 }
             };
             let coord = UpgradeCoordinator::with_backoff(Role::Initiator, 0, 1, 100);
-            eprintln!("ct-agent channel: #104 upgrade — offering direct candidate {endpoint} in-band");
             run_upgradable_session_initiator(
                 relay_send,
                 relay_recv,
@@ -270,7 +325,11 @@ where
                 &relay_peer,
                 coord,
                 1,
-                || async move { Some(endpoint) },
+                move || async move {
+                    let endpoint = discover().await?;
+                    eprintln!("ct-agent channel: #104 upgrade — offering direct candidate {endpoint} in-band");
+                    Some(endpoint)
+                },
                 move || async move {
                     // Accept the incoming direct dial (the responder dials us), then handshake as the
                     // direct-Noise RESPONDER (the dialer is the Noise initiator).
@@ -433,7 +492,7 @@ pub(crate) async fn join_via_relay_fallback<P>(
     own_noise_private: &[u8; 32],
     peer_noise_public: &[u8; 32],
     local: P,
-    upgrade: Option<(Endpoint, String)>,
+    upgrade: Option<DirectUpgrade>,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
@@ -489,22 +548,26 @@ impl ParkedRelayLeg {
         own_noise_private: &[u8; 32],
         peer_noise_public: &[u8; 32],
         local: P,
-        upgrade: Option<(Endpoint, String)>,
+        upgrade: Option<DirectUpgrade>,
     ) -> Result<(), BoxError>
     where
         P: AsyncRead + AsyncWrite + Unpin,
     {
         match self {
             Self::Quic(conn) => match upgrade {
-                Some((listener, own_direct_endpoint)) => {
-                    run_channel_session_upgradable(
+                Some(upgrade) => {
+                    // #296: the offer is learned through the listener's own socket, asking the
+                    // edge next to this relay leg, right before the Offer goes out.
+                    let relay = conn.remote_address();
+                    let listener = upgrade.listener();
+                    run_upgradable_relay_session(
                         &conn,
                         role,
                         own_noise_private,
                         peer_noise_public,
                         local,
                         Some(listener),
-                        Some(own_direct_endpoint),
+                        move || async move { upgrade.offer(relay).await },
                         DIRECT_DIAL_TIMEOUT,
                     )
                     .await
@@ -844,7 +907,7 @@ pub(crate) async fn race_accept_against_relay<P>(
     own_noise_private: &[u8; 32],
     peer_noise_public: &[u8; 32],
     local: P,
-    upgrade: Option<(Endpoint, String)>,
+    upgrade: Option<DirectUpgrade>,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
@@ -994,7 +1057,7 @@ pub async fn join_via_relay_ladder<P>(
     // `&Connection` to `join_via_relay`); the `:443` front-door rung is a plain TLS-TCP
     // byte stream with no independent QUIC connection to open a second stream on, so it
     // stays a plain relay session regardless of this option.
-    upgrade: Option<(Endpoint, String)>,
+    upgrade: Option<DirectUpgrade>,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
