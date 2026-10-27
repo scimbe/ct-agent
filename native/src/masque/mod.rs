@@ -114,12 +114,44 @@ pub async fn dial_quic_via_masque(
     // presents a REAL publicly-trusted cert (Let's Encrypt via deSEC DNS-01, same
     // as Portal/Auth) -- not the Edge's own self-signed QUIC-pinned `edge_cert`.
     // `edge_cert` is still the right (and only) trust anchor for the INNER
-    // tunneled QUIC handshake, which really is that pinned cert (see
-    // `dial_quic_via_masque_with_proxy_roots`, below, which this production entry
-    // point wraps with the real public CA set).
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    dial_quic_via_masque_with_proxy_roots(proxy_tcp_addr, sni_host, target, edge_cert, token, roots).await
+    // tunneled QUIC handshake, which really is that pinned cert (the inner config
+    // comes from `quic_client_config`, see `dial_quic_via_masque_unbounded`).
+    dial_quic_via_masque_within(MASQUE_DIAL_TIMEOUT, proxy_tcp_addr, sni_host, target, edge_cert, token, public_front_door_tls())
+        .await
+}
+
+/// The OUTER (agent-to-proxy-front-door) TLS config of a MASQUE dial: `roots` as
+/// the trust anchors, ALPN `h2`, never early data, TLS 1.3 sessions only (#290, the
+/// same rules as the edge dials in `crate::transport`). The front door is a server
+/// this crate does not build; should it negotiate TLS 1.2, a kept 1.2 session would
+/// resume without a fresh key exchange, with the `x-ct-masque-token` bearer inside.
+fn outer_tls_config(roots: rustls::RootCertStore) -> Arc<rustls::ClientConfig> {
+    crate::transport::install_crypto_provider();
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+    tls_config.enable_early_data = false;
+    tls_config.resumption = crate::transport::tls13_only_resumption();
+    Arc::new(tls_config)
+}
+
+/// #290: the production outer config -- the real public CA set -- built once per
+/// process. A config per dial kept no TLS session, so every MASQUE redial paid a full
+/// handshake with the front door (and rebuilt the root store); the kept one lets the
+/// redial resume. `CT_TLS_RESUMPTION=0` builds one per dial again
+/// ([`crate::transport::tls_resumption_on`]).
+fn public_front_door_tls() -> Arc<rustls::ClientConfig> {
+    static CONFIG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
+    let build = || {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        outer_tls_config(roots)
+    };
+    if !crate::transport::tls_resumption_on() {
+        return build();
+    }
+    Arc::clone(CONFIG.get_or_init(build))
 }
 
 /// Same as [`dial_quic_via_masque`], but with the OUTER (agent-to-proxy-front-door)
@@ -127,6 +159,7 @@ pub async fn dial_quic_via_masque(
 /// tests exercise this function against a self-signed test cert without needing a
 /// real publicly-trusted one, while production always goes through the wrapper
 /// above.
+#[cfg(test)]
 async fn dial_quic_via_masque_with_proxy_roots(
     proxy_tcp_addr: SocketAddr,
     sni_host: &str,
@@ -135,7 +168,8 @@ async fn dial_quic_via_masque_with_proxy_roots(
     token: &str,
     proxy_roots: rustls::RootCertStore,
 ) -> Result<quinn::Connection, BoxError> {
-    dial_quic_via_masque_within(MASQUE_DIAL_TIMEOUT, proxy_tcp_addr, sni_host, target, edge_cert, token, proxy_roots)
+    let proxy_tls = outer_tls_config(proxy_roots);
+    dial_quic_via_masque_within(MASQUE_DIAL_TIMEOUT, proxy_tcp_addr, sni_host, target, edge_cert, token, proxy_tls)
         .await
 }
 
@@ -153,11 +187,11 @@ async fn dial_quic_via_masque_within(
     target: SocketAddr,
     edge_cert: CertificateDer<'static>,
     token: &str,
-    proxy_roots: rustls::RootCertStore,
+    proxy_tls: Arc<rustls::ClientConfig>,
 ) -> Result<quinn::Connection, BoxError> {
     tokio::time::timeout(
         bound,
-        dial_quic_via_masque_unbounded(proxy_tcp_addr, sni_host, target, edge_cert, token, proxy_roots),
+        dial_quic_via_masque_unbounded(proxy_tcp_addr, sni_host, target, edge_cert, token, proxy_tls),
     )
     .await
     .map_err(|_| -> BoxError { format!("MASQUE dial via {proxy_tcp_addr} timed out after {bound:?}").into() })?
@@ -169,15 +203,11 @@ async fn dial_quic_via_masque_unbounded(
     target: SocketAddr,
     edge_cert: CertificateDer<'static>,
     token: &str,
-    proxy_roots: rustls::RootCertStore,
+    proxy_tls: Arc<rustls::ClientConfig>,
 ) -> Result<quinn::Connection, BoxError> {
     let tcp = TcpStream::connect(proxy_tcp_addr).await?;
 
-    let mut tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(proxy_roots)
-        .with_no_client_auth();
-    tls_config.alpn_protocols = vec![b"h2".to_vec()];
-    let connector = TlsConnector::from(Arc::new(tls_config));
+    let connector = TlsConnector::from(proxy_tls);
     let server_name = rustls::pki_types::ServerName::try_from(sni_host.to_string())
         .map_err(|e| format!("invalid MASQUE SNI host {sni_host:?}: {e}"))?;
     let tls = connector.connect(server_name, tcp).await?;
