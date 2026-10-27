@@ -557,7 +557,7 @@ channel_run_single() {
   need_operator_pub
   stage "start member A (accept)" "see $WORK/logs/accept.log; 'refused the channel join' means the member add did not take effect"
   mkfifo "$WORK/run/accept.in" 2>/dev/null || true
-  exec 7<>"$WORK/run/accept.in"     # keeps A's stdin open: at end-of-file A loses the data (#299)
+  exec 7<>"$WORK/run/accept.in"     # keeps A's stdin open: at end-of-file A loses the data on an edge before CADS-Tunnel v0.5.0 (#299)
   run_side accept env CT_CHANNEL_ROLE=accept "$CTA" channel <&7 >"$recv" 2>"$WORK/logs/accept.log" &
   apid=$!; echo "$apid" > "$WORK/run/accept.pid"; FG_PIDS="$apid"
   sleep "${CT_QS_A_HEAD_START:-5}"

@@ -152,6 +152,52 @@ impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
     }
 }
 
+/// ct-agent#314: the session's `local` side, reporting its first READ error through a oneshot.
+/// `noise_pump` hands a local read error back from its outbound direction without closing the
+/// cipher side, and its `join!` then waits for the inbound direction -- which ends only when the
+/// PEER sends a byte or closes. A peer that completed the Noise handshake and then stays silent
+/// therefore held a session whose own side had already failed (the field case: the peer-grant
+/// gate giving up after `PEER_GRANT_TIMEOUT`) for ever, and with it a forward initiator's
+/// reconnect loop or a serve slot. [`run_channel_session_on_stream`] watches this signal and stops
+/// waiting for such a peer after [`LOCAL_FAILURE_GRACE`].
+///
+/// Only the read side reports. A gate that refuses the peer on the write side (a grant that does
+/// not verify) fails both directions, so its next read reports it. A plain local write error --
+/// a stream handler that closed its stdin, a closed stdout -- ends only the inbound direction,
+/// while the outbound one may still be delivering what the local side produces; cutting that after
+/// the grace would truncate a response the peer is still receiving.
+struct LocalFailSignal<P> {
+    inner: P,
+    /// Taken on the first read error; the session runner holds the receiver.
+    failed: Option<tokio::sync::oneshot::Sender<io::Error>>,
+}
+
+impl<P: AsyncRead + Unpin> AsyncRead for LocalFailSignal<P> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Err(e)) = &polled {
+            if let Some(tx) = this.failed.take() {
+                let _ = tx.send(io::Error::new(e.kind(), e.to_string()));
+            }
+        }
+        polled
+    }
+}
+
+// Writes pass through unreported (see the type's doc).
+impl<P: AsyncWrite + Unpin> AsyncWrite for LocalFailSignal<P> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Open (Initiate) or accept (Accept) the channel bi-stream on `conn`, **bounded** by `setup_timeout`
 /// (#139) so a stalled direct link fails fast (`io::ErrorKind::TimedOut`) instead of hanging — the
 /// exact `open_bi`/`accept_bi` gap central traced. The timeout is a parameter so tests can drive it
@@ -223,6 +269,11 @@ where
     // caller can drop the connection / exit without truncating the tail. Bounded so a vanished
     // peer can never hang teardown; on timeout or a lost connection we've done our best.
     const SEND_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    // The SIGTERM drain must not exit under this wait either: the session stopped counting as
+    // established when the pump returned, so the tail counts on its own until the peer acked it
+    // (health.rs). No await lies between the two, so a drain look can catch at most a passing
+    // zero, never the two zero looks in a row it needs to end.
+    let _tail = super::health::health().quic_tail();
     let _ = send.finish(); // idempotent — the pump already FIN'd on EOF; ignore "already closed"
     let _ = tokio::time::timeout(SEND_DRAIN_TIMEOUT, send.stopped()).await;
     Ok(())
@@ -231,6 +282,16 @@ where
 /// #150: how long [`graceful_stream_drain`] waits for the peer to close before giving up — matches
 /// the QUIC send-drain bound (#134) so a vanished peer can never hang teardown.
 const RELAY_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// ct-agent#314: once this member's own side of a session failed (see [`LocalFailSignal`]), how
+/// long the peer still gets to end the session the normal way before the runner stops waiting.
+/// A live peer answers within one round trip; nothing it sends after this side failed could be
+/// delivered anyway.
+pub(crate) const LOCAL_FAILURE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// ct-agent#314: the drain bound after the runner gave up on such a peer. It stayed silent for the
+/// whole grace, so the 30 s of [`RELAY_DRAIN_TIMEOUT`] would only delay the caller's reconnect.
+pub(crate) const LOCAL_FAILURE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// #150: graceful teardown of a stream session before the process may exit. FIN our write half, then
 /// read the peer to EOF (bounded by `timeout`) — keeping the process, and in a container its network
@@ -258,6 +319,10 @@ where
 /// `tokio::io::split`ting the stream and passing the halves here. So a member whose relay
 /// port is also blocked (a truly `:443`-only network) relays over `:443` unchanged; the
 /// Noise_IK session stays end-to-end and the edge only forwards ciphertext.
+///
+/// When reading `local` fails (e.g. the peer-grant gate refusing the peer), the session ends with
+/// that error within [`LOCAL_FAILURE_GRACE`] plus [`LOCAL_FAILURE_DRAIN`], whether or not the peer
+/// ever sends another byte (ct-agent#314).
 pub async fn run_channel_session_on_stream<W, R, P>(
     send: W,
     recv: R,
@@ -327,6 +392,9 @@ where
             eprintln!("{}", traffic_status_line());
         }
     });
+    // Readiness (`/readyz`) and the shutdown drain count this session as established until the
+    // function returns, the #150 drain below included (health.rs).
+    let _established = super::health::health().session_established();
 
     // Reborrow the halves so they survive the pump: after the session ends we must drain before
     // returning (#150), because a caller may exit immediately (a single-shot `ct-agent channel` as a
@@ -334,9 +402,34 @@ where
     // `:443`/TLS-TCP relay socket's tail the way a bare host would. `graceful_stream_drain` FINs and
     // waits (bounded) for the peer to close, keeping the process + netns alive until our tail is
     // delivered. (The QUIC path keeps its stronger `stopped()` ack-wait in `run_channel_session`.)
-    let pumped = noise_pump(session, BiStream { send: &mut send, recv: &mut recv }, local).await;
+    //
+    // ct-agent#314: the pump alone never ends while a silent peer holds the transport open, even
+    // after this side failed (see `LocalFailSignal`). So it races that failure: the peer gets
+    // LOCAL_FAILURE_GRACE to end the session the normal way, then the pump is dropped (releasing
+    // the reborrowed halves) and the session ends with the local error.
+    let (failed_tx, mut failed_rx) = tokio::sync::oneshot::channel();
+    let local = LocalFailSignal { inner: local, failed: Some(failed_tx) };
+    let (pumped, gave_up) = {
+        let pump = noise_pump(session, BiStream { send: &mut send, recv: &mut recv }, local);
+        tokio::pin!(pump);
+        tokio::select! {
+            biased;
+            pumped = &mut pump => (pumped, false),
+            Ok(failure) = &mut failed_rx => match tokio::time::timeout(LOCAL_FAILURE_GRACE, &mut pump).await {
+                Ok(pumped) => (pumped, false),
+                Err(_) => {
+                    eprintln!(
+                        "ct-agent channel: this side of the session failed ({failure}) and the peer \
+                         did not end it within {LOCAL_FAILURE_GRACE:?} -- ending the session (#314)"
+                    );
+                    (Err(failure), true)
+                }
+            },
+        }
+    };
     drop(ticker);
-    graceful_stream_drain(&mut send, &mut recv, RELAY_DRAIN_TIMEOUT).await;
+    let drain = if gave_up { LOCAL_FAILURE_DRAIN } else { RELAY_DRAIN_TIMEOUT };
+    graceful_stream_drain(&mut send, &mut recv, drain).await;
     eprintln!("{}", traffic_status_line());
     crate::events::emit(
         crate::events::CHANNEL_SESSION,

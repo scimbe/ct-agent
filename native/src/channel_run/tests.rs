@@ -4848,6 +4848,7 @@ async fn run_channel_join_with_admission_runs_the_direct_session_from_a_443_ladd
             a_local_run,
             false,
             false, // ct-agent#22 (b): accept_race off (serial)
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -5280,6 +5281,171 @@ async fn two_443_only_members_learn_each_others_noise_key_and_form_the_tunnel() 
 }
 
 #[tokio::test]
+async fn pipe_member_with_local_eof_still_receives_over_the_ka_park_pump_299() {
+    // #299: a pipe member whose stdin is already at EOF when the session opens (an accept side
+    // started with `< /dev/null`) never received what the peer sent, and both sides still
+    // reported `ok=true`. The edge half of the cause: every admitted `:443` leg runs through the
+    // park pump (`admit_and_pair_on_boxed_stream`), and before CADS-Tunnel#856 a keepalive leg's
+    // client EOF tore the WHOLE pump down -- A's own FIN closed A's receive direction too, and
+    // B's bytes hit a dead splice. Every agent leg is a keepalive leg (the KA ALPN is offered
+    // first since v0.4.13). The other `:443` tests here pair with `admit_and_pair_on_stream`,
+    // which has no pump, so they could not see it. This one goes through the real KA park pump:
+    // A's local input ends at once, B sends N bytes and then ends; A must receive all N bytes
+    // and both sessions must end Ok. Red with the dev-dependency ct-edge v0.4.20, green from
+    // v0.5.0 (#856 forwards a client EOF as a half-close and keeps the other direction).
+    use ct_common::channel::{
+        member_noise_attest_bytes, ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant,
+        CHANNEL_ENDPOINT_RELAY_ONLY,
+    };
+    use ct_edge::channel_broker::{
+        admit_and_pair_on_boxed_stream, finish_relay_pair_over_streams, BoxedChannelStream, ChannelPairer,
+    };
+    use ct_edge::transport::build_tcp_tls_listener_at;
+    use ed25519_dalek::Signer;
+    use std::sync::Mutex;
+    use tokio::io::{duplex, split};
+
+    let op = SigningKey::from_bytes(&[0x63u8; 32]);
+    let op_pub = op.verifying_key().to_bytes();
+    let channel = [0x99u8; 32];
+    let holder_a = SigningKey::from_bytes(&[0x64u8; 32]);
+    let holder_b = SigningKey::from_bytes(&[0x65u8; 32]);
+    let ha_pub = holder_a.verifying_key().to_bytes();
+    let noise_a = generate_static_keypair();
+    let noise_b = generate_static_keypair();
+    let (na, na_pub) = (noise_a.private, noise_a.public);
+    let (nb, nb_pub) = (noise_b.private, noise_b.public);
+    let attest_a = holder_a
+        .sign(&member_noise_attest_bytes(&ChannelId(channel), &ha_pub, &na_pub))
+        .to_bytes();
+    let attest_b = holder_b
+        .sign(&member_noise_attest_bytes(&ChannelId(channel), &holder_b.verifying_key().to_bytes(), &nb_pub))
+        .to_bytes();
+    let signed = |h: &SigningKey, dir| {
+        let g = ChannelGrant {
+            channel: ChannelId(channel),
+            holder: SigningKey::verifying_key(h).to_bytes(),
+            direction: dir,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }
+    };
+    // As in #299: A accepts, B initiates; both are `:443`-only.
+    let req_a = ChannelJoinRequest {
+        grant: signed(&holder_a, Direction::Accept),
+        endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+    };
+    let req_b = ChannelJoinRequest {
+        grant: signed(&holder_b, Direction::Initiate),
+        endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+    };
+
+    // The front door as the edge runs it for a KA-negotiated client: every admitted leg is
+    // wrapped in the park pump (`keepalive = true`), then the two legs are relay-spliced.
+    let (listener, acceptor, edge_cert) =
+        build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap()).await.expect("tls-tcp listener");
+    let fd_addr = listener.local_addr().expect("front-door addr");
+    let edge = tokio::spawn(async move {
+        let pairer: Mutex<ChannelPairer<_>> = Mutex::new(ChannelPairer::new());
+        let authorize = move |c: ChannelId, h: [u8; 32]| async move {
+            if c.0 != channel {
+                return None;
+            }
+            let (noise, attest) = if h == ha_pub { (na_pub, attest_a) } else { (nb_pub, attest_b) };
+            Some((op_pub, Some(noise), Some(attest)))
+        };
+        let mut paired = None;
+        for _ in 0..2 {
+            let (tcp, peer) = listener.accept().await.expect("accept tcp");
+            let tls = acceptor.accept(tcp).await.expect("tls accept");
+            let boxed: BoxedChannelStream = Box::pin(tls);
+            if let Some(((x, _), (y, _))) = admit_and_pair_on_boxed_stream(
+                boxed,
+                peer,
+                500u64,
+                Duration::from_secs(5),
+                &authorize,
+                10_000u64,
+                &pairer,
+                None,
+                true, // keepalive: the pump every agent leg runs through (#500 K2)
+            )
+            .await
+            .expect("admit + pair the :443 member")
+            {
+                paired = Some((x, y));
+            }
+        }
+        let (x, y) = paired.expect("two same-channel members paired over :443");
+        // Not unwrapped: against a pre-#856 edge the splice ends with an error, and the
+        // assertions below are the ones that must name the failure.
+        let _ = finish_relay_pair_over_streams(x, y, 500u64).await;
+    });
+
+    let join_and_run = move |req: ChannelJoinRequest,
+                             holder: SigningKey,
+                             role: ChannelRole,
+                             own: [u8; 32],
+                             cert: rustls::pki_types::CertificateDer<'static>,
+                             local: tokio::io::DuplexStream| async move {
+        let stream = crate::transport::tcp_tls_connect_channel(fd_addr, cert).await.expect("tls-tcp connect");
+        let (mut recv, mut send) = split(stream);
+        let outcome = present_channel_relay_join_on_stream(&mut send, &mut recv, &req, &holder, None)
+            .await
+            .expect("relay join");
+        let peer_noise = match outcome {
+            ChannelJoinOutcome::Admitted { peer_noise_pubkey, .. } => {
+                peer_noise_pubkey.expect("the ack conveys the peer's Noise key (#122)")
+            }
+            other => panic!("the :443 join must be Admitted, got {other:?}"),
+        };
+        run_channel_session_on_stream(send, recv, role, &own, &peer_noise, local).await
+    };
+
+    let (a_app, a_local) = duplex(64 * 1024);
+    let (b_app, b_local) = duplex(64 * 1024);
+    let a = tokio::spawn(join_and_run(req_a, holder_a, ChannelRole::Accept, na, edge_cert.clone(), a_local));
+    let b = tokio::spawn(join_and_run(req_b, holder_b, ChannelRole::Initiate, nb, edge_cert, b_local));
+
+    // A: stdin at EOF from the start (`< /dev/null`), stdout still wanted.
+    let (mut a_out, mut a_in) = split(a_app);
+    a_in.shutdown().await.expect("A's local input ends at once");
+    // B: N bytes (several Noise records), then EOF -- `echo ... | ct-agent channel`.
+    let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    let (mut b_out, mut b_in) = split(b_app);
+    let sent = payload.clone();
+    let b_writer = tokio::spawn(async move {
+        b_in.write_all(&sent).await.expect("B writes its payload");
+        b_in.shutdown().await.expect("B's local input ends");
+        let mut rest = Vec::new();
+        let _ = b_out.read_to_end(&mut rest).await;
+        rest
+    });
+
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), a_out.read_to_end(&mut got))
+        .await
+        .expect("A's local output ends within 20s")
+        .expect("A reads its local output");
+    assert_eq!(
+        got.len(),
+        payload.len(),
+        "A, whose local input is at EOF, must still receive every byte B sent over the KA park pump (#299)"
+    );
+    assert_eq!(got, payload, "byte-exact");
+
+    let a_res = tokio::time::timeout(Duration::from_secs(20), a).await.expect("A's session ends").expect("A joins");
+    let b_res = tokio::time::timeout(Duration::from_secs(20), b).await.expect("B's session ends").expect("B joins");
+    a_res.expect("A's session ends Ok");
+    b_res.expect("B's session ends Ok");
+    let b_got = b_writer.await.expect("B's writer joins");
+    assert!(b_got.is_empty(), "A sent nothing, so B's local output carries nothing");
+    let _ = tokio::time::timeout(Duration::from_secs(5), edge).await;
+}
+
+#[tokio::test]
 async fn run_channel_join_auto_falls_back_to_the_relay_when_direct_is_blocked() {
     // #72 AF4-relay-orchestrate: the auto-recovery. The rendezvous hands the
     // initiator a peer endpoint that BLACKHOLES (bound-but-silent), so the direct
@@ -5468,6 +5634,7 @@ async fn quic_lazy_relay_dials_only_on_fallback_and_forms_the_tunnel() {
             a_local_run,
             false,
             false, // ct-agent#22 (b): accept_race off (serial)
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -5704,6 +5871,161 @@ async fn large_transfer_is_not_truncated_when_the_sender_tears_down_after_the_se
         .expect("responder task");
     assert!(ok, "the full {len}-byte payload was delivered (no truncation) despite the abrupt sender teardown (#134)");
     assert_eq!(got, expected, "delivered bytes are byte-exact and complete");
+}
+
+// SIGTERM/SIGINT and readiness wired into the real persistent serve admission: the park the
+// serve loop holds at a `:443` front door (admitted by the production gate, never answered)
+// counts as parked, so an accept member is ready on it, and the stop closes that leg and walks
+// no further rung. Driven through `shutdown::admit_next_peer` -- the one call the serve loop's
+// admission closure makes -- with this test's own stop token and health counts.
+#[tokio::test]
+async fn a_serve_members_park_counts_for_readiness_and_the_stop_closes_it() {
+    use super::health::{with_health, ChannelHealth};
+    use ct_common::channel::ChannelId;
+    use ct_edge::channel_broker::admit_channel_join_on_duplex;
+    use ct_edge::transport::build_tcp_tls_listener_at;
+
+    // `serve_cfg`'s operator and channel.
+    let op_pub = SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes();
+    let channel = [0xD1u8; 32];
+    let (fd_listener, acceptor, edge_cert) =
+        build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap()).await.expect("tls-tcp listener");
+    let fd_addr = fd_listener.local_addr().expect("front-door addr");
+    let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+    let edge = tokio::spawn(async move {
+        let (tcp, peer) = fd_listener.accept().await.expect("the member's leg connects");
+        let tls = acceptor.accept(tcp).await.expect("tls accept");
+        let (mut stream, _req, _op, _noise, _attest, _observed) = admit_channel_join_on_duplex(
+            tls,
+            peer,
+            500u64, // now < expires_at (1_000)
+            Duration::from_secs(5),
+            &move |c: ChannelId, _h: [u8; 32]| {
+                let ok = c.0 == channel;
+                async move { ok.then_some((op_pub, None, None)) }
+            },
+        )
+        .await
+        .expect("admit the member's join over :443");
+        let _ = parked_tx.send(());
+        // Parked: no answer ever. Read until the member closes the leg.
+        let mut buf = [0u8; 64];
+        while let Ok(n) = stream.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
+        // A member that had only lost this leg would walk on to the ladder's next rung.
+        tokio::time::timeout(Duration::from_secs(1), fd_listener.accept()).await.is_ok()
+    });
+
+    let cfg = serve_cfg(Some(fd_addr), Some(hex_encode(edge_cert.as_ref())), true);
+    let request = ChannelJoinRequest { grant: cfg.grant.clone(), endpoint: "203.0.113.7:7007".to_string() };
+    let ctx = ServeSessionCtx::from_cfg(&cfg, request, None);
+    let health: &'static ChannelHealth = Box::leak(Box::new(ChannelHealth::new()));
+    let stop = tokio_util::sync::CancellationToken::new();
+    let admission = with_health(health, super::shutdown::admit_next_peer(&ctx, &stop));
+    tokio::pin!(admission);
+    tokio::select! {
+        out = &mut admission => panic!("the admission ended before the edge held its park: {out:?}"),
+        parked = parked_rx => parked.expect("the edge parked the join"),
+    }
+    assert_eq!(health.parks(), 1, "the park on the ladder counts as parked");
+    let why = health
+        .readiness_at(crate::codec::now_unix(), true)
+        .expect("an accept member parked at the edge is ready");
+    assert!(why.contains("parked at the edge"), "{why}");
+
+    stop.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1500), &mut admission).await.is_err(),
+        "after the stop the admission never resolves, so the serve loop parks no more"
+    );
+    let next_rung = tokio::time::timeout(Duration::from_secs(5), edge)
+        .await
+        .expect("the stop closed the parked leg")
+        .expect("edge task");
+    assert!(!next_rung, "the whole admission is gone, not just its leg");
+    assert_eq!(health.parks(), 0);
+}
+
+// The SIGTERM drain must wait for a QUIC session until the peer acknowledged its tail (#134), not
+// only until its pump returned: a one-shot pipe whose session completes during the drain would
+// otherwise exit under `run_channel_session`'s `stopped()` wait and cut that tail after all. The
+// peer runs on a runtime of its own, which the test freezes once the peer's FIN has reached this
+// side, so nothing acknowledges the tail until the test thaws it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quic_session_stays_in_flight_until_the_peer_acknowledged_its_tail() {
+    use super::health::{with_health, ChannelHealth};
+    use crate::transport::{build_channel_dialer, build_direct_listener_at};
+
+    let ours = generate_static_keypair();
+    let theirs = generate_static_keypair();
+    let (our_priv, our_pub, their_priv, their_pub) = (ours.private, ours.public, theirs.private, theirs.public);
+
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+    let (freeze_tx, freeze_rx) = tokio::sync::oneshot::channel::<()>();
+    let (frozen_tx, frozen_rx) = tokio::sync::oneshot::channel::<()>();
+    let (thaw_tx, thaw_rx) = std::sync::mpsc::channel::<()>();
+    let peer = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("peer runtime");
+        rt.block_on(async move {
+            let (server, _cert) = build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("listener");
+            addr_tx.send(server.local_addr().expect("addr")).expect("hand over the address");
+            let conn = server.accept().await.expect("incoming").await.expect("conn");
+            // Nothing to send: the peer FINs right after the handshake. What it receives stays in
+            // its local buffer (kept open, so the session never fails on it).
+            let (peer_run, peer_test) = tokio::io::duplex(64 * 1024);
+            let (peer_test_r, mut peer_test_w) = tokio::io::split(peer_test);
+            // A shutdown, not a drop: the duplex closes only with both halves gone.
+            peer_test_w.shutdown().await.expect("the peer's EOF");
+            let session = tokio::spawn(async move {
+                let _ = run_channel_session(&conn, ChannelRole::Accept, &their_priv, &our_pub, peer_run).await;
+                conn
+            });
+            freeze_rx.await.expect("freeze");
+            let _ = frozen_tx.send(());
+            // Blocks this runtime's only thread: no task of the peer runs, its QUIC stack included.
+            let _ = thaw_rx.recv();
+            let _ = tokio::time::timeout(Duration::from_secs(10), session).await;
+            drop(peer_test_r);
+        });
+    });
+
+    let addr = addr_rx.recv_timeout(Duration::from_secs(10)).expect("the peer's address");
+    let endpoint = build_channel_dialer().expect("dialer");
+    let conn = endpoint.connect(addr, "localhost").expect("cfg").await.expect("conn");
+    let (our_run, our_test) = tokio::io::duplex(64 * 1024);
+    let (mut our_test_r, mut our_test_w) = tokio::io::split(our_test);
+    let health: &'static ChannelHealth = Box::leak(Box::new(ChannelHealth::new()));
+    let session = tokio::spawn(with_health(health, async move {
+        let ended = run_channel_session(&conn, ChannelRole::Initiate, &our_priv, &their_pub, our_run).await;
+        (ended, conn)
+    }));
+    // The peer's FIN arrives here as EOF: from now on this side needs nothing more from the peer.
+    let mut nothing = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), our_test_r.read_to_end(&mut nothing))
+        .await
+        .expect("the peer's EOF within 10 s")
+        .expect("read");
+    assert_eq!(health.in_flight(false), 1, "the session is established");
+    freeze_tx.send(()).expect("freeze");
+    frozen_rx.await.expect("the peer froze");
+    // The tail, then this side's EOF: the pump is over at once, and the session waits in
+    // `stopped()` for an acknowledgement the frozen peer cannot send.
+    our_test_w.write_all(b"the tail").await.expect("tail");
+    our_test_w.shutdown().await.expect("eof");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!session.is_finished(), "the session waits for the acknowledgement of its tail");
+    assert_eq!(health.in_flight(false), 1, "so the shutdown drain must keep waiting for it too");
+    thaw_tx.send(()).expect("thaw");
+    let (ended, _conn) = tokio::time::timeout(Duration::from_secs(10), session)
+        .await
+        .expect("the session ends once the peer acknowledged the tail")
+        .expect("session task");
+    ended.expect("a clean session");
+    assert_eq!(health.in_flight(false), 0);
+    peer.join().expect("peer thread");
 }
 
 #[tokio::test]
@@ -6102,6 +6424,7 @@ async fn two_relay_only_members_join_without_a_dialable_address_and_relay_splice
             a_local,
             false,
             false, // ct-agent#22 (b): accept_race off (serial)
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -6133,6 +6456,7 @@ async fn two_relay_only_members_join_without_a_dialable_address_and_relay_splice
             b_local,
             false,
             false, // ct-agent#22 (b): accept_race off (serial)
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -6246,6 +6570,7 @@ async fn direct_upgrade_opt_in_still_completes_over_the_relay_when_the_candidate
             a_local,
             true, // #104 direct_upgrade opt-in
             false, // ct-agent#22 (b): accept_race off (serial)
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -6276,6 +6601,7 @@ async fn direct_upgrade_opt_in_still_completes_over_the_relay_when_the_candidate
             b_local,
             true, // #104 direct_upgrade opt-in
             false, // ct-agent#22 (b): accept_race off (serial)
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -6936,6 +7262,7 @@ async fn accept_race_direct_wins_and_closes_the_parked_relay_leg_22() {
             b_local,
             false,
             true, // ct-agent#22 (b): accept-vs-relay race ON
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -7162,6 +7489,7 @@ async fn accept_race_relay_wins_far_below_the_accept_window_when_no_direct_dial_
             b_local,
             false,
             true, // ct-agent#22 (b): accept-vs-relay race ON
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -7270,6 +7598,7 @@ async fn accept_race_off_does_not_dial_the_relay_before_the_accept_window_expire
             b_local,
             false,
             false, // ct-agent#22 (b): race OFF -- the default, today's serial order
+            None, // #292: no peer pin (unchanged hub semantics)
         )
         .await
     });
@@ -8468,6 +8797,314 @@ async fn forward_initiator_keeps_retrying_a_refusal_that_can_still_clear() {
     looping.abort();
 }
 
+// --- ct-agent#314: a session whose own side failed ends, even if the peer stays silent ---------
+//
+// The field report: a forward initiator logged `state=open`, then "the peer did not present its
+// grant within 10s", and never dialled again while its process stayed up. #267's reconnect
+// decision is not the cause (a gate refusal is no grant end, pinned in `peer_grant`'s tests).
+// The session itself never returned: `noise_pump` hands a local read error back from its
+// outbound direction without closing the cipher side, and its `join!` then waits for the inbound
+// direction, which ends only when the peer sends a byte or closes. A peer that finished the
+// Noise handshake and then stays silent -- a wedged process, an ungated member waiting for a
+// whole frame, a half-dead splice -- held the session and the loop behind it for ever.
+
+/// A peer that completes the Noise handshake in `role` and then holds the transport open without
+/// ever writing a byte or closing it.
+async fn silent_noise_peer(
+    transport: tokio::io::DuplexStream,
+    role: ChannelRole,
+    own_private: [u8; 32],
+    peer_public: [u8; 32],
+) {
+    let (mut r, mut w) = tokio::io::split(transport);
+    let _ = match role {
+        ChannelRole::Initiate => ct_common::a2a::a2a_initiate(&mut w, &mut r, &own_private, &peer_public).await,
+        ChannelRole::Accept => ct_common::a2a::a2a_respond(&mut w, &mut r, &own_private).await,
+    };
+    // Both halves stay alive: no byte, no FIN, ever.
+    std::future::pending::<()>().await;
+}
+
+/// One gated session in `role` against [`silent_noise_peer`] in the other role: what it returned
+/// (`None`: still running after three grant timeouts) and after how long.
+async fn gated_session_against_a_silent_peer(role: ChannelRole) -> (Option<io::Result<()>>, Duration) {
+    let (initiate_check, accept_check) = forward_grant_checks(crate::codec::now_unix() + 3600);
+    let check = match role {
+        ChannelRole::Initiate => initiate_check,
+        ChannelRole::Accept => accept_check,
+    };
+    let peer_role = match role {
+        ChannelRole::Initiate => ChannelRole::Accept,
+        ChannelRole::Accept => ChannelRole::Initiate,
+    };
+    let (me, peer) = (generate_static_keypair(), generate_static_keypair());
+    let (me_priv, me_pub, peer_priv, peer_pub) = (me.private, me.public, peer.private, peer.public);
+    let (my_transport, peer_transport) = tokio::io::duplex(1 << 16);
+    let silent = tokio::spawn(silent_noise_peer(peer_transport, peer_role, peer_priv, me_pub));
+    let (_app, local) = tokio::io::duplex(4096);
+    let gate = PeerGrantGate::new(local, Some(check));
+    let (r, w) = tokio::io::split(my_transport);
+    let started = tokio::time::Instant::now();
+    let ended = tokio::time::timeout(
+        PEER_GRANT_TIMEOUT * 3,
+        run_channel_session_on_stream(w, r, role, &me_priv, &peer_pub, gate),
+    )
+    .await
+    .ok();
+    let after = started.elapsed();
+    silent.abort();
+    (ended, after)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_grant_timeout_ends_the_session_even_if_the_peer_stays_silent_314() {
+    for role in [ChannelRole::Initiate, ChannelRole::Accept] {
+        let (ended, after) = gated_session_against_a_silent_peer(role).await;
+        let err = ended
+            .unwrap_or_else(|| panic!("{role:?}: the session must return, not wait for the silent peer for ever"))
+            .expect_err("a session whose gate refused the peer is not a clean end");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{role:?}: {err}");
+        assert!(err.to_string().contains("did not present its grant"), "{role:?}: {err}");
+        assert!(
+            after <= PEER_GRANT_TIMEOUT + LOCAL_FAILURE_GRACE + LOCAL_FAILURE_DRAIN + Duration::from_millis(100),
+            "{role:?}: ended after {after:?}"
+        );
+    }
+}
+
+/// A session's local side whose writes fail -- a stream handler that closed its stdin after
+/// reading its request -- while its reads keep delivering whatever the test feeds in.
+struct WriteFailsLocal(tokio::io::DuplexStream);
+
+impl tokio::io::AsyncRead for WriteFailsLocal {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for WriteFailsLocal {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::task::Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "the handler closed its stdin")))
+    }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_local_write_error_does_not_cut_a_still_producing_read_side_314() {
+    // The #314 bound is for a session whose own side can no longer produce anything. A local
+    // WRITE error ends only the inbound direction: a stream handler that closed its stdin can
+    // still be streaming its answer. The peer then sends one more byte (a trailing newline), the
+    // write fails -- and everything the handler produces afterwards, for longer than the grace and
+    // the drain together, must still reach the peer, as it did in v0.7.40.
+    let (a, b) = (generate_static_keypair(), generate_static_keypair());
+    let (a_priv, a_pub, b_priv, b_pub) = (a.private, a.public, b.private, b.public);
+    let (a_transport, b_transport) = tokio::io::duplex(1 << 16);
+    let (mut handler_out, handler_side) = tokio::io::duplex(4096);
+    let member = tokio::spawn(async move {
+        let (r, w) = tokio::io::split(a_transport);
+        run_channel_session_on_stream(w, r, ChannelRole::Initiate, &a_priv, &b_pub, WriteFailsLocal(handler_side)).await
+    });
+    let (mut peer_app, peer_local) = tokio::io::duplex(4096);
+    let peer = tokio::spawn(async move {
+        let (r, w) = tokio::io::split(b_transport);
+        run_channel_session_on_stream(w, r, ChannelRole::Accept, &b_priv, &a_pub, peer_local).await
+    });
+    peer_app.write_all(b"\n").await.unwrap();
+    let chunks = 6u8;
+    let producing = tokio::spawn(async move {
+        for i in 0..chunks {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            handler_out.write_all(&[b'a' + i; 100]).await.unwrap();
+        }
+        // Dropping `handler_out` is the handler's EOF.
+    });
+    assert!(
+        Duration::from_secs(u64::from(chunks)) > LOCAL_FAILURE_GRACE + LOCAL_FAILURE_DRAIN,
+        "the handler must keep producing past the bound"
+    );
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(60), peer_app.read_to_end(&mut got))
+        .await
+        .expect("the peer sees the end of the answer")
+        .unwrap();
+    let want: Vec<u8> = (0..chunks).flat_map(|i| [b'a' + i; 100]).collect();
+    assert_eq!(got.len(), want.len(), "the whole answer arrives, not the part produced within the grace");
+    assert_eq!(got, want);
+    producing.await.unwrap();
+    drop(peer_app);
+    let ended = tokio::time::timeout(Duration::from_secs(60), member)
+        .await
+        .expect("the session ends once the handler is done")
+        .unwrap();
+    assert_eq!(
+        ended.expect_err("the failed write is still reported").kind(),
+        io::ErrorKind::BrokenPipe,
+    );
+    peer.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn forward_initiator_reconnects_after_a_silent_peer_never_presents_its_grant_314() {
+    // The #314 shape end to end over the reconnect loop: every admission pairs with a peer that
+    // completes the handshake and never presents its grant. Each session must end, so the loop
+    // admits again with backoff -- on unchanged code the first session never returned.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (listener, _bound) =
+        bind_forward_listener("127.0.0.1:0".parse().unwrap()).expect("the loopback listener binds");
+    let admissions = std::sync::Arc::new(AtomicUsize::new(0));
+    let silent_peers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (counted, peers) = (admissions.clone(), silent_peers.clone());
+    let admit = move |local: LocalDuplex| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        let (initiate_check, _) = forward_grant_checks(crate::codec::now_unix() + 3600);
+        let (a, b) = (generate_static_keypair(), generate_static_keypair());
+        let (a_priv, a_pub, b_priv, b_pub) = (a.private, a.public, b.private, b.public);
+        let (a_transport, b_transport) = tokio::io::duplex(1 << 16);
+        peers
+            .lock()
+            .unwrap()
+            .push(tokio::spawn(silent_noise_peer(b_transport, ChannelRole::Accept, b_priv, a_pub)).abort_handle());
+        async move {
+            let gate = PeerGrantGate::new(local, Some(initiate_check));
+            let (ar, aw) = tokio::io::split(a_transport);
+            run_channel_session_on_stream(aw, ar, ChannelRole::Initiate, &a_priv, &b_pub, gate).await
+        }
+    };
+    let looping = tokio::spawn(run_forward_initiate_reconnect_loop(
+        listener,
+        "127.0.0.1:9".to_string(),
+        forward_stream::DEFAULT_MAX_STREAMS,
+        Duration::from_secs(forward_stream::DEFAULT_IDLE_SECS),
+        crate::codec::now_unix() + 3600,
+        admit,
+        |_: &io::Error| false,
+    ));
+    let deadline = tokio::time::Instant::now() + PEER_GRANT_TIMEOUT * 3;
+    while admissions.load(Ordering::SeqCst) < 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        admissions.load(Ordering::SeqCst) >= 2,
+        "the initiator must admit again after a session whose peer never presented its grant"
+    );
+    assert!(!looping.is_finished(), "a refusal is no grant end: the forward keeps going (#267)");
+    looping.abort();
+    for peer in silent_peers.lock().unwrap().iter() {
+        peer.abort();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn forward_reconnect_waits_are_jittered_so_a_fleet_does_not_reconnect_in_lockstep_314() {
+    // After an edge restart every forward initiator ends its session in the same second; with a
+    // deterministic 1, 2, 4 ... s backoff they all came back in lockstep. Each wait now lies in
+    // [step/2, step] of the unchanged doubling sequence, and is not the bare step.
+    use std::sync::{Arc, Mutex};
+    let (listener, _bound) =
+        bind_forward_listener("127.0.0.1:0".parse().unwrap()).expect("the loopback listener binds");
+    let admitted_at: Arc<Mutex<Vec<tokio::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    let times = admitted_at.clone();
+    let looping = tokio::spawn(run_forward_initiate_reconnect_loop(
+        listener,
+        "127.0.0.1:9".to_string(),
+        forward_stream::DEFAULT_MAX_STREAMS,
+        Duration::from_secs(forward_stream::DEFAULT_IDLE_SECS),
+        crate::codec::now_unix() + 3600,
+        move |_local: LocalDuplex| {
+            times.lock().unwrap().push(tokio::time::Instant::now());
+            async { Err::<(), io::Error>(io::Error::other("the edge is restarting")) }
+        },
+        |_: &io::Error| false,
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while admitted_at.lock().unwrap().len() < 5 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    looping.abort();
+    let at = admitted_at.lock().unwrap().clone();
+    assert!(at.len() >= 5, "the loop kept reconnecting: {} admissions", at.len());
+    // The timer wheel rounds a sleep up to the next millisecond.
+    let tick = Duration::from_millis(1);
+    let mut step = FORWARD_RECONNECT_MIN;
+    let mut shorter = 0;
+    for pair in at.windows(2).take(4) {
+        let gap = pair[1] - pair[0];
+        assert!(gap >= step / 2 && gap <= step + tick, "gap {gap:?} outside [{:?}, {step:?}]", step / 2);
+        if gap + tick < step {
+            shorter += 1;
+        }
+        step = (step * 2).min(FORWARD_RECONNECT_MAX);
+    }
+    assert!(shorter > 0, "every wait was the bare deterministic step: no jitter");
+}
+
+#[tokio::test]
+async fn a_forward_accept_gate_presents_its_grant_without_the_opt_in_314() {
+    // The issue's own hypothesis was that a persistent-serve accept member of a forward
+    // (CT_CHANNEL_SERVE=1 + CT_CHANNEL_FORWARD_ALLOW) never ran the gate, and that
+    // CT_CHANNEL_REQUIRE_PEER_GRANT=1 was the fix. This pins the rule that refutes it: a forward
+    // accept member's gate forces the check whatever the opt-in says, so the accept side's first
+    // bytes towards the peer are its own grant. That the serve loop's sessions get their gate
+    // here is read from the code, not driven by this test: `serve_admitted_session` ->
+    // `run_channel_join_with_admission` -> `gate_local` -> `gate_local_from`, the same call every
+    // plane session makes (driving it would need process-wide env, which these tests avoid).
+    use ed25519_dalek::Signer as _;
+    let operator = ed25519_dalek::SigningKey::from_bytes(&[0x41u8; 32]);
+    let holder = ed25519_dalek::SigningKey::from_bytes(&[0x03u8; 32]);
+    let g = ct_common::channel::ChannelGrant {
+        channel: ct_common::channel::ChannelId([0x97u8; 32]),
+        holder: holder.verifying_key().to_bytes(),
+        direction: ct_common::channel::Direction::Accept,
+        rights: ct_common::channel::Rights::ReadWrite,
+        delegable: false,
+        expires_at: crate::codec::now_unix() + 3600,
+    };
+    let request = ChannelJoinRequest {
+        grant: ct_common::channel::SignedChannelGrant { signature: operator.sign(&g.signing_bytes()).to_bytes(), grant: g },
+        endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+    };
+    let operator_hex = crate::codec::hex_encode(&operator.verifying_key().to_bytes());
+    // What the gate reads of a forward accept member's configuration; the role is the argument.
+    let forward_accept = |k: &str| match k {
+        forward::FORWARD_ALLOW_ENV => Some("127.0.0.1:5432".to_string()),
+        OPERATOR_PUBKEY_ENV => Some(operator_hex.clone()),
+        _ => None, // no CT_CHANNEL_REQUIRE_PEER_GRANT
+    };
+    let (_app, local) = tokio::io::duplex(4096);
+    let mut gate = gate_local_from(local, &request, ChannelRole::Accept, [0x02u8; 32], &holder, &forward_accept)
+        .expect("a forward accept member with an operator key builds its gate");
+    let mut first = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(5), gate.read_exact(&mut first))
+        .await
+        .expect("the grant is the first thing the session reads")
+        .unwrap();
+    assert_eq!(&first, b"CTPG1", "the accept side presents its grant without the opt-in");
+
+    // The control: the same member without the allowlist is no forward, and without the opt-in
+    // its gate stays transparent -- so the line above is the forward rule, not a default.
+    let not_a_forward = |k: &str| (k == OPERATOR_PUBKEY_ENV).then(|| operator_hex.clone());
+    let (mut app, local) = tokio::io::duplex(4096);
+    let mut gate = gate_local_from(local, &request, ChannelRole::Accept, [0x02u8; 32], &holder, &not_a_forward)
+        .expect("builds");
+    app.write_all(b"plain").await.unwrap();
+    let mut got = [0u8; 5];
+    gate.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"plain");
+}
+
 /// Reads until `tcp` either delivers exactly `expect_len` bytes or EOFs, returning exactly the
 /// bytes it got. An empty result is a clean refusal (the cap bit before a single echo byte came
 /// back); `expect_len` bytes is a full echo; anything in between is the truncation this test
@@ -8745,8 +9382,24 @@ async fn channel_forward_aborted_client_stops_the_target_and_frees_the_channel()
 // --- flow control per stream (see the design of the forward, section 5). Measured on two nodes: one slow receiver stalled every other stream
 // of the same forward (50/50 fast requests timed out while a 64 KiB/s export ran).
 
+/// One write of a [`spawn_flow_target`] download, and the largest read of
+/// [`read_pattern_with_stall_watchdog`].
+const FLOW_CHUNK: usize = 64 * 1024;
+
+/// The `n` bytes at `offset` of every [`spawn_flow_target`] download: byte `i` is `i % 251`.
+/// #304: built once, with 250 bytes of slack, so any offset is one slice -- the target writes it
+/// and the reader compares it with one memcmp. The per-byte loops on both sides it replaces ran
+/// at opt-level 0 and were part of the CPU time of the 64 MiB test.
+fn flow_pattern_at(offset: usize, n: usize) -> &'static [u8] {
+    static PATTERN: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| (0..FLOW_CHUNK + 251).map(|i| (i % 251) as u8).collect());
+    &pattern[offset % 251..][..n]
+}
+
 /// Target for the flow-control tests: the first byte of each connection picks its role.
-/// `b'B'` = big download (`len` bytes of a fixed pattern, then close), anything else = echo.
+/// `b'B'` = big download (`len` bytes of a fixed pattern, then close), `b'S'` = the same `len`
+/// bytes, then silence with the connection held open (a stalled download, #304), anything
+/// else = echo.
 async fn spawn_flow_target(len: usize) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -8758,18 +9411,24 @@ async fn spawn_flow_target(len: usize) -> SocketAddr {
                 if s.read_exact(&mut first).await.is_err() {
                     return;
                 }
-                if first[0] == b'B' {
+                if first[0] == b'B' || first[0] == b'S' {
                     let mut sent = 0usize;
-                    let mut chunk = vec![0u8; 64 * 1024];
                     while sent < len {
-                        let n = chunk.len().min(len - sent);
-                        for (i, b) in chunk[..n].iter_mut().enumerate() {
-                            *b = ((sent + i) % 251) as u8;
-                        }
-                        if s.write_all(&chunk[..n]).await.is_err() {
+                        let n = FLOW_CHUNK.min(len - sent);
+                        if s.write_all(flow_pattern_at(sent, n)).await.is_err() {
                             return;
                         }
                         sent += n;
+                    }
+                    if first[0] == b'S' {
+                        // No shutdown: the reader must see a stall, not an end of stream.
+                        let mut rest = [0u8; 256];
+                        loop {
+                            match s.read(&mut rest).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => {}
+                            }
+                        }
                     }
                     let _ = s.shutdown().await;
                 } else {
@@ -8832,39 +9491,229 @@ async fn channel_forward_slow_receiver_does_not_stall_other_streams() {
     .expect("test hung for 60 s");
 }
 
+/// #304/#309: how long a pattern download may go without a single byte before the reader calls
+/// it a stall. The 64 MiB test used to have a fixed 60 s for the whole transfer. On CI it took
+/// p50 49 s, p90 58 s, max 59.6 s over 75 green runs, and each of its 5 failures was that 60 s
+/// limit itself -- never a short or corrupted transfer. Even the slowest green run delivered a
+/// 64 KiB read every ~60 ms, so 20 s without a byte is a stall, not a slow runner.
+const TRANSFER_STALL: Duration = Duration::from_secs(20);
+
+/// #304/#309: the outer bound of the large-transfer test. It only stops a transfer that keeps
+/// trickling (never TRANSFER_STALL without a byte) from holding CI forever: 10x the slowest
+/// green CI run.
+const TRANSFER_BACKSTOP: Duration = Duration::from_secs(600);
+
+/// Reads a [`spawn_flow_target`] download of `len` bytes from `r`, checking every byte against
+/// the pattern. #304: fails on missing PROGRESS -- no byte for `stall` -- instead of on a time
+/// budget for the whole transfer; and on a corrupted byte or a short or long stream. The error
+/// carries the bytes received and a report with the elapsed time and the average rate. For
+/// `slow_phase` it first reads 4 KiB every 10 ms (a slow receiver), then up to 64 KiB at once.
+/// Returns how long the download took and the longest wait for a single read, i.e. how close
+/// the download came to `stall`.
+async fn read_pattern_with_stall_watchdog<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut R,
+    len: usize,
+    stall: Duration,
+    slow_phase: Duration,
+) -> Result<(Duration, Duration), (usize, String)> {
+    // tokio's clock: wall time here, virtual time in a paused-time test.
+    let started = tokio::time::Instant::now();
+    let report = |got: usize| {
+        let secs = started.elapsed().as_secs_f64();
+        let mib = got as f64 / f64::from(1u32 << 20);
+        format!("after {got} of {len} bytes ({mib:.1} MiB), {secs:.1} s in, {:.2} MiB/s", mib / secs.max(0.001))
+    };
+    let mut buf = vec![0u8; FLOW_CHUNK];
+    let mut got = 0usize;
+    let mut next_progress = 16 << 20;
+    let mut longest_wait = Duration::ZERO;
+    loop {
+        let slow = started.elapsed() < slow_phase;
+        let want = if slow { 4096 } else { buf.len() };
+        // A fresh bound for every read: the watchdog measures progress, not the whole download.
+        let asked = tokio::time::Instant::now();
+        let n = match tokio::time::timeout(stall, r.read(&mut buf[..want])).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err((got, format!("read failed ({e}) {}", report(got)))),
+            Err(_) => return Err((got, format!("stalled: no byte for {stall:?} {}", report(got)))),
+        };
+        longest_wait = longest_wait.max(asked.elapsed());
+        if n == 0 {
+            if got == len {
+                return Ok((started.elapsed(), longest_wait));
+            }
+            return Err((got, format!("ended early: end of stream {}", report(got))));
+        }
+        if got + n > len {
+            return Err((got, format!("more bytes than sent: {} {}", got + n, report(got))));
+        }
+        let expected = flow_pattern_at(got, n);
+        if buf[..n] != *expected {
+            let i = buf[..n].iter().zip(expected).position(|(a, b)| a != b).unwrap_or(0);
+            let what = format!("byte {} corrupted ({} instead of {})", got + i, buf[i], expected[i]);
+            return Err((got, format!("{what} {}", report(got))));
+        }
+        got += n;
+        if got >= next_progress {
+            // Shown with a failure (or --nocapture): how the rate developed up to it.
+            eprintln!("pattern download: {}", report(got));
+            next_progress += 16 << 20;
+        }
+        if slow {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
 /// T2: a large transfer arrives complete and in order, read slowly first and then at full speed.
+/// #304/#309: bounded by progress (TRANSFER_STALL), not by a fixed time for all 64 MiB -- that
+/// measured the runner's single-core speed (debug-build Noise on one thread), not the forward.
 #[tokio::test]
 async fn channel_forward_large_transfer_arrives_complete() {
-    tokio::time::timeout(Duration::from_secs(60), async {
+    tokio::time::timeout(TRANSFER_BACKSTOP, async {
         const LEN: usize = 64 << 20;
         let target = spawn_flow_target(LEN).await;
         let (bound, a_task, b_task) = spawn_forward_pair(target.to_string(), 16, Duration::from_secs(60));
         let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
         c.write_all(b"B").await.unwrap();
-        let mut got = 0usize;
-        let mut buf = vec![0u8; 64 * 1024];
         // First 2 s: a slow reader (4 KiB every 10 ms), then full speed.
-        let slow_until = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let want = if std::time::Instant::now() < slow_until { 4096 } else { buf.len() };
-            let n = c.read(&mut buf[..want]).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            for (i, b) in buf[..n].iter().enumerate() {
-                assert_eq!(*b, ((got + i) % 251) as u8, "byte {} corrupted", got + i);
-            }
-            got += n;
-            if std::time::Instant::now() < slow_until {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-        assert_eq!(got, LEN, "the transfer must arrive complete");
+        let (took, longest_wait) =
+            read_pattern_with_stall_watchdog(&mut c, LEN, TRANSFER_STALL, Duration::from_secs(2))
+                .await
+                .unwrap_or_else(|(_, e)| panic!("the transfer must arrive complete: {e}"));
+        // A slower forward no longer fails this test, so every run logs its rate and its headroom
+        // to TRANSFER_STALL. Written past libtest's capture, which shows `eprintln!` only for a
+        // failing test (CI runs plain `cargo test`), as one write so the line stays whole.
+        let mib = LEN as f64 / f64::from(1u32 << 20);
+        let secs = took.as_secs_f64();
+        let line = format!(
+            "T2 (#304): {mib:.0} MiB through the forward pair in {secs:.1} s ({:.2} MiB/s), \
+             longest wait for a byte {longest_wait:.1?} (stall bound {TRANSFER_STALL:?})\n",
+            mib / secs
+        );
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+        a_task.abort();
+        b_task.abort();
+    })
+    .await
+    .expect("test hung for 600 s (TRANSFER_BACKSTOP); the progress lines above show how far it got");
+}
+
+/// #304: the stall watchdog of T2 fires through the forward. The target sends 1 MiB, then goes
+/// silent with the connection open -- a download stuck mid-way -- and the reader must give up
+/// after its bound with a stall report, neither hang nor pass. The watchdog starts once the first
+/// byte is through, so a forward that delivers nothing fails here instead of passing as a "stall
+/// after 0 bytes". (The exact byte count of a report is pinned by the in-memory test below; here
+/// a runtime stall on a loaded runner during the first MiB could legitimately trip the 2 s
+/// watchdog early, so the count is only bounded: more than 0, at most the 1 MiB sent.)
+#[tokio::test]
+async fn channel_forward_stall_watchdog_reports_a_silent_target_304() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        const SENT: usize = 1 << 20;
+        let target = spawn_flow_target(SENT).await;
+        let (bound, a_task, b_task) = spawn_forward_pair(target.to_string(), 16, Duration::from_secs(60));
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        c.write_all(b"S").await.unwrap();
+        // `peek` returns only once a byte is there (or at end of stream), and leaves it unread.
+        let peeked = tokio::time::timeout(TRANSFER_STALL, c.peek(&mut [0u8; 1]))
+            .await
+            .expect("no byte through the forward within TRANSFER_STALL")
+            .unwrap();
+        assert_eq!(peeked, 1, "the forward ended the download before its first byte");
+        let t = std::time::Instant::now();
+        let (got, e) = read_pattern_with_stall_watchdog(&mut c, 4 * SENT, Duration::from_secs(2), Duration::ZERO)
+            .await
+            .expect_err("a target that goes silent must trip the stall watchdog");
+        assert!(e.starts_with("stalled: no byte for 2s after "), "{e}");
+        assert!(got > 0 && got <= SENT && e.contains(&format!("after {got} of {} bytes", 4 * SENT)), "{e}");
+        assert!(e.contains(" s in, ") && e.ends_with(" MiB/s"), "the report carries time and rate: {e}");
+        assert!(t.elapsed() >= Duration::from_secs(2), "fired before its bound: {e}");
         a_task.abort();
         b_task.abort();
     })
     .await
     .expect("test hung for 60 s");
+}
+
+/// #304: the reader's pattern check is not vacuous (one memcmp per read replaced a per-byte
+/// assertion) and its reports are exact: a stall, a corrupted byte, a short and a long stream
+/// each fail with the right byte count. In memory and on paused time, so the stall bound is free.
+#[tokio::test(start_paused = true)]
+async fn pattern_reader_reports_a_stall_a_corrupted_byte_and_a_wrong_length_304() {
+    async fn read(data: &[u8], len: usize) -> Result<(Duration, Duration), (usize, String)> {
+        let mut rest = data;
+        read_pattern_with_stall_watchdog(&mut rest, len, TRANSFER_STALL, Duration::ZERO).await
+    }
+    let len = 3 * FLOW_CHUNK + 1000;
+    let mut data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    assert!(read(&data, len).await.is_ok(), "the exact pattern passes");
+
+    let bad = 2 * FLOW_CHUNK + 77;
+    data[bad] ^= 0xff;
+    let (got, e) = read(&data, len).await.expect_err("a flipped byte fails");
+    assert_eq!(got, 2 * FLOW_CHUNK, "{e}");
+    assert!(e.starts_with(&format!("byte {bad} corrupted")), "{e}");
+    data[bad] ^= 0xff;
+
+    let (got, e) = read(&data[..len - 1], len).await.expect_err("one byte short fails");
+    assert_eq!(got, len - 1, "{e}");
+    assert!(e.starts_with("ended early: end of stream"), "{e}");
+    let (_, e) = read(&data, len - 1).await.expect_err("one byte too many fails");
+    assert!(e.starts_with(&format!("more bytes than sent: {len}")), "{e}");
+
+    // A stall: the first chunk, then silence with the writer still open. With a bound other than
+    // TRANSFER_STALL, so a reader that ignores its `stall` argument fails here.
+    let stall = Duration::from_secs(7);
+    let (mut w, mut r) = tokio::io::duplex(FLOW_CHUNK);
+    let head = data[..FLOW_CHUNK].to_vec();
+    tokio::spawn(async move {
+        w.write_all(&head).await.unwrap();
+        std::future::pending::<()>().await; // keeps `w` open: silence, not end of stream
+    });
+    // Without a working watchdog no timer is left and paused time parks for good; the hour (free
+    // on paused time) turns that hang into a failure.
+    let (got, e) = tokio::time::timeout(
+        Duration::from_secs(3600),
+        read_pattern_with_stall_watchdog(&mut r, len, stall, Duration::ZERO),
+    )
+    .await
+    .expect("no stall report within an hour: the reader has no working watchdog")
+    .expect_err("silence trips the watchdog");
+    assert_eq!(got, FLOW_CHUNK, "{e}");
+    assert_eq!(
+        e,
+        format!("stalled: no byte for 7s after {FLOW_CHUNK} of {len} bytes (0.1 MiB), 7.0 s in, 0.01 MiB/s")
+    );
+}
+
+/// #304/#309: the bound is on PROGRESS, not on the whole download -- the point of the change. A
+/// download that takes three times TRANSFER_STALL in all, but never waits that long for a byte,
+/// must pass; a bound on the total time (the old fixed 60 s under another name) fails it. With
+/// the crypto optimized, T2 itself ends far below TRANSFER_STALL and could not tell the two apart.
+/// Paused time, so the minute is free.
+#[tokio::test(start_paused = true)]
+async fn pattern_reader_passes_a_slow_download_that_never_stalls_304() {
+    let len = 3 * FLOW_CHUNK + 1000;
+    let gap = TRANSFER_STALL - Duration::from_secs(5);
+    let (mut w, mut r) = tokio::io::duplex(FLOW_CHUNK);
+    tokio::spawn(async move {
+        let mut sent = 0;
+        while sent < len {
+            let n = FLOW_CHUNK.min(len - sent);
+            tokio::time::sleep(gap).await;
+            w.write_all(flow_pattern_at(sent, n)).await.unwrap();
+            sent += n;
+        }
+        // `w` drops here: end of stream.
+    });
+    let (took, longest_wait) = read_pattern_with_stall_watchdog(&mut r, len, TRANSFER_STALL, Duration::ZERO)
+        .await
+        .unwrap_or_else(|(_, e)| panic!("a slow download that never stalls must pass: {e}"));
+    assert!(took >= 3 * TRANSFER_STALL, "four gaps of {gap:?}, yet the download took only {took:?}");
+    assert!(
+        longest_wait >= gap && longest_wait < TRANSFER_STALL,
+        "the longest wait for a byte is one gap of {gap:?}, not {longest_wait:?}"
+    );
 }
 
 /// A forward pair with credit flow control switched per member (mixed-version tests).
@@ -11064,4 +11913,839 @@ async fn channel_forward_new_connection_is_answered_while_uploads_fill_a_slow_re
         .await
         .expect("a new connection waited more than 15 s behind sixteen uploads");
     eprintln!("new connection behind sixteen uploads over a 62 500 B/s relay: {took:?}");
+}
+
+// --- #292: CT_CHANNEL_PEER_PIN, binding an endpoint to its partner --------------------------------
+//
+// A channel is a hub (ADR-0020): admission pairs a member with any other member holding a grant,
+// and nothing compared that peer with an expected partner. These drive the real join paths with an
+// admission that names the partner, another member, or the partner under another Noise key, and
+// check what the pin lets through -- and that a refusal takes the leg its session would have taken
+// and closes it before the Noise handshake, is no grant end (#267) and no flap (#250).
+
+/// The operator signing key of the pin tests; its public key also derives the link channel.
+fn pin_operator() -> SigningKey {
+    SigningKey::from_bytes(&[0x0Au8; 32])
+}
+
+/// One member of a pin test channel: its holder key, its Noise keypair (copied out:
+/// `StaticKeypair` is not `Clone`) and its holder-signed attestation for that channel.
+struct PinMember {
+    holder: SigningKey,
+    noise_private: [u8; 32],
+    noise_public: [u8; 32],
+    attestation: [u8; 64],
+}
+
+impl PinMember {
+    fn new(channel: [u8; 32], seed: u8) -> Self {
+        Self::with_noise(channel, seed, generate_static_keypair())
+    }
+
+    /// The member with holder seed `seed` under the given Noise key -- the same holder with a
+    /// rotated (or rolled-back) key when `seed` is reused.
+    fn with_noise(channel: [u8; 32], seed: u8, noise: ct_common::noise::StaticKeypair) -> Self {
+        use ed25519_dalek::Signer as _;
+        let holder = SigningKey::from_bytes(&[seed; 32]);
+        let holder_pub = holder.verifying_key().to_bytes();
+        let attestation = holder
+            .sign(&ct_common::channel::member_noise_attest_bytes(
+                &ct_common::channel::ChannelId(channel),
+                &holder_pub,
+                &noise.public,
+            ))
+            .to_bytes();
+        Self { holder, noise_private: noise.private, noise_public: noise.public, attestation }
+    }
+
+    fn holder_pub(&self) -> [u8; 32] {
+        self.holder.verifying_key().to_bytes()
+    }
+
+    /// What the edge hands the OTHER member when it pairs it with this one.
+    fn admitted_as_peer(&self, endpoint: &str) -> ChannelJoinOutcome {
+        ChannelJoinOutcome::Admitted {
+            peer_endpoint: endpoint.to_string(),
+            peer_noise_pubkey: Some(self.noise_public),
+            peer_holder: Some(self.holder_pub()),
+            peer_attestation: Some(self.attestation),
+            observed_reflexive: None,
+        }
+    }
+
+    /// This member's operator-signed grant on `channel` for `role`.
+    fn grant(&self, channel: [u8; 32], role: ChannelRole) -> ct_common::channel::SignedChannelGrant {
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ed25519_dalek::Signer as _;
+        let g = ChannelGrant {
+            channel: ChannelId(channel),
+            holder: self.holder_pub(),
+            direction: match role {
+                ChannelRole::Initiate => Direction::Initiate,
+                ChannelRole::Accept => Direction::Accept,
+            },
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: crate::codec::now_unix() + 3600,
+        };
+        SignedChannelGrant { signature: pin_operator().sign(&g.signing_bytes()).to_bytes(), grant: g }
+    }
+
+    fn request(&self, channel: [u8; 32], role: ChannelRole) -> ChannelJoinRequest {
+        ChannelJoinRequest {
+            grant: self.grant(channel, role),
+            endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+        }
+    }
+}
+
+/// The members of one link-derived pin test channel: `me`, my `partner` (the other end of the
+/// link), `other` (a third member holding a grant) and `rotated` (the partner's holder under
+/// another Noise key).
+struct PinChannel {
+    channel: [u8; 32],
+    me: PinMember,
+    partner: PinMember,
+    other: PinMember,
+    rotated: PinMember,
+}
+
+fn pin_channel() -> PinChannel {
+    let (me_seed, partner_seed) = (0x31u8, 0x32u8);
+    let channel = ct_common::channel::channel_id_for_link(
+        &pin_operator().verifying_key().to_bytes(),
+        &SigningKey::from_bytes(&[me_seed; 32]).verifying_key().to_bytes(),
+        &SigningKey::from_bytes(&[partner_seed; 32]).verifying_key().to_bytes(),
+    )
+    .0;
+    PinChannel {
+        channel,
+        me: PinMember::new(channel, me_seed),
+        partner: PinMember::new(channel, partner_seed),
+        other: PinMember::new(channel, 0x33),
+        rotated: PinMember::new(channel, partner_seed),
+    }
+}
+
+fn pin_on(member: &PinMember, noise: Option<[u8; 32]>) -> PeerPin {
+    PeerPin::Peers(vec![PinnedPeer { holder: member.holder_pub(), noise }])
+}
+
+fn pin_link() -> PeerPin {
+    PeerPin::Link { operator: pin_operator().verifying_key().to_bytes() }
+}
+
+/// A UDP address nothing listens on: a relay leg that must never be needed.
+fn pin_dead_addr() -> SocketAddr {
+    let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    s.local_addr().unwrap()
+}
+
+/// A relay address that refuses every QUIC connection at once: a relay leg that is tried fails
+/// fast (a dead address would hold it for the dialer's whole idle timeout).
+fn pin_refusing_relay() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let (ep, _) = build_server_endpoint_with_cert().expect("refusing relay");
+    let addr = ep.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        while let Some(incoming) = ep.accept().await {
+            incoming.refuse();
+        }
+    });
+    (addr, task)
+}
+
+/// One leg as the endpoint it was opened to saw it (a peer's direct listener, or the relay):
+/// whether the member connected, whether it opened a stream (a Noise handshake message needs one;
+/// on the relay, so does the join presentation), and whether it closed the connection with the
+/// pin's close reason.
+#[derive(Debug, Default, Clone, Copy)]
+struct LegSeen {
+    connected: bool,
+    stream: bool,
+    pin_close: bool,
+}
+
+/// Accept one connection on `server` within `timeout` and watch it for two seconds (see
+/// [`LegSeen`]); dropping `server` at the end closes whatever is still open.
+async fn watch_one_leg(server: Endpoint, timeout: Duration) -> LegSeen {
+    let incoming = match tokio::time::timeout(timeout, server.accept()).await {
+        Ok(Some(incoming)) => incoming,
+        _ => return LegSeen::default(),
+    };
+    let Ok(conn) = incoming.await else {
+        return LegSeen::default();
+    };
+    let stream = matches!(tokio::time::timeout(Duration::from_secs(2), conn.accept_bi()).await, Ok(Ok(_)));
+    let pin_close = match tokio::time::timeout(Duration::from_secs(2), conn.closed()).await {
+        Ok(quinn::ConnectionError::ApplicationClosed(close)) => close.reason.as_ref() == b"peer not pinned (#292)",
+        _ => false,
+    };
+    LegSeen { connected: true, stream, pin_close }
+}
+
+/// What one admitted session did: its result, what the peer's advertised address and the relay
+/// saw of it, and the grant end it recorded (#267).
+struct PinJoinWatch {
+    result: Result<(), BoxError>,
+    peer: LegSeen,
+    relay: LegSeen,
+    grant_end: Option<String>,
+}
+
+/// Runs `c.me` through `run_channel_join_with_admission` in `role`, admitted with `peer`, against
+/// two live endpoints that watch what reaches them: the peer's advertised address (an initiator
+/// dials it) and the relay (an acceptor without a listener goes there).
+async fn join_and_watch(c: &PinChannel, role: ChannelRole, peer: &PinMember, pin: Option<&PeerPin>) -> PinJoinWatch {
+    let (peer_ep, _) = build_server_endpoint_with_cert().expect("peer endpoint");
+    let (relay_ep, _) = build_server_endpoint_with_cert().expect("relay endpoint");
+    let peer_addr = peer_ep.local_addr().unwrap();
+    let relay_addr = relay_ep.local_addr().unwrap();
+    let seen_peer = tokio::spawn(watch_one_leg(peer_ep, Duration::from_millis(1500)));
+    let seen_relay = tokio::spawn(watch_one_leg(relay_ep, Duration::from_millis(1500)));
+    let record = super::peer_grant::GrantEndRecord::default();
+    let (_app, local) = tokio::io::duplex(1024);
+    let request = c.me.request(c.channel, role);
+    let joined = tokio::time::timeout(
+        Duration::from_secs(20),
+        super::peer_grant::with_grant_end_record(
+            record.clone(),
+            run_channel_join_with_admission(
+                peer.admitted_as_peer(&peer_addr.to_string()),
+                RelayFallback::QuicLazy(relay_addr),
+                &request,
+                &c.me.holder,
+                role,
+                &c.me.noise_private,
+                None, // no listener: an acceptor goes straight to the relay leg
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                local,
+                false,
+                false,
+                pin,
+            ),
+        ),
+    )
+    .await;
+    PinJoinWatch {
+        result: joined.unwrap_or_else(|_| Err("the join did not end within 20 s".into())),
+        peer: seen_peer.await.unwrap(),
+        relay: seen_relay.await.unwrap(),
+        grant_end: record.ended(),
+    }
+}
+
+#[tokio::test]
+async fn an_unpinned_peer_is_refused_and_its_leg_closed_before_the_handshake_in_both_roles_292() {
+    let c = pin_channel();
+    let cases = [
+        ("another member of the channel", pin_on(&c.partner, None), &c.other),
+        ("the partner under another Noise key", pin_on(&c.partner, Some(c.partner.noise_public)), &c.rotated),
+        ("a member that is not the other end of the link", pin_link(), &c.other),
+    ];
+    for role in [ChannelRole::Initiate, ChannelRole::Accept] {
+        // Control: unpinned, the same admission takes its leg -- an initiator dials the peer and
+        // sends its Noise handshake message on a stream, a listener-less acceptor goes to the relay.
+        let control = join_and_watch(&c, role, &c.other, None).await;
+        match role {
+            ChannelRole::Initiate => {
+                assert!(control.peer.connected && control.peer.stream, "control: the initiator dials and handshakes");
+                assert!(!control.peer.pin_close, "control: no pin, no pin close");
+            }
+            ChannelRole::Accept => assert!(control.relay.connected, "control: the acceptor opens a relay leg"),
+        }
+        for (what, pin, peer) in &cases {
+            let seen = join_and_watch(&c, role, peer, Some(pin)).await;
+            let Err(err) = seen.result else { panic!("{what} ({role:?}): not refused") };
+            assert!(super::peer_pin::is_peer_not_pinned(&err), "{what} ({role:?}): {err}");
+            assert!(
+                !is_definitive_admission_refusal(&err) && !is_park_expired(&err),
+                "{what} ({role:?}): not an edge refusal or a park expiry, so no refusal backoff: {err}"
+            );
+            assert_eq!(seen.grant_end, None, "{what} ({role:?}): a pin refusal is not a grant end (#267)");
+            // The refusal takes the leg the session would have taken, so the refused member's own
+            // leg is not left for this endpoint's next session -- but nothing of the session on it.
+            match role {
+                ChannelRole::Initiate => {
+                    assert!(seen.peer.connected, "{what}: the refusal dials the admitted address like a session");
+                    assert!(!seen.peer.stream, "{what}: no stream, so no Noise handshake message");
+                    assert!(seen.peer.pin_close, "{what}: closed at once with the pin's close reason");
+                    assert!(!seen.relay.connected, "{what}: the direct leg was the leg; no relay leg");
+                }
+                ChannelRole::Accept => {
+                    assert!(seen.relay.connected, "{what}: the refusal takes its relay leg like a session");
+                    assert!(!seen.peer.connected, "{what}: an acceptor dials nobody");
+                }
+            }
+        }
+    }
+}
+
+/// A member's relay leg driven by hand, without a Noise session: present the join to the relay
+/// and, once the edge has spliced the leg, send a few bytes when initiating (the edge forwards an
+/// initiator's stream once it carries data), then count what arrives from the other end until
+/// the leg ends.
+async fn raw_relay_leg(
+    relay_addr: SocketAddr,
+    request: ChannelJoinRequest,
+    holder: SigningKey,
+    role: ChannelRole,
+) -> Result<usize, BoxError> {
+    let conn = crate::transport::build_channel_dialer()?.connect(relay_addr, "localhost")?.await?;
+    match present_channel_join_marked(&conn, &request, &holder, PHASE_MARKER_RELAY).await? {
+        ChannelJoinOutcome::Admitted { .. } => {}
+        other => return Err(format!("the relay did not admit the raw leg: {other:?}").into()),
+    }
+    let Ok((mut send, mut recv)) = open_relay_channel_streams(&conn, role).await else {
+        return Ok(0);
+    };
+    if role == ChannelRole::Initiate {
+        let _ = send.write_all(b"not a noise message").await;
+    }
+    let mut got = Vec::new();
+    let _ = AsyncReadExt::read_to_end(&mut recv, &mut got).await;
+    Ok(got.len())
+}
+
+#[tokio::test]
+async fn a_refused_pairing_uses_up_its_relay_leg_so_the_partner_is_spliced_next_292() {
+    // Review finding on the first version, which refused before any I/O: the edge pairs relay
+    // legs on their own (the next arrivals here, the oldest waiting leg of another holder in the
+    // field), not by the rendezvous pairing. The refused member does not know it was refused and
+    // parks its relay leg as for any session; with no leg of this endpoint to meet, that leg
+    // waited -- and the edge spliced it with this endpoint's NEXT leg, the partner's session.
+    // Driven over the production relay completer (`broker_channel_relay`), in both roles.
+    use ct_edge::channel_broker::broker_channel_relay;
+    let c = pin_channel();
+    let pin = pin_on(&c.partner, None);
+    let op_pub = pin_operator().verifying_key().to_bytes();
+    for role in [ChannelRole::Initiate, ChannelRole::Accept] {
+        let peer_role = match role {
+            ChannelRole::Initiate => ChannelRole::Accept,
+            ChannelRole::Accept => ChannelRole::Initiate,
+        };
+        let channel = c.channel;
+        let (relay_ep, _) = build_server_endpoint_with_cert().expect("relay");
+        let relay_addr = relay_ep.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            loop {
+                let _ = broker_channel_relay(&relay_ep, 500, move |ch, _h| async move {
+                    (ch.0 == channel).then_some((op_pub, None, None))
+                })
+                .await;
+            }
+        });
+
+        // 1. The other member parks its relay leg first, as it does after any rendezvous pairing
+        //    with a relay-only member.
+        let other_leg = tokio::spawn(raw_relay_leg(
+            relay_addr,
+            c.other.request(c.channel, peer_role),
+            c.other.holder.clone(),
+            peer_role,
+        ));
+        // 2. This endpoint, paired with that member by the rendezvous, is pinned to the partner.
+        let (_app, local) = tokio::io::duplex(1024);
+        let request = c.me.request(c.channel, role);
+        let refused = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_channel_join_with_admission(
+                c.other.admitted_as_peer(ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY),
+                RelayFallback::QuicLazy(relay_addr),
+                &request,
+                &c.me.holder,
+                role,
+                &c.me.noise_private,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                local,
+                false,
+                false,
+                Some(&pin),
+            ),
+        )
+        .await
+        .expect("the refusal ends");
+        let Err(err) = refused else { panic!("{role:?}: the other member was not refused") };
+        assert!(super::peer_pin::is_peer_not_pinned(&err), "{role:?}: {err}");
+        let got = tokio::time::timeout(Duration::from_secs(15), other_leg)
+            .await
+            .unwrap_or_else(|_| panic!("{role:?}: the other member's relay leg was left waiting at the relay"))
+            .unwrap()
+            .expect("the other member's leg was admitted");
+        assert_eq!(got, 0, "{role:?}: not one byte -- no Noise handshake message -- from the refusing endpoint");
+
+        // 3. The partner's session: its leg and this endpoint's next one are spliced together.
+        let payload = b"the partner, spliced next".to_vec();
+        let (mut my_app, my_local) = tokio::io::duplex(8192);
+        let (mut partner_app, partner_local) = tokio::io::duplex(8192);
+        let (me_holder, me_priv, me_admitted) = (
+            c.me.holder.clone(),
+            c.me.noise_private,
+            c.me.admitted_as_peer(ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY),
+        );
+        let (partner_holder, partner_priv, partner_admitted) = (
+            c.partner.holder.clone(),
+            c.partner.noise_private,
+            c.partner.admitted_as_peer(ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY),
+        );
+        let (my_request, partner_request) = (c.me.request(c.channel, role), c.partner.request(c.channel, peer_role));
+        let pin_mine = pin.clone();
+        let mine = tokio::spawn(async move {
+            run_channel_join_with_admission(
+                partner_admitted,
+                RelayFallback::QuicLazy(relay_addr),
+                &my_request,
+                &me_holder,
+                role,
+                &me_priv,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                my_local,
+                false,
+                false,
+                Some(&pin_mine),
+            )
+            .await
+        });
+        let theirs = tokio::spawn(async move {
+            run_channel_join_with_admission(
+                me_admitted,
+                RelayFallback::QuicLazy(relay_addr),
+                &partner_request,
+                &partner_holder,
+                peer_role,
+                &partner_priv,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                partner_local,
+                false,
+                false,
+                None,
+            )
+            .await
+        });
+        partner_app.write_all(&payload).await.expect("the partner writes");
+        let mut got = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(15), my_app.read_exact(&mut got))
+            .await
+            .unwrap_or_else(|_| panic!("{role:?}: the partner's session carried nothing"))
+            .expect("read");
+        assert_eq!(got, payload, "{role:?}: the partner's bytes arrive over its spliced session");
+        mine.abort();
+        theirs.abort();
+        relay.abort();
+    }
+}
+
+/// Runs `me` through `run_channel_join_with_admission` in `role`, paired (by the admission) with
+/// `peer`, which runs a real direct Noise session on the other side; whether a payload crossed it.
+async fn pinned_session_carries_data(me: &PinMember, peer: &PinMember, channel: [u8; 32], role: ChannelRole, pin: Option<PeerPin>) -> bool {
+    let payload = b"only the pinned partner".to_vec();
+    let request = me.request(channel, role);
+    let (holder, my_priv, my_pub) = (me.holder.clone(), me.noise_private, me.noise_public);
+    let peer_priv = peer.noise_private;
+    let (mut my_app, my_local) = tokio::io::duplex(8192);
+    let (mut peer_app, peer_local) = tokio::io::duplex(8192);
+    let relay = pin_dead_addr();
+    let (mine, theirs) = match role {
+        ChannelRole::Initiate => {
+            // The peer accepts on a direct listener; this member dials the admitted address.
+            let (listener, _cert) =
+                crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("listener");
+            let admission = peer.admitted_as_peer(&listener.local_addr().unwrap().to_string());
+            let theirs = tokio::spawn(async move {
+                let conn = listener.accept().await.expect("incoming").await.expect("conn");
+                run_channel_session(&conn, ChannelRole::Accept, &peer_priv, &my_pub, peer_local).await.map_err(BoxError::from)
+            });
+            let mine = tokio::spawn(async move {
+                run_channel_join_with_admission(
+                    admission,
+                    RelayFallback::QuicLazy(relay),
+                    &request,
+                    &holder,
+                    ChannelRole::Initiate,
+                    &my_priv,
+                    None,
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                    my_local,
+                    false,
+                    false,
+                    pin.as_ref(),
+                )
+                .await
+            });
+            (mine, theirs)
+        }
+        ChannelRole::Accept => {
+            // This member accepts on its direct listener; the peer dials it.
+            let (listener, _cert) =
+                crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("listener");
+            let my_addr = listener.local_addr().unwrap();
+            let admission = peer.admitted_as_peer("203.0.113.7:7000");
+            let mine = tokio::spawn(async move {
+                run_channel_join_with_admission(
+                    admission,
+                    RelayFallback::QuicLazy(relay),
+                    &request,
+                    &holder,
+                    ChannelRole::Accept,
+                    &my_priv,
+                    Some(listener),
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                    my_local,
+                    false,
+                    false,
+                    pin.as_ref(),
+                )
+                .await
+            });
+            let theirs = tokio::spawn(async move {
+                let conn = dial_peer_direct(my_addr, Duration::from_secs(5))
+                    .await
+                    .map_err(|e| BoxError::from(format!("{e:?}")))?;
+                run_channel_session(&conn, ChannelRole::Initiate, &peer_priv, &my_pub, peer_local)
+                    .await
+                    .map_err(BoxError::from)
+            });
+            (mine, theirs)
+        }
+    };
+    // The peer writes, this member reads: a refused session never delivers it.
+    let _ = peer_app.write_all(&payload).await;
+    let mut got = vec![0u8; payload.len()];
+    let carried = matches!(
+        tokio::time::timeout(Duration::from_secs(10), my_app.read_exact(&mut got)).await,
+        Ok(Ok(_))
+    ) && got == payload;
+    mine.abort();
+    theirs.abort();
+    carried
+}
+
+#[tokio::test]
+async fn the_pinned_partner_gets_its_session_and_without_a_pin_any_member_still_does_292() {
+    let c = pin_channel();
+    for role in [ChannelRole::Initiate, ChannelRole::Accept] {
+        assert!(
+            pinned_session_carries_data(&c.me, &c.other, c.channel, role, None).await,
+            "{role:?}: unset is the hub semantics, unchanged -- any member holding a grant gets a session"
+        );
+        for pin in [pin_on(&c.partner, None), pin_on(&c.partner, Some(c.partner.noise_public)), pin_link()] {
+            assert!(
+                pinned_session_carries_data(&c.me, &c.partner, c.channel, role, Some(pin.clone())).await,
+                "{role:?}: the partner named by {pin:?} gets its session"
+            );
+        }
+        assert!(
+            pinned_session_carries_data(&c.me, &c.rotated, c.channel, role, Some(pin_on(&c.partner, None))).await,
+            "{role:?}: a holder-only pin lets the partner rotate its Noise key"
+        );
+        assert!(
+            !pinned_session_carries_data(&c.me, &c.other, c.channel, role, Some(pin_on(&c.partner, None))).await,
+            "{role:?}: another member of the channel gets nothing"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pin_refusal_neither_feeds_nor_resets_the_serve_loops_flap_streak_292() {
+    // Two sessions die at once (a #250 streak of 2), then the edge pairs a member the pin does
+    // not name, three times in a row. Each backoff before the next admit stays the streak-of-2
+    // one: 50 ms * 2^2 = 200 ms, jittered into [100 ms, 200 ms] (plus up to 1 ms of timer
+    // rounding). Fed by the refusals the streak would reach 5 and the last backoff 800-1600 ms;
+    // reset by them, there would be none.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let c = pin_channel();
+    let pin = pin_on(&c.partner, None);
+    let (channel, me, other, other_noise) =
+        (ct_common::channel::ChannelId(c.channel), c.me.holder_pub(), c.other.holder_pub(), c.other.noise_public);
+    let admitted_at = std::sync::Arc::new(std::sync::Mutex::new(Vec::<tokio::time::Instant>::new()));
+    let log = admitted_at.clone();
+    let admit = move || {
+        log.lock().unwrap().push(tokio::time::Instant::now());
+        async { Ok::<(), BoxError>(()) }
+    };
+    let served = std::sync::Arc::new(AtomicUsize::new(0));
+    let serve = move |_: ()| {
+        let n = served.fetch_add(1, Ordering::SeqCst);
+        let refused = (2..=4).contains(&n).then(|| pin.check(&channel, &me, &other, &other_noise));
+        async move {
+            match (n, refused) {
+                (0 | 1, _) => Err::<(), BoxError>("session died near-instantly".into()),
+                (_, Some(Err(refused))) => Err(Box::new(refused) as BoxError),
+                (_, Some(Ok(()))) => Err("the other member passed the pin".into()),
+                _ => {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    Ok(())
+                }
+            }
+        }
+    };
+    let driver = tokio::spawn(serve_loop_concurrent(1, Duration::from_millis(50), admit, serve));
+    for _ in 0..1000 {
+        if admitted_at.lock().unwrap().len() >= 6 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let at = admitted_at.lock().unwrap().clone();
+    assert!(at.len() >= 6, "the loop admitted again after each pin refusal: {} admits", at.len());
+    for i in 3..=5 {
+        let gap = at[i] - at[i - 1];
+        assert!(
+            gap >= Duration::from_millis(100) && gap <= Duration::from_millis(201),
+            "after pin refusal {}: the flap streak stayed at 2, backoff {gap:?}",
+            i - 2
+        );
+    }
+    driver.abort();
+}
+
+/// A brokered member's config for the pin wiring tests: `role`, relay-only, the given broker and
+/// relay, plus `extra` (e.g. `CT_CHANNEL_PEER_PIN`).
+fn pin_cfg(
+    me: &PinMember,
+    channel: [u8; 32],
+    role: ChannelRole,
+    broker: SocketAddr,
+    relay: SocketAddr,
+    extra: &[(&str, String)],
+) -> Result<ChannelJoinCliConfig, String> {
+    let mut m: HashMap<String, String> = HashMap::new();
+    for (k, v) in [
+        ("CT_CHANNEL_ROLE", if role == ChannelRole::Initiate { "initiate" } else { "accept" }.to_string()),
+        ("CT_CHANNEL_BROKER", broker.to_string()),
+        ("CT_CHANNEL_RELAY", relay.to_string()),
+        ("CT_CHANNEL_RELAY_ONLY", "1".to_string()),
+        ("CT_CHANNEL_GRANT", hex_encode(&me.grant(channel, role).encode())),
+        ("CT_CHANNEL_HOLDER_KEY", hex_encode(&me.holder.to_bytes())),
+        ("CT_CHANNEL_NOISE_KEY", hex_encode(&me.noise_private)),
+    ] {
+        m.insert(k.to_string(), v);
+    }
+    for (k, v) in extra {
+        m.insert(k.to_string(), v.clone());
+    }
+    ChannelJoinCliConfig::from_lookup(move |k| m.get(k).cloned())
+}
+
+#[test]
+fn the_pin_is_parsed_at_start_and_refused_where_it_cannot_apply_292() {
+    let c = pin_channel();
+    let edge: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let with = |pin: String| pin_cfg(&c.me, c.channel, ChannelRole::Accept, edge, edge, &[(PEER_PIN_ENV, pin)]);
+    let cfg = with(format!("holder:{}", hex_encode(&c.partner.holder_pub()))).expect("a valid pin parses");
+    assert_eq!(cfg.peer_pin, Some(pin_on(&c.partner, None)));
+    assert_eq!(with(" ".to_string()).expect("blank parses").peer_pin, None, "blank is unset");
+    let err = with("holder:nothex".to_string()).err().expect("a malformed pin stops the start");
+    assert!(err.contains(PEER_PIN_ENV), "{err}");
+    let err = with("link".to_string()).err().expect("link needs the operator key");
+    assert!(err.contains("CT_CHANNEL_OPERATOR_PUBKEY"), "{err}");
+    let op = hex_encode(&pin_operator().verifying_key().to_bytes());
+    let cfg = pin_cfg(&c.me, c.channel, ChannelRole::Accept, edge, edge, &[
+        (PEER_PIN_ENV, "link".to_string()),
+        ("CT_CHANNEL_OPERATOR_PUBKEY", op),
+    ])
+    .expect("link with the operator key parses");
+    assert_eq!(cfg.peer_pin, Some(pin_link()));
+    let not_the_operator = hex_encode(&SigningKey::from_bytes(&[0x0Bu8; 32]).verifying_key().to_bytes());
+    let err = pin_cfg(&c.me, c.channel, ChannelRole::Accept, edge, edge, &[
+        (PEER_PIN_ENV, "link".to_string()),
+        ("CT_CHANNEL_OPERATOR_PUBKEY", not_the_operator),
+    ])
+    .err()
+    .expect("link under a key that did not sign this grant stops the start");
+    assert!(err.contains("not signed by"), "{err}");
+
+    // The direct-address mode has no admission to pin: set there, the pin is refused, not ignored.
+    let direct = |pin: &str| {
+        cfg_from(&[
+            ("CT_CHANNEL_ROLE", "accept"),
+            ("CT_CHANNEL_ADDR", "127.0.0.1:7000"),
+            ("CT_CHANNEL_NOISE_KEY", K64),
+            ("CT_CHANNEL_PEER_NOISE_KEY", K64),
+            (PEER_PIN_ENV, pin),
+        ])
+    };
+    let err = direct("link").expect_err("a pin in the direct-address mode");
+    assert!(err.contains(PEER_PIN_ENV) && err.contains("CT_CHANNEL_PEER_NOISE_KEY"), "{err}");
+    assert!(direct("").is_ok(), "empty is unset there too");
+}
+
+#[tokio::test]
+async fn the_configured_pin_reaches_the_serve_and_the_one_shot_join_paths_292() {
+    let c = pin_channel();
+    let pin = [(PEER_PIN_ENV, format!("holder:{}", hex_encode(&c.partner.holder_pub())))];
+
+    // Persistent serve: config -> ServeSessionCtx -> serve_admitted_session. Relay-only, so the
+    // refused session takes its relay leg (here a relay that drops it) before it returns.
+    let (relay_ep, _) = build_server_endpoint_with_cert().expect("relay");
+    let relay_addr = relay_ep.local_addr().unwrap();
+    let dialed_relay = tokio::spawn(accept_one_and_hold(relay_ep, Duration::from_secs(2), Duration::ZERO));
+    let cfg = pin_cfg(&c.me, c.channel, ChannelRole::Accept, pin_dead_addr(), relay_addr, &pin)
+        .expect("serve config");
+    let ctx = std::sync::Arc::new(ServeSessionCtx::from_cfg(&cfg, c.me.request(c.channel, ChannelRole::Accept), None));
+    let Err(err) =
+        serve_admitted_session(ctx, c.other.admitted_as_peer(ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY)).await
+    else {
+        panic!("the serve session with an unpinned member was not refused")
+    };
+    assert!(super::peer_pin::is_peer_not_pinned(&err), "{err}");
+    assert!(dialed_relay.await.unwrap(), "the refused serve session took its relay leg");
+
+    // One-shot initiate (the forward initiator and the persistent call run this too): config ->
+    // run_one_admission_session_with_local, admitted by a stub broker that pairs the other member.
+    let (broker_ep, _) = build_server_endpoint_with_cert().expect("broker");
+    let broker_addr = broker_ep.local_addr().unwrap();
+    let (peer_ep, _) = build_server_endpoint_with_cert().expect("peer endpoint");
+    let peer_addr = peer_ep.local_addr().unwrap();
+    let seen_peer = tokio::spawn(watch_one_leg(peer_ep, Duration::from_secs(5)));
+    let (noise, holder, att) = (c.other.noise_public, c.other.holder_pub(), c.other.attestation);
+    let broker = tokio::spawn(async move { stub_broker_admit(&broker_ep, peer_addr, noise, holder, att).await });
+    let cfg = pin_cfg(&c.me, c.channel, ChannelRole::Initiate, broker_addr, pin_dead_addr(), &pin)
+        .expect("initiate config");
+    let request = ChannelJoinRequest {
+        grant: cfg.grant.clone(),
+        endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+    };
+    let (_app, local) = tokio::io::duplex(1024);
+    let joined = tokio::time::timeout(
+        Duration::from_secs(20),
+        run_one_admission_session_with_local(&cfg, &request, &cfg.broker_ladder(), &cfg.relay_ladder(), &None, local),
+    )
+    .await
+    .expect("the one-shot join ends");
+    let Err(err) = joined else { panic!("the one-shot join with an unpinned member was not refused") };
+    assert!(super::peer_pin::is_peer_not_pinned(&err), "{err}");
+    let seen = seen_peer.await.unwrap();
+    assert!(
+        seen.connected && !seen.stream && seen.pin_close,
+        "the refusal dialed the admitted address, sent no handshake message and closed the leg: {seen:?}"
+    );
+    broker.abort();
+}
+
+#[tokio::test]
+async fn both_dcutr_joins_check_the_pin_before_the_relay_stream_and_the_gate_dial_292() {
+    use ct_edge::transport::build_client_endpoint;
+    let c = pin_channel();
+    let pin = pin_on(&c.partner, None);
+    let request = c.me.request(c.channel, ChannelRole::Accept);
+    let circuit: libp2p::Multiaddr = "/ip4/127.0.0.1/udp/9/quic-v1".parse().unwrap();
+    // A gate address that keeps a TCP connection in its backlog: the relay-gate join must never
+    // dial it.
+    let gate = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gate_addr = gate.local_addr().unwrap();
+    for gated in [false, true] {
+        // The relay admission pairs the other member (the edge relays its attested identity).
+        let (relay_ep, cert) = build_server_endpoint_with_cert().expect("relay");
+        let relay_addr = relay_ep.local_addr().unwrap();
+        let (noise, holder, att) = (c.other.noise_public, c.other.holder_pub(), c.other.attestation);
+        let relay = tokio::spawn(async move { stub_broker_admit(&relay_ep, relay_addr, noise, holder, att).await });
+        let client = build_client_endpoint(cert.clone()).expect("client");
+        let relay_conn = client.connect(relay_addr, "localhost").expect("cfg").await.expect("relay conn");
+        let (_app, local) = tokio::io::duplex(1024);
+        let joined = tokio::time::timeout(Duration::from_secs(10), async {
+            if gated {
+                join_via_relay_gate_dcutr(
+                    &relay_conn,
+                    &request,
+                    &c.me.holder,
+                    ChannelRole::Accept,
+                    &c.me.noise_private,
+                    local,
+                    gate_addr,
+                    cert,
+                    &request.grant,
+                    Some(&pin),
+                )
+                .await
+            } else {
+                join_via_relay_dcutr(
+                    &relay_conn,
+                    &request,
+                    &c.me.holder,
+                    ChannelRole::Accept,
+                    &c.me.noise_private,
+                    local,
+                    circuit.clone(),
+                    Some(&pin),
+                )
+                .await
+            }
+        })
+        .await
+        .expect("the join ends at the pin, not at a stream or dial timeout");
+        let Err(err) = joined else { panic!("gated={gated}: the unpinned member was not refused") };
+        assert!(super::peer_pin::is_peer_not_pinned(&err), "gated={gated}: {err}");
+        relay.abort();
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), gate.accept()).await.is_err(),
+        "the relay-gate leg was never dialed"
+    );
+}
+
+#[tokio::test]
+async fn a_forward_initiator_reconnects_after_a_pin_refusal_292() {
+    // The forward initiator's loop ends only on a grant end or a revoked grant; a pin refusal is
+    // neither, so it asks again (with backoff) until the edge pairs the partner.
+    let c = pin_channel();
+    let (listener, _bound) =
+        bind_forward_listener("127.0.0.1:0".parse().unwrap()).expect("the loopback listener binds");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    let request = c.me.request(c.channel, ChannelRole::Initiate);
+    let (holder, my_priv) = (c.me.holder.clone(), c.me.noise_private);
+    let (noise, peer_holder, att) = (c.other.noise_public, c.other.holder_pub(), c.other.attestation);
+    let pin = pin_on(&c.partner, None);
+    // The refusal takes the relay leg its session would have taken; this relay refuses it at once.
+    let (relay, _refusing) = pin_refusing_relay();
+    let looping = tokio::spawn(run_forward_initiate_reconnect_loop(
+        listener,
+        "127.0.0.1:9".to_string(),
+        forward_stream::DEFAULT_MAX_STREAMS,
+        Duration::from_secs(forward_stream::DEFAULT_IDLE_SECS),
+        crate::codec::now_unix() + 3600,
+        move |local: LocalDuplex| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (request, holder, pin) = (request.clone(), holder.clone(), pin.clone());
+            let admission = ChannelJoinOutcome::Admitted {
+                peer_endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+                peer_noise_pubkey: Some(noise),
+                peer_holder: Some(peer_holder),
+                peer_attestation: Some(att),
+                observed_reflexive: None,
+            };
+            async move {
+                run_channel_join_with_admission(
+                    admission,
+                    RelayFallback::QuicLazy(relay),
+                    &request,
+                    &holder,
+                    ChannelRole::Initiate,
+                    &my_priv,
+                    None,
+                    Duration::from_secs(2),
+                    Duration::from_secs(2),
+                    local,
+                    false,
+                    false,
+                    Some(&pin),
+                )
+                .await
+            }
+        },
+        is_revoked_grant_refusal,
+    ));
+    tokio::time::sleep(FORWARD_RECONNECT_MIN * 3).await;
+    assert!(!looping.is_finished(), "a pin refusal does not end the forward");
+    assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2, "it admitted again after the refusal");
+    looping.abort();
 }

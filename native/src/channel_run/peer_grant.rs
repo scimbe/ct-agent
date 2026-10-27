@@ -73,7 +73,8 @@ pub const OPERATOR_PUBKEY_ENV: &str = "CT_CHANNEL_OPERATOR_PUBKEY";
 const MAGIC: &[u8; 5] = b"CTPG1";
 /// Length of the prelude each side sends: the magic, then the fixed-size encoded grant.
 pub(crate) const PRELUDE_LEN: usize = MAGIC.len() + SignedChannelGrant::WIRE_LEN;
-/// How long a peer has, after the Noise handshake, to present its grant.
+/// How long a peer has, after the Noise handshake, to present its grant. The clock starts at the
+/// session pump's first touch of the gate, which comes right after the handshake (ct-agent#314).
 pub(crate) const PEER_GRANT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The budget a session gets once its grant has ended: within it every forwarded
 /// stream of that session is closed on BOTH members and no new one is opened. Nothing here ever
@@ -363,7 +364,11 @@ struct Gate {
     verified: bool,
     failed: Option<String>,
     reader: Option<Waker>,
-    deadline: Pin<Box<tokio::time::Sleep>>,
+    /// [`PEER_GRANT_TIMEOUT`], armed on the first poll of either side ([`Gate::arm_deadline`]).
+    /// ct-agent#314: armed when the gate was built -- right after admission -- it also ran through
+    /// the direct dial, the accept window, the relay pairing and the Noise handshake, and a slow
+    /// pairing failed the gate on its second poll, milliseconds after `state=open`.
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<P> PeerGrantGate<P> {
@@ -381,7 +386,7 @@ impl<P> PeerGrantGate<P> {
             verified: false,
             failed: None,
             reader: None,
-            deadline: Box::pin(tokio::time::sleep(PEER_GRANT_TIMEOUT)),
+            deadline: None,
             check,
         });
         Self {
@@ -429,6 +434,23 @@ impl Gate {
     fn done(&self) -> bool {
         self.verified && self.out_pos == self.out.len()
     }
+
+    /// Start the peer's [`PEER_GRANT_TIMEOUT`] now, unless it already runs. Called on every poll
+    /// of either side: the session pump touches its local side only once the Noise handshake is
+    /// done, so the first call is where "after the Noise handshake" begins (ct-agent#314).
+    fn arm_deadline(&mut self) {
+        if self.deadline.is_none() {
+            self.deadline = Some(Box::pin(tokio::time::sleep(PEER_GRANT_TIMEOUT)));
+        }
+    }
+
+    /// Whether the peer's time is up, registering `cx` on the deadline otherwise.
+    fn deadline_passed(&mut self, cx: &mut Context<'_>) -> bool {
+        self.arm_deadline();
+        self.deadline
+            .as_mut()
+            .is_some_and(|deadline| std::future::Future::poll(deadline.as_mut(), cx).is_ready())
+    }
 }
 
 // `AsyncWrite` as well as `AsyncRead`: when the grant ends, the read side
@@ -451,6 +473,7 @@ impl<P: AsyncRead + AsyncWrite + Unpin> AsyncRead for PeerGrantGate<P> {
             return Poll::Ready(Ok(()));
         }
         if let Some(g) = this.gate.as_mut() {
+            g.arm_deadline();
             if g.out_pos < g.out.len() {
                 let n = buf.remaining().min(g.out.len() - g.out_pos);
                 buf.put_slice(&g.out[g.out_pos..g.out_pos + n]);
@@ -464,7 +487,7 @@ impl<P: AsyncRead + AsyncWrite + Unpin> AsyncRead for PeerGrantGate<P> {
                 return Poll::Ready(Err(denied(why)));
             }
             if !g.verified {
-                if std::future::Future::poll(g.deadline.as_mut(), cx).is_ready() {
+                if g.deadline_passed(cx) {
                     let secs = PEER_GRANT_TIMEOUT.as_secs();
                     return Poll::Ready(Err(
                         g.fail(format!("the peer did not present its grant within {secs}s"))
@@ -495,6 +518,7 @@ impl<P: AsyncWrite + Unpin> AsyncWrite for PeerGrantGate<P> {
                 return Poll::Ready(Err(denied(why)));
             }
             if !g.verified {
+                g.arm_deadline();
                 let take = data.len().min(PRELUDE_LEN - g.peer.len());
                 g.peer.extend_from_slice(&data[..take]);
                 if g.peer.len() == PRELUDE_LEN {
@@ -983,6 +1007,69 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// ct-agent#314: both gates are built right after admission; the direct dial, the accept
+    /// window, the relay pairing and the Noise handshake then take their time before the session
+    /// pump first touches either of them. None of that may count against the peer's
+    /// [`PEER_GRANT_TIMEOUT`] -- the constant's own doc says "after the Noise handshake".
+    #[tokio::test(start_paused = true)]
+    async fn the_grant_deadline_starts_when_the_session_starts_not_at_admission_314() {
+        let f = Fixture::new();
+        let (mut a, local_a) = tokio::io::duplex(4096);
+        let (mut b, local_b) = tokio::io::duplex(4096);
+        let mut gate_a = PeerGrantGate::new(local_a, Some(f.check(ChannelRole::Initiate)));
+        let mut gate_b = PeerGrantGate::new(local_b, Some(f.check(ChannelRole::Accept)));
+        // A slow pairing: three grant timeouts pass before the session starts.
+        tokio::time::advance(PEER_GRANT_TIMEOUT * 3).await;
+        let tunnel = tokio::spawn(async move {
+            let _ = tokio::io::copy_bidirectional(&mut gate_a, &mut gate_b).await;
+        });
+        a.write_all(b"prompt").await.unwrap();
+        let mut got = [0u8; 6];
+        b.read_exact(&mut got)
+            .await
+            .expect("the members verify each other although the pairing took longer than the timeout");
+        assert_eq!(&got, b"prompt");
+        b.write_all(b"answer").await.unwrap();
+        a.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"answer");
+        tunnel.abort();
+    }
+
+    /// ct-agent#314, the issue's second reading ("after #267 the refusal counts as a grant end")
+    /// pinned: only [`GrantLifetime::end`] writes the record a forward's reconnect loop decides
+    /// on. A refusal by the gate -- the timeout, or a grant that does not verify -- is not a grant
+    /// end, so the loop reconnects as soon as the session returns.
+    #[tokio::test(start_paused = true)]
+    async fn a_grant_refusal_is_not_recorded_as_a_grant_end_314() {
+        let f = Fixture::new();
+        let record = GrantEndRecord::default();
+        let (timed_out, forged) = with_grant_end_record(record.clone(), async {
+            let (_app, local) = tokio::io::duplex(4096);
+            let mut gate = PeerGrantGate::new(local, Some(f.check(ChannelRole::Initiate)));
+            let mut prelude = vec![0u8; PRELUDE_LEN];
+            gate.read_exact(&mut prelude).await.unwrap();
+            let mut more = [0u8; 1];
+            let timed_out = gate.read(&mut more).await.unwrap_err();
+
+            let (_app, local) = tokio::io::duplex(4096);
+            let mut gate = PeerGrantGate::new(local, Some(f.check(ChannelRole::Initiate)));
+            let foreign = grant(
+                &SigningKey::from_bytes(&[0x66; 32]),
+                CHANNEL,
+                f.acceptor,
+                Direction::Accept,
+                crate::codec::now_unix() + 3600,
+            );
+            let forged = gate.write_all(&prelude_of(&foreign)).await.unwrap_err();
+            (timed_out, forged)
+        })
+        .await;
+        assert_eq!(timed_out.kind(), io::ErrorKind::PermissionDenied);
+        assert!(timed_out.to_string().contains("did not present its grant"), "{timed_out}");
+        assert_eq!(forged.kind(), io::ErrorKind::PermissionDenied);
+        assert!(record.ended().is_none(), "a refusal is not a grant end: {:?}", record.ended());
     }
 
     /// A scripted control plane for the re-check: the listed states, then `Valid` forever.
