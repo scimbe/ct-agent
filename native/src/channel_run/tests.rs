@@ -14051,3 +14051,118 @@ async fn a_forward_initiator_reconnects_after_a_pin_refusal_292() {
     assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2, "it admitted again after the refusal");
     looping.abort();
 }
+
+/// A member's join request for the forward-prelude test below: its grant on `channel`, signed by
+/// `operator`, for the direction of `role`.
+fn prelude_test_request(
+    operator: &ed25519_dalek::SigningKey,
+    holder: &ed25519_dalek::SigningKey,
+    channel: [u8; 32],
+    role: ChannelRole,
+) -> ChannelJoinRequest {
+    use ed25519_dalek::Signer as _;
+    let g = ct_common::channel::ChannelGrant {
+        channel: ct_common::channel::ChannelId(channel),
+        holder: holder.verifying_key().to_bytes(),
+        direction: match role {
+            ChannelRole::Initiate => ct_common::channel::Direction::Initiate,
+            ChannelRole::Accept => ct_common::channel::Direction::Accept,
+        },
+        rights: ct_common::channel::Rights::ReadWrite,
+        delegable: false,
+        expires_at: crate::codec::now_unix() + 3600,
+    };
+    ChannelJoinRequest {
+        grant: ct_common::channel::SignedChannelGrant { signature: operator.sign(&g.signing_bytes()).to_bytes(), grant: g },
+        endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn a_forward_initiator_reaches_a_persistent_serve_forward_accept_through_both_gates_080() {
+    // Production, 2026-10-27, v0.8.0 on both members: a `CT_CHANNEL_FORWARD` initiator against a
+    // `CT_CHANNEL_SERVE=1` + `CT_CHANNEL_FORWARD_ALLOW` acceptor logged `state=open` and then
+    // "forward frame read failed (InvalidData): stream 1414547249: unknown forward frame tag 67"
+    // -- the peer-grant prelude `CTPG1` read as a forward frame. Driven here as the two members
+    // build their sessions: the gate from `gate_local_from` (the forward forces the check on both
+    // sides), the local side as `channel_local` builds it, the accept session inside the serve
+    // loop's grant-end record, the initiator through its reconnect loop.
+    let operator = ed25519_dalek::SigningKey::from_bytes(&[0x51u8; 32]);
+    let operator_hex = crate::codec::hex_encode(&operator.verifying_key().to_bytes());
+    let channel = [0x96u8; 32];
+    let init_holder = ed25519_dalek::SigningKey::from_bytes(&[0x12u8; 32]);
+    let acc_holder = ed25519_dalek::SigningKey::from_bytes(&[0x13u8; 32]);
+    let init_request = prelude_test_request(&operator, &init_holder, channel, ChannelRole::Initiate);
+    let acc_request = prelude_test_request(&operator, &acc_holder, channel, ChannelRole::Accept);
+    let (target_addr, _target) = spawn_echo_target(1).await;
+    let target = target_addr.to_string();
+    let idle = Duration::from_secs(forward_stream::DEFAULT_IDLE_SECS);
+    let (listener, bound) = bind_forward_listener("127.0.0.1:0".parse().unwrap()).expect("listener");
+
+    let (op_i, op_a, tgt_i, tgt_a) = (operator_hex.clone(), operator_hex.clone(), target.clone(), target.clone());
+    let admit = move |local: LocalDuplex| {
+        let (a, b) = (generate_static_keypair(), generate_static_keypair());
+        let (a_priv, a_pub, b_priv, b_pub) = (a.private, a.public, b.private, b.public);
+        let (a_transport, b_transport) = tokio::io::duplex(1 << 16);
+        // The acceptor: persistent serve with an allowlist (no CT_CHANNEL_FORWARD).
+        let acc_holder_pub = acc_holder.verifying_key().to_bytes();
+        let (acc_request, acc_holder, op_a, tgt_a) = (acc_request.clone(), acc_holder.clone(), op_a.clone(), tgt_a.clone());
+        let init_holder_pub = init_holder.verifying_key().to_bytes();
+        tokio::spawn(super::peer_grant::with_grant_end_record(GrantEndRecord::default(), async move {
+            let env = |k: &str| match k {
+                forward::FORWARD_ALLOW_ENV => Some(tgt_a.clone()),
+                OPERATOR_PUBKEY_ENV => Some(op_a.clone()),
+                "CT_CHANNEL_SERVE" => Some("1".to_string()),
+                _ => None,
+            };
+            let local = ChannelLocal::Forward(Ok(forward_accept_local(
+                Some(tgt_a.clone()),
+                None,
+                forward_stream::DEFAULT_MAX_STREAMS,
+                idle,
+            )));
+            let gate = gate_local_from(local, &acc_request, ChannelRole::Accept, init_holder_pub, &acc_holder, &env)
+                .expect("the accept gate builds");
+            let (br, bw) = tokio::io::split(b_transport);
+            run_channel_session_on_stream(bw, br, ChannelRole::Accept, &b_priv, &a_pub, gate).await
+        }));
+        let (init_request, init_holder, op_i, tgt_i) = (init_request.clone(), init_holder.clone(), op_i.clone(), tgt_i.clone());
+        async move {
+            let spec = format!("127.0.0.1:0={tgt_i}");
+            let env = |k: &str| match k {
+                forward_stream::FORWARD_ENV => Some(spec.clone()),
+                OPERATOR_PUBKEY_ENV => Some(op_i.clone()),
+                _ => None,
+            };
+            let gate = gate_local_from(
+                ChannelLocal::Forward(Ok(local)),
+                &init_request,
+                ChannelRole::Initiate,
+                acc_holder_pub,
+                &init_holder,
+                &env,
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+            let (ar, aw) = tokio::io::split(a_transport);
+            run_channel_session_on_stream(aw, ar, ChannelRole::Initiate, &a_priv, &b_pub, gate).await
+        }
+    };
+    let looping = tokio::spawn(run_forward_initiate_reconnect_loop(
+        listener,
+        target,
+        forward_stream::DEFAULT_MAX_STREAMS,
+        idle,
+        crate::codec::now_unix() + 3600,
+        OnOwnGrantEnd::Exit,
+        admit,
+        |_: &io::Error| false,
+    ));
+    let mut tcp = tokio::time::timeout(Duration::from_secs(10), open_forwarded_stream(bound, b'p'))
+        .await
+        .expect("the forwarded connection reaches the target through both gates");
+    tcp.write_all(b"q").await.unwrap();
+    let mut echoed = [0u8; 1];
+    tcp.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"q");
+    looping.abort();
+}
