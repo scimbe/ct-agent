@@ -611,7 +611,7 @@ pub(crate) async fn run_persistent_call_reconnect_loop(
     let admit = |local: ChannelLocal| {
         run_one_admission_session_with_local(cfg, request, broker_ladder, relay_ladder, front_door_cert, local, InitiateWait::Persistent)
     };
-    run_persistent_call_reconnect_loop_with(slug, cfg.call_reconnect, admit).await
+    run_persistent_call_reconnect_loop_with(slug, cfg.call_reconnect, Some(request.grant.grant.expires_at), admit).await
 }
 
 /// [`run_persistent_call_reconnect_loop`]'s actual loop, parameterized over the admission step
@@ -622,6 +622,7 @@ pub(crate) async fn run_persistent_call_reconnect_loop(
 pub(crate) async fn run_persistent_call_reconnect_loop_with<A, Fut>(
     slug: String,
     call_reconnect: bool,
+    own_expires_at: Option<u64>,
     admit: A,
 ) -> Result<(), BoxError>
 where
@@ -644,15 +645,24 @@ where
         }
         // Thread end drops `tx` -> the loop below sees source EOF -> clean teardown.
     });
-    run_persistent_call_reconnect_loop_over(slug, call_reconnect, admit, &mut rx, tokio::io::stdout()).await
+    run_persistent_call_reconnect_loop_over(slug, call_reconnect, own_expires_at, admit, &mut rx, tokio::io::stdout())
+        .await
 }
 
 /// The reconnect loop's core, split out one layer further so a test can feed it lines through an
 /// `mpsc::Sender` it controls directly (no real stdin/process involved) and capture output via an
 /// in-memory `out` instead of real stdout.
+///
+/// ct-agent#308: `own_expires_at` is this member's own grant expiry (`None` in tests that do not
+/// watch one). Once that grant is over -- by its expiry, or an admission refusal that says so
+/// (see [`own_grant_refusal`]) -- the loop ends with [`OwnGrantEnded`] (exit status 77) instead
+/// of redialling for ever with a grant that never works again while stdin calls queue up
+/// unanswered. Since every session ends at the own expiry (R1), that would happen at every
+/// expiry, not only after a later session end.
 pub(crate) async fn run_persistent_call_reconnect_loop_over<A, Fut, W>(
     slug: String,
     call_reconnect: bool,
+    own_expires_at: Option<u64>,
     admit: A,
     rx: &mut tokio::sync::mpsc::Receiver<String>,
     mut out: W,
@@ -664,20 +674,59 @@ where
 {
     let retry_backoff = std::time::Duration::from_millis(200);
     let mut consecutive_flaps: u32 = 0;
+    let own_end = |reason: String| -> BoxError {
+        eprintln!("ct-agent channel --call-service {slug} (persistent): {reason} -- not reconnecting (#308)");
+        OwnGrantEnded::boxed(reason)
+    };
+    let expired = |at: u64| format!("this member's channel grant expired (expires_at {at})");
+    let expiry = || async move {
+        match own_expires_at {
+            Some(at) => {
+                grant_expiry_timer(at).await;
+                at
+            }
+            None => std::future::pending().await,
+        }
+    };
 
     loop {
+        if let Some(at) = own_expires_at.filter(|&at| crate::codec::now_unix() >= at) {
+            return Err(own_end(expired(at)));
+        }
         let (session_side, serve_side) = tokio::io::duplex(1 << 16);
         let attempt_started = std::time::Instant::now();
 
         // No task to guard here: `calls` drives the other half inline (ct-agent#180).
-        let pump = admit(ChannelLocal::Serve(session_side.into()));
+        // ct-agent#308: inside a grant-end record, so this loop learns whose grant ended it.
+        let record = GrantEndRecord::default();
+        let pump = with_grant_end_record(record.clone(), admit(ChannelLocal::Serve(session_side.into())));
         let calls = run_service_calls_persistent(serve_side, &slug, rx, &mut out);
+        let own_expiry = expiry();
         tokio::pin!(pump);
         tokio::pin!(calls);
+        tokio::pin!(own_expiry);
 
         let clean_eof = tokio::select! {
-            _ = &mut pump => false,
+            pumped = &mut pump => {
+                // ct-agent#308: this member's own grant is over -- the session's gate recorded
+                // it (R1), or the edge refused the admission for it.
+                if let Some(reason) = record
+                    .ended()
+                    .filter(|end| end.scope == GrantEndScope::Own)
+                    .map(|end| end.reason)
+                    .or_else(|| pumped.err().and_then(|e| own_grant_refusal(&e, own_expires_at, crate::codec::now_unix())))
+                {
+                    return Err(own_end(reason));
+                }
+                false
+            }
             r = &mut calls => matches!(r, Ok(())),
+            at = &mut own_expiry => {
+                // The session's gate holds the same expiry (R1) and ends it the regular way
+                // within the teardown budget; a session still being admitted is dropped.
+                let _ = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, &mut pump).await;
+                return Err(own_end(expired(at)));
+            }
         };
         // Whichever future didn't finish is dropped here, cancelling it -- the same
         // shutdown-by-drop idiom this codebase already relies on elsewhere (e.g. the
@@ -713,7 +762,12 @@ where
              reconnecting in {delay:?} (streak {consecutive_flaps}, #47)",
             attempt_started.elapsed()
         );
-        tokio::time::sleep(delay).await;
+        // ct-agent#308: the own grant can run out during the backoff too.
+        tokio::select! {
+            biased;
+            at = expiry() => return Err(own_end(expired(at))),
+            () = tokio::time::sleep(delay) => {}
+        }
     }
 }
 
