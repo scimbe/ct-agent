@@ -14,7 +14,7 @@ linked — those threads carry the full evidence.
 | One-shot service call (opt-out) | `CT_CHANNEL_CALL_SERVICE=<slug>` **+** `CT_CHANNEL_CALL_PERSISTENT=0` | The pre-v0.5.0 default: join → pair → Noise → **one** `service/<slug>` call (stdin = input, stdout = **bare** output) → exit. The historical crew-bridge `CREW_*_CMD` contract — **a caller still expecting bare one-shot output must set `=0` when upgrading to v0.5.0** (migration note in the release; only explicit `0`/`false`/`no` opts out). |
 | One-shot raw MCP call | `CT_CHANNEL_CALL=<method>` (+ `CT_CHANNEL_CALL_PARAMS`) | One JSON-RPC request/response, prints the whole envelope, exits. |
 | Persistent serve | `CT_CHANNEL_ROLE=accept` + `CT_CHANNEL_SERVE=1` | Parks at the broker, serves each paired peer's session **concurrently** (up to `CT_CHANNEL_SERVE_CONCURRENCY`, default 8, [#200]) — a JSON-RPC request loop per session, any number of calls per session. `CT_AGENT_SERVICE_HANDLER_CMD` spawns a fresh handler per request (the handler stays stateless even under a held session). |
-| Raw pipe | neither | stdin/stdout spliced over the channel. |
+| Raw pipe | neither | stdin/stdout spliced over the channel. stdin end-of-file is a **half-close**: it ends only the direction towards the peer, the peer's bytes keep arriving on stdout until the peer ends too. On the `:443` front door that needs an edge with CADS-Tunnel v0.5.0 or later; an older edge drops the receive direction as well ([#299]). **`ok=true` in the `channel_session` close event, and exit status 0, mean "the transport closed cleanly", not "the peer received everything"**: a relay that cuts the stream can produce the same clean close, and there is no end-to-end delivery acknowledgement. Check delivery in the application (a reply, a checksum) when it matters. |
 | **Direct address (no broker at all)** | `CT_CHANNEL_ADDR` + `CT_CHANNEL_PEER_NOISE_KEY` (+ `CT_CHANNEL_PEER_CERT` when initiating) | Dials the peer **directly**; the edge is not involved in pairing. This is the `first-channel` tutorial's path. Every other row in this table goes through the broker — this one is the reason not to read "channel" as "always via the edge". |
 
 **Every row above except Direct address needs the control plane, not just a valid grant.** Source-verified
@@ -554,4 +554,5 @@ needed exactly once, at `sign`, so an operator can review the unsigned skeleton 
 [#250]: https://github.com/scimbe/ct-agent/issues/15
 [#330]: https://github.com/scimbe/ct-agent/issues/16
 [#47]: https://github.com/scimbe/ct-agent/issues/47
+[#299]: https://github.com/scimbe/ct-agent/issues/299
 [#314]: https://github.com/scimbe/ct-agent/issues/314
