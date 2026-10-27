@@ -555,6 +555,33 @@ async fn close_stream_relay_leg<W: AsyncWrite + Unpin>(send: &mut W) {
     let _ = tokio::time::timeout(RELAY_LEG_CLOSE_TIMEOUT, send.shutdown()).await;
 }
 
+/// How long a `:443` relay leg waits for its partner before it gives up and closes the leg
+/// (`CT_CHANNEL_RELAY_PAIR_SECS`). The relay join has no wait bound in ct-common, and the edge
+/// holds a relay-phase keepalive park like any other -- up to its keepalive park TTL where an
+/// operator raised it (CADS-Tunnel#506) -- so a partner that never came (a stale or dead
+/// rendezvous pairing) held this leg, and a serve slot, for that long. 45 s: the partner was
+/// paired seconds ago, and the QUIC relay leg already gives up after the same 45 s.
+pub(crate) const RELAY_PAIR_BOUND_DEFAULT: std::time::Duration = std::time::Duration::from_secs(45);
+/// The knob's floor: the edge parks a relay leg for its 30 s base lease, and a shorter client
+/// bound would abandon relay waits the edge can still pair.
+const RELAY_PAIR_BOUND_MIN_SECS: u64 = 35;
+const RELAY_PAIR_BOUND_MAX_SECS: u64 = 300;
+
+/// Parse `CT_CHANNEL_RELAY_PAIR_SECS`: a positive integer, clamped to 35-300 s; unset, empty,
+/// `0` or garbage give [`RELAY_PAIR_BOUND_DEFAULT`]. Pure.
+pub(crate) fn relay_pair_bound_from_env(value: Option<&str>) -> std::time::Duration {
+    match value.and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n >= 1) {
+        Some(n) => std::time::Duration::from_secs(n.clamp(RELAY_PAIR_BOUND_MIN_SECS, RELAY_PAIR_BOUND_MAX_SECS)),
+        None => RELAY_PAIR_BOUND_DEFAULT,
+    }
+}
+
+/// [`relay_pair_bound_from_env`] over the process environment, read once.
+pub(crate) fn relay_pair_bound() -> std::time::Duration {
+    static BOUND: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *BOUND.get_or_init(|| relay_pair_bound_from_env(std::env::var("CT_CHANNEL_RELAY_PAIR_SECS").ok().as_deref()))
+}
+
 /// What [`park_relay_leg_until`] resolved to.
 pub(crate) enum RelayLegPark {
     /// The edge paired and spliced this leg; the Noise session may start on it.
@@ -617,7 +644,8 @@ where
             park_relay_leg_on_quic(conn, request, holder, &mut abandon).await
         }
         RelayFallback::Ladder { rungs, edge_cert, direct_timeout } => {
-            park_relay_leg_via_ladder(rungs, edge_cert, direct_timeout, request, holder, &mut abandon).await
+            park_relay_leg_via_ladder(rungs, edge_cert, direct_timeout, request, holder, &mut abandon, relay_pair_bound())
+                .await
         }
     }
 }
@@ -666,14 +694,16 @@ where
 /// [`park_relay_leg_until`]; the walk order, fall-through rule, log lines and frozen error
 /// wording are those of the pre-split [`join_via_relay_ladder`], whose doc comment explains
 /// them). Only the *transport* connect of a rung may fall through to the next; once a rung
-/// connects, its admission outcome is terminal.
-async fn park_relay_leg_via_ladder<A>(
+/// connects, its admission outcome is terminal. `pair_bound` caps the wait of a `:443` leg for
+/// its partner ([`relay_pair_bound`]); a QUIC rung keeps its own 45 s bound.
+pub(crate) async fn park_relay_leg_via_ladder<A>(
     rungs: &[ChannelDialRung],
     edge_cert: CertificateDer<'static>,
     direct_timeout: std::time::Duration,
     request: &ChannelJoinRequest,
     holder: &SigningKey,
     abandon: &mut A,
+    pair_bound: std::time::Duration,
 ) -> Result<RelayLegPark, BoxError>
 where
     A: std::future::Future<Output = ()> + Unpin,
@@ -710,16 +740,36 @@ where
                     // early-eof class. An old edge negotiated a legacy id: no marker sent.
                     let phase_marker = crate::channel::phase_marker_for(&stream, crate::channel::PHASE_MARKER_RELAY);
                     let (mut recv, mut send) = tokio::io::split(stream);
-                    let outcome = tokio::select! {
+                    // Only a marker leaves the select: the presenting future borrows `send` until
+                    // the select ends, and both early ends close the leg through `send` (#22).
+                    enum RelayWait {
+                        Presented(Result<ChannelJoinOutcome, BoxError>),
+                        Abandoned,
+                        TimedOut,
+                    }
+                    let waited = tokio::select! {
                         biased;
-                        _ = &mut *abandon => None,
+                        _ = &mut *abandon => RelayWait::Abandoned,
+                        _ = tokio::time::sleep(pair_bound) => RelayWait::TimedOut,
                         presented = present_channel_relay_join_on_stream(&mut send, &mut recv, request, holder, phase_marker) => {
-                            Some(presented)
+                            RelayWait::Presented(presented)
                         }
                     };
-                    let Some(outcome) = outcome else {
-                        close_stream_relay_leg(&mut send).await;
-                        return Ok(RelayLegPark::Abandoned);
+                    let outcome = match waited {
+                        RelayWait::Abandoned => {
+                            close_stream_relay_leg(&mut send).await;
+                            return Ok(RelayLegPark::Abandoned);
+                        }
+                        RelayWait::TimedOut => {
+                            eprintln!(
+                                "ct-agent channel: relay leg found no partner within {}s -- closing it (CT_CHANNEL_RELAY_PAIR_SECS)",
+                                pair_bound.as_secs()
+                            );
+                            // close_notify, not a bare drop: the edge marks the park dead at once.
+                            close_stream_relay_leg(&mut send).await;
+                            return Err(RelayPairTimeout::boxed(pair_bound));
+                        }
+                        RelayWait::Presented(presented) => presented,
                     };
                     return match outcome? {
                         ChannelJoinOutcome::Admitted { .. } => {
