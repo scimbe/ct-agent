@@ -53,6 +53,10 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// `Accept` peer waits on its `listener` (bounded by `accept_timeout`; timeout →
 /// relay, since the initiator that can't reach it directly went to the relay too). The
 /// relay carries ciphertext only — the Noise_IK session stays end-to-end either way.
+///
+/// Runs without a peer pin: `CT_CHANNEL_PEER_PIN` is part of [`ChannelJoinCliConfig`], which this
+/// pre-dialed-broker entry point does not take. The CLI paths reach
+/// [`run_channel_join_with_admission`] with the configured pin.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_channel_join<P>(
     broker_conn: &Connection,
@@ -89,6 +93,7 @@ where
         local,
         false, // #104: this entry point predates the option and stays opt-out by default
         false, // ct-agent#22 (b): same -- the accept-vs-relay race is opt-in (CT_CHANNEL_ACCEPT_RACE)
+        None,  // #292: no peer pin on this entry point (see its doc)
     )
     .await
 }
@@ -107,6 +112,9 @@ where
 /// `accept_race` (ct-agent#22 (b), opt-in) makes an `Accept` member with a bound listener
 /// race its accept window against the relay leg (`race_accept_against_relay`) instead of
 /// serialising the two; off, the accept-then-relay order is byte-for-byte unchanged.
+/// `peer_pin` (#292, `CT_CHANNEL_PEER_PIN`): `Some` refuses an admitted peer the pin does not
+/// name with [`PeerNotPinned`]; the leg its session would have taken is still taken and closed
+/// before the Noise handshake ([`close_refused_pairing`]). `None` is unchanged.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_channel_join_with_admission<P>(
     admission: ChannelJoinOutcome,
@@ -128,6 +136,9 @@ pub async fn run_channel_join_with_admission<P>(
     // against the relay leg ([`race_accept_against_relay`]) instead of waiting the full
     // `accept_timeout` before it even dials the relay.
     accept_race: bool,
+    // #292, opt-in via CT_CHANNEL_PEER_PIN (None -> unchanged hub semantics): the partner this
+    // endpoint is bound to, checked against the attested peer below.
+    peer_pin: Option<&PeerPin>,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
@@ -167,6 +178,25 @@ where
             return Err(ParkExpired::boxed("channel park expired with no partner within the edge park window (#21) -- re-parking"))
         }
     };
+    // #292: the pin binds this endpoint to the partner it names. A refused pairing still takes the
+    // leg its session would have taken and closes it before the Noise handshake: the refused member
+    // dials this endpoint or parks its relay leg all the same, and a relay leg left waiting at the
+    // edge is spliced with this endpoint's NEXT relay leg -- the partner's session (see peer_pin).
+    if let Err(refused) = check_peer_pin(peer_pin, request, &peer_holder, &peer_noise) {
+        close_refused_pairing(
+            relay,
+            request,
+            holder,
+            role,
+            &peer_endpoint,
+            listener,
+            dial_timeout,
+            accept_timeout,
+            observed_reflexive,
+        )
+        .await;
+        return Err(refused);
+    }
     // The attestation binds the Noise key to `peer_holder` only; the peer's operator-signed grant
     // binds `peer_holder` to this channel (checked inside the session when enabled).
     let local = gate_local(local, request, role, peer_holder, holder)?;
@@ -513,6 +543,8 @@ pub(crate) fn verify_relayed_dcutr_peer(
     Ok((noise, peer_holder))
 }
 
+// #292: the peer pin is the eighth argument, as on its relay-gate sibling.
+#[allow(clippy::too_many_arguments)]
 pub async fn join_via_relay_dcutr<P>(
     relay_conn: &Connection,
     request: &ChannelJoinRequest,
@@ -521,6 +553,8 @@ pub async fn join_via_relay_dcutr<P>(
     own_noise_private: &[u8; 32],
     local: P,
     circuit_relay: libp2p::Multiaddr,
+    // #292: CT_CHANNEL_PEER_PIN, checked right after the relay admission, before the relay stream.
+    peer_pin: Option<&PeerPin>,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
@@ -546,6 +580,12 @@ where
             return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
         }
     };
+    // #292: this admission IS the relay leg -- the edge spliced it with the peer's when it acked --
+    // so a refusal closes it at once, before the relay stream and the Noise handshake.
+    if let Err(refused) = check_peer_pin(peer_pin, request, &peer_holder, &peer_noise) {
+        close_refused_relay_conn(relay_conn);
+        return Err(refused);
+    }
     let local = gate_local(local, request, role, peer_holder, holder)?;
     // The DCUtR session runs the Noise_IK over the relay bi-stream as its base leg, punching to
     // direct in the background. Initiator opens the bi-stream; acceptor accepts the edge-opened one.
@@ -655,6 +695,11 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // `request` (a partial move would forbid the `cfg.broker_ladder()` `&self` call).
     // CT_CHANNEL_FRONT_DOOR_SNI: install before any front-door dial (None = unchanged).
     crate::transport::set_front_door_sni(cfg.front_door_sni.clone());
+    // #292: name the pin at start, or warn about a forward that has none (a hub member without a
+    // forward starts with the same output as before).
+    if let Some(line) = peer_pin_start_line(cfg.peer_pin.as_ref(), forward_session_configured()) {
+        eprintln!("{line}");
+    }
     let broker_ladder = cfg.broker_ladder();
     let relay_ladder = cfg.relay_ladder();
     let front_door_cert = cfg.front_door_cert.clone();
@@ -721,6 +766,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                     relay_gate_addr,
                     relay_gate_cert.clone(),
                     &cfg.grant,
+                    cfg.peer_pin.as_ref(),
                 )
                 .await)
             })
@@ -751,6 +797,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                     &cfg.own_noise_private,
                     local,
                     circuit.clone(),
+                    cfg.peer_pin.as_ref(),
                 )
                 .await)
             })
@@ -906,6 +953,15 @@ impl ChannelRunConfig {
             .as_deref()
             .and_then(hex32)
             .ok_or("CT_CHANNEL_PEER_NOISE_KEY required (64 hex chars)")?;
+        // #292: the pin binds a brokered admission's peer; this mode has no admission and already
+        // pins the peer's Noise key. Refused rather than ignored: a security setting that is set
+        // but enforced nowhere is worse than none.
+        if f(PEER_PIN_ENV).is_some_and(|v| !v.trim().is_empty()) {
+            return Err(format!(
+                "{PEER_PIN_ENV} applies to the brokered join (CT_CHANNEL_BROKER); the direct-address mode \
+                 pins the peer by CT_CHANNEL_PEER_NOISE_KEY already -- unset {PEER_PIN_ENV} here"
+            ));
+        }
         // Optional: pin the peer's transport cert. Omit it and the initiator dials
         // accept-any (Noise_IK authenticates), which keeps the one-liner self-contained.
         let peer_cert_der = match f("CT_CHANNEL_PEER_CERT").filter(|s| !s.trim().is_empty()) {
@@ -988,6 +1044,11 @@ pub use session::*;
 // Security audit: the peer's grant, checked end to end after the Noise handshake (opt-in).
 mod peer_grant;
 pub use peer_grant::*;
+
+// #292: binding this endpoint to its partner (CT_CHANNEL_PEER_PIN, opt-in), checked on every
+// brokered admission right after its attestation.
+mod peer_pin;
+pub use peer_pin::*;
 
 // Control-plane re-check of the peer's grant while a forward session runs.
 pub(crate) mod grant_watch;
