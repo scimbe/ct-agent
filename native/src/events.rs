@@ -66,7 +66,11 @@ pub const DIRECT_REFUSED: &str = "direct_refused";
 /// peer-triggerable event, while the counter on `/metrics` stays exact -- the number to read
 /// before relying on the required mode.
 pub const DIRECT_LEGACY_SERVED: &str = "direct_legacy_served";
-/// `{state: open|close, peer}`: an A2A channel session started or ended.
+/// An A2A channel session's life: `{state: open, peer}` / `{state: close, peer, ok}` around the
+/// session (`peer` = the peer's Noise key), `{state: refused, reason}` when the peer's grant fails
+/// the peer-grant check, `{state: refused, reason, peer_holder}` when `CT_CHANNEL_PEER_PIN` does not
+/// name the admitted peer (#292, rate-limited), and `{state: grant_ended, reason}` when the grant
+/// that authorized a running session expired or was revoked.
 pub const CHANNEL_SESSION: &str = "channel_session";
 /// `{tool, ok}`: a `bridge/*` tool was invoked (refusals count as `ok=false`).
 pub const BRIDGE_CALL: &str = "bridge_call";

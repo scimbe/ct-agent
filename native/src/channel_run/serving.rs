@@ -43,6 +43,8 @@ pub(crate) struct ServeSessionCtx {
     pub(crate) direct_upgrade: bool,
     /// ct-agent#22 (b), mirrors [`ChannelJoinCliConfig::accept_race`] (`CT_CHANNEL_ACCEPT_RACE`).
     pub(crate) accept_race: bool,
+    /// #292, mirrors [`ChannelJoinCliConfig::peer_pin`] (`CT_CHANNEL_PEER_PIN`).
+    pub(crate) peer_pin: Option<PeerPin>,
 }
 
 impl ServeSessionCtx {
@@ -81,6 +83,7 @@ impl ServeSessionCtx {
             listener,
             direct_upgrade: cfg.direct_upgrade,
             accept_race: cfg.accept_race,
+            peer_pin: cfg.peer_pin.clone(),
         }
     }
 
@@ -133,7 +136,10 @@ pub(crate) async fn admit_one_peer(ctx: &ServeSessionCtx) -> Result<ChannelJoinO
                 .connect(ctx.broker_addr, "localhost")?
                 .await?;
             // CADS-Tunnel#495 U2 (a'): broker_conn is admission-only -- PHASE_MARKER_RENDEZVOUS.
-            present_channel_join_marked(&broker_conn, &ctx.request, &ctx.holder, PHASE_MARKER_RENDEZVOUS).await?
+            // Parked from here on, for `/readyz` (health.rs) -- the ladder counts its legs alike.
+            super::health::health()
+                .parked(present_channel_join_marked(&broker_conn, &ctx.request, &ctx.holder, PHASE_MARKER_RENDEZVOUS))
+                .await?
         }
     };
     reject_refused_outcome(outcome)
@@ -193,7 +199,14 @@ pub(crate) async fn serve_admitted_session(
         ChannelJoinOutcome::Admitted { peer_noise_pubkey, .. } => *peer_noise_pubkey,
         _ => None,
     };
-    let local = channel_local(peer);
+    // #292: a pairing the pin refuses gets no local side -- no handler process, no forward engine
+    // (and no "accepting TCP forward requests" line) for a member that is refused anyway. Its
+    // session still takes and closes its leg; an inert duplex stands in for the local side.
+    let local = if pin_refuses_admission(ctx.peer_pin.as_ref(), &ctx.request, &admission) {
+        ChannelLocal::Serve(tokio::io::duplex(1).0.into())
+    } else {
+        channel_local(peer)
+    };
     run_channel_join_with_admission(
         admission,
         relay,
@@ -207,6 +220,7 @@ pub(crate) async fn serve_admitted_session(
         local,
         ctx.direct_upgrade,
         ctx.accept_race,
+        ctx.peer_pin.as_ref(),
     )
     .await
 }
@@ -408,10 +422,21 @@ where
                     let _permit = permit; // held for the whole session; frees a slot on drop
                     let started = std::time::Instant::now();
                     let result = fut.await;
-                    let flapped = is_flapping_session(started.elapsed(), result.is_err());
-                    record_flap_outcome(&flap_counter, flapped);
+                    // #292: a pin refusal is a decision about that one peer, not a sign of
+                    // interference on the path -- it neither feeds nor resets the #250 streak, so
+                    // a member that keeps getting paired with this endpoint does not raise the
+                    // backoff before the pinned partner's next admission.
+                    let refused = matches!(&result, Err(e) if is_peer_not_pinned(e));
+                    if !refused {
+                        let flapped = is_flapping_session(started.elapsed(), result.is_err());
+                        record_flap_outcome(&flap_counter, flapped);
+                    }
+                    // A pin refusal is already reported by its rate-limited `channel_session`
+                    // event; this line is not rate-limited, and the refused member sets its pace.
                     if let Err(e) = result {
-                        eprintln!("ct-agent channel: serve session ended with error (#200): {e}");
+                        if !refused {
+                            eprintln!("ct-agent channel: serve session ended with error (#200): {e}");
+                        }
                     }
                 });
             }
@@ -582,7 +607,10 @@ where
             None => {
                 let broker_conn = crate::transport::build_channel_dialer()?.connect(cfg.broker_addr, "localhost")?.await?;
                 // CADS-Tunnel#495 U2 (a'): broker_conn is admission-only -- PHASE_MARKER_RENDEZVOUS.
-                present_channel_join_marked(&broker_conn, request, &cfg.holder, PHASE_MARKER_RENDEZVOUS).await
+                // Parked from here on, for `/readyz` (health.rs).
+                super::health::health()
+                    .parked(present_channel_join_marked(&broker_conn, request, &cfg.holder, PHASE_MARKER_RENDEZVOUS))
+                    .await
             }
         }
     };
@@ -634,6 +662,7 @@ where
         local,
         cfg.direct_upgrade,
         cfg.accept_race,
+        cfg.peer_pin.as_ref(),
     )
     .await
 }
