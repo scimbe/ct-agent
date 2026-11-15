@@ -13,6 +13,16 @@
 # to fix yet), so this never costs a new deployment anything.
 set -e
 
+# ct-agent#414: give the dropped-to uid a usable HOME. There is no /etc/passwd entry for
+# 65532, so the process otherwise inherits root's HOME (e.g. /root, unwritable to it) no
+# matter what -- it isn't unset, so a `${HOME:-...}` fallback would never trigger. HOME is
+# therefore always overridden to the directory the Dockerfile already chowns to 65532.
+# CT_AGENT_STATE_DIR only DEFAULTS to it: ssh_owner.rs's fail-closed message names HOME as
+# its own fallback for CT_AGENT_STATE_DIR, otherwise dead in a volume-less container, but an
+# operator who sets CT_AGENT_STATE_DIR explicitly keeps full control over where state lives.
+export HOME=/var/lib/ct-agent
+export CT_AGENT_STATE_DIR="${CT_AGENT_STATE_DIR:-/var/lib/ct-agent}"
+
 # Only a directory the agent does not own yet is migrated: `/shared` may be a volume other
 # containers write too, and re-owning their files on every start would hand this uid their
 # secrets. Once the top is 65532 the migration has happened; files added later are left alone.

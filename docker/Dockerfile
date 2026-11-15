@@ -32,6 +32,12 @@ RUN apt-get update \
 # extra downloaded binary.
 RUN groupadd --gid 65532 ctagent
 
+# ct-agent#414: a writable HOME for uid 65532. No /etc/passwd entry exists for it, so once
+# entrypoint.sh drops privileges the process inherits root's HOME (unwritable to 65532) --
+# and ssh_owner.rs's fail-closed message tells the operator to "set CT_AGENT_STATE_DIR (or
+# HOME)", implying a HOME-based state-dir fallback that is otherwise dead in this image.
+RUN mkdir -p /var/lib/ct-agent && chown 65532:65532 /var/lib/ct-agent
+
 ARG CT_AGENT_RELEASE=latest
 COPY verify-release.sh /usr/local/bin/verify-release.sh
 
