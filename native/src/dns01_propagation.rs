@@ -201,18 +201,45 @@ impl PropagationWaiter {
         let deadline = Instant::now() + self.timeout;
         let mut last_seen: Vec<String> = Vec::new();
         loop {
+            // Query every resolver of the round concurrently via a JoinSet: a single stalled
+            // resolver used to hold up the whole round for the full `request_timeout` before
+            // the next one was even asked (each lookup is still bounded by that same
+            // `request_timeout`, applied per-request as before). Each task owns its own clone
+            // of the shared client and resolver_url so it can run as a genuinely separate
+            // task, and carries its index so results can be matched back to their
+            // `resolver_url` in `resolver_urls` order -- the same order the old sequential
+            // loop processed them in, so the cloudflare-miss detection and `last_seen`
+            // overwrite semantics are unchanged.
+            let mut set = tokio::task::JoinSet::new();
+            for (idx, resolver_url) in self.resolver_urls.iter().enumerate() {
+                let http = self.http.clone();
+                let request_timeout = self.request_timeout;
+                let resolver_url = resolver_url.clone();
+                let name = record_name.to_string();
+                set.spawn(async move { (idx, Self::lookup(&http, request_timeout, &resolver_url, &name).await) });
+            }
+            let mut results: Vec<Option<Result<Vec<String>, String>>> =
+                (0..self.resolver_urls.len()).map(|_| None).collect();
+            while let Some(res) = set.join_next().await {
+                if let Ok((idx, result)) = res {
+                    results[idx] = Some(result);
+                }
+            }
             let mut cloudflare_missed = false;
             let mut all_agree = true;
-            for resolver_url in &self.resolver_urls {
-                let matched = match self.lookup(resolver_url, record_name).await {
-                    Ok(values) => {
+            for (resolver_url, result) in self.resolver_urls.iter().zip(results) {
+                let matched = match result {
+                    Some(Ok(values)) => {
                         let matched = values.iter().any(|v| v == expected_value);
                         if !matched {
                             last_seen = values;
                         }
                         matched
                     }
-                    Err(_) => false,
+                    // A transport error, or a task that never completed (round-robin
+                    // bookkeeping only -- there is no round-level timeout here, so this is
+                    // just a spawned task panicking) is "not yet visible from that resolver".
+                    Some(Err(_)) | None => false,
                 };
                 if !matched {
                     all_agree = false;
@@ -254,11 +281,18 @@ impl PropagationWaiter {
             .await;
     }
 
-    async fn lookup(&self, resolver_url: &str, name: &str) -> Result<Vec<String>, String> {
-        let resp = self
-            .http
+    /// Not a method (no waiter state beyond the client/timeout, both passed in): kept free of
+    /// `&self` so a round of these can be driven from a `JoinSet`, which needs each spawned
+    /// future to be `'static`.
+    async fn lookup(
+        http: &reqwest::Client,
+        request_timeout: Duration,
+        resolver_url: &str,
+        name: &str,
+    ) -> Result<Vec<String>, String> {
+        let resp = http
             .get(resolver_url)
-            .timeout(self.request_timeout)
+            .timeout(request_timeout)
             .header("accept", "application/dns-json")
             .query(&[("name", name), ("type", "TXT")])
             .send()
