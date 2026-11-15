@@ -602,6 +602,29 @@ async fn quic_control_exchange(
     .map_err(|_| -> BoxError { format!("{what} ack timed out after {bound:?}").into() })?
 }
 
+/// #387: the bounded write+flush+read-ack round trip shared by every TCP-fallback
+/// registration frame (`'A'`/`'K'` and `'B'`/`'L'`/`'F'` alike) -- only the ack
+/// classification differs between roles, which each caller keeps for itself.
+/// `what` names the frame in the timeout error.
+async fn stream_register_exchange<S>(
+    stream: &mut S,
+    msg: &[u8],
+    what: &str,
+) -> Result<[u8; 2], BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::time::timeout(REGISTER_ACK_TIMEOUT, async {
+        stream.write_all(msg).await?;
+        stream.flush().await?;
+        let mut ack = [0u8; 2];
+        stream.read_exact(&mut ack).await?;
+        Ok::<[u8; 2], BoxError>(ack)
+    })
+    .await
+    .map_err(|_| -> BoxError { format!("{what} ack timed out after {REGISTER_ACK_TIMEOUT:?}").into() })?
+}
+
 /// Shared body of the `'A'`/`'K'` TCP-fallback registration: both roles have a
 /// byte-identical wire format (`role(1) | token(32)` → 2-byte `OK`/`NO` ack), so
 /// the only thing that varies is the role byte itself.
@@ -615,29 +638,17 @@ where
 {
     let mut msg = vec![role];
     msg.extend_from_slice(&token.0);
-    tokio::time::timeout(REGISTER_ACK_TIMEOUT, async {
-        stream.write_all(&msg).await?;
-        stream.flush().await?;
-        let mut ack = [0u8; 2];
-        stream.read_exact(&mut ack).await?;
-        Ok::<[u8; 2], BoxError>(ack)
-    })
-    .await
-    .map_err(|_| -> BoxError {
-        format!("tunnel registration ack timed out after {REGISTER_ACK_TIMEOUT:?}").into()
-    })?
-    .and_then(|ack| {
-        if &ack == b"OK" {
-            Ok(())
-        } else if &ack == b"NO" {
-            // Typed (ct-agent#45 slice 3) so the fallback worker can count it
-            // toward the revocation view; on THIS path a single `NO` is still
-            // ambiguous (#410 sub-cap vs. revoked) -- see `RegistrationRefused`.
-            Err(RegistrationRefused::boxed())
-        } else {
-            Err("edge rejected tunnel registration".into())
-        }
-    })
+    let ack = stream_register_exchange(stream, &msg, "tunnel registration").await?;
+    if &ack == b"OK" {
+        Ok(())
+    } else if &ack == b"NO" {
+        // Typed (ct-agent#45 slice 3) so the fallback worker can count it
+        // toward the revocation view; on THIS path a single `NO` is still
+        // ambiguous (#410 sub-cap vs. revoked) -- see `RegistrationRefused`.
+        Err(RegistrationRefused::boxed())
+    } else {
+        Err("edge rejected tunnel registration".into())
+    }
 }
 
 /// Drive the ping phase of a `'K'` registration to its end: answer every PING
@@ -775,36 +786,26 @@ async fn register_tunnel_stream_browser_with_role<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // #387: same 1..=253 range `bind_hostname` enforces for the QUIC `'H'` frame --
+    // previously this frame only checked the length fit in the wire's u16, not that
+    // it was a plausible hostname at all.
     let host_bytes = host.as_bytes();
-    let host_len: u16 = host_bytes
-        .len()
-        .try_into()
-        .map_err(|_| "hostname too long for the browser-register frame")?;
+    if host_bytes.is_empty() || host_bytes.len() > 253 {
+        return Err("hostname length out of range (1..=253)".into());
+    }
+    let host_len = host_bytes.len() as u16;
     let mut msg = vec![role];
     msg.extend_from_slice(&token.0);
     msg.extend_from_slice(&host_len.to_be_bytes());
     msg.extend_from_slice(host_bytes);
     // See REGISTER_ACK_TIMEOUT's doc (#589 forensics) -- this is the exact live
     // path a `CT_AGENT_MODE=browser` agent (e.g. sort.bunsenbrenner.org) uses.
-    tokio::time::timeout(REGISTER_ACK_TIMEOUT, async {
-        stream.write_all(&msg).await?;
-        stream.flush().await?;
-        let mut ack = [0u8; 2];
-        stream.read_exact(&mut ack).await?;
-        Ok::<[u8; 2], BoxError>(ack)
-    })
-    .await
-    .map_err(|_| -> BoxError {
-        format!("browser hostname registration ack timed out after {REGISTER_ACK_TIMEOUT:?}")
-            .into()
-    })?
-    .and_then(|ack| {
-        if &ack == b"OK" {
-            Ok(())
-        } else {
-            Err("edge rejected browser hostname registration".into())
-        }
-    })
+    let ack = stream_register_exchange(stream, &msg, "browser hostname registration").await?;
+    if &ack == b"OK" {
+        Ok(())
+    } else {
+        Err("edge rejected browser hostname registration".into())
+    }
 }
 
 /// Connect to the Edge over **TLS-over-TCP** — the UDP-blocked fallback dialer
