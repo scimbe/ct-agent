@@ -205,21 +205,39 @@ pub(crate) fn spawn_stream_handler(cmd: &str, service: &str) -> io::Result<Strea
     Ok(StreamHandlerProcess { child, io: tokio::io::join(stdout, stdin) })
 }
 
+/// Object-safe union of [`AsyncRead`] + [`AsyncWrite`], so [`ChannelLocal::io`] can hand back
+/// a single trait object for whichever concrete stream the active variant holds, instead of
+/// every poll method re-matching all variants (ct-agent#402: all four poll methods on
+/// `ChannelLocal` repeated the same six-way match, including the identical `Err` arm twice
+/// each -- one dynamic-dispatch indirection here is a fair trade for that duplication).
+trait AsyncReadWrite: AsyncRead + AsyncWrite {}
+impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
+
+impl ChannelLocal {
+    /// The active variant's stream, or the construction error it was built from (`Stream`'s
+    /// spawn failure, `Forward`'s bad config / failed bind) -- same "fail loud on every poll"
+    /// contract the four call sites below shared before this helper existed.
+    fn io(&mut self) -> io::Result<&mut (dyn AsyncReadWrite + Unpin)> {
+        match self {
+            ChannelLocal::Pipe(p) => Ok(p),
+            ChannelLocal::Serve(d) => Ok(d),
+            ChannelLocal::Stream(Ok(s)) => Ok(s),
+            ChannelLocal::Stream(Err(e)) => Err(io::Error::new(e.kind(), e.to_string())),
+            ChannelLocal::Forward(Ok(d)) => Ok(d),
+            ChannelLocal::Forward(Err(e)) => Err(io::Error::new(e.kind(), e.to_string())),
+        }
+    }
+}
+
 impl AsyncRead for ChannelLocal {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            ChannelLocal::Pipe(p) => Pin::new(p).poll_read(cx, buf),
-            ChannelLocal::Serve(d) => Pin::new(d).poll_read(cx, buf),
-            ChannelLocal::Stream(Ok(s)) => Pin::new(s).poll_read(cx, buf),
-            ChannelLocal::Stream(Err(e)) => Poll::Ready(Err(io::Error::new(e.kind(), e.to_string()))),
-            ChannelLocal::Forward(Ok(d)) => Pin::new(d).poll_read(cx, buf),
-            ChannelLocal::Forward(Err(e)) => {
-                Poll::Ready(Err(io::Error::new(e.kind(), e.to_string())))
-            }
+        match self.get_mut().io() {
+            Ok(s) => Pin::new(s).poll_read(cx, buf),
+            Err(e) => Poll::Ready(Err(e)),
         }
     }
 }
@@ -230,39 +248,21 @@ impl AsyncWrite for ChannelLocal {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            ChannelLocal::Pipe(p) => Pin::new(p).poll_write(cx, buf),
-            ChannelLocal::Serve(d) => Pin::new(d).poll_write(cx, buf),
-            ChannelLocal::Stream(Ok(s)) => Pin::new(s).poll_write(cx, buf),
-            ChannelLocal::Stream(Err(e)) => Poll::Ready(Err(io::Error::new(e.kind(), e.to_string()))),
-            ChannelLocal::Forward(Ok(d)) => Pin::new(d).poll_write(cx, buf),
-            ChannelLocal::Forward(Err(e)) => {
-                Poll::Ready(Err(io::Error::new(e.kind(), e.to_string())))
-            }
+        match self.get_mut().io() {
+            Ok(s) => Pin::new(s).poll_write(cx, buf),
+            Err(e) => Poll::Ready(Err(e)),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            ChannelLocal::Pipe(p) => Pin::new(p).poll_flush(cx),
-            ChannelLocal::Serve(d) => Pin::new(d).poll_flush(cx),
-            ChannelLocal::Stream(Ok(s)) => Pin::new(s).poll_flush(cx),
-            ChannelLocal::Stream(Err(e)) => Poll::Ready(Err(io::Error::new(e.kind(), e.to_string()))),
-            ChannelLocal::Forward(Ok(d)) => Pin::new(d).poll_flush(cx),
-            ChannelLocal::Forward(Err(e)) => {
-                Poll::Ready(Err(io::Error::new(e.kind(), e.to_string())))
-            }
+        match self.get_mut().io() {
+            Ok(s) => Pin::new(s).poll_flush(cx),
+            Err(e) => Poll::Ready(Err(e)),
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            ChannelLocal::Pipe(p) => Pin::new(p).poll_shutdown(cx),
-            ChannelLocal::Serve(d) => Pin::new(d).poll_shutdown(cx),
-            ChannelLocal::Stream(Ok(s)) => Pin::new(s).poll_shutdown(cx),
-            ChannelLocal::Stream(Err(e)) => Poll::Ready(Err(io::Error::new(e.kind(), e.to_string()))),
-            ChannelLocal::Forward(Ok(d)) => Pin::new(d).poll_shutdown(cx),
-            ChannelLocal::Forward(Err(e)) => {
-                Poll::Ready(Err(io::Error::new(e.kind(), e.to_string())))
-            }
+        match self.get_mut().io() {
+            Ok(s) => Pin::new(s).poll_shutdown(cx),
+            Err(e) => Poll::Ready(Err(e)),
         }
     }
 }
