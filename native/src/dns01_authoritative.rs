@@ -160,8 +160,10 @@ enum Probe {
 }
 
 impl AuthoritativeChecker {
-    /// Ask one specific server, directly, for `name`'s TXT values.
-    async fn txt_at(&self, server: IpAddr, name: &str) -> Result<Vec<String>, String> {
+    /// Ask one specific server, directly, for `name`'s TXT values. Not a method (no server
+    /// state is used): kept free of `&self` so a round of these can be driven from a
+    /// `JoinSet`, which needs each spawned future to be `'static`.
+    async fn txt_at(server: IpAddr, name: &str) -> Result<Vec<String>, String> {
         let name_server = NameServerConfig::udp_and_tcp(server);
         let config = ResolverConfig::from_parts(None, Vec::new(), vec![name_server]);
         let mut opts = ResolverOpts::default();
@@ -186,7 +188,7 @@ impl AuthoritativeChecker {
 
     /// Ask one server for the zone's SOA -- a record every authoritative
     /// server for that zone must serve. Used purely as a liveness probe.
-    async fn soa_reachable(&self, server: IpAddr, zone: &str) -> bool {
+    async fn soa_reachable(server: IpAddr, zone: &str) -> bool {
         let name_server = NameServerConfig::udp_and_tcp(server);
         let config = ResolverConfig::from_parts(None, Vec::new(), vec![name_server]);
         let mut opts = ResolverOpts::default();
@@ -214,13 +216,13 @@ impl AuthoritativeChecker {
     /// must serve. An SOA answer proves the server is reachable and talking
     /// to us, so the TXT miss is real propagation lag; no SOA answer means we
     /// simply cannot see this server from here.
-    async fn probe(&self, server: IpAddr, name: &str, expected: &str, zone: &str) -> Probe {
-        if let Ok(values) = self.txt_at(server, name).await {
+    async fn probe(server: IpAddr, name: &str, expected: &str, zone: &str) -> Probe {
+        if let Ok(values) = Self::txt_at(server, name).await {
             if values.iter().any(|v| v == expected) {
                 return Probe::Present;
             }
         }
-        if self.soa_reachable(server, zone).await {
+        if Self::soa_reachable(server, zone).await {
             Probe::Absent
         } else {
             Probe::Unreachable
@@ -239,10 +241,44 @@ impl AuthoritativeChecker {
         let servers = self.authoritative_addrs(&zone).await?;
         let deadline = Instant::now() + self.timeout;
         loop {
-            let mut probes = Vec::with_capacity(servers.len());
-            for (host, ip) in &servers {
-                probes.push((host.as_str(), *ip, self.probe(*ip, record_name, expected_value, &zone).await));
+            // Probe every server concurrently instead of one at a time, via a JoinSet: each
+            // probe already carries its own internal cap (QUERY_TIMEOUT for the TXT query,
+            // plus another QUERY_TIMEOUT for the SOA liveness fallback on a miss), so a round
+            // now costs roughly one probe's worst case regardless of server count, instead of
+            // the sum over all of them. Bound the whole round by whatever's left of the
+            // overall deadline so the last round near expiry can't overshoot it by a full
+            // probe's worth of extra waiting; dropping the JoinSet when the timeout fires
+            // aborts whatever is still in flight.
+            let round_budget = deadline
+                .saturating_duration_since(Instant::now())
+                .min(QUERY_TIMEOUT * 2 + Duration::from_secs(1))
+                .max(Duration::from_millis(1));
+            let mut set = tokio::task::JoinSet::new();
+            for (idx, (_, ip)) in servers.iter().enumerate() {
+                let ip = *ip;
+                let name = record_name.to_string();
+                let expected = expected_value.to_string();
+                let zone = zone.clone();
+                set.spawn(async move { (idx, Self::probe(ip, &name, &expected, &zone).await) });
             }
+            let mut results: Vec<Option<Probe>> = (0..servers.len()).map(|_| None).collect();
+            let _ = tokio::time::timeout(round_budget, async {
+                while let Some(res) = set.join_next().await {
+                    if let Ok((idx, probe)) = res {
+                        results[idx] = Some(probe);
+                    }
+                }
+            })
+            .await;
+            // A server whose probe didn't finish in time (round timed out, or its task
+            // panicked) is nothing learned -- classify it Unreachable for this round only
+            // (the same "we don't know" bucket a real transport timeout would land in) rather
+            // than guessing Present/Absent; the loop simply tries again next round.
+            let probes: Vec<(&str, IpAddr, Probe)> = servers
+                .iter()
+                .zip(results)
+                .map(|((host, ip), probe)| (host.as_str(), *ip, probe.unwrap_or(Probe::Unreachable)))
+                .collect();
             let (missing, unreachable) = pending_servers(&probes);
             // Not one authoritative server is reachable from here. That is a
             // fact about this host's network, not about propagation -- most
@@ -332,15 +368,18 @@ mod tests {
         // NOT look like "the record is missing" -- it must carry the marker
         // the ACME client keys off to fall back to public resolvers, because
         // refusing here blocks an issuance that would otherwise succeed.
-        let checker = AuthoritativeChecker::with_timeout(Duration::from_millis(200)).unwrap();
         // TEST-NET-1 never answers: neither the TXT query nor the SOA
         // liveness probe gets a reply, so this must classify as Unreachable.
         // Critically, hickory renders that timeout with the SAME "no records
         // found" text as a real authoritative negative -- which is exactly
         // why the SOA probe exists rather than error-string matching.
-        let probe = checker
-            .probe("192.0.2.1".parse().unwrap(), "_acme-challenge.example.invalid", "whatever", "example.invalid")
-            .await;
+        let probe = AuthoritativeChecker::probe(
+            "192.0.2.1".parse().unwrap(),
+            "_acme-challenge.example.invalid",
+            "whatever",
+            "example.invalid",
+        )
+        .await;
         assert_eq!(probe, Probe::Unreachable, "a silent server is unreachable, not 'record absent'");
     }
 
@@ -362,10 +401,9 @@ mod tests {
         // Fail-closed: an unreachable authoritative server must never be
         // silently treated as agreeing -- that would reintroduce exactly the
         // too-weak signal this module exists to replace.
-        let checker = AuthoritativeChecker::with_timeout(Duration::from_millis(50)).unwrap();
         // TEST-NET-1 (RFC 5737), guaranteed not to answer.
         let unreachable: IpAddr = "192.0.2.1".parse().unwrap();
-        let values = checker.txt_at(unreachable, "_acme-challenge.example.invalid").await;
+        let values = AuthoritativeChecker::txt_at(unreachable, "_acme-challenge.example.invalid").await;
         assert!(values.is_err(), "an unreachable server errors rather than returning an empty success");
     }
 }
