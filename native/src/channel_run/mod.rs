@@ -1134,7 +1134,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
 /// environment so the whole thing fits a copy-paste one-liner. The peer's transport
 /// cert and Noise key travel as hex (as the broker/CP will hand them over); Noise_IK
 /// is the real mutual authentication, so the QUIC cert is only the transport anchor.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ChannelRunConfig {
     pub role: ChannelRole,
     /// Responder: the address to bind. Initiator: the peer address to dial.
@@ -1145,6 +1145,20 @@ pub struct ChannelRunConfig {
     pub peer_noise_public: [u8; 32],
     /// Initiator only: the peer responder's QUIC cert (DER) to trust for the dial.
     pub peer_cert_der: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for ChannelRunConfig {
+    /// Hand-written so `own_noise_private` -- this agent's raw X25519 private key -- never
+    /// appears in a `{cfg:?}` log line or panic message.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelRunConfig")
+            .field("role", &self.role)
+            .field("addr", &self.addr)
+            .field("own_noise_private", &"<redacted>")
+            .field("peer_noise_public", &self.peer_noise_public)
+            .field("peer_cert_der", &self.peer_cert_der)
+            .finish()
+    }
 }
 
 impl ChannelRunConfig {

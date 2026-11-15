@@ -215,7 +215,7 @@ pub struct AgentConfig {
 /// (a copy-pasted proxy address with no matching SNI host, say), so `from_env_with`
 /// treats "some but not all four set" as a hard config error rather than silently
 /// leaving MASQUE disabled.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MasqueFallbackConfig {
     /// Where to dial TCP+TLS+h2 -- the Edge's own public front door
     /// (`CT_AGENT_MASQUE_PROXY`, e.g. `edge_host:443`). A [`DialTarget`], so a front
@@ -238,6 +238,19 @@ pub struct MasqueFallbackConfig {
     /// Edge's own INTERNAL QUIC listener, so `masque-proxy` requires this token
     /// from every caller (fail-closed on its own side too).
     pub token: String,
+}
+
+impl std::fmt::Debug for MasqueFallbackConfig {
+    /// Hand-written so `token` -- the bearer credential `masque-proxy` requires from every
+    /// caller -- never appears in a `{cfg:?}` log line or panic message.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MasqueFallbackConfig")
+            .field("proxy_addr", &self.proxy_addr)
+            .field("sni_host", &self.sni_host)
+            .field("target", &self.target)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Resolve a `host:port` (or `IP:port`) to a [`SocketAddr`] (#45). A literal

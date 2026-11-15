@@ -197,7 +197,6 @@ async fn notify_issuance_complete(http: &reqwest::Client, cp_url: &str, token: &
 }
 
 /// Everything one issuance/renewal run needs.
-#[derive(Debug)]
 pub struct AcmeCertConfig {
     /// Control-plane base URL (proves hostname ownership via `routing_token`).
     pub cp_url: String,
@@ -241,6 +240,26 @@ pub struct AcmeCertConfig {
     /// this agent may talk to beyond the known-CA registry, see
     /// [`crate::acme_client::directory_url_policy`]. Empty for every public deployment.
     pub acme_directory_extra_hosts: Vec<String>,
+}
+
+impl std::fmt::Debug for AcmeCertConfig {
+    /// Hand-written so `routing_token` -- sufficient to take a tunnel's traffic -- never appears
+    /// in a `{cfg:?}` log line or panic message.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcmeCertConfig")
+            .field("cp_url", &self.cp_url)
+            .field("routing_token", &"<redacted>")
+            .field("hostname", &self.hostname)
+            .field("cert_out_dir", &self.cert_out_dir)
+            .field("account_key_path", &self.account_key_path)
+            .field("dns01_resolver_urls", &self.dns01_resolver_urls)
+            .field("dns01_propagation_timeout", &self.dns01_propagation_timeout)
+            .field("dns01_initial_delay", &self.dns01_initial_delay)
+            .field("dns01_use_authoritative", &self.dns01_use_authoritative)
+            .field("dns01_attempts", &self.dns01_attempts)
+            .field("acme_directory_extra_hosts", &self.acme_directory_extra_hosts)
+            .finish()
+    }
 }
 
 impl AcmeCertConfig {
