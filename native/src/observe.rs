@@ -251,7 +251,19 @@ fn is_local_host(host: &str) -> bool {
 /// retried after a short pause instead of ending the listener.
 pub(crate) async fn serve_bounded(listener: tokio::net::TcpListener, app: Router, limits: ListenerLimits) -> Result<(), BoxError> {
     let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    // ct-agent#180: every spawn is owned by a TaskGuard or a JoinSet, wrapped by `tracked` so
+    // it counts in `ct_agent_tasks_live` -- this accept loop was the one bare `tokio::spawn`
+    // left on the data plane. Owning the per-connection tasks in a `JoinSet` here means
+    // aborting (or just dropping) `serve_bounded`'s own task -- which is what happens when the
+    // listener task is aborted -- aborts every connection task still in flight too, instead of
+    // leaving up to `max_connections` of them running for up to `connection_lifetime` with no
+    // owner.
+    let mut connections = tokio::task::JoinSet::new();
     loop {
+        // Reap tasks that finished since the last iteration so the set doesn't grow for the
+        // life of the listener; each connection's own outcome (including a timed-out one) was
+        // already handled inside its task, so there's nothing further to do with the result.
+        while connections.try_join_next().is_some() {}
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
             Err(_) => {
@@ -263,14 +275,14 @@ pub(crate) async fn serve_bounded(listener: tokio::net::TcpListener, app: Router
             continue; // over the cap: `stream` drops here, closing it
         };
         let service = hyper_util::service::TowerToHyperService::new(app.clone());
-        tokio::spawn(async move {
+        connections.spawn(crate::task_guard::tracked(async move {
             let _permit = permit;
             let conn = hyper::server::conn::http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
                 .header_read_timeout(limits.header_read_timeout)
                 .serve_connection(hyper_util::rt::TokioIo::new(stream), service);
             let _ = tokio::time::timeout(limits.connection_lifetime, conn).await;
-        });
+        }));
     }
 }
 
