@@ -553,6 +553,57 @@ pub(crate) fn verify_relayed_dcutr_peer(
     Ok((noise, peer_holder))
 }
 
+/// The frozen `Refused`/`ParkExpired` → error mapping shared by every relay-join variant and
+/// [`crate::channel_run::connectivity::park_relay_leg_on_quic`]. `None` for `Admitted` -- the
+/// caller still needs to inspect the admitted payload itself.
+fn refused_or_park_expired(outcome: &ChannelJoinOutcome) -> Option<BoxError> {
+    match outcome {
+        // #524: base string frozen, category appended when present.
+        ChannelJoinOutcome::Refused { category } => Some(AdmissionRefused::boxed_with_category(
+            "edge relay refused the channel join",
+            category.as_deref(),
+        )),
+        // #21: the relay park was reaped before a partner arrived -- retryable, not a refusal.
+        ChannelJoinOutcome::ParkExpired => Some(ParkExpired::boxed(
+            "edge relay park expired with no partner within the park window (#21) -- re-park the relay leg",
+        )),
+        ChannelJoinOutcome::Admitted { .. } => None,
+    }
+}
+
+/// Shared tail of `join_via_relay_dcutr`, `join_via_relay_without_dcutr` and
+/// `join_via_relay_gate_dcutr`: classify a [`ChannelJoinOutcome`] into the peer's attested
+/// Noise key, its holder, and (when the edge observed one) this member's own reflexive
+/// address. `what` names the call site (e.g. "DCUtR relay join") for the one admitted-but-
+/// no-peer-key error, whose frozen wording differs slightly per caller.
+pub(crate) fn relayed_peer(
+    outcome: ChannelJoinOutcome,
+    request: &ChannelJoinRequest,
+    what: &str,
+) -> Result<([u8; 32], [u8; 32], Option<SocketAddr>), BoxError> {
+    if let Some(err) = refused_or_park_expired(&outcome) {
+        return Err(err);
+    }
+    match outcome {
+        ChannelJoinOutcome::Admitted {
+            peer_noise_pubkey: Some(noise),
+            peer_holder,
+            peer_attestation,
+            observed_reflexive,
+            ..
+        } => {
+            let (noise, peer_holder) = verify_relayed_dcutr_peer(request, noise, peer_holder, peer_attestation)?;
+            Ok((noise, peer_holder, observed_reflexive))
+        }
+        ChannelJoinOutcome::Admitted { .. } => {
+            Err(format!("{what} needs the peer's relayed Noise key (register the member's key, #101)").into())
+        }
+        ChannelJoinOutcome::Refused { .. } | ChannelJoinOutcome::ParkExpired => {
+            unreachable!("Refused/ParkExpired already returned above")
+        }
+    }
+}
+
 // #292: the peer pin is the eighth argument, as on its relay-gate sibling.
 #[allow(clippy::too_many_arguments)]
 pub async fn join_via_relay_dcutr<P>(
@@ -571,25 +622,8 @@ where
 {
     // CADS-Tunnel#495 U2 (a'): relay_conn's own bi-stream carries the DCUtR base leg
     // below -- PHASE_MARKER_RELAY.
-    let (peer_noise, peer_holder) = match present_channel_join_marked(relay_conn, request, holder, PHASE_MARKER_RELAY).await? {
-        ChannelJoinOutcome::Admitted { peer_noise_pubkey: Some(noise), peer_holder, peer_attestation, .. } => {
-            verify_relayed_dcutr_peer(request, noise, peer_holder, peer_attestation)?
-        }
-        ChannelJoinOutcome::Admitted { .. } => {
-            return Err("DCUtR relay join needs the peer's relayed Noise key (register the member's key, #101)".into())
-        }
-        ChannelJoinOutcome::Refused { category } => {
-            // #524: base string frozen, category appended when present.
-            return Err(AdmissionRefused::boxed_with_category(
-                "edge relay refused the channel join",
-                category.as_deref(),
-            ));
-        }
-        // #21: the relay park was reaped before a partner arrived -- retryable, not a refusal.
-        ChannelJoinOutcome::ParkExpired => {
-            return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
-        }
-    };
+    let outcome = present_channel_join_marked(relay_conn, request, holder, PHASE_MARKER_RELAY).await?;
+    let (peer_noise, peer_holder, _observed_reflexive) = relayed_peer(outcome, request, "DCUtR relay join")?;
     // #292: this admission IS the relay leg -- the edge spliced it with the peer's when it acked --
     // so a refusal closes it at once, before the relay stream and the Noise handshake.
     if let Err(refused) = check_peer_pin(peer_pin, request, &peer_holder, &peer_noise) {
@@ -692,25 +726,8 @@ where
 {
     // CADS-Tunnel#495 U2 (a'): relay_conn's own bi-stream carries the session -- PHASE_MARKER_RELAY,
     // as on both DCUtR joins.
-    let (peer_noise, peer_holder) = match present_channel_join_marked(relay_conn, request, holder, PHASE_MARKER_RELAY).await? {
-        ChannelJoinOutcome::Admitted { peer_noise_pubkey: Some(noise), peer_holder, peer_attestation, .. } => {
-            verify_relayed_dcutr_peer(request, noise, peer_holder, peer_attestation)?
-        }
-        ChannelJoinOutcome::Admitted { .. } => {
-            return Err("relay-only join needs the peer's relayed Noise key (register the member's key, #101)".into())
-        }
-        ChannelJoinOutcome::Refused { category } => {
-            // #524: base string frozen, category appended when present.
-            return Err(AdmissionRefused::boxed_with_category(
-                "edge relay refused the channel join",
-                category.as_deref(),
-            ));
-        }
-        // #21: the relay park was reaped before a partner arrived -- retryable, not a refusal.
-        ChannelJoinOutcome::ParkExpired => {
-            return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
-        }
-    };
+    let outcome = present_channel_join_marked(relay_conn, request, holder, PHASE_MARKER_RELAY).await?;
+    let (peer_noise, peer_holder, _observed_reflexive) = relayed_peer(outcome, request, "relay-only join")?;
     let local = gate_local(local, request, role, peer_holder, holder)?;
     let (relay_send, relay_recv) = open_relay_channel_streams(relay_conn, role).await?;
     run_relay_session_declining_upgrades(relay_send, relay_recv, local, role, own_noise_private, &peer_noise).await

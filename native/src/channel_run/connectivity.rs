@@ -126,34 +126,9 @@ where
     // CADS-Tunnel#495 U2 (a'): relay_conn's actual (post-admission) bi-stream carries the
     // relay-gate leg's data below -- PHASE_MARKER_RELAY, mirroring the :443 relay ladder's
     // own phase_marker_for(&stream, PHASE_MARKER_RELAY) call.
-    let (peer_noise, own_observed_reflexive, peer_holder) =
-        match present_channel_join_marked(relay_conn, request, holder, PHASE_MARKER_RELAY).await? {
-        ChannelJoinOutcome::Admitted {
-            peer_noise_pubkey: Some(noise),
-            peer_holder,
-            peer_attestation,
-            observed_reflexive,
-            ..
-        } => {
-            // ct-agent#41 (#35 "Path A"): see verify_relayed_dcutr_peer's own doc comment.
-            let (noise, peer_holder) = verify_relayed_dcutr_peer(request, noise, peer_holder, peer_attestation)?;
-            (noise, observed_reflexive, peer_holder)
-        }
-        ChannelJoinOutcome::Admitted { .. } => {
-            return Err("DCUtR relay-gate join needs the peer's relayed Noise key (register the member's key, #101)".into())
-        }
-        ChannelJoinOutcome::Refused { category } => {
-            // #524: base string frozen, category appended when present.
-            return Err(AdmissionRefused::boxed_with_category(
-                "edge relay refused the channel join",
-                category.as_deref(),
-            ));
-        }
-        // #21: the relay park was reaped before a partner arrived -- retryable, not a refusal.
-        ChannelJoinOutcome::ParkExpired => {
-            return Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
-        }
-    };
+    // ct-agent#41 (#35 "Path A"): see verify_relayed_dcutr_peer's own doc comment.
+    let outcome = present_channel_join_marked(relay_conn, request, holder, PHASE_MARKER_RELAY).await?;
+    let (peer_noise, peer_holder, own_observed_reflexive) = relayed_peer(outcome, request, "DCUtR relay-gate join")?;
     // #292: this admission IS the relay leg (see `join_via_relay_dcutr`): a refusal closes it at once.
     if let Err(refused) = check_peer_pin(peer_pin, request, &peer_holder, &peer_noise) {
         close_refused_relay_conn(relay_conn);
@@ -737,19 +712,10 @@ where
         close_quic_relay_leg(&conn);
         return Ok(RelayLegPark::Abandoned);
     };
-    match outcome? {
-        ChannelJoinOutcome::Admitted { .. } => Ok(RelayLegPark::Admitted(ParkedRelayLeg::Quic(conn))),
-        ChannelJoinOutcome::Refused { category } => {
-            // #524: base string frozen, category appended when present.
-            Err(AdmissionRefused::boxed_with_category(
-                "edge relay refused the channel join",
-                category.as_deref(),
-            ))
-        }
-        // #21: the relay park was reaped before a partner arrived -- retryable, not a refusal.
-        ChannelJoinOutcome::ParkExpired => {
-            Err(ParkExpired::boxed("edge relay park expired with no partner within the park window (#21) -- re-park the relay leg"))
-        }
+    let outcome = outcome?;
+    match refused_or_park_expired(&outcome) {
+        Some(err) => Err(err),
+        None => Ok(RelayLegPark::Admitted(ParkedRelayLeg::Quic(conn))),
     }
 }
 
