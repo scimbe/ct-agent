@@ -94,6 +94,45 @@ expect_env "case 2" "$d2/env.log" "CT_AGENT_EDGE=cp.example:4433"
 case "$out2" in *"is loopback"*) echo "ok: case 2 warned about a loopback origin" ;; *) echo "FAIL: case 2 no loopback warning" >&2; fail=1 ;; esac
 rm -rf "$d2" "$stubs"
 
+# --- case 3: control plane emits spaced JSON (e.g. "secret": "..." / "mesh_edge_port": 4433) --
+# ensure_env's field extraction must not require the compact form (#385).
+spaced_stubs="$(mktemp -d)"
+cat > "$spaced_stubs/curl" <<'STUB'
+#!/bin/sh
+echo "curl $*" >> "$STUB_LOG"
+case "$*" in
+  *bootstrap/redeem*) cat >/dev/null; printf '{"secret": "CT_JOIN_TOKEN=redeemedjoin;CT_AGENT_TOKEN=redeemedagent"}' ;;
+  *releases/latest*)  printf '{"tag_name": "v9.9.9"}' ;;
+  *network-info*)     printf '{ "mesh_edge_port" : 4433 }' ;;
+esac
+STUB
+chmod +x "$spaced_stubs/curl"
+d3="$(mktemp -d)"
+cat > "$d3/docker" <<'STUB'
+#!/bin/sh
+echo "docker $*" >> "$STUB_LOG"
+if [ "$1" = "run" ]; then
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "-e" ]; then
+      case "$a" in *=*) echo "ENV $a" ;; *) eval "v=\${$a-__UNSET__}"; echo "ENV $a=$v" ;; esac
+    fi
+    prev="$a"
+  done >> "$STUB_ENV"
+fi
+exit 0
+STUB
+chmod +x "$d3/docker"
+cp "$d3/docker" "$spaced_stubs/docker"
+out3=$(cd "$d3" && env -i PATH="$spaced_stubs:$PATH" HOME="$d3" STUB_LOG="$d3/argv.log" STUB_ENV="$d3/env.log" \
+  CT_BOOTSTRAP=sekritbootstrap CT_AGENT_CP_URL=https://cp.example \
+  CT_AGENT_HOSTNAME=demo.example CT_AGENT_ORIGIN=10.0.0.5:8080 \
+  bash -c "set -uo pipefail; source '$SETUP_SH'; MODE=docker; ensure_env && install_docker && echo DOCKER_OK" </dev/null 2>&1)
+case "$out3" in *DOCKER_OK*) echo "ok: case 3 completed (spaced JSON)" ;; *) echo "FAIL: case 3: $out3" >&2; fail=1 ;; esac
+expect_env "case 3" "$d3/env.log" "CT_AGENT_TOKEN=redeemedagent"
+expect_env "case 3" "$d3/env.log" "CT_AGENT_EDGE=cp.example:4433"
+rm -rf "$d3" "$spaced_stubs"
+
 if [ "$fail" -eq 0 ]; then
   echo "PASS: setup.sh keeps secrets out of argv and hands --docker its full config"
 else
