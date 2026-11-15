@@ -82,6 +82,11 @@ impl Frame {
             }
             Frame::Close { id, reason } => {
                 let r = reason.as_deref().unwrap_or("");
+                // #411: `reason` can carry an arbitrary local error string (e.g. a dial
+                // failure's OS/DNS message) with no upstream length check. Truncate on a
+                // char boundary rather than let it desync the peer's `Frame::read`, which
+                // rejects anything past MAX_TARGET_WIRE_LEN as a session-ending InvalidData.
+                let r = truncate_to_wire_len(r, MAX_TARGET_WIRE_LEN);
                 let rb = r.as_bytes();
                 let mut out = Vec::with_capacity(1 + 4 + 1 + 2 + rb.len());
                 out.push(TAG_CLOSE);
@@ -94,8 +99,27 @@ impl Frame {
         }
     }
 
-    /// Write [`Frame::encode`]'s bytes to `w` in one call.
+    /// Write [`Frame::encode`]'s bytes to `w` in one call. Rejects an `Open.target` or
+    /// `Data.payload` that exceeds the reader's own caps ([`MAX_TARGET_WIRE_LEN`],
+    /// [`MAX_DATA_FRAME_LEN`]) instead of emitting a frame the peer is bound to reject
+    /// (`Close.reason` is truncated rather than rejected in [`Frame::encode`] — it is
+    /// cosmetic, not protocol-critical, so losing its tail is better than losing the frame).
     pub(crate) async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
+        match self {
+            Frame::Open { target, .. } if target.len() > MAX_TARGET_WIRE_LEN => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("forward Open target of {} bytes exceeds the {MAX_TARGET_WIRE_LEN}-byte cap", target.len()),
+                ));
+            }
+            Frame::Data { payload, .. } if payload.len() > MAX_DATA_FRAME_LEN => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("forward Data frame of {} bytes exceeds the {MAX_DATA_FRAME_LEN}-byte cap", payload.len()),
+                ));
+            }
+            _ => {}
+        }
         w.write_all(&self.encode()).await
     }
 
@@ -146,6 +170,19 @@ impl Frame {
             ))),
         }
     }
+}
+
+/// Truncate `s` to at most `max_len` bytes on a UTF-8 char boundary, so the result is still
+/// valid UTF-8 and fits in the wire's `u16` length-prefixed string.
+fn truncate_to_wire_len(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len {
+        return s;
+    }
+    let mut end = max_len;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 async fn read_string<R: AsyncRead + Unpin>(r: &mut R, max_len: usize) -> io::Result<String> {
