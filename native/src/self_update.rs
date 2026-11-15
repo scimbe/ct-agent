@@ -190,21 +190,17 @@ pub struct UpdateCheck {
     pub asset_name: String,
 }
 
-/// Extract `tag_name` from the GitHub releases API's JSON body -- the same
-/// plain-`sed`-style extraction idiom `scripts/setup.sh` already uses for
-/// other GitHub/control-plane API responses (no `serde_json` dependency
-/// pulled in just for one field; this crate already parses JSON manually
-/// elsewhere, e.g. `acme_client.rs`, for the same reason: avoid a full
-/// deserializer for a single scalar).
+/// Extract `tag_name` from the GitHub releases API's JSON body. This crate
+/// already depends on `serde_json` (e.g. the manifest parsing below), so
+/// deserializing the one field we need is no heavier than hand-scanning for
+/// it, and doesn't silently match a `"tag_name"` that happens to appear
+/// somewhere unexpected (a release body/description, for instance).
 fn extract_tag_name(body: &str) -> Option<String> {
-    let key = "\"tag_name\"";
-    let idx = body.find(key)?;
-    let after_key = &body[idx + key.len()..];
-    let colon = after_key.find(':')?;
-    let after_colon = after_key[colon + 1..].trim_start();
-    let after_colon = after_colon.strip_prefix('"')?;
-    let end = after_colon.find('"')?;
-    Some(after_colon[..end].to_string())
+    #[derive(serde::Deserialize)]
+    struct Latest {
+        tag_name: String,
+    }
+    serde_json::from_str::<Latest>(body).ok().map(|l| l.tag_name)
 }
 
 /// Map this process's own platform to the exact asset-name suffix
@@ -264,7 +260,8 @@ pub async fn check_latest(current_version: &str) -> Result<UpdateCheck, String> 
     if !resp.status().is_success() {
         return Err(format!("GET {RELEASES_API}: HTTP {}", resp.status()));
     }
-    let body = resp.text().await.map_err(|e| format!("reading response body: {e}"))?;
+    let body = read_body_capped(resp, RELEASES_API, MAX_MANIFEST_BYTES).await?;
+    let body = String::from_utf8(body).map_err(|e| format!("GET {RELEASES_API}: non-UTF-8 body: {e}"))?;
     let latest_version =
         extract_tag_name(&body).ok_or_else(|| "no tag_name in the releases API response".to_string())?;
     let asset_name = asset_name_for_platform(std::env::consts::OS, std::env::consts::ARCH)?;
