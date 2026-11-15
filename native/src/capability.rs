@@ -142,16 +142,12 @@ fn resolve_primary_identity(
         // sharing it. Staging removes the window instead of relying on retry luck.
         let origin_key = OriginKey::generate();
         let cap = mint(origin_key.origin_identity());
-        let key_tmp = format!("{kp}.new");
-        let cap_tmp = format!("{cap_path}.new");
-        write_owner_only(&key_tmp, &origin_key.private_bytes())?;
-        if let Err(e) = write_owner_only(&cap_tmp, &cap.encode()) {
-            let _ = std::fs::remove_file(&key_tmp);
-            return Err(e);
-        }
-        std::fs::rename(&key_tmp, kp)?;
-        std::fs::rename(&cap_tmp, cap_path)?;
-        crate::secret_file::sync_parent_dir(std::path::Path::new(cap_path))?;
+        crate::secret_file::promote_pair(
+            std::path::Path::new(kp),
+            |p| write_owner_only(&p.to_string_lossy(), &origin_key.private_bytes()),
+            std::path::Path::new(cap_path),
+            |p| write_owner_only(&p.to_string_lossy(), &cap.encode()),
+        )?;
         return Ok((cap, origin_key.private_bytes()));
     }
     // Default: a fresh, unique single-agent identity.
@@ -219,32 +215,19 @@ pub fn rotate_origin_key(
         .join(format!("retired-{}.key", hex8(&old_cap.origin.0)));
     write_owner_only(&retired.to_string_lossy(), &old_key)?;
     // Promote the new key + capability as a near-atomic unit, not two independent
-    // writes: stage both to `.new` temp paths first, then rename both into place.
-    // `resolve_primary_identity`'s shared-identity load reads `key_path`/`cap_path`
-    // independently with no cross-check that they name the SAME origin identity --
-    // if the old code's two direct writes landed key_path=NEW but cap_path=OLD (a
-    // crash or a write error, e.g. disk full, between them), the agent would next
-    // boot with a private key that doesn't match its own persisted capability, and
-    // silently fail every Noise handshake with no clear signal why. Staging first
-    // means the FAR more likely failure (an error mid-write) leaves key_path/
-    // cap_path completely untouched -- still a consistent OLD pair -- rather than a
-    // mismatched mix; only a crash landing exactly between the two renames (fast,
-    // near-instantaneous syscalls) remains a residual window, far smaller than
-    // spanning two full-content writes.
-    let key_tmp = format!("{key_path}.new");
-    let cap_tmp = format!("{cap_path}.new");
-    write_owner_only(&key_tmp, &new_key.private_bytes())?;
-    if let Err(e) = write_owner_only(&cap_tmp, &new_cap.encode()) {
-        // key_tmp already landed -- clean it up so a failed rotation doesn't leave
-        // a stray `.new` file (containing key material) sitting next to key_path
-        // forever. Best-effort: the real key_path/cap_path pair is what matters
-        // for correctness, and is already untouched at this point either way.
-        let _ = std::fs::remove_file(&key_tmp);
-        return Err(e);
-    }
-    std::fs::rename(&key_tmp, key_path)?;
-    std::fs::rename(&cap_tmp, cap_path)?;
-    crate::secret_file::sync_parent_dir(std::path::Path::new(cap_path))?;
+    // writes (see `secret_file::promote_pair`'s own doc comment for the crash window
+    // this closes): `resolve_primary_identity`'s shared-identity load reads
+    // `key_path`/`cap_path` independently with no cross-check that they name the SAME
+    // origin identity -- two direct writes could land key_path=NEW but cap_path=OLD on
+    // a crash or write error between them, and the agent would next boot with a
+    // private key that doesn't match its own persisted capability, silently failing
+    // every Noise handshake with no clear signal why.
+    crate::secret_file::promote_pair(
+        std::path::Path::new(key_path),
+        |p| write_owner_only(&p.to_string_lossy(), &new_key.private_bytes()),
+        std::path::Path::new(cap_path),
+        |p| write_owner_only(&p.to_string_lossy(), &new_cap.encode()),
+    )?;
     Ok(new_cap)
 }
 

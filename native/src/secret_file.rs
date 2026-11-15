@@ -110,6 +110,45 @@ fn temp_sibling(path: &Path) -> std::path::PathBuf {
     path.with_file_name(format!(".{name}.tmp"))
 }
 
+/// Stage two related files -- e.g. a fresh identity key and its matching capability
+/// (`capability.rs`), or a private key and its certificate chain (`acme_orchestrate.rs`) --
+/// to `.new` siblings via `write_first`/`write_second`, and promote both to their final
+/// paths only once BOTH stage-writes land. This is the one crash-consistency shape that
+/// was implemented three times with the same comments explaining the same crash window:
+/// if the second stage-write fails, the first's `.new` is removed and the error returned
+/// (the real on-disk pair is untouched either way, since neither final path was touched
+/// yet); otherwise `first` is renamed before `second` -- so a reader polling for `second`
+/// never observes it without its already-renamed partner -- then the parent directory is
+/// `fsync`'d once. `write_first`/`write_second` carry whatever mode/secrecy a caller needs
+/// (plain [`write_private`]/[`write_durable`], or a wrapper that also creates a missing
+/// parent directory) -- this helper only owns the staging/rollback/rename/sync shape, not
+/// the write policy.
+pub fn promote_pair<E: From<std::io::Error>>(
+    first_path: &Path,
+    write_first: impl FnOnce(&Path) -> Result<(), E>,
+    second_path: &Path,
+    write_second: impl FnOnce(&Path) -> Result<(), E>,
+) -> Result<(), E> {
+    let first_tmp = new_sibling(first_path);
+    let second_tmp = new_sibling(second_path);
+    write_first(&first_tmp)?;
+    if let Err(e) = write_second(&second_tmp) {
+        let _ = std::fs::remove_file(&first_tmp);
+        return Err(e);
+    }
+    std::fs::rename(&first_tmp, first_path)?;
+    std::fs::rename(&second_tmp, second_path)?;
+    sync_parent_dir(second_path)?;
+    Ok(())
+}
+
+/// `<path>.new`, the staging sibling [`promote_pair`] writes before renaming into place.
+fn new_sibling(path: &Path) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".new");
+    std::path::PathBuf::from(s)
+}
+
 /// `fsync` the directory holding `path`, so a completed `rename` into it survives a power
 /// loss. A no-op where directories cannot be opened for syncing.
 pub fn sync_parent_dir(path: &Path) -> std::io::Result<()> {

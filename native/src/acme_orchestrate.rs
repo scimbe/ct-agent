@@ -465,27 +465,24 @@ pub async fn obtain_or_renew(config: &AcmeCertConfig) -> Result<bool, BoxError> 
         }
     };
 
-    // Stage both to `.new` temp paths first, promote only once both
-    // stage-writes succeed. Two direct writes (the previous shape) leave a
-    // crash/write-error window where a FRESH key lands on disk paired with
-    // the STALE cert -- an origin's webserver that reloads key material as
-    // soon as it changes would then serve a key that doesn't match its own
-    // certificate, and nothing self-corrects the mismatch until the next
-    // renewal is due (up to `RENEW_AFTER_DAYS`). Renamed key-before-cert,
-    // same as before, so a reader polling for the cert file still never sees
-    // a cert with no matching key on disk yet.
+    // Stage both to `.new` temp paths first, promote only once both stage-writes
+    // succeed (see `secret_file::promote_pair`'s own doc comment for the crash
+    // window this closes): two direct writes would leave a crash/write-error
+    // window where a FRESH key lands on disk paired with the STALE cert -- an
+    // origin's webserver that reloads key material as soon as it changes would
+    // then serve a key that doesn't match its own certificate, and nothing
+    // self-corrects the mismatch until the next renewal is due (up to
+    // `RENEW_AFTER_DAYS`). Renamed key-before-cert, same as before, so a reader
+    // polling for the cert file still never sees a cert with no matching key on
+    // disk yet.
     let key_path = config.key_path();
     let cert_path = config.cert_path();
-    let key_tmp = PathBuf::from(format!("{}.new", key_path.display()));
-    let cert_tmp = PathBuf::from(format!("{}.new", cert_path.display()));
-    write_private(&key_tmp, issued.key_pem.as_bytes())?;
-    if let Err(e) = crate::secret_file::write_durable(&cert_tmp, issued.cert_chain_pem.as_bytes()) {
-        let _ = std::fs::remove_file(&key_tmp);
-        return Err(e.into());
-    }
-    std::fs::rename(&key_tmp, &key_path)?;
-    std::fs::rename(&cert_tmp, &cert_path)?;
-    crate::secret_file::sync_parent_dir(&cert_path)?;
+    crate::secret_file::promote_pair(
+        &key_path,
+        |p| write_private(p, issued.key_pem.as_bytes()),
+        &cert_path,
+        |p| crate::secret_file::write_durable(p, issued.cert_chain_pem.as_bytes()),
+    )?;
     eprintln!(
         "ct-agent: obtained a certificate for {} ({} -> {})",
         config.hostname,
