@@ -126,7 +126,8 @@ diff)
   # in CI, by running the check from the base revision's copy (see the workflow).
   # Added lines with file:line locations (rename-aware, binary files are skipped by git). The file
   # header is only read outside a hunk, so an added line that starts with "++ " is not taken for one.
-  git diff --unified=0 --no-color --diff-filter=AMR "$base...$head" -- . \
+  git -c core.quotePath=off diff --no-ext-diff --src-prefix=a/ --dst-prefix=b/ \
+      --unified=0 --no-color --diff-filter=AMR "$base...$head" -- . \
       ':!scripts/check-public-hygiene.sh' ':!scripts/public-hygiene.patterns' \
       ':!scripts/tests/test-public-hygiene.sh' |
     awk -v us="$us" '
