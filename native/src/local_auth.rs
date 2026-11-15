@@ -1027,7 +1027,7 @@ impl LinkStore {
         };
         links.push(link.clone());
         self.save(&mut links, now)?;
-        emit_link_event("minted", &link, "");
+        emit_link_event("minted", &link);
         Ok(MintedLink { id, token, label: link.label, expires_at: link.expires_at, single_use })
     }
 
@@ -1054,7 +1054,7 @@ impl LinkStore {
         link.revoked_at = Some(now);
         let revoked = link.clone();
         self.save(&mut links, now)?;
-        emit_link_event("revoked", &revoked, "");
+        emit_link_event("revoked", &revoked);
         Ok(revoked)
     }
 
@@ -1119,24 +1119,51 @@ impl LinkStore {
         if via == LinkPresentation::Query {
             self.save(&mut links, now).map_err(LinkRejection::Store)?;
         }
-        let via_name = match via {
-            LinkPresentation::Query => "query",
-            LinkPresentation::Cookie => "cookie",
-        };
-        emit_link_event("redeemed", &snapshot, &format!(" via={via_name} first_use={first_use}"));
+        emit_link_redeemed(&snapshot, via, first_use);
         Ok(redeemed)
     }
 }
 
-/// The mint / redeem / revoke audit line. This worktree has no `events`
-/// module (an `emit` helper landed on main after this branch forked, if at
-/// all), so the line goes to stderr with the wording an events sink would
-/// carry -- swap the body for `crate::events::emit` when merging onto it.
-fn emit_link_event(what: &str, link: &ShareLink, extra: &str) {
-    eprintln!(
-        "ct-agent: local-auth link {what} id={} label={:?} expires_at={} single_use={}{extra}",
-        link.id, link.label, link.expires_at, link.single_use
+/// The mint / revoke / URL-redemption audit line: always emitted via [`crate::events::emit`]
+/// (ct-agent#406), so it shows up in `/events`, the ring and `ct_agent_events_total` like
+/// every other lifecycle event.
+fn emit_link_event(what: &str, link: &ShareLink) {
+    crate::events::emit(
+        crate::events::LOCAL_AUTH_LINK,
+        serde_json::json!({
+            "what": what,
+            "id": link.id,
+            "label": link.label,
+            "expires_at": link.expires_at,
+            "single_use": link.single_use,
+        }),
     );
+}
+
+/// A cookie presentation is peer-triggerable once per gated connection of a guest session, so
+/// it goes through [`crate::events::emit_limited`] instead of an unconditional [`emit_link_event`]
+/// (ct-agent#406): still counted exactly on `/metrics`, but rate-limited on stderr/the ring like
+/// every other pre-authentication event.
+fn emit_link_redeemed(link: &ShareLink, via: LinkPresentation, first_use: bool) {
+    let via_name = match via {
+        LinkPresentation::Query => "query",
+        LinkPresentation::Cookie => "cookie",
+    };
+    let fields = serde_json::json!({
+        "what": "redeemed",
+        "id": link.id,
+        "label": link.label,
+        "expires_at": link.expires_at,
+        "single_use": link.single_use,
+        "via": via_name,
+        "first_use": first_use,
+    });
+    match via {
+        LinkPresentation::Query => crate::events::emit(crate::events::LOCAL_AUTH_LINK, fields),
+        LinkPresentation::Cookie => {
+            crate::events::emit_limited(crate::events::LOCAL_AUTH_LINK, fields);
+        }
+    }
 }
 
 /// The request line and headers of one HTTP/1.x request head, borrowed from
