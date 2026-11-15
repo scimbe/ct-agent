@@ -97,8 +97,7 @@ pub(crate) fn hex_bytes(s: &str) -> Option<Vec<u8>> {
 }
 
 pub(crate) fn hex32(s: &str) -> Option<[u8; 32]> {
-    let v = hex_bytes(s)?;
-    <[u8; 32]>::try_from(v.as_slice()).ok()
+    crate::codec::hex_decode::<32>(s.trim())
 }
 
 /// #190: the shared "required env field" parses the CliConfig `from_lookup` parsers repeat. Each was

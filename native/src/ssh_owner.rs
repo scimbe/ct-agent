@@ -68,20 +68,14 @@ impl OwnerKey {
 
     /// Parse the hex form (64 hex digits, whitespace around it ignored).
     pub fn from_hex(s: &str) -> Result<Self, String> {
-        let t = s.trim();
-        if t.len() != 64 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("owner key must be 64 hex digits".to_string());
-        }
-        let mut k = [0u8; 32];
-        for (i, chunk) in t.as_bytes().chunks(2).enumerate() {
-            k[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or("zz"), 16).map_err(|e| e.to_string())?;
-        }
-        Ok(Self(k))
+        crate::codec::hex_decode::<32>(s.trim())
+            .map(Self)
+            .ok_or_else(|| "owner key must be 64 hex digits".to_string())
     }
 
     /// The hex form (what `ct-agent ssh-owner show` prints and `--owner-key` takes).
     pub fn to_hex(&self) -> String {
-        self.0.iter().map(|b| format!("{b:02x}")).collect()
+        crate::codec::hex_encode(&self.0)
     }
 
     /// The tag for `nonce`: HMAC-SHA256(key, DOMAIN || nonce). Domain-separated so the key can
