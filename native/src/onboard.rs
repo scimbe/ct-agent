@@ -235,6 +235,20 @@ impl OnboardedAgent {
         let agent_tmp = state_dir.join(format!("{}.new", Self::AGENT_FILE));
         let tenant_tmp = state_dir.join(format!("{}.new", Self::TENANT_FILE));
 
+        // Overwriting a PRIOR agent's persisted state (a foreign `identity.key` already on
+        // disk, bound to a different agent id): remove it up front, before any staging
+        // below. `identity.key` is now the commit point (see the renames at the bottom) --
+        // if the old one stayed in place through the agent/tenant renames, a crash landing
+        // between those renames and the identity rename would leave the OLD identity.key
+        // paired with THIS call's NEW agent/tenant files. `restore()` only checks the
+        // AGENT_FILE content against the caller's agent_id, so it would then silently
+        // resume with a mismatched identity instead of falling back to a fresh enrollment.
+        if let Ok(persisted_agent) = std::fs::read_to_string(&agent_path) {
+            if persisted_agent != self.agent_id.0 {
+                let _ = std::fs::remove_file(&identity_path);
+            }
+        }
+
         let staged = self
             .identity
             .save_secret_to(&identity_tmp)
@@ -249,10 +263,15 @@ impl OnboardedAgent {
             return Err(e);
         }
 
-        std::fs::rename(&identity_tmp, &identity_path)?;
+        // `identity.key` is the commit point: rename agent + tenant first, `identity.key`
+        // last. `restore()` keys on `identity.key` existing and then reads AGENT_FILE/
+        // TENANT_FILE as plain I/O (any error there propagates raw) -- renaming it last
+        // means its presence always implies a complete, matching triple, and its absence
+        // always means "no state yet", never a partial one `restore()` can't make sense of.
         std::fs::rename(&agent_tmp, &agent_path)?;
         std::fs::rename(&tenant_tmp, &tenant_path)?;
-        crate::secret_file::sync_parent_dir(&tenant_path)?;
+        std::fs::rename(&identity_tmp, &identity_path)?;
+        crate::secret_file::sync_parent_dir(&identity_path)?;
         Ok(())
     }
 
@@ -483,6 +502,48 @@ mod tests {
         assert!(!dir.join(OnboardedAgent::TENANT_FILE).exists(), "no partial tenant file");
         assert!(!dir.join(format!("{}.new", OnboardedAgent::IDENTITY_FILE)).exists(), "no leftover identity temp file");
         assert!(!dir.join(format!("{}.new", OnboardedAgent::AGENT_FILE)).exists(), "no leftover agent temp file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #397: overwriting a foreign agent's persisted state removes the stale
+    /// `identity.key` up front, even when the restaging that follows then fails --
+    /// so a crash/error here can never leave the OLD identity.key paired with the
+    /// NEW agent/tenant files (which `restore()` would accept as a match on
+    /// agent id alone, silently resuming under the wrong identity).
+    #[test]
+    fn persist_removes_the_stale_identity_key_when_overwriting_a_different_agent_even_if_restaging_then_fails() {
+        let dir = std::env::temp_dir().join(format!("ct-onboard-foreign-overwrite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let agent_a = OnboardedAgent {
+            identity: AgentIdentity::generate(),
+            agent_id: AgentId("agent-a".into()),
+            tenant: TenantId("tenant-a".into()),
+            config: AgentConfig::parse("127.0.0.1:4433", "127.0.0.1:8080").unwrap(),
+        };
+        agent_a.persist(&dir).expect("agent A persists cleanly");
+        assert!(dir.join(OnboardedAgent::IDENTITY_FILE).exists());
+
+        // Force the identity re-stage to fail (EISDIR) for agent B's persist.
+        std::fs::create_dir_all(dir.join(format!("{}.new", OnboardedAgent::IDENTITY_FILE))).unwrap();
+
+        let agent_b = OnboardedAgent {
+            identity: AgentIdentity::generate(),
+            agent_id: AgentId("agent-b".into()),
+            tenant: TenantId("tenant-b".into()),
+            config: AgentConfig::parse("127.0.0.1:4433", "127.0.0.1:8080").unwrap(),
+        };
+        agent_b.persist(&dir).expect_err("identity re-stage must fail (EISDIR)");
+
+        // The stale agent-A identity.key must be gone -- not left in place to be
+        // mismatched against a NEW agent/tenant file by some later retry.
+        assert!(!dir.join(OnboardedAgent::IDENTITY_FILE).exists(), "stale identity.key removed up front");
+        assert!(
+            OnboardedAgent::restore(&dir, &AgentId("agent-a".into())).unwrap().is_none(),
+            "agent A's state is gone, not falsely restorable"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
