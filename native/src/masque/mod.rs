@@ -206,6 +206,9 @@ async fn dial_quic_via_masque_unbounded(
     proxy_tls: Arc<rustls::ClientConfig>,
 ) -> Result<quinn::Connection, BoxError> {
     let tcp = TcpStream::connect(proxy_tcp_addr).await?;
+    // The QUIC datagrams riding on this proxy hop are small (ACKs, keepalives); don't let
+    // Nagle hold them back (ssh_access.rs does the same for its own interactive stream).
+    let _ = tcp.set_nodelay(true);
 
     let connector = TlsConnector::from(proxy_tls);
     let server_name = rustls::pki_types::ServerName::try_from(sni_host.to_string())
