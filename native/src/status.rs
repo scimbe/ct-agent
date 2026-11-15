@@ -32,6 +32,36 @@ struct StatusInner {
     update_state: String,
 }
 
+/// `Ok` when `inner` is registered and the edge was seen within
+/// [`HEALTHZ_MAX_SILENCE_SECS`] of `now`; `Err(reason)` otherwise. Pulled out of
+/// `AgentStatus::healthz_at` (ct-agent#400) so `snapshot_at` can evaluate health on the
+/// already-cloned `StatusInner` it read under its own lock, instead of re-locking and risking
+/// a `/status` document whose `registered`/`last_seen_secs_ago` fields disagree with `healthy`
+/// because a setter ran between the two locks.
+fn health(inner: &StatusInner, now: u64) -> Result<(), String> {
+    if inner.registered_since.is_none() {
+        return Err(match &inner.last_error {
+            Some(e) => format!("not registered with an edge (transport={}, last error: {e})", inner.transport),
+            None => format!("not registered with an edge (transport={})", inner.transport),
+        });
+    }
+    match inner.last_seen {
+        None => Err("registered but the edge has not been observed alive yet".to_string()),
+        Some(seen) => {
+            let silence = now.saturating_sub(seen);
+            if silence < HEALTHZ_MAX_SILENCE_SECS {
+                Ok(())
+            } else {
+                Err(format!(
+                    "registered over {} but nothing heard from the edge for {silence}s \
+                     (limit {HEALTHZ_MAX_SILENCE_SECS}s)",
+                    inner.transport
+                ))
+            }
+        }
+    }
+}
+
 /// The connection-level status. The process-wide instance is [`STATUS`]; tests
 /// build their own with [`AgentStatus::new`] (the same per-instance pattern as
 /// `task_guard::LiveGauge`, ct-agent#180).
@@ -169,7 +199,7 @@ impl AgentStatus {
                 "inbound": facts.masque_dropped_datagrams.1,
             },
             "events_ring_write_errors": facts.events_ring_write_errors,
-            "healthy": self.healthz_at(now).is_ok(),
+            "healthy": health(&s, now).is_ok(),
         })
     }
 
@@ -177,27 +207,7 @@ impl AgentStatus {
     /// [`HEALTHZ_MAX_SILENCE_SECS`]; `Err(reason)` otherwise.
     pub fn healthz_at(&self, now: u64) -> Result<(), String> {
         let s = self.inner.read_safe();
-        if s.registered_since.is_none() {
-            return Err(match &s.last_error {
-                Some(e) => format!("not registered with an edge (transport={}, last error: {e})", s.transport),
-                None => format!("not registered with an edge (transport={})", s.transport),
-            });
-        }
-        match s.last_seen {
-            None => Err("registered but the edge has not been observed alive yet".to_string()),
-            Some(seen) => {
-                let silence = now.saturating_sub(seen);
-                if silence < HEALTHZ_MAX_SILENCE_SECS {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "registered over {} but nothing heard from the edge for {silence}s \
-                         (limit {HEALTHZ_MAX_SILENCE_SECS}s)",
-                        s.transport
-                    ))
-                }
-            }
-        }
+        health(&s, now)
     }
 
     /// `ct_agent_registered`, `ct_agent_reconnects_total` and
