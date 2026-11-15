@@ -206,6 +206,10 @@ async fn dial_quic_via_masque_unbounded(
     proxy_tls: Arc<rustls::ClientConfig>,
 ) -> Result<quinn::Connection, BoxError> {
     let tcp = TcpStream::connect(proxy_tcp_addr).await?;
+    // ct-agent#395: small QUIC datagrams (ACKs, keepalives) over this TCP hop would
+    // otherwise sit behind Nagle's algorithm, same reasoning as ssh_access.rs's
+    // interactive stream. Best-effort: a failure here is not worth tearing down the dial.
+    let _ = tcp.set_nodelay(true);
 
     let connector = TlsConnector::from(proxy_tls);
     let server_name = rustls::pki_types::ServerName::try_from(sni_host.to_string())
