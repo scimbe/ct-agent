@@ -42,19 +42,61 @@ const DNS01_ATTEMPTS: u32 = 3;
 /// short enough that a successful retry still feels like one command.
 const RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
-/// Whether an error is the DNS-01 propagation race worth a fresh order, as
-/// opposed to something a retry cannot fix (bad account, malformed CSR,
-/// network down, CA refusing the identifier).
-fn is_dns01_failure(e: &BoxError) -> bool {
-    let m = e.to_string();
-    m.contains("DNS-01 authoritative check failed")
-        || m.contains("DNS-01 propagation check failed")
-        || m.contains("publishing the DNS-01 challenge record failed")
-        || m.contains(DNS01_VALIDATION_FAILED)
+/// #390: the error type for one ACME order attempt, carrying WHY it failed as a variant rather
+/// than leaving the caller to pattern-match the message text. Retry eligibility is decided once,
+/// at the point each variant is constructed (inside [`AcmeClient::confirm_then_complete`] and
+/// [`AcmeClient::complete_challenge`]), so a later rewording of the message can no longer
+/// silently change whether a failure burns another order against the CA's rate limit.
+#[derive(Debug)]
+enum AcmeError {
+    /// The DNS-01 propagation/validation race was lost — a fresh order can fix it.
+    Dns01Race(String),
+    /// Publishing the challenge TXT record itself failed (provider error) — also worth a fresh
+    /// order, since the provider or the zone may have recovered by the next attempt.
+    Dns01Publish(String),
+    /// Anything else: a retry of the whole order will not help.
+    Other(BoxError),
+}
+
+impl std::fmt::Display for AcmeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AcmeError::Dns01Race(m) | AcmeError::Dns01Publish(m) => write!(f, "{m}"),
+            AcmeError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for AcmeError {}
+
+impl From<BoxError> for AcmeError {
+    fn from(e: BoxError) -> Self {
+        AcmeError::Other(e)
+    }
+}
+
+impl From<&str> for AcmeError {
+    fn from(s: &str) -> Self {
+        AcmeError::Other(s.into())
+    }
+}
+
+impl From<String> for AcmeError {
+    fn from(s: String) -> Self {
+        AcmeError::Other(s.into())
+    }
+}
+
+/// Whether an [`AcmeError`] is the DNS-01 propagation race worth a fresh order, as opposed to
+/// something a retry cannot fix (bad account, malformed CSR, network down, CA refusing the
+/// identifier) — a match on the variant, not on the message text.
+fn is_dns01_failure(e: &AcmeError) -> bool {
+    matches!(e, AcmeError::Dns01Race(_) | AcmeError::Dns01Publish(_))
 }
 
 /// Marker [`complete_challenge`](AcmeClient::complete_challenge) puts into an invalid
-/// authorization's error when the CA's reason is one a fresh order can fix.
+/// authorization's [`AcmeError::Dns01Race`] message when the CA's reason is one a fresh order
+/// can fix.
 const DNS01_VALIDATION_FAILED: &str = "DNS-01 validation failed";
 
 /// Whether an `invalid` authorization failed for a reason the propagation race explains:
@@ -341,7 +383,7 @@ impl AcmeClient {
         authoritative: Option<&AuthoritativeChecker>,
         attempts: u32,
     ) -> Result<IssuedCert, BoxError> {
-        let mut last_err: Option<BoxError> = None;
+        let mut last_err: Option<AcmeError> = None;
         for attempt in 1..=attempts.max(1) {
             match self.issue_once(hostname, publish, propagation, authoritative).await {
                 Ok(cert) => return Ok(cert),
@@ -352,10 +394,10 @@ impl AcmeClient {
                     last_err = Some(e);
                     tokio::time::sleep(RETRY_BACKOFF).await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             }
         }
-        Err(last_err.unwrap_or_else(|| "certificate issuance failed with no recorded error".into()))
+        Err(last_err.map(Into::into).unwrap_or_else(|| "certificate issuance failed with no recorded error".into()))
     }
 
     async fn issue_once(
@@ -364,7 +406,7 @@ impl AcmeClient {
         publish: &Dns01Provider,
         propagation: Option<&PropagationWaiter>,
         authoritative: Option<&AuthoritativeChecker>,
-    ) -> Result<IssuedCert, BoxError> {
+    ) -> Result<IssuedCert, AcmeError> {
         if self.account_url.is_none() {
             self.register_account().await?;
         }
@@ -412,7 +454,7 @@ impl AcmeClient {
         publish: &Dns01Provider,
         propagation: Option<&PropagationWaiter>,
         authoritative: Option<&AuthoritativeChecker>,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), AcmeError> {
         let authz = self.post_as_get(authz_url).await?;
         let challenge =
             acme::select_dns01(&authz).ok_or("ACME server offered no dns-01 challenge for this authorization")?;
@@ -423,7 +465,7 @@ impl AcmeClient {
         let publish_result = publish.set_txt(&record_name, &txt_value).await;
         let outcome = match publish_result {
             Ok(()) => self.confirm_then_complete(&record_name, &txt_value, &challenge.url, authz_url, propagation, authoritative).await,
-            Err(e) => Err(format!("publishing the DNS-01 challenge record failed: {e}").into()),
+            Err(e) => Err(AcmeError::Dns01Publish(format!("publishing the DNS-01 challenge record failed: {e}"))),
         };
         // Always attempt cleanup, whether validation succeeded or not -- a
         // stale challenge TXT record must not linger either way.
@@ -454,7 +496,7 @@ impl AcmeClient {
         authz_url: &str,
         propagation: Option<&PropagationWaiter>,
         authoritative: Option<&AuthoritativeChecker>,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), AcmeError> {
         if let Some(checker) = authoritative {
             match checker.wait_for_all(record_name, txt_value).await {
                 Ok(()) => return self.complete_challenge(challenge_url, authz_url).await,
@@ -473,19 +515,19 @@ impl AcmeClient {
                          whole-order retry is what covers that."
                     );
                 }
-                Err(e) => return Err(format!("DNS-01 authoritative check failed: {e}").into()),
+                Err(e) => return Err(AcmeError::Dns01Race(format!("DNS-01 authoritative check failed: {e}"))),
             }
         }
         if let Some(waiter) = propagation {
             match waiter.wait_for(record_name, txt_value).await {
                 Ok(()) => return self.complete_challenge(challenge_url, authz_url).await,
-                Err(e) => return Err(format!("DNS-01 propagation check failed: {e}").into()),
+                Err(e) => return Err(AcmeError::Dns01Race(format!("DNS-01 propagation check failed: {e}"))),
             }
         }
         self.complete_challenge(challenge_url, authz_url).await
     }
 
-    async fn complete_challenge(&mut self, challenge_url: &str, authz_url: &str) -> Result<(), BoxError> {
+    async fn complete_challenge(&mut self, challenge_url: &str, authz_url: &str) -> Result<(), AcmeError> {
         // Signal readiness (RFC 8555 §7.5.1: an empty JSON object, not POST-as-GET).
         let resp = self.post_signed(challenge_url, Some(&serde_json::json!({}))).await?;
         if !resp.status().is_success() {
@@ -497,7 +539,9 @@ impl AcmeClient {
             match authz.get("status").and_then(|s| s.as_str()) {
                 Some("valid") => return Ok(()),
                 Some("invalid") if invalid_authz_is_dns01_race(&authz) => {
-                    return Err(format!("authorization {authz_url} became invalid ({DNS01_VALIDATION_FAILED}): {authz}").into())
+                    return Err(AcmeError::Dns01Race(format!(
+                        "authorization {authz_url} became invalid ({DNS01_VALIDATION_FAILED}): {authz}"
+                    )))
                 }
                 Some("invalid") => return Err(format!("authorization {authz_url} became invalid: {authz}").into()),
                 _ if std::time::Instant::now() >= deadline => {
@@ -845,17 +889,19 @@ mod tests {
     fn only_dns01_race_failures_are_worth_a_fresh_order() {
         // Retrying costs a real CA order and eats into Let's Encrypt's
         // 5-failed-validations-per-hostname-per-hour budget, so the classifier
-        // must be narrow: the propagation race yes, everything else no.
-        let retryable: Vec<BoxError> = vec![
-            "DNS-01 authoritative check failed: TXT ... still missing from: ns2.desec.org".into(),
-            "DNS-01 propagation check failed: did not become publicly resolvable".into(),
-            "publishing the DNS-01 challenge record failed: control plane returned 502".into(),
+        // must be narrow: the propagation race yes, everything else no. #390: the
+        // classifier is now a match on the variant each failure was actually
+        // constructed as, not a search over the message text.
+        let retryable = [
+            AcmeError::Dns01Race("DNS-01 authoritative check failed: TXT ... still missing from: ns2.desec.org".into()),
+            AcmeError::Dns01Race("DNS-01 propagation check failed: did not become publicly resolvable".into()),
+            AcmeError::Dns01Publish("publishing the DNS-01 challenge record failed: control plane returned 502".into()),
         ];
         for e in &retryable {
             assert!(is_dns01_failure(e), "should retry: {e}");
         }
 
-        let fatal: Vec<BoxError> = vec![
+        let fatal: Vec<AcmeError> = vec![
             "account registration failed: 400".into(),
             "order creation failed: 429".into(),
             "ACME directory fetch failed: 503".into(),
@@ -892,24 +938,30 @@ mod tests {
         ] {
             let authz = invalid_authz(fatal);
             assert!(!invalid_authz_is_dns01_race(&authz), "{fatal} must not retry");
-            let e: BoxError = format!("authorization https://acme/authz/1 became invalid: {authz}").into();
+            // Mirrors complete_challenge's own classification for a non-race "invalid":
+            // AcmeError::Other, never Dns01Race.
+            let e: AcmeError = format!("authorization https://acme/authz/1 became invalid: {authz}").into();
             assert!(!is_dns01_failure(&e), "the authz JSON alone must not make {fatal} retryable");
         }
-        let e: BoxError =
-            format!("authorization https://acme/authz/1 became invalid ({DNS01_VALIDATION_FAILED}): {{}}").into();
+        let e = AcmeError::Dns01Race(format!(
+            "authorization https://acme/authz/1 became invalid ({DNS01_VALIDATION_FAILED}): {{}}"
+        ));
         assert!(is_dns01_failure(&e));
     }
 
     #[tokio::test]
     async fn a_non_dns_failure_is_returned_immediately_without_burning_more_orders() {
         // Pointing at a directory URL that does not resolve fails before any
-        // order exists; that must surface at once, not after N attempts.
+        // order exists; that must surface at once, not after N attempts. The
+        // discovery failure itself predates AcmeClient and so is never an
+        // AcmeError, but every such transport failure that DOES flow through
+        // the order machinery is classified AcmeError::Other, never a race.
         let account = AccountKey::generate().unwrap();
         let err = match AcmeClient::discover_with_allowed_hosts("http://127.0.0.1:1/directory", account, &loopback_only()).await {
             Ok(_) => panic!("discover against a dead port must not succeed"),
             Err(e) => e,
         };
-        assert!(!is_dns01_failure(&err), "a transport failure is not a DNS-01 race");
+        assert!(!is_dns01_failure(&AcmeError::Other(err)), "a transport failure is not a DNS-01 race");
     }
 
     #[tokio::test]
