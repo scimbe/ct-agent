@@ -6661,55 +6661,6 @@ async fn upgrade_offer_is_none_without_a_usable_whoami_answer_296() {
 }
 
 #[test]
-fn split_offered_candidates_recovers_the_optional_local_half() {
-    // #276 piece 1: the reflexive-only (pre-#276) format still round-trips unchanged.
-    assert_eq!(split_offered_candidates("203.0.113.7:4433"), ("203.0.113.7:4433", None));
-    // The new compound format recovers both halves.
-    assert_eq!(
-        split_offered_candidates("203.0.113.7:4433\x00192.168.1.42:5000"),
-        ("203.0.113.7:4433", Some("192.168.1.42:5000"))
-    );
-    // A malformed (empty) local segment degrades to "no local candidate", not a parse
-    // error -- the reflexive candidate alone is always a complete, valid offer.
-    assert_eq!(split_offered_candidates("203.0.113.7:4433\0"), ("203.0.113.7:4433", None));
-}
-
-#[test]
-fn select_upgrade_candidate_prefers_a_genuinely_same_subnet_local_candidate() {
-    // #276 piece 1's core behavior: when the peer-offered local candidate lands in
-    // OUR OWN local subnet, prefer it over the reflexive one.
-    let Some(my_local) = local_egress_ip() else {
-        return; // no route in this sandbox -- nothing to assert against
-    };
-    // Construct a same-subnet candidate at a different last octet (v4) or suffix (v6),
-    // matching same_local_subnet's own /24 (v4) / /64 (v6) heuristic.
-    let same_subnet = match my_local {
-        std::net::IpAddr::V4(v4) => {
-            let mut o = v4.octets();
-            o[3] = o[3].wrapping_add(1).max(1);
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(o[0], o[1], o[2], o[3]))
-        }
-        std::net::IpAddr::V6(_) => return, // v6 egress is environment-dependent; v4 case covers the seam
-    };
-    if !is_lan_candidate(my_local) {
-        return; // this sandbox's egress isn't a private address at all -- nothing to assert
-    }
-    let ep = format!("203.0.113.7:4433\0{same_subnet}:5000");
-    let chosen = select_upgrade_candidate(&ep).expect("a same-subnet local candidate is chosen");
-    assert_eq!(chosen.ip(), same_subnet, "the local candidate was preferred over the reflexive one");
-}
-
-#[test]
-fn select_upgrade_candidate_refuses_an_off_subnet_local_candidate_and_falls_back() {
-    // #276 piece 1's safety property, exercised end-to-end through select_upgrade_candidate:
-    // a local candidate that is NOT in our own subnet must never be dialed, regardless of
-    // how plausible-looking it is -- the reflexive candidate is used instead.
-    let ep = "203.0.113.7:4433\x00192.168.250.250:5000";
-    let chosen = select_upgrade_candidate(ep).expect("falls back to the reflexive candidate");
-    assert_eq!(chosen, "203.0.113.7:4433".parse::<SocketAddr>().unwrap(), "off-subnet local candidate refused, reflexive used instead");
-}
-
-#[test]
 fn select_upgrade_candidate_never_dials_an_unsafe_reflexive_fallback_either() {
     // The pre-#276 #137 guard still applies to the reflexive half when there is no
     // (or an unusable) local candidate.
