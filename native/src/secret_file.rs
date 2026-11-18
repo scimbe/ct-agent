@@ -77,11 +77,14 @@ pub fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
 
 fn replace_atomically(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     use std::io::Write;
+    // ct-agent#380: `temp_sibling` now returns a name unique to this call, so
+    // there is no longer a pre-existing temp of OURS to clean up here -- and
+    // critically, no longer a chance that what WAS there belonged to a
+    // concurrent writer racing the same `path`. `create_new` below still
+    // refuses outright if the name somehow collides (a vanishingly unlikely
+    // stale leftover from a crashed process reusing both this pid and this
+    // call's counter value), rather than silently deleting and stepping on it.
     let tmp = temp_sibling(path);
-    match std::fs::remove_file(&tmp) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-        _ => {}
-    }
     let written = (|| {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
@@ -104,10 +107,23 @@ fn replace_atomically(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<(
     written
 }
 
-/// `.<name>.tmp` next to `path`.
+/// Process-wide, so two concurrent writers in the same process (different
+/// threads, e.g. two async tasks) never get the same counter value. ct-agent#380.
+static TEMP_SIBLING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `.<name>.<pid>-<n>.tmp` next to `path` -- unique to this call, not a fixed
+/// name. ct-agent#380: two writers racing the same `path` (e.g. two CLI
+/// invocations both rotating the same stored secret) used to delete and
+/// recreate the identical temp name, so the second writer's unlink-then-create
+/// could step on the first writer's still-in-progress file, defeating the
+/// atomic-replace guarantee under concurrency. A unique `(pid, counter)` pair
+/// per call removes the collision instead of racing it: different processes
+/// never share a pid, and two calls within one process never share a counter
+/// value, regardless of which thread makes them.
 fn temp_sibling(path: &Path) -> std::path::PathBuf {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    path.with_file_name(format!(".{name}.tmp"))
+    let n = TEMP_SIBLING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_file_name(format!(".{name}.{}-{n}.tmp", std::process::id()))
 }
 
 /// `fsync` the directory holding `path`, so a completed `rename` into it survives a power
@@ -230,20 +246,33 @@ mod tests {
         let dir = scratch("atomic");
         let path = dir.join("token.json");
         write_private(&path, b"first").unwrap();
-        // A stale temp from an interrupted earlier write, even a symlink, is not followed.
-        let tmp = dir.join(".token.json.tmp");
-        #[cfg(unix)]
-        {
-            let decoy = dir.join("decoy");
-            std::fs::write(&decoy, b"untouched").unwrap();
-            std::os::unix::fs::symlink(&decoy, &tmp).unwrap();
-            write_private(&path, b"second").unwrap();
-            assert_eq!(std::fs::read(&decoy).unwrap(), b"untouched");
-        }
-        #[cfg(not(unix))]
         write_private(&path, b"second").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"second");
-        assert!(std::fs::symlink_metadata(&tmp).is_err(), "no temp file left behind");
+        // ct-agent#380: the temp sibling's name is now unique per call (pid +
+        // an in-process counter), not fixed -- so "no leftover" is checked by
+        // directory scan for anything matching the pattern, rather than for
+        // one exact, no-longer-used filename.
+        let leftover = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with(".token.json.") && n.ends_with(".tmp")
+            });
+        assert!(!leftover, "no temp file left behind");
+    }
+
+    #[test]
+    fn concurrent_writers_to_the_same_path_never_pick_the_same_temp_name() {
+        // ct-agent#380: the actual regression this issue describes -- two
+        // "writers" (simulated here by direct calls, since the real bug was in
+        // the name itself, not in scheduling) computing the temp sibling for
+        // the SAME path must never collide.
+        let dir = scratch("concurrent-temp-names");
+        let path = dir.join("token.json");
+        let a = temp_sibling(&path);
+        let b = temp_sibling(&path);
+        assert_ne!(a, b, "two calls for the same path must get different temp names");
     }
 
     #[cfg(target_os = "linux")]
