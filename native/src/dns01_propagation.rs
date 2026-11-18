@@ -111,7 +111,20 @@ pub struct PropagationWaiter {
 }
 
 impl PropagationWaiter {
+    /// ct-agent#373: an empty `resolver_urls` makes [`Self::wait_for`] return
+    /// `Ok(())` on its very first round without performing a single lookup --
+    /// `acme_orchestrate`'s own config parser already guards against this at
+    /// the one real call site ("an empty list made the propagation check pass
+    /// without a single lookup"), but that guard lives in the caller, not
+    /// here. Falling back to [`DEFAULT_RESOLVER_URLS`] makes the invariant
+    /// hold for this type itself, not just for the one caller that currently
+    /// remembers to check.
     pub fn new(resolver_urls: Vec<String>, timeout: Duration) -> Self {
+        let resolver_urls = if resolver_urls.is_empty() {
+            DEFAULT_RESOLVER_URLS.iter().map(|s| s.to_string()).collect()
+        } else {
+            resolver_urls
+        };
         Self::with_interval(resolver_urls, timeout, DEFAULT_INTERVAL)
     }
 
@@ -347,6 +360,20 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{addr}/dns-query")
+    }
+
+    #[test]
+    fn new_falls_back_to_the_defaults_on_an_empty_resolver_list() {
+        // ct-agent#373: an empty list must not silently mean "zero lookups
+        // always agree" -- `new` falls back to DEFAULT_RESOLVER_URLS instead.
+        let waiter = PropagationWaiter::new(vec![], Duration::from_secs(1));
+        assert_eq!(
+            waiter.resolver_urls,
+            DEFAULT_RESOLVER_URLS.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+
+        let waiter = PropagationWaiter::new(vec!["https://example.invalid/doh".to_string()], Duration::from_secs(1));
+        assert_eq!(waiter.resolver_urls, vec!["https://example.invalid/doh".to_string()], "a non-empty list is kept as-is");
     }
 
     #[tokio::test]
