@@ -1428,7 +1428,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // revocation can find and drop this tunnel. Otherwise mint a random token.
     let forced_token = match std::env::var("CT_AGENT_TOKEN") {
         Ok(s) if !s.trim().is_empty() => Some(parse_routing_token_hex(&s).ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("CT_AGENT_TOKEN is set but not a valid routing token (expected 64 hex characters, got {s:?})").into()
+            format!("CT_AGENT_TOKEN is set but not a valid routing token (expected 64 hex characters, got {} characters)", s.trim().chars().count()).into()
         })?),
         _ => None,
     };
