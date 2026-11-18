@@ -992,8 +992,32 @@ impl LinkStore {
         serde_json::from_slice(&bytes).map_err(|e| format!("parsing {:?}: {e}", self.path))
     }
 
-    /// Prune, then write `0600`. Every write goes through here.
+    /// Merge in whatever the file holds right now before writing, then prune, then write
+    /// `0600`. Every write goes through here.
+    ///
+    /// ct-agent#358: the CLI (`link-revoke`, `link`) and the serving agent are separate
+    /// processes sharing this file; `self.lock` only serialises this process's own
+    /// read-modify-write cycles. Without re-reading immediately before this write, a stale
+    /// in-memory copy loaded before another process's write -- a revocation, or a fresh
+    /// mint -- would silently overwrite it here, which is exactly the guarantee this
+    /// module's own doc comment already claims never happens ("never a way to un-revoke a
+    /// link"). A revocation can only become MORE revoked by this merge (never cleared), and
+    /// a link minted by the other process that we never loaded is kept rather than dropped.
+    /// `used_at`/`session_hashes` races stay the pre-existing, explicitly tolerated window.
     fn save(&self, links: &mut Vec<ShareLink>, now: u64) -> Result<(), String> {
+        if let Ok(on_disk) = self.load() {
+            for disk_link in &on_disk {
+                match links.iter_mut().find(|l| l.id == disk_link.id) {
+                    Some(link) => {
+                        if let Some(disk_revoked) = disk_link.revoked_at {
+                            link.revoked_at =
+                                Some(link.revoked_at.map_or(disk_revoked, |ours| ours.min(disk_revoked)));
+                        }
+                    }
+                    None => links.push(disk_link.clone()),
+                }
+            }
+        }
         links.retain(|l| now < l.expires_at.saturating_add(LINK_PRUNE_AFTER.as_secs()));
         std::fs::create_dir_all(&self.state_dir).map_err(|e| format!("creating {:?}: {e}", self.state_dir))?;
         #[cfg(unix)]
@@ -1655,6 +1679,34 @@ mod tests {
         assert!(err.contains("already revoked"), "{err}");
         let err = store.revoke_at(NOW, "nope").unwrap_err();
         assert!(err.contains("no share link with id nope"), "{err}");
+    }
+
+    #[test]
+    fn ct_agent_358_a_concurrent_revoke_or_mint_survives_the_other_processs_stale_save() {
+        // ct-agent#358: the CLI and the serving agent are separate processes sharing this
+        // file, guarded only by an in-process Mutex each -- modeled here as two LinkStores
+        // over the same dir, with `save` called directly to inject a stale in-memory copy
+        // the way a real race would.
+        let dir = scratch("link-race-358");
+        let agent = LinkStore::new(&dir);
+        let cli = LinkStore::new(&dir);
+
+        // A revocation already on disk must never be cleared by a stale save.
+        let minted = agent.mint_at(NOW, HOUR, false, "race").unwrap();
+        let mut agents_stale_copy = agent.load().unwrap(); // snapshot BEFORE the CLI's revoke
+        assert!(agents_stale_copy[0].revoked_at.is_none());
+        cli.revoke_at(NOW + 1, &minted.id).unwrap(); // disk now has revoked_at = Some(NOW+1)
+        agent.save(&mut agents_stale_copy, NOW + 2).unwrap(); // agent writes back its stale copy
+        let after = cli.list().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].revoked_at, Some(NOW + 1), "the revocation must survive the agent's stale save");
+
+        // A link minted by the other process must not be wiped out by a stale save either.
+        let mut agents_pre_mint_snapshot = agent.load().unwrap(); // taken BEFORE the CLI's mint
+        let fresh = cli.mint_at(NOW + 3, HOUR, false, "fresh from cli").unwrap();
+        agent.save(&mut agents_pre_mint_snapshot, NOW + 4).unwrap();
+        let ids: Vec<_> = cli.list().unwrap().into_iter().map(|l| l.id).collect();
+        assert!(ids.contains(&fresh.id), "a concurrently minted link must survive a stale save: {ids:?}");
     }
 
     #[cfg(unix)]
