@@ -824,10 +824,27 @@ demo_origin() { # host:port
 }
 
 tunnel_questions() {
+  # ct-agent#347: CT_AGENT_CP_URL is asked unconditionally, before we know whether
+  # we're about to reuse a .env that was written against a DIFFERENT control
+  # plane. `ask` defaults it to $DEFAULT_CP under --yes whenever the caller
+  # didn't set it explicitly -- remember which case we're in so the reuse
+  # branch below can tell "caller asked for a different CP" (an error, same
+  # treatment as the hostname mismatch) apart from "nothing was asked for,
+  # fall back to what .env already has" (not an error).
+  local cp_was_explicit=0; [ -z "${CT_AGENT_CP_URL:-}" ] || cp_was_explicit=1
   ask CT_AGENT_CP_URL "Control plane" "$DEFAULT_CP"
-  CP="${CT_AGENT_CP_URL%/}"; check_cp "$CP"
+  CP="${CT_AGENT_CP_URL%/}"
   if [ -f "$WORK/.env" ] && grep -q '^CT_AGENT_TOKEN=' "$WORK/.env"; then
     ok ".env found in $WORK -- reusing hostname and tokens"
+    local stored_cp; stored_cp="$(envval CT_AGENT_CP_URL)"
+    if [ -n "$stored_cp" ]; then
+      stored_cp="${stored_cp%/}"
+      if [ "$cp_was_explicit" -eq 1 ] && [ "$CP" != "$stored_cp" ]; then
+        die "$WORK/.env is for control plane $stored_cp, not $CT_AGENT_CP_URL. Use --clean first, or another --workdir"
+      fi
+      CP="$stored_cp"
+    fi
+    check_cp "$CP"
     HOSTNAME_="$(envval CT_AGENT_HOSTNAME)"; AGENT_TOKEN="$(envval CT_AGENT_TOKEN)"; AGENT_JOIN_TOKEN="$(envval CT_AGENT_JOIN_TOKEN)"
     ORIGIN="$(envval CT_AGENT_ORIGIN)"
     need "CT_AGENT_HOSTNAME in .env" "$HOSTNAME_" "$RE_HOST"; need "CT_AGENT_ORIGIN in .env" "$ORIGIN" "$RE_ORIGIN"
@@ -837,6 +854,7 @@ tunnel_questions() {
     fi
     return
   fi
+  check_cp "$CP"
   ask CT_AGENT_HOSTNAME "Hostname of the tunnel (as on the Install page)" ""
   HOSTNAME_="$CT_AGENT_HOSTNAME"; need "CT_AGENT_HOSTNAME" "$HOSTNAME_" "$RE_HOST"
   ask CT_BOOTSTRAP "Bootstrap token of the Install page (hidden)" "" secret
