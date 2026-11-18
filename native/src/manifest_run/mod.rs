@@ -58,29 +58,30 @@ pub fn unix_now() -> Result<u64, String> {
 /// token and the manifest/bundle bytes in cleartext to anyone on path, with no warning from the
 /// tool -- exactly the class of bug the https:// checks elsewhere in this file exist to prevent.
 fn require_registry_url_scheme(url: &str) -> Result<(), String> {
-    if url.starts_with("https://") {
+    // #371: hand-rolled string splitting (on `/`, `?`, `@`, `:`) is a SECOND URL parser next
+    // to the one that actually makes the request (reqwest's, which is the WHATWG `url` crate)
+    // -- any place the two disagree on where the authority/host ends is a bypass. The `url`
+    // crate also ends an http(s) authority at `\` and `#`, which a plain string split on
+    // `/`/`?` does not: `http://evil.invalid\@127.0.0.1/` string-splits (on `/`) to
+    // `evil.invalid\@127.0.0.1`, whose last `@`-segment is `127.0.0.1` (accepted here before),
+    // while the `url` crate parses the authority as ending at the `\` and connects to
+    // `evil.invalid`. Parsing with the SAME crate that makes the request removes this whole
+    // differential class (#97's userinfo bypass included) instead of chasing one delimiter at
+    // a time.
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return Err(format!("CT_MANIFEST_REGISTRY_URL is not a valid URL: {url:?}"));
+    };
+    if parsed.scheme() == "https" {
         return Ok(());
     }
-    if let Some(rest) = url.strip_prefix("http://") {
-        let authority = rest.split(['/', '?']).next().unwrap_or("");
-        // Strip userinfo (`user:pass@host`) before host extraction (#97): without this, an
-        // authority like `127.0.0.1:8787@evil.invalid` string-splits on `:` to `127.0.0.1`
-        // here (loopback exception granted) while reqwest/the `url` crate parse
-        // `127.0.0.1:8787` as userinfo and actually connect to `evil.invalid` -- the two
-        // parsers disagreeing lets the real request leak the write token and manifest/bundle
-        // bytes in cleartext to whatever host is named after the `@`. `rsplit` (not `split`)
-        // keeps the LAST `@`-separated segment, matching how userinfo parsing works even if
-        // the (URL-illegal but not rejected by this string-split guard) userinfo itself
-        // contains an `@`.
-        let host = authority.rsplit('@').next().unwrap_or(authority);
-        // Bracketed IPv6 (`[::1]:8787`) needs its own split -- a bare `:` split would chop it
-        // apart at every colon inside the address itself.
-        let host = match host.strip_prefix('[') {
-            Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
-            None => host.split(':').next().unwrap_or(""),
-        };
-        if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-            return Ok(());
+    if parsed.scheme() == "http" && parsed.username().is_empty() && parsed.password().is_none() {
+        // `host_str()` keeps the brackets around an IPv6 literal (`"[::1]"`); strip them
+        // before comparing so the loopback check doesn't depend on that formatting.
+        if let Some(host) = parsed.host_str() {
+            let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+            if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+                return Ok(());
+            }
         }
     }
     Err(format!(
@@ -1422,6 +1423,11 @@ mod tests {
             "http://127.0.0.1:8787@evil.invalid",
             "http://localhost:1@evil.invalid/",
             "http://[::1]:8787@evil.invalid",
+            // #371: the WHATWG `url` crate ends an http authority at `\`, a plain `/`/`?`
+            // string split does not -- this string-splits to a last-`@`-segment of
+            // `127.0.0.1/`, "looking" loopback, while the request actually goes to
+            // `evil.invalid`.
+            "http://evil.invalid\\@127.0.0.1/",
         ] {
             let err = require_registry_url_scheme(bad)
                 .expect_err(&format!("{bad} must be rejected -- it would leak the registry write token and manifest/bundle bytes in cleartext"));
