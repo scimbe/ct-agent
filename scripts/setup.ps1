@@ -146,6 +146,17 @@ function Import-DotEnv {
     if ($bundle -match 'CT_JOIN_TOKEN=([^;]*)')  { $env:CT_AGENT_JOIN_TOKEN = $Matches[1] }
     if ($bundle -match 'CT_AGENT_TOKEN=([^;]*)') { $env:CT_AGENT_TOKEN     = $Matches[1] }
     Ok "bootstrap redeemed"
+    # ct-agent#346: CT_BOOTSTRAP is single-use. Leaving a spent one in .env made
+    # every later run (a reboot, a retry, -Green) die at the redeem step above
+    # with a misleading "expired/already used" error. Replace it with the
+    # tokens it just redeemed into, so a re-run against this same .env reads
+    # real, reusable credentials instead of re-spending nothing.
+    if (Test-Path .env) {
+      $lines = Get-Content .env | Where-Object { $_ -notmatch '^CT_BOOTSTRAP=' }
+      $lines += "CT_AGENT_JOIN_TOKEN=$env:CT_AGENT_JOIN_TOKEN"
+      $lines += "CT_AGENT_TOKEN=$env:CT_AGENT_TOKEN"
+      Set-Content -Path .env -Value $lines
+    }
   }
 
   $missing = @()
