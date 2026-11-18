@@ -414,6 +414,13 @@ pub fn relay_listen_policy(listen: &str, allow_public: bool) -> Result<bool, Str
     }
 }
 
+/// #388: the one identify protocol string the relay and every DCUtR client swarm must agree on
+/// -- [`build_relay_swarm`], [`build_dcutr_relay_client_swarm`] and
+/// [`build_dcutr_relay_client_swarm_over_stream`] all construct an `identify::Behaviour` with
+/// this exact string, which is how a client's `identify::Event::Received` ever fires for the
+/// relay's reports at all.
+const DCUTR_IDENTIFY_PROTOCOL: &str = "/ct-dcutr-id/1.0.0";
+
 /// Build the **relay node**'s swarm: a Tokio TCP transport upgraded with libp2p-noise +
 /// yamux, driving the Circuit-Relay v2 **server** [`relay::Behaviour`]. This node forwards
 /// circuits between clients; it terminates none of our channel traffic and never sees
@@ -454,7 +461,7 @@ fn build_relay_swarm() -> Result<Swarm<RelayServerBehaviour>, BoxError> {
         .with_behaviour(|key| RelayServerBehaviour {
             relay: relay::Behaviour::new(key.public().to_peer_id(), relay::Config::default()),
             identify: identify::Behaviour::new(identify::Config::new(
-                "/ct-dcutr-id/1.0.0".to_string(),
+                DCUTR_IDENTIFY_PROTOCOL.to_string(),
                 key.public(),
             )),
         })?
@@ -786,10 +793,6 @@ pub(crate) struct SeedExternalAddr {
 }
 
 impl SeedExternalAddr {
-    fn new(addr: Option<Multiaddr>) -> Self {
-        Self { pending: addr.into_iter().collect() }
-    }
-
     /// Seed more than one external-address candidate at once — e.g. a TCP-
     /// observed AND a QUIC-observed reflexive address for the same member
     /// (#248/#238): each is only useful to DCUtR's direct-dial attempt on the
@@ -847,6 +850,28 @@ impl NetworkBehaviour for SeedExternalAddr {
     fn on_swarm_event(&mut self, _event: libp2p::swarm::FromSwarm) {}
 }
 
+/// #388: the one place [`DcutrRelayClientBehaviour`] is actually assembled, used by both
+/// [`build_dcutr_relay_client_swarm`] and [`build_dcutr_relay_client_swarm_over_stream`] --
+/// they differed only in how many `seeds` they already have in hand (none vs. the caller's
+/// own reflexive addresses), never in the wiring itself.
+fn dcutr_client_behaviour(
+    key: &libp2p::identity::Keypair,
+    relay_client: relay::client::Behaviour,
+    seeds: Vec<Multiaddr>,
+) -> DcutrRelayClientBehaviour {
+    DcutrRelayClientBehaviour {
+        relay_client,
+        dcutr: dcutr::Behaviour::new(key.public().to_peer_id()),
+        // Advertise/observe addresses so DCUtR can discover the reflexive address to punch.
+        identify: identify::Behaviour::new(identify::Config::new(DCUTR_IDENTIFY_PROTOCOL.to_string(), key.public())),
+        stream: stream::Behaviour::new(),
+        // #248: reaches dcutr::Behaviour's own candidate pool, which Swarm::add_external_address
+        // (broadcasting only ExternalAddrConfirmed, a variant dcutr never listens for) does not.
+        // See SeedExternalAddr's doc comment.
+        seed_reflexive: SeedExternalAddr::new_many(seeds),
+    }
+}
+
 /// Build a **DCUtR-enabled relay client**'s swarm: identical to [`build_relay_client_swarm`]
 /// (TCP + noise + yamux + the Circuit-Relay v2 client transport) except its behaviour also
 /// carries [`dcutr::Behaviour`], constructed with this peer's own id, so a relayed connection
@@ -865,17 +890,7 @@ pub(crate) fn build_dcutr_relay_client_swarm() -> Result<Swarm<DcutrRelayClientB
         // address to punch toward. The relay coordination leg can remain TCP.
         .with_quic()
         .with_relay_client(noise::Config::new, yamux::Config::default)?
-        .with_behaviour(|key, relay_client| DcutrRelayClientBehaviour {
-            relay_client,
-            dcutr: dcutr::Behaviour::new(key.public().to_peer_id()),
-            // Advertise/observe addresses so DCUtR can discover the reflexive address to punch.
-            identify: identify::Behaviour::new(identify::Config::new(
-                "/ct-dcutr-id/1.0.0".to_string(),
-                key.public(),
-            )),
-            stream: stream::Behaviour::new(),
-            seed_reflexive: SeedExternalAddr::new(None),
-        })?
+        .with_behaviour(|key, relay_client| dcutr_client_behaviour(key, relay_client, Vec::new()))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
         .build();
     Ok(swarm)
@@ -1054,19 +1069,7 @@ where
             )
         })?
         .with_relay_client(noise::Config::new, yamux::Config::default)?
-        .with_behaviour(|key, relay_client| DcutrRelayClientBehaviour {
-            relay_client,
-            dcutr: dcutr::Behaviour::new(key.public().to_peer_id()),
-            identify: identify::Behaviour::new(identify::Config::new(
-                "/ct-dcutr-id/1.0.0".to_string(),
-                key.public(),
-            )),
-            stream: stream::Behaviour::new(),
-            // #248: THE actual fix -- reaches dcutr::Behaviour's own candidate pool, which
-            // Swarm::add_external_address (broadcasting only ExternalAddrConfirmed, a variant
-            // dcutr never listens for) does not. See SeedExternalAddr's doc comment.
-            seed_reflexive: SeedExternalAddr::new_many(own_reflexive),
-        })?
+        .with_behaviour(|key, relay_client| dcutr_client_behaviour(key, relay_client, own_reflexive))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
         .build();
     Ok(swarm)
@@ -2292,7 +2295,7 @@ mod tests {
         use std::task::{Context, Poll};
 
         let addr: Multiaddr = "/ip4/203.0.113.10/tcp/4433".parse().unwrap();
-        let mut behaviour = SeedExternalAddr::new(Some(addr.clone()));
+        let mut behaviour = SeedExternalAddr::new_many(vec![addr.clone()]);
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -2304,8 +2307,8 @@ mod tests {
         // `pending`).
         assert!(matches!(behaviour.poll(&mut cx), Poll::Pending), "must not re-emit on a second poll");
 
-        // `None` (no reflexive known) never emits anything at all.
-        let mut empty = SeedExternalAddr::new(None);
+        // No reflexive known ("None") never emits anything at all.
+        let mut empty = SeedExternalAddr::new_many(vec![]);
         assert!(matches!(empty.poll(&mut cx), Poll::Pending), "no address -> always Pending");
     }
 
