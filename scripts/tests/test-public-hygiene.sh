@@ -60,6 +60,15 @@ set +e; out="$(PUBLIC_HYGIENE_EXTRA_SHA256="$h" run)"; rc=$?; set -e
 echo "$out" | grep -q zzinternalhost && fail "hashed token printed (or matched in a file path)"
 echo "$out" | grep -q "doc.md:2 rule=listed-token" || fail "listed token not located in the text line"
 
+# 4b. a listed token adjacent to '.', '-' or '_' is still found (#351)
+git checkout -q -b hashed-adjacent "$base"
+{ echo "see zzinternalhost."; echo "visit zzinternalhost.example.com"; echo "box zzinternalhost-01"; } >> doc.md
+git commit -qam "Add adjacent forms"
+set +e; out="$(PUBLIC_HYGIENE_EXTRA_SHA256="$h" run)"; rc=$?; set -e
+[ "$rc" = 1 ] || fail "adjacent listed-token forms did not go red (rc=$rc)"
+for l in 2 3 4; do echo "$out" | grep -q "doc.md:$l rule=listed-token" || fail "adjacent form on line $l not located"; done
+echo "$out" | grep -q zzinternalhost && fail "hashed token printed"
+
 # 5. an added line that starts with "++ " is not taken for a "+++" file header (B1)
 git checkout -q -b plusplus "$base"; echo "++ ref ""XYZ-20261231-077" >> doc.md; git commit -qam "Add line"
 set +e; out="$(run)"; rc=$?; set -e
