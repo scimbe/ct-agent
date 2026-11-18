@@ -1336,7 +1336,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let (policy, generated) = ct_agent::ssh_owner::owner_auth_from_env(&|k| std::env::var(k).ok(), state_dir.as_deref())
                 .map_err(|e| format!("ct-agent: {e}"))?;
             let t = match &policy {
-                ct_agent::ssh_owner::OwnerAuth::Required(key) => {
+                ct_agent::ssh_owner::OwnerAuth::Required(_key) => {
                     let path = state_dir.as_deref().map(ct_agent::ssh_owner::OwnerKey::path_in);
                     eprintln!(
                         "ct-agent: SSH owner authentication ON (scimbe/ct-agent#214): every terminated stream must \
@@ -1345,11 +1345,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     );
                     if generated {
                         eprintln!(
-                            "ct-agent: SSH owner key GENERATED (shown once; `ct-agent ssh-owner show` prints it again):\n\
-                             ct-agent: {}\n\
-                             ct-agent: on the client: ct-agent ssh-config <hostname> --owner-key {}",
-                            key.to_hex(),
-                            key.to_hex()
+                            "ct-agent: SSH owner key GENERATED -- not shown in this log; run \
+                             `ct-agent ssh-owner show` on this host to print it to your own terminal, \
+                             then set it up on the client with: ct-agent ssh-config <hostname> --owner-key-file <file>"
                         );
                     }
                     t.with_owner_auth(policy.clone())
