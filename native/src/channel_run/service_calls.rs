@@ -1999,10 +1999,21 @@ pub(crate) fn channel_local(peer: Option<[u8; 32]>) -> ChannelLocal {
     // #135 L2.3 client: one MCP request/response over the channel, then exit.
     if let Ok(method) = std::env::var("CT_CHANNEL_CALL") {
         let method = method.trim().to_string();
-        let params = std::env::var("CT_CHANNEL_CALL_PARAMS")
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .unwrap_or(serde_json::Value::Null);
+        // ct-agent#374: distinguish unset (fine, params default to null) from set-but-invalid
+        // JSON (a local config mistake, not a request to send `params: null`) -- the #94
+        // warning just above already covers the sibling "set but ignored" case for the OTHER
+        // mode, so this one should fail the same way rather than silently sending nothing.
+        let params_raw = std::env::var("CT_CHANNEL_CALL_PARAMS").ok();
+        let params = match params_raw.as_deref().map(str::trim) {
+            None | Some("") => serde_json::Value::Null,
+            Some(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("ct-agent channel: CT_CHANNEL_CALL_PARAMS is not valid JSON: {e}");
+                    std::process::exit(1);
+                }
+            },
+        };
         eprintln!("ct-agent channel: --call {method} (one MCP request over the channel, then exit)");
         return ChannelLocal::Serve(call_local(method, params));
     }
