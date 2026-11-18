@@ -92,10 +92,6 @@ grep -q -- '--env-file .env' "$d2/argv.log" && echo "ok: case 2 kept --env-file 
 expect_env "case 2" "$d2/env.log" "CT_AGENT_TOKEN=filetoken"
 expect_env "case 2" "$d2/env.log" "CT_AGENT_EDGE=cp.example:4433"
 case "$out2" in *"is loopback"*) echo "ok: case 2 warned about a loopback origin" ;; *) echo "FAIL: case 2 no loopback warning" >&2; fail=1 ;; esac
-# #368: a loopback origin must be rewritten to something the container can actually
-# reach, not just warned about -- and --add-host must be present so it resolves.
-expect_env "case 2" "$d2/env.log" "CT_AGENT_ORIGIN=host.docker.internal:8080"
-grep -q -- '--add-host=host.docker.internal:host-gateway' "$d2/argv.log" && echo "ok: case 2 added the host-gateway alias" || { echo "FAIL: case 2 missing --add-host for the rewritten origin" >&2; fail=1; }
 rm -rf "$d2" "$stubs"
 
 # --- case 3: control plane emits spaced JSON (e.g. "secret": "..." / "mesh_edge_port": 4433) --

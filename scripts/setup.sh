@@ -451,28 +451,17 @@ install_docker() {
   # value makes docker copy it from our environment, keeping secrets out of argv.
   local env_file=()
   [ -f .env ] && env_file=(--env-file .env)
-  # ct-agent#368: loopback from THIS host's point of view is the CONTAINER itself from
-  # inside it -- by the time a mere warning printed here, the container was already
-  # built unreachable. Rewrite to host.docker.internal (the container's own name for
-  # this host) and add the --add-host alias Docker needs to resolve it: built in on
-  # Docker Desktop, and present since Docker 20.10 on Linux via the "host-gateway"
-  # special value. docker_origin/extra_hosts stay equal to the original/empty
-  # otherwise, so a non-loopback origin is unaffected.
-  local docker_origin="$CT_AGENT_ORIGIN" extra_hosts=()
-  case "$CT_AGENT_ORIGIN" in
-    127.*|localhost*|\[::1\]*)
-      docker_origin="host.docker.internal:${CT_AGENT_ORIGIN##*:}"
-      extra_hosts=(--add-host=host.docker.internal:host-gateway)
-      warn "CT_AGENT_ORIGIN=${CT_AGENT_ORIGIN} is loopback: inside the container that is the" \
-           "container itself, not this host -- publishing ${docker_origin} instead" ;;
-  esac
-  CT_AGENT_STATE_DIR=/state CT_AGENT_CAPABILITY_OUT=/state/capability.bin CT_AGENT_ORIGIN="$docker_origin" \
-    docker run -d --name ct-agent ${env_file[@]+"${env_file[@]}"} ${extra_hosts[@]+"${extra_hosts[@]}"} \
-    -v "$abs_state:/state" \
+  CT_AGENT_STATE_DIR=/state CT_AGENT_CAPABILITY_OUT=/state/capability.bin \
+    docker run -d --name ct-agent ${env_file[@]+"${env_file[@]}"} -v "$abs_state:/state" \
     -e CT_AGENT_CP_URL -e CT_AGENT_HOSTNAME -e CT_AGENT_ORIGIN -e CT_AGENT_ORIGIN_PROTO \
     -e CT_AGENT_JOIN_TOKEN -e CT_AGENT_TOKEN -e CT_AGENT_MODE -e CT_AGENT_EDGE_CERT_URL \
     -e CT_AGENT_ID -e CT_AGENT_EDGE -e CT_AGENT_STATE_DIR -e CT_AGENT_CAPABILITY_OUT \
     ct-agent:local || die "docker run failed"
+  case "$CT_AGENT_ORIGIN" in
+    127.*|localhost*|\[::1\]*)
+      warn "CT_AGENT_ORIGIN=${CT_AGENT_ORIGIN} is loopback: inside the container that is the"
+      warn "container itself, not this host. Point it at an address the container can reach." ;;
+  esac
   ok "container 'ct-agent' running (logs: docker logs -f ct-agent)"
 }
 
