@@ -207,7 +207,7 @@ impl OnboardedAgent {
     /// "any one of three sequential writes" down to "a crash landing exactly
     /// between the renames" (fast, near-instantaneous syscalls).
     pub fn persist(&self, state_dir: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(state_dir)?;
+        crate::secret_file::create_private_dir_all(state_dir)?;
         // Security-hardening pass, B.1: the files inside `state_dir` are each
         // written at 0600 (`secret_file::write_private`), but `create_dir_all`
         // leaves the DIRECTORY itself at the process umask (commonly 0755) --

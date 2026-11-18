@@ -115,44 +115,23 @@ impl OwnerKey {
     }
 
     /// Write the key to `path` (dir 0700, file 0600, created atomically via a temp file).
+    ///
+    /// ct-agent#396: delegates the temp-file/`O_NOFOLLOW`/rename/parent-fsync sequence to
+    /// [`crate::secret_file::write_private`] -- the one audited implementation of that
+    /// crash-safe 0600 write -- instead of hand-rolling a second copy of it here. The
+    /// directory handling (create, then explicitly re-tighten to 0700 even if it already
+    /// existed) is unchanged.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        use std::io::Write;
         let dir = path.parent().ok_or_else(|| format!("{}: no parent directory", path.display()))?;
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        crate::secret_file::create_private_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
         }
-        let tmp = path.with_extension("key.tmp");
-        // create_new (O_CREAT|O_EXCL) never follows a pre-planted symlink and never
-        // inherits a stale temp file's mode; removing a leftover first unlinks the
-        // link itself, not its target. A re-plant in between fails closed.
-        match std::fs::remove_file(&tmp) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(format!("{}: {e}", tmp.display()));
-            }
-            _ => {}
-        }
-        {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut f = opts.open(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
-            f.write_all(self.to_hex().as_bytes()).and_then(|_| f.write_all(b"\n")).map_err(|e| format!("{}: {e}", tmp.display()))?;
-            f.sync_all().map_err(|e| format!("{}: {e}", tmp.display()))?;
-        }
-        std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        let mut contents = self.to_hex().into_bytes();
+        contents.push(b'\n');
+        crate::secret_file::write_private(path, &contents).map_err(|e| format!("{}: {e}", path.display()))
     }
 
     /// The key in `state_dir`, generated and saved if there is none. Returns `(key, generated)`.
