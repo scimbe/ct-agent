@@ -262,33 +262,13 @@ pub(crate) fn own_endpoint_looks_reachable(
     adv.ip() == obs.ip()
 }
 
+/// A member whose advertised listen address is not globally routable (NAT-only / private
+/// address, #94) can't be dialed directly, so it defaults to relay-only. Delegates to the
+/// shared [`ct_common::channel::is_global_unicast`] — the exact primitive the edge's
+/// `safe_endpoint` is built on — so this auto-detection can never drift from what the edge
+/// will accept as an advertised endpoint.
 pub fn relay_only_mode(explicit: bool, listen_addr: SocketAddr) -> bool {
-    explicit || !is_globally_routable(listen_addr.ip())
-}
-
-/// Whether `ip` is a globally-routable (global-unicast) address — the mirror of the edge's
-/// `safe_endpoint` range check (#94): loopback / unspecified / multicast, RFC1918 private,
-/// link-local (`169.254/16`, `fe80::/10`), CGNAT (`100.64/10`) and IPv6 unique-local
-/// (`fc00::/7`) are all NOT routable. A member with only such an address can't be dialed, so
-/// it defaults to relay-only.
-fn is_globally_routable(ip: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
-        return false;
-    }
-    match ip {
-        IpAddr::V4(v4) => {
-            if v4.is_private() || v4.is_link_local() {
-                return false;
-            }
-            let o = v4.octets();
-            !(o[0] == 100 && (64..=127).contains(&o[1])) // reject CGNAT 100.64.0.0/10
-        }
-        IpAddr::V6(v6) => {
-            let s0 = v6.segments()[0];
-            (s0 & 0xfe00) != 0xfc00 && (s0 & 0xffc0) != 0xfe80 // reject fc00::/7 + fe80::/10
-        }
-    }
+    explicit || !ct_common::channel::is_global_unicast(listen_addr)
 }
 
 /// #137 SSRF guard for the #104 in-band relay→direct upgrade. The responder dials a
