@@ -802,55 +802,68 @@ pub async fn dial_relay_gate_over_443(
         .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate tcp+tls connect to {addr} failed after {:?}: {e}", t0.elapsed()); } e })?;
     if dbg { eprintln!("ct-agent channel: debug relay-gate tcp+tls connect to {addr} ok in {:?}", t0.elapsed()); }
     let t1 = std::time::Instant::now();
-    stream.write_all(&grant.encode()).await
-        .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate write grant failed after {:?}: {e}", t1.elapsed()); } e })?;
-    let mut challenge = [0u8; 32];
-    stream.read_exact(&mut challenge).await
-        .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate read challenge failed after {:?}: {e}", t1.elapsed()); } e })?;
-    if dbg { eprintln!("ct-agent channel: debug relay-gate grant+challenge round-trip ok in {:?}", t1.elapsed()); }
-    let sig = holder.sign(&challenge).to_bytes();
-    stream.write_all(&sig).await
-        .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate write possession sig failed: {e}"); } e })?;
-    let mut ack = [0u8; 2];
-    let t2 = std::time::Instant::now();
-    stream.read_exact(&mut ack).await
-        .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate read ack failed after {:?}: {e}", t2.elapsed()); } e })?;
-    if &ack != b"OK" {
-        if dbg { eprintln!("ct-agent channel: debug relay-gate pre-auth refused, ack={ack:?}"); }
-        // #524: on a refusal the edge follows the `NO` sentinel with a length-framed
-        // category token and shuts the stream down — opportunistically read it (bounded;
-        // an old edge yields EOF at once → None → the generic message below, unchanged).
-        let category = if &ack == b"NO" {
-            let mut tail = Vec::new();
-            let mut bounded = (&mut stream).take(crate::channel::REFUSAL_CATEGORY_MAX_LEN as u64 + 1);
-            match tokio::time::timeout(std::time::Duration::from_secs(2), bounded.read_to_end(&mut tail)).await {
-                Ok(Ok(_)) => crate::channel::decode_refusal_category(&tail),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        // #24: typed -- this is the relay-gate's wire `NO`, a DEFINITIVE refusal the
-        // retry policy must back off on (it was a bare string before, invisible to
-        // `is_definitive_admission_refusal`, so the serve loop hot-looped on it).
-        return Err(AdmissionRefused::boxed_with_category(
-            "relay-gate: pre-auth refused (grant not authorized -- see the edge's own log)",
-            category.as_deref(),
-        ));
-    }
-    if dbg { eprintln!("ct-agent channel: debug relay-gate pre-auth ok (ack=OK) in {:?} total", t0.elapsed()); }
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await
-        .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate read peer-id length failed: {e}"); } e })?;
-    let len = u16::from_be_bytes(len_buf) as usize;
-    let mut peer_buf = vec![0u8; len];
-    stream.read_exact(&mut peer_buf).await
-        .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate read peer-id bytes ({len}B) failed: {e}"); } e })?;
-    let peer_str = String::from_utf8(peer_buf)
-        .map_err(|e| -> BoxError { format!("relay-gate: relay-node peer id not utf8: {e}").into() })?;
-    let relay_peer: libp2p::PeerId = peer_str
-        .parse()
-        .map_err(|e| -> BoxError { format!("relay-gate: malformed relay-node peer id {peer_str:?}: {e}").into() })?;
+    // ct-agent#377: everything from here on is a bare `read_exact`/`write_all` with no
+    // per-call timeout -- only the refusal-tail read below was ever bounded. A gate or
+    // middlebox that accepts the TCP+TLS connect and then goes silent mid-exchange used to
+    // hang this attempt forever instead of hitting `run_dcutr_join_loop`'s dial-failure
+    // backoff. `ADMISSION_EXCHANGE_TIMEOUT` is the same bound `present_channel_join_on_stream`
+    // already holds the rendezvous/relay exchange to.
+    let relay_peer: libp2p::PeerId = tokio::time::timeout(ADMISSION_EXCHANGE_TIMEOUT, async {
+        stream.write_all(&grant.encode()).await
+            .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate write grant failed after {:?}: {e}", t1.elapsed()); } e })?;
+        let mut challenge = [0u8; 32];
+        stream.read_exact(&mut challenge).await
+            .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate read challenge failed after {:?}: {e}", t1.elapsed()); } e })?;
+        if dbg { eprintln!("ct-agent channel: debug relay-gate grant+challenge round-trip ok in {:?}", t1.elapsed()); }
+        let sig = holder.sign(&challenge).to_bytes();
+        stream.write_all(&sig).await
+            .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate write possession sig failed: {e}"); } e })?;
+        let mut ack = [0u8; 2];
+        let t2 = std::time::Instant::now();
+        stream.read_exact(&mut ack).await
+            .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate read ack failed after {:?}: {e}", t2.elapsed()); } e })?;
+        if &ack != b"OK" {
+            if dbg { eprintln!("ct-agent channel: debug relay-gate pre-auth refused, ack={ack:?}"); }
+            // #524: on a refusal the edge follows the `NO` sentinel with a length-framed
+            // category token and shuts the stream down — opportunistically read it (bounded;
+            // an old edge yields EOF at once → None → the generic message below, unchanged).
+            let category = if &ack == b"NO" {
+                let mut tail = Vec::new();
+                let mut bounded = (&mut stream).take(crate::channel::REFUSAL_CATEGORY_MAX_LEN as u64 + 1);
+                match tokio::time::timeout(std::time::Duration::from_secs(2), bounded.read_to_end(&mut tail)).await {
+                    Ok(Ok(_)) => crate::channel::decode_refusal_category(&tail),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            // #24: typed -- this is the relay-gate's wire `NO`, a DEFINITIVE refusal the
+            // retry policy must back off on (it was a bare string before, invisible to
+            // `is_definitive_admission_refusal`, so the serve loop hot-looped on it).
+            return Err(AdmissionRefused::boxed_with_category(
+                "relay-gate: pre-auth refused (grant not authorized -- see the edge's own log)",
+                category.as_deref(),
+            ));
+        }
+        if dbg { eprintln!("ct-agent channel: debug relay-gate pre-auth ok (ack=OK) in {:?} total", t0.elapsed()); }
+        let mut len_buf = [0u8; 2];
+        stream.read_exact(&mut len_buf).await
+            .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate read peer-id length failed: {e}"); } e })?;
+        let len = u16::from_be_bytes(len_buf) as usize;
+        let mut peer_buf = vec![0u8; len];
+        stream.read_exact(&mut peer_buf).await
+            .map_err(|e| { if dbg { eprintln!("ct-agent channel: debug relay-gate read peer-id bytes ({len}B) failed: {e}"); } e })?;
+        let peer_str = String::from_utf8(peer_buf)
+            .map_err(|e| -> BoxError { format!("relay-gate: relay-node peer id not utf8: {e}").into() })?;
+        let relay_peer: libp2p::PeerId = peer_str
+            .parse()
+            .map_err(|e| -> BoxError { format!("relay-gate: malformed relay-node peer id {peer_str:?}: {e}").into() })?;
+        Ok::<libp2p::PeerId, BoxError>(relay_peer)
+    })
+    .await
+    .map_err(|_| -> BoxError {
+        format!("relay-gate: pre-auth exchange timed out after {ADMISSION_EXCHANGE_TIMEOUT:?}").into()
+    })??;
     if dbg { eprintln!("ct-agent channel: debug relay-gate handshake complete, relay-node peer={relay_peer} in {:?} total", t0.elapsed()); }
     Ok((stream, relay_peer))
 }
