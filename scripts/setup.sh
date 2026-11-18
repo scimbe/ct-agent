@@ -209,7 +209,7 @@ ensure_env() {
     resp=$(printf '{"token":"%s"}' "$CT_BOOTSTRAP" | curl -fsSL -X POST -H 'content-type: application/json' \
       --data-binary @- "${CT_AGENT_CP_URL%/}/bootstrap/redeem") \
       || die "bootstrap redeem failed — the token may be expired/already used"
-    bundle=$(printf '%s' "$resp" | sed -n 's/.*"secret":"\([^"]*\)".*/\1/p')
+    bundle=$(printf '%s' "$resp" | sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
     CT_AGENT_JOIN_TOKEN=$(printf '%s' "$bundle" | sed -n 's/.*CT_JOIN_TOKEN=\([^;"]*\).*/\1/p')
     CT_AGENT_TOKEN=$(printf '%s' "$bundle" | sed -n 's/.*CT_AGENT_TOKEN=\([^;"]*\).*/\1/p')
     export CT_AGENT_JOIN_TOKEN CT_AGENT_TOKEN
@@ -263,7 +263,7 @@ ensure_env() {
     # host:port string -- the host is the same one CT_AGENT_CP_URL points at.
     local ni edge_host edge_port
     ni=$(curl -fsSL "${CT_AGENT_CP_URL%/}/network-info" 2>/dev/null || true)
-    edge_port=$(printf '%s' "$ni" | sed -n 's/.*"mesh_edge_port":\([0-9]*\).*/\1/p')
+    edge_port=$(printf '%s' "$ni" | sed -n 's/.*"mesh_edge_port"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
     edge_host=$(printf '%s' "$CT_AGENT_CP_URL" | sed -E 's#^[a-zA-Z]+://##; s#[:/].*##')
     [ -n "$edge_port" ] && [ -n "$edge_host" ] && CT_AGENT_EDGE="${edge_host}:${edge_port}"
     [ -n "$CT_AGENT_EDGE" ] || die "could not determine CT_AGENT_EDGE automatically — set it in .env (host:port of the mesh edge)"
@@ -462,7 +462,7 @@ poll_status() {
     # quickstart.sh's cp_add_member already gives the bearer header.
     resp=$(printf 'url = "%s"\n' "${CT_AGENT_CP_URL%/}/agent/acme-admission/${CT_AGENT_TOKEN}/${CT_AGENT_HOSTNAME}" \
       | curl -fsSL --config - 2>/dev/null || true)
-    status=$(printf '%s' "$resp" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
+    status=$(printf '%s' "$resp" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
     if [ -n "$status" ] && [ "$status" != "$last" ]; then
       case "$status" in
         rot)   warn "🔴 Rot — still being set up, waiting..." ;;
