@@ -203,15 +203,28 @@ ensure_env() {
   if [ -n "${CT_BOOTSTRAP:-}" ]; then
     log "redeeming CT_BOOTSTRAP server-side"
     : "${CT_AGENT_CP_URL:?set CT_AGENT_CP_URL in .env}"
+    # ct-agent#367: same token-alphabet check quickstart.sh's redeem() already does --
+    # a stray quote/space/newline from a bad paste would otherwise reach the JSON body
+    # verbatim and produce a malformed request (and a misleading "expired/already used"
+    # error) instead of a clear local message.
+    case "$CT_BOOTSTRAP" in *[!A-Za-z0-9._~-]*) die "CT_BOOTSTRAP holds characters a token never has — copy it again from the Install page" ;; esac
     local resp bundle
     # Body on stdin (printf is a builtin): as a --data argument the token would be
     # readable by any local user via ps / /proc/<pid>/cmdline while curl runs.
-    resp=$(printf '{"token":"%s"}' "$CT_BOOTSTRAP" | curl -fsSL -X POST -H 'content-type: application/json' \
+    # ct-agent#367: no -L / --max-redirs 0 -- with -L, a 307/308 response re-sends this
+    # body, bootstrap token included, to whatever host the redirect names. quickstart.sh's
+    # redeem() already runs this call the same way.
+    resp=$(printf '{"token":"%s"}' "$CT_BOOTSTRAP" | curl -fsS --max-redirs 0 -X POST -H 'content-type: application/json' \
       --data-binary @- "${CT_AGENT_CP_URL%/}/bootstrap/redeem") \
       || die "bootstrap redeem failed — the token may be expired/already used"
     bundle=$(printf '%s' "$resp" | sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
     CT_AGENT_JOIN_TOKEN=$(printf '%s' "$bundle" | sed -n 's/.*CT_JOIN_TOKEN=\([^;"]*\).*/\1/p')
     CT_AGENT_TOKEN=$(printf '%s' "$bundle" | sed -n 's/.*CT_AGENT_TOKEN=\([^;"]*\).*/\1/p')
+    # ct-agent#367: the redeemed tokens were exported without any validation. Same
+    # alphabet check as quickstart.sh's RE_TOKEN, so a malformed or empty response is
+    # caught here instead of surfacing later as a confusing agent error.
+    case "$CT_AGENT_JOIN_TOKEN" in ""|*[!A-Za-z0-9._~+/=-]*) die "the control plane returned a token with unexpected characters — nothing was written" ;; esac
+    case "$CT_AGENT_TOKEN" in ""|*[!A-Za-z0-9._~+/=-]*) die "the control plane returned a token with unexpected characters — nothing was written" ;; esac
     export CT_AGENT_JOIN_TOKEN CT_AGENT_TOKEN
     ok "bootstrap redeemed"
   fi
