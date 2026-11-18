@@ -1282,7 +1282,8 @@ pub async fn connected_dcutr_stream_pair() -> Result<(P2pDuplex, P2pDuplex), Box
     let client_b = build_dcutr_relay_client_swarm()?;
     let (b_driver, dialer_stream) = dcutr_dial_via_relay(client_b, a_via_relay, a_peer).await?;
     b_driver.detach();
-    let listener_stream = inbound_rx.await?;
+    let mut inbound_rx = inbound_rx;
+    let listener_stream = inbound_rx.recv().await.ok_or("inbound DCUtR stream channel closed before any stream arrived")?;
     Ok((dialer_stream, listener_stream))
 }
 
@@ -1305,8 +1306,51 @@ pub async fn connected_dcutr_stream_pair() -> Result<(P2pDuplex, P2pDuplex), Box
 pub(crate) async fn dcutr_reserve_and_accept(
     client: Swarm<DcutrRelayClientBehaviour>,
     relay_circuit: Multiaddr,
-) -> Result<(TaskGuard<()>, tokio::sync::oneshot::Receiver<P2pDuplex>), BoxError> {
+) -> Result<(TaskGuard<()>, tokio::sync::mpsc::Receiver<P2pDuplex>), BoxError> {
     dcutr_reserve_and_accept_on(&TASKS_LIVE, client, relay_circuit, DCUTR_SETUP_TIMEOUT).await
+}
+
+/// ct-agent#370: how many unauthenticated inbound `/ct/channel/1.0.0` substreams
+/// [`dcutr_reserve_and_accept_on`] queues while waiting for the one from the attested peer.
+/// Small and bounded: a flood from a network-adjacent third party should cost it nothing more
+/// than filling this queue (then its streams are simply dropped, `try_send`), never block the
+/// swarm's own event loop and never grow without bound.
+const INBOUND_UPGRADE_QUEUE: usize = 8;
+
+/// ct-agent#370: how long ONE inbound candidate gets to finish its Noise handshake in
+/// [`accept_first_authenticated`]. Without a per-stream bound, a third party that opens the
+/// substream and then goes silent holds the loop until the overall deadline, starving the
+/// legitimate peer queued behind it.
+const DCUTR_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Take inbound candidate streams from `rx` one at a time until `establish` authenticates one,
+/// `rx` closes, or `deadline` elapses. A candidate that fails -- or stalls past `per_handshake` --
+/// costs only its own slot.
+async fn accept_first_authenticated<S, T, E, F, Fut>(
+    mut rx: tokio::sync::mpsc::Receiver<S>,
+    deadline: Duration,
+    per_handshake: Duration,
+    mut establish: F,
+) -> Option<T>
+where
+    F: FnMut(S) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let deadline = tokio::time::Instant::now() + deadline;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let stream = match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(stream)) => stream,
+            Ok(None) | Err(_) => return None,
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if let Ok(Ok(result)) = tokio::time::timeout(per_handshake.min(remaining), establish(stream)).await {
+            return Some(result);
+        }
+    }
 }
 
 /// How long [`dcutr_reserve_and_accept`] waits for the relay to accept the reservation and
@@ -1321,17 +1365,22 @@ async fn dcutr_reserve_and_accept_on(
     mut client: Swarm<DcutrRelayClientBehaviour>,
     relay_circuit: Multiaddr,
     setup_timeout: Duration,
-) -> Result<(TaskGuard<()>, tokio::sync::oneshot::Receiver<P2pDuplex>), BoxError> {
+) -> Result<(TaskGuard<()>, tokio::sync::mpsc::Receiver<P2pDuplex>), BoxError> {
     let mut incoming = client.behaviour().stream.new_control().accept(CT_CHANNEL_PROTOCOL)?;
     // #136: offer direct TCP+QUIC candidates so DCUtR can punch (else only the relay leg exists).
     add_direct_punch_listeners(&mut client)?;
     client.listen_on(relay_circuit)?;
     let (reserved_tx, reserved_rx) = tokio::sync::oneshot::channel();
-    let (inbound_tx, inbound_rx) = tokio::sync::oneshot::channel();
+    // ct-agent#370: was a oneshot that delivered exactly the FIRST inbound substream from ANY
+    // peer and silently dropped every one after -- the listeners are bound on 0.0.0.0, so a
+    // third party that reaches them (or the circuit) before the real attested peer's dial
+    // permanently consumed the one slot. The caller's Noise_IK handshake still refuses an
+    // unauthenticated stream, but by then the legitimate one is already gone. An mpsc queue
+    // lets the caller try each candidate in turn until one actually authenticates.
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(INBOUND_UPGRADE_QUEUE);
     let dbg = crate::channel_run::debug_timing_enabled();
     let driver = gauge.spawn(async move {
         let mut reserved_tx = Some(reserved_tx);
-        let mut inbound_tx = Some(inbound_tx);
         loop {
             tokio::select! {
                 ev = client.next() => {
@@ -1371,9 +1420,10 @@ async fn dcutr_reserve_and_accept_on(
                     }
                 }
                 Some((_peer, stream)) = incoming.next() => {
-                    if let Some(tx) = inbound_tx.take() {
-                        let _ = tx.send(stream.compat());
-                    }
+                    // ct-agent#370: best-effort -- a full queue (flood, or the caller already
+                    // found its peer and stopped polling) just drops the newest candidate rather
+                    // than blocking this event loop or growing without bound.
+                    let _ = inbound_tx.try_send(stream.compat());
                 }
             }
         }
@@ -1698,11 +1748,17 @@ where
                 coord,
                 1,
                 || async move { Some(advertise) },
+                // ct-agent#370: inbound_rx can now carry more than one candidate stream (any
+                // network-adjacent peer that reaches the listener before the real one does adds
+                // itself to the queue) -- try each in turn, bounded by DCUTR_SETUP_TIMEOUT
+                // overall, until one actually authenticates via Noise_IK or the queue/deadline
+                // runs out. A third party's stream fails the handshake and costs one iteration,
+                // never the whole upgrade slot.
                 move || async move {
-                    let stream = inbound_rx.await.ok()?;
-                    ct_common::a2a::establish_direct_over_duplex(stream, false, &direct_priv, &direct_peer)
-                        .await
-                        .ok()
+                    accept_first_authenticated(inbound_rx, DCUTR_SETUP_TIMEOUT, DCUTR_HANDSHAKE_TIMEOUT, |stream| {
+                        ct_common::a2a::establish_direct_over_duplex(stream, false, &direct_priv, &direct_peer)
+                    })
+                    .await
                 },
             )
             .await
@@ -2417,7 +2473,8 @@ mod tests {
         let client_b = build_dcutr_relay_client_swarm().unwrap();
         let (b_driver, mut dialer) =
             dcutr_dial_via_relay_on(&GAUGE, client_b, a_via_relay, a_peer, Duration::from_secs(10)).await.unwrap();
-        let mut listener = tokio::time::timeout(Duration::from_secs(10), inbound_rx).await.unwrap().unwrap();
+        let mut inbound_rx = inbound_rx;
+        let mut listener = tokio::time::timeout(Duration::from_secs(10), inbound_rx.recv()).await.unwrap().unwrap();
         assert_eq!(GAUGE.get(), 2, "both swarms are driven while the session holds their guards");
 
         // The streams work while the guards are held.
@@ -2866,6 +2923,34 @@ mod tests {
         })
         .await
         .expect("the DCUtR-enabled relayed Noise round-trip completes within 15s (a hang here is a deadlock)");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_inbound_stream_does_not_block_the_next_candidate() {
+        // ct-agent#370: candidate 1 never finishes its handshake (attacker), 2 is the real peer.
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(1u8).await.unwrap();
+        tx.send(2u8).await.unwrap();
+        let got = accept_first_authenticated(rx, Duration::from_secs(5), Duration::from_millis(100), |s| async move {
+            if s == 1 {
+                std::future::pending::<Result<u8, ()>>().await
+            } else {
+                Ok(s)
+            }
+        })
+        .await;
+        assert_eq!(got, Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_failing_inbound_stream_is_skipped_and_an_empty_queue_times_out() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(1u8).await.unwrap();
+        let got = accept_first_authenticated(rx, Duration::from_millis(200), Duration::from_millis(100), |s| async move {
+            Err::<u8, _>(s)
+        })
+        .await;
+        assert_eq!(got, None);
     }
 
     #[tokio::test]
