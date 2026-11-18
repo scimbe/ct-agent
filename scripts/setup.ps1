@@ -333,7 +333,15 @@ function Install-Docker {
   docker buildx build --load -t ct-agent:local --build-arg "CT_AGENT_RELEASE=$latestTag" "https://github.com/scimbe/ct-agent.git#${latestTag}:docker"
   if ($LASTEXITCODE -ne 0) { Die "docker build failed" }
   Log "starting the container"
+  # ct-agent#350: under $ErrorActionPreference = 'Stop' (set at the top of this script),
+  # redirecting a NATIVE command's stderr with `2>` makes PowerShell 5.1 (and early 7.x)
+  # wrap its first stderr line as a terminating ErrorRecord -- `docker rm` on a
+  # not-yet-existing container (the normal first-install case) writes exactly that line.
+  # Scoped to just this call so every other native command keeps failing loudly.
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'SilentlyContinue'
   docker rm -f ct-agent 2>$null | Out-Null
+  $ErrorActionPreference = $prevEap
   New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
   $absState = (Resolve-Path $StateDir).Path
   # Import-DotEnv resolved the redeemed tokens, CT_AGENT_ID, CT_AGENT_EDGE and the
