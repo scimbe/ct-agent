@@ -400,7 +400,10 @@ function Show-FinalReport {
     Write-Host ""
     Write-Host "  Still Gelb. To get your own certificate (Grün) once you're ready:"
     Write-Host "    1. Make sure $($env:CT_AGENT_ORIGIN) serves PLAIN HTTP (not TLS) for now."
-    Write-Host "    2. `$env:CT_AGENT_CP_URL='$($env:CT_AGENT_CP_URL)'; `$env:CT_AGENT_TOKEN='$($env:CT_AGENT_TOKEN)'; `$env:CT_AGENT_HOSTNAME='$($env:CT_AGENT_HOSTNAME)'; .\ct-agent.exe certificate"
+    # ct-agent#348: CT_AGENT_TOKEN is a bearer credential -- it stays out of this
+    # printed hint (terminal scrollback, any captured install log); the
+    # operator's own .env (or shell environment, for the one-liner) has it.
+    Write-Host "    2. `$env:CT_AGENT_CP_URL='$($env:CT_AGENT_CP_URL)'; `$env:CT_AGENT_TOKEN='<see .env, or your shell env if you used the one-liner>'; `$env:CT_AGENT_HOSTNAME='$($env:CT_AGENT_HOSTNAME)'; .\ct-agent.exe certificate"
     Write-Host "    3. Once Grün, switch $($env:CT_AGENT_ORIGIN) back to serving its own TLS cert."
   }
 }
