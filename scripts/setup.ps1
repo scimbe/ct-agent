@@ -243,9 +243,19 @@ function Install-Direct {
     Remove-Item .\ct-agent.exe.download -ErrorAction SilentlyContinue
     Die "$asset does not match its .sha256 -- refusing to install it"
   }
-  Move-Item -Force .\ct-agent.exe.download .\ct-agent.exe
   Ok "checksum verified"
-  Warn "release signature not verified on Windows (checksum only)"
+  # ct-agent#349: a checksum fetched from the same release base as the binary gives
+  # integrity against corruption, not authenticity -- a replaced asset or a hostile
+  # $ReleaseBase mirror would pass it too. Windows PowerShell has no built-in ed25519
+  # to verify the signed release-manifest.json the way scripts/setup.sh does, so this
+  # requires an explicit opt-in (the same CT_AGENT_UPDATE_SKIP_VERIFY setup.sh already
+  # documents) to install on checksum alone, instead of silently accepting it.
+  if (-not $env:CT_AGENT_UPDATE_SKIP_VERIFY) {
+    Remove-Item .\ct-agent.exe.download -ErrorAction SilentlyContinue
+    Die "the release signature cannot be verified on Windows (checksum only); set `$env:CT_AGENT_UPDATE_SKIP_VERIFY='1' to install on checksum alone anyway"
+  }
+  Move-Item -Force .\ct-agent.exe.download .\ct-agent.exe
+  Warn "CT_AGENT_UPDATE_SKIP_VERIFY is set: release signature NOT verified (checksum only)"
   Ok "ct-agent binary ready"
 
   $fresh = -not ((Test-Path $StateDir) -and (Get-ChildItem $StateDir -ErrorAction SilentlyContinue))
