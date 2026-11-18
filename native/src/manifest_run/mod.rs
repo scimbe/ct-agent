@@ -561,7 +561,6 @@ pub struct ActivateCliConfig {
     pub require_binary_sandbox: bool,
 }
 
-#[derive(Debug)]
 pub struct RegistryActivationConfig {
     pub registry_url: String,
     pub registry_write_token: String,
@@ -569,6 +568,18 @@ pub struct RegistryActivationConfig {
     /// Phase 3's ledger is honest bookkeeping, not a payment-grade attestation (see
     /// `registry::post_activation`'s own doc comment for the full rationale).
     pub activator_pubkey: String,
+}
+
+impl std::fmt::Debug for RegistryActivationConfig {
+    /// Hand-written so `registry_write_token` -- a bearer credential sufficient to write to the
+    /// activation ledger -- never appears in a `{cfg:?}` log line or panic message.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryActivationConfig")
+            .field("registry_url", &self.registry_url)
+            .field("registry_write_token", &"<redacted>")
+            .field("activator_pubkey", &self.activator_pubkey)
+            .finish()
+    }
 }
 
 impl ActivateCliConfig {
