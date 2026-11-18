@@ -30,13 +30,23 @@ fn to_hex(bytes: &[u8]) -> String {
 // native (non-wasm) target -- that would make these pure, otherwise-plain
 // helpers untestable with `cargo test`. Converted to `JsError` only at the
 // `#[wasm_bindgen]`-exposed boundary below, where a real JS runtime exists.
+// ct-agent#363: decode on `s.as_bytes()` in fixed-size chunks rather than slicing the `&str`
+// at byte offsets (`&s[i..i + 2]`) -- a str slice boundary that lands inside a multi-byte
+// UTF-8 character panics, which a plain `s.len() % 2 == 0` length check does not rule out
+// (e.g. "a\u{e9}b" is 4 bytes but its middle byte boundary is mid-character). Operating on
+// raw bytes sidesteps the UTF-8 validity question entirely: any non-hex byte, ASCII or not,
+// is simply rejected by `from_str_radix`'s own `Err`, never panics.
 fn from_hex(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    let bytes = s.as_bytes();
+    if bytes.len() % 2 != 0 {
         return Err("hex string must have an even length".to_string());
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| "invalid hex character".to_string()))
+    bytes
+        .chunks_exact(2)
+        .map(|chunk| {
+            let pair = std::str::from_utf8(chunk).map_err(|_| "invalid hex character".to_string())?;
+            u8::from_str_radix(pair, 16).map_err(|_| "invalid hex character".to_string())
+        })
         .collect()
 }
 
@@ -580,6 +590,14 @@ mod tests {
         assert!(from_hex("abc").is_err());
         assert!(from_hex("zz").is_err());
         assert_eq!(from_hex("00ff").unwrap(), vec![0x00, 0xff]);
+    }
+
+    #[test]
+    fn from_hex_rejects_rather_than_panics_on_a_multi_byte_char() {
+        // ct-agent#363: "a\u{e9}b" ('a', 'é' (2 UTF-8 bytes), 'b') is 4 bytes -- the same
+        // even length as a valid 2-byte hex string -- but byte index 2 lands inside 'é',
+        // which a `&str` slice there would panic on instead of returning an `Err`.
+        assert!(from_hex("a\u{e9}b").is_err());
     }
 
     #[test]
