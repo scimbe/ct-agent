@@ -1371,6 +1371,7 @@ pub(crate) fn decode_hex_32_bridge_peer(s: &str) -> Option<[u8; 32]> {
 /// per invocation (a refused caller is `ok=false` like any other error).
 fn bridge_traced(
     tool: &'static str,
+    bridge_peer: [u8; 32],
     handler: impl Fn(&ct_common::mcp::CallContext, &serde_json::Value) -> Result<serde_json::Value, String>
         + Send
         + Sync
@@ -1380,6 +1381,15 @@ fn bridge_traced(
        + Sync
        + 'static {
     move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
+        // ct-agent#382: the peer-gate check used to be copied into every one of the ten
+        // handlers below (and in register_bridge_manifest_plan_tool); doing it once here
+        // means a new bridge tool cannot be registered without the gate, and the refusal
+        // text (which the tests pin per tool) is generated from `tool` instead of hand-typed.
+        if ctx.peer != Some(bridge_peer) {
+            let out = Err(format!("{tool}: caller is not this agent's configured bridge peer"));
+            crate::events::emit(crate::events::BRIDGE_CALL, serde_json::json!({ "tool": tool, "ok": false }));
+            return out;
+        }
         let out = handler(ctx, args);
         crate::events::emit(crate::events::BRIDGE_CALL, serde_json::json!({ "tool": tool, "ok": out.is_ok() }));
         out
@@ -1421,10 +1431,7 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
         "Agent bridge status: this agent's version and that the bridge gate is active. Callable \
          only by this agent's configured bridge peer (CT_CHANNEL_BRIDGE_PEER) -- refused for any \
          other channel member, even an otherwise-admitted one.",
-        bridge_traced("bridge/status", move |ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
-            if ctx.peer != Some(bridge_peer) {
-                return Err("bridge/status: caller is not this agent's configured bridge peer".to_string());
-            }
+        bridge_traced("bridge/status", bridge_peer, move |_ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
             Ok(serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "bridge_gated": true,
@@ -1443,10 +1450,7 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
          needs manifest_trust_allowlist_configured + manifest_work_dir_configured, and \
          docker_available for compose-kind manifests. Never returns actual key/token/secret VALUES, \
          only which optional features are turned on. No arguments.",
-        bridge_traced("bridge/config", move |ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
-            if ctx.peer != Some(bridge_peer) {
-                return Err("bridge/config: caller is not this agent's configured bridge peer".to_string());
-            }
+        bridge_traced("bridge/config", bridge_peer, move |_ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
             Ok(bridge_config_summary(
                 |k| std::env::var(k).ok(),
                 crate::login::oidc_credential_state(),
@@ -1466,10 +1470,7 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
          resolution `channel register`/`channel allowlist` already use). The channel is always THIS agent's \
          own -- never caller-supplied, so a bridge peer can't use this to enumerate an unrelated \
          channel's membership. No arguments.",
-        bridge_traced("bridge/channel-members", move |ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
-            if ctx.peer != Some(bridge_peer) {
-                return Err("bridge/channel-members: caller is not this agent's configured bridge peer".to_string());
-            }
+        bridge_traced("bridge/channel-members", bridge_peer, move |_ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
             let env = |k: &str| std::env::var(k).ok();
             let cp_url = env("CT_AGENT_CP_URL")
                 .ok_or_else(|| "bridge/channel-members: this agent has no CT_AGENT_CP_URL configured".to_string())?
@@ -1505,10 +1506,7 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
          belong to THIS agent's channel (CT_CHANNEL_ID / CT_GRANT_CHANNEL). Needs CT_AGENT_CP_URL \
          and a usable OIDC credential, like `bridge/channel-members`. The portal should confirm \
          with the owner before calling it.",
-        bridge_traced("bridge/channel-revoke", move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
-            if ctx.peer != Some(bridge_peer) {
-                return Err("bridge/channel-revoke: caller is not this agent's configured bridge peer".to_string());
-            }
+        bridge_traced("bridge/channel-revoke", bridge_peer, move |_ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
             let env = |k: &str| std::env::var(k).ok();
             let cp_url = env("CT_AGENT_CP_URL")
                 .ok_or_else(|| "bridge/channel-revoke: this agent has no CT_AGENT_CP_URL configured".to_string())?;
@@ -1541,10 +1539,7 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
         "List the e-mails allow-listed for self-service claim on this agent's own channel \
          (ChannelAllowlistRequest/ControlPlaneClient::channel_allowlist_list -- the exact \
          already-shipped call `ct-agent channel allowlist list` itself makes). No arguments.",
-        bridge_traced("bridge/allowlist-list", move |ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
-            if ctx.peer != Some(bridge_peer) {
-                return Err("bridge/allowlist-list: caller is not this agent's configured bridge peer".to_string());
-            }
+        bridge_traced("bridge/allowlist-list", bridge_peer, move |_ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
             let env = |k: &str| std::env::var(k).ok();
             let emails = tokio::runtime::Handle::current().block_on(async {
                 let token = crate::login::resolve_oidc_token_with_retry(
@@ -1567,10 +1562,7 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
          {email}. Same call `ct-agent channel allowlist add <email>` already makes \
          (ControlPlaneClient::channel_allowlist_add) -- owner-scoped by the resolved OIDC \
          bearer token, not by anything the caller supplies.",
-        bridge_traced("bridge/allowlist-add", move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
-            if ctx.peer != Some(bridge_peer) {
-                return Err("bridge/allowlist-add: caller is not this agent's configured bridge peer".to_string());
-            }
+        bridge_traced("bridge/allowlist-add", bridge_peer, move |_ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
             let email = args
                 .get("email")
                 .and_then(|v| v.as_str())
@@ -1599,10 +1591,7 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
          (ControlPlaneClient::channel_allowlist_remove) -- owner-scoped by the resolved OIDC \
          bearer token, not by anything the caller supplies. Does NOT revoke an already-claimed \
          membership -- only stops a NEW claim of that e-mail going forward.",
-        bridge_traced("bridge/allowlist-remove", move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
-            if ctx.peer != Some(bridge_peer) {
-                return Err("bridge/allowlist-remove: caller is not this agent's configured bridge peer".to_string());
-            }
+        bridge_traced("bridge/allowlist-remove", bridge_peer, move |_ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
             let email = args
                 .get("email")
                 .and_then(|v| v.as_str())
@@ -1633,10 +1622,7 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
          as `manifest_location` verbatim. An entry's `installer_kind`, where the registry reports one, \
          is \"compose\" (sandboxed, Docker) or \"binary\" (raw, bare executable) -- the portal's picker \
          surfaces this directly, no separate flag. No arguments.",
-        bridge_traced("bridge/manifest-list", move |ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
-            if ctx.peer != Some(bridge_peer) {
-                return Err("bridge/manifest-list: caller is not this agent's configured bridge peer".to_string());
-            }
+        bridge_traced("bridge/manifest-list", bridge_peer, move |_ctx: &ct_common::mcp::CallContext, _args: &serde_json::Value| {
             let registry_url = std::env::var("CT_MANIFEST_REGISTRY_URL")
                 .map_err(|_| "bridge/manifest-list: this agent has no CT_MANIFEST_REGISTRY_URL configured".to_string())?
                 .trim_end_matches('/')
@@ -1677,10 +1663,7 @@ pub(crate) fn register_bridge_tools(reg: &mut ct_common::mcp::ToolRegistry, brid
          this host, unless the agent's OWN process environment carries CT_ALLOW_UNSANDBOXED=1 -- \
          that opt-out is inherited from the agent's environment and is never caller-controlled. \
          Call bridge/manifest-plan first to see the verdict without installing.",
-        bridge_traced("bridge/manifest-install", move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
-            if ctx.peer != Some(bridge_peer) {
-                return Err("bridge/manifest-install: caller is not this agent's configured bridge peer".to_string());
-            }
+        bridge_traced("bridge/manifest-install", bridge_peer, move |_ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
             if std::env::var("CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL").is_ok() {
                 return Err(
                     "bridge/manifest-install: disabled on this agent (CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL \
@@ -1748,10 +1731,7 @@ pub(crate) fn register_bridge_manifest_plan_tool(
          read); the real install scans the unpacked bundle. Trust allowlist, work directory and the \
          CT_ALLOW_UNSANDBOXED opt-out come from this agent's OWN environment, never from the caller. \
          Not gated by CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL: a plan installs nothing.",
-        bridge_traced("bridge/manifest-plan", move |ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
-            if ctx.peer != Some(bridge_peer) {
-                return Err("bridge/manifest-plan: caller is not this agent's configured bridge peer".to_string());
-            }
+        bridge_traced("bridge/manifest-plan", bridge_peer, move |_ctx: &ct_common::mcp::CallContext, args: &serde_json::Value| {
             let manifest_location = args
                 .get("manifest_location")
                 .and_then(|v| v.as_str())
