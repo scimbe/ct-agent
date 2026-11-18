@@ -394,9 +394,13 @@ function Wait-ForTier {
     } else {
       Log "requesting your own certificate (ct-agent certificate)"
       $env:CT_ACME_CERT_OUT_DIR = if ($env:CT_ACME_CERT_OUT_DIR) { $env:CT_ACME_CERT_OUT_DIR } else { '.\ct-agent-cert' }
+      # ct-agent#366: own log files -- .\ct-agent.log/.err.log are still open by the
+      # serving agent Install-Direct started, and Start-Process redirection CREATES the
+      # target file rather than appending, so reusing those paths either hits a sharing
+      # violation or truncates the serving agent's log out from under it.
       Start-Process -FilePath .\ct-agent.exe -ArgumentList 'certificate' -WindowStyle Hidden `
-        -RedirectStandardOutput .\ct-agent.log -RedirectStandardError .\ct-agent.err.log
-      Ok "certificate issuance running in the background (watch .\ct-agent.log)"
+        -RedirectStandardOutput .\ct-agent-cert.log -RedirectStandardError .\ct-agent-cert.err.log
+      Ok "certificate issuance running in the background (watch .\ct-agent-cert.log)"
     }
   }
   $script:FinalStatus = if ($status) { $status } else { 'unknown' }
