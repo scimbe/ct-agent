@@ -223,6 +223,25 @@ function Install-Template {
 
 # --- 5. install + onboard --------------------------------------------------------
 function Install-Direct {
+  # ct-agent#341: a re-run that doesn't stop an already-running agent tries to
+  # Move-Item over its still-open ct-agent.exe later in this function, which
+  # fails with a raw file-in-use error instead of a clear message -- or, on
+  # platforms where the move happens to succeed, starts a second process
+  # under the same identity.
+  if (Test-Path $PidFile) {
+    $oldPid = Get-Content $PidFile -ErrorAction SilentlyContinue
+    $oldProc = if ($oldPid) { Get-Process -Id $oldPid -ErrorAction SilentlyContinue } else { $null }
+    if ($oldProc) {
+      Log "stopping the previous ct-agent (pid $oldPid) before starting a new one"
+      Stop-Process -Id $oldPid -ErrorAction SilentlyContinue
+      Start-Sleep -Seconds 1
+      if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) {
+        Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue
+      }
+    }
+    Remove-Item $PidFile -ErrorAction SilentlyContinue
+  }
+
   $asset = "ct-agent-windows-$($script:Arch).exe"
   $url = "$ReleaseBase/$asset"
   Log "downloading $asset"
