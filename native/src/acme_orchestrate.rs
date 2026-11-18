@@ -523,7 +523,17 @@ pub async fn run_renewal_loop(config: AcmeCertConfig) -> ! {
             }
             Err(e) => {
                 eprintln!("ct-agent: certificate obtain/renew failed: {e}");
-                CHECK_INTERVAL
+                // ct-agent#361: an error here includes failures that happen BEFORE any CA
+                // order exists -- an admission-broker poll that transiently didn't
+                // respond, or this hostname simply not admitted yet. Unconditionally
+                // waiting the full CHECK_INTERVAL (6h) treated those exactly like a
+                // failure deep into a real CA order, which is the case this interval is
+                // actually meant to protect (CA rate limits). Re-poll admission the same
+                // way the Ok(false) branch above already does: if the hostname is known
+                // to still be waiting (or the blip has since cleared and a fresh poll
+                // succeeds), fall back to the short ADMISSION_POLL_INTERVAL instead of
+                // guessing six hours were warranted.
+                admission_poll_interval(&config).await
             }
         };
         tokio::time::sleep(sleep_for).await;
