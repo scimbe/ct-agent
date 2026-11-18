@@ -164,69 +164,15 @@ pub(crate) fn build_upgrade_candidate(
     Some(DirectUpgrade { endpoint, reflexive_edge })
 }
 
-/// #276: whether `ip` is the kind of address worth offering as a LAN-local direct-upgrade
-/// candidate at all (private RFC1918 or IPv6 ULA) -- loopback/link-local/multicast/global
-/// addresses are never useful here (a global address already goes through the reflexive
-/// candidate; loopback/link-local/multicast can never be a peer's real LAN address).
-/// #296: no longer offered (see [`DirectUpgrade::offer`]); kept for the #276 selection tests.
-#[cfg(test)]
-pub(crate) fn is_lan_candidate(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_private(),
-        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00, // unique-local fc00::/7
-    }
-}
-
-/// Best-effort local (LAN-facing) IP: "connect" a UDP socket to an unrouted public address
-/// (no packet is sent -- it only makes the OS pick the default-route source interface) and
-/// read the socket's local address. `None` when there is no route. Mirrors the same trick
-/// `CADS-Tunnel`'s `ct-client` crate already uses for its own local-egress classifier
-/// (`ladder.rs::local_egress_ip`) -- deliberately no new dependency for interface
-/// enumeration.
-pub(crate) fn local_egress_ip() -> Option<std::net::IpAddr> {
-    let sock = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    // 192.0.2.1 is TEST-NET-1 (RFC 5737): never a real host, so nothing is contacted --
-    // connect() only fixes the source interface via the routing table.
-    sock.connect(("192.0.2.1", 9)).ok()?;
-    sock.local_addr().ok().map(|a| a.ip())
-}
-
-/// #276: split a peer-offered direct-upgrade endpoint into its required reflexive
-/// candidate and an optional LAN-local one, the counterpart to `build_upgrade_candidate`'s
-/// `reflexive\0local` encoding. An empty or malformed local segment degrades to "no local
-/// candidate" rather than a parse error -- the reflexive candidate alone is always a
-/// complete, valid offer on its own (unchanged pre-#276 behavior).
-/// #296: this release offers one address only, and the pinned ct-common responder refuses an
-/// offer carrying a `\0` half before this ever runs (CADS-Tunnel#480), so in practice only
-/// the plain, single-address form reaches here.
-pub(crate) fn split_offered_candidates(ep: &str) -> (&str, Option<&str>) {
-    match ep.split_once('\0') {
-        Some((reflexive, local)) if !local.is_empty() => (reflexive, Some(local)),
-        Some((reflexive, _)) => (reflexive, None),
-        None => (ep, None),
-    }
-}
-
-/// #276: choose which of a peer-offered candidate pair to actually dial. Prefers the
-/// LAN-local candidate — cheap, low-latency, and if it connects it's almost certainly the
-/// same network — but ONLY after `same_local_subnet` confirms it against THIS host's own
-/// local address; a malformed local candidate, a family mismatch, or a candidate outside
-/// our own subnet all fall through to the existing `#137`-guarded reflexive candidate,
-/// never to an ungated dial. This is the one seam both `dial_probe` and
+/// #276/#296: this release offers a peer-provided direct-upgrade endpoint as a single
+/// reflexive address only (the LAN-local candidate half this used to also consider is no
+/// longer offered, see [`DirectUpgrade::offer`], and the pinned ct-common responder refuses
+/// a `\0`-paired offer before this ever runs, CADS-Tunnel#480), so selection reduces to the
+/// `#137` SSRF guard on that one address. This is the one seam both `dial_probe` and
 /// `dial_and_establish` call, so "is this safe" and "what do we actually dial" can never
 /// disagree.
 pub(crate) fn select_upgrade_candidate(ep: &str) -> Option<SocketAddr> {
-    let (reflexive, local) = split_offered_candidates(ep);
-    if let Some(local) = local {
-        if let Ok(candidate) = local.parse::<SocketAddr>() {
-            if let Some(my_local) = local_egress_ip() {
-                if ct_common::channel::same_local_subnet(my_local, candidate.ip()) {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-    upgrade_safe_endpoint(reflexive)
+    upgrade_safe_endpoint(ep)
 }
 
 /// Why a direct dial to a paired peer did not connect (#72 AF4-session-resilience).
