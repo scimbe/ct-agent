@@ -456,7 +456,12 @@ poll_status() {
   local status="" last=""
   while [ "$SECONDS" -lt "$deadline" ]; do
     local resp
-    resp=$(curl -fsSL "${CT_AGENT_CP_URL%/}/agent/acme-admission/${CT_AGENT_TOKEN}/${CT_AGENT_HOSTNAME}" 2>/dev/null || true)
+    # ct-agent#348: the URL on argv would be readable by any local user via ps /
+    # /proc/<pid>/cmdline for as long as this curl runs, every 3s for up to 120s --
+    # the URL goes through stdin (printf is a builtin) instead, same treatment
+    # quickstart.sh's cp_add_member already gives the bearer header.
+    resp=$(printf 'url = "%s"\n' "${CT_AGENT_CP_URL%/}/agent/acme-admission/${CT_AGENT_TOKEN}/${CT_AGENT_HOSTNAME}" \
+      | curl -fsSL --config - 2>/dev/null || true)
     status=$(printf '%s' "$resp" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
     if [ -n "$status" ] && [ "$status" != "$last" ]; then
       case "$status" in
@@ -512,7 +517,11 @@ final_report() {
     echo
     echo "  Still Gelb. To get your own certificate (Grün) once you're ready:"
     echo "    1. Make sure ${CT_AGENT_ORIGIN} serves PLAIN HTTP (not TLS) for now."
-    echo "    2. CT_AGENT_CP_URL=${CT_AGENT_CP_URL} CT_AGENT_TOKEN=${CT_AGENT_TOKEN} CT_AGENT_HOSTNAME=${CT_AGENT_HOSTNAME} \\"
+    # ct-agent#348: CT_AGENT_TOKEN is a bearer credential -- it stays out of this
+    # printed hint (terminal scrollback, any captured install log) and out of the
+    # process list; the operator's own .env (or shell environment, for the
+    # env-var-only bootstrap one-liner) already has it.
+    echo "    2. CT_AGENT_CP_URL=${CT_AGENT_CP_URL} CT_AGENT_TOKEN=<see .env, or your shell env if you used the one-liner> CT_AGENT_HOSTNAME=${CT_AGENT_HOSTNAME} \\"
     echo "         CT_ACME_CERT_OUT_DIR=./ct-agent-cert ./ct-agent certificate"
     echo "    3. Once Grün, switch ${CT_AGENT_ORIGIN} back to serving its own TLS cert."
   fi
