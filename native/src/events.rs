@@ -118,8 +118,15 @@ pub const FORWARD_OPEN: &str = "forward_open";
 /// bytes read from `target` and sent to the peer.
 pub const FORWARD_CLOSE: &str = "forward_close";
 
+/// `{what, id, label, expires_at, single_use}` (+ `via`, `first_use` on a redemption): a
+/// `local_auth` share-link lifecycle event -- `minted`, `revoked`, or `redeemed`
+/// (scimbe/ct-agent#406). A cookie redemption happens once per gated connection of a guest
+/// session, so it goes through [`emit_limited`] like the other peer-triggerable kinds; mint,
+/// revoke and a URL (query) redemption go through plain [`emit`].
+pub const LOCAL_AUTH_LINK: &str = "local_auth_link";
+
 /// Every event kind, in the order `/metrics` renders `ct_agent_events_total{kind}`.
-pub const KINDS: [&str; 20] = [
+pub const KINDS: [&str; 21] = [
     REGISTERED,
     REGISTRATION_FAILED,
     DISCONNECTED,
@@ -140,6 +147,7 @@ pub const KINDS: [&str; 20] = [
     FORWARD_REFUSED,
     FORWARD_OPEN,
     FORWARD_CLOSE,
+    LOCAL_AUTH_LINK,
 ];
 
 // ---- the event ----------------------------------------------------------------
