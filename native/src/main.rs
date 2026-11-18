@@ -1426,9 +1426,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // #27 RB2b: if the portal supplied the tunnel's routing token (CT_AGENT_TOKEN,
     // set by the install one-liner), register at the edge under THAT token so a
     // revocation can find and drop this tunnel. Otherwise mint a random token.
-    let forced_token = std::env::var("CT_AGENT_TOKEN")
-        .ok()
-        .and_then(|s| parse_routing_token_hex(&s));
+    let forced_token = match std::env::var("CT_AGENT_TOKEN") {
+        Ok(s) if !s.trim().is_empty() => Some(parse_routing_token_hex(&s).ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("CT_AGENT_TOKEN is set but not a valid routing token (expected 64 hex characters, got {s:?})").into()
+        })?),
+        _ => None,
+    };
     let identity = resolve_serving_identity_with_token(
         origin_key_path.as_deref(),
         &cap_out,
