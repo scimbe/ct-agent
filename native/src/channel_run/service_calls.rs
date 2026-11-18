@@ -435,47 +435,65 @@ pub(crate) fn call_local(method: String, params: serde_json::Value) -> LocalDupl
 /// [`call_local`]'s raw-method mode (which prints the whole JSON-RPC envelope for a caller-supplied
 /// method + static params), this is the crew-native contract: one `service/<slug>` call, plain
 /// output. Split out so it can be frozen-tested against an in-process serve peer.
+#[cfg(test)]
 pub(crate) async fn run_service_call<S>(local: S, slug: &str, input: &str) -> std::io::Result<String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (result, _local) = run_service_call_keeping_local(local, slug, input).await;
+    result
+}
+
+/// [`run_service_call`], but also hands `local` back instead of dropping it -- so a caller
+/// that wants to observe the result before the session actually ends (ct-agent#386:
+/// `call_service_local` prints the moment the reply arrives, THEN holds `local` open for
+/// [`upgrade_grace`]'s window) can do so without racing its own teardown against the result.
+pub(crate) async fn run_service_call_keeping_local<S>(local: S, slug: &str, input: &str) -> (std::io::Result<String>, S)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut recv, mut send) = tokio::io::split(local);
     let result = call_role_service(&mut send, &mut recv, slug, input).await;
-    // #248: a one-shot call used to drop `local` (tearing the whole session down) the
-    // INSTANT the reply arrived -- structurally too fast for any concurrent relay->direct
-    // upgrade (#104's in-band candidate exchange, or the relay-gate DCUtR hole-punch,
-    // both of which need real network round-trips: address exchange, then a simultaneous
-    // connect attempt) to ever land, even when the upgrade is actively in flight and
-    // would otherwise have succeeded. Live-reproduced: dozens of real relay-gate DCUtR
-    // sessions, admission+circuit genuinely established, none ever showed a completed
-    // hole-punch -- every one raced the reply against a sub-200ms teardown and lost.
-    // Give a real upgrade attempt a fair window before tearing down, but ONLY when one
-    // could plausibly be in flight (either upgrade mechanism configured) -- unconditional
-    // added latency on every call would be a real regression for latency-sensitive
-    // production use (the crew bridge also drives this same one-shot path).
-    if result.is_ok() {
-        let upgrade_configured = std::env::var_os("CT_CHANNEL_RELAY_GATE").is_some()
-            || std::env::var_os("CT_CHANNEL_CIRCUIT_RELAY").is_some()
-            || std::env::var_os("CT_CHANNEL_DIRECT_UPGRADE").is_some();
-        if upgrade_configured {
-            // #248: 2s (the original fb5a799 value, tuned against local-loopback tests where a
-            // hole-punch is near-instant) turned out too short for a REAL cross-NAT relay-gate
-            // DCUtR attempt over genuine WAN paths -- live-reproduced on the bob-1<->bob-2
-            // pairing after aad49fb finally got both sides' real reflexive addresses into
-            // DCUtR's candidate pool: the swarm logged `Dialing` toward the peer's real address,
-            // then the one-shot process exited (reply already received over the relay leg,
-            // concurrently) before any `ConnectionEstablished`/`OutgoingConnectionError` for that
-            // dial appeared, even with CT_DEBUG_A2A_TIMING on. A real hole-punch involves actual
-            // network round-trips over the internet (address exchange, then a simultaneous
-            // connect attempt, possibly retried) -- meaningfully slower than anything on
-            // loopback. This is still a blind fixed sleep, not "wait for the actual upgrade
-            // outcome" -- a real fix would have the channel session signal completion
-            // (success/failure/timeout) instead of guessing a window, which remains open.
-            const UPGRADE_GRACE: std::time::Duration = std::time::Duration::from_secs(6);
-            tokio::time::sleep(UPGRADE_GRACE).await;
-        }
+    (result, recv.unsplit(send))
+}
+
+/// #248: a one-shot call used to drop its session (tearing the whole thing down) the INSTANT
+/// the reply arrived -- structurally too fast for any concurrent relay->direct upgrade (#104's
+/// in-band candidate exchange, or the relay-gate DCUtR hole-punch, both of which need real
+/// network round-trips: address exchange, then a simultaneous connect attempt) to ever land,
+/// even when the upgrade is actively in flight and would otherwise have succeeded.
+/// Live-reproduced: dozens of real relay-gate DCUtR sessions, admission+circuit genuinely
+/// established, none ever showed a completed hole-punch -- every one raced the reply against a
+/// sub-200ms teardown and lost. Give a real upgrade attempt a fair window before tearing down,
+/// but ONLY when one could plausibly be in flight (either upgrade mechanism configured) --
+/// unconditional added latency on every call would be a real regression for latency-sensitive
+/// production use (the crew bridge also drives this same one-shot path).
+///
+/// ct-agent#386: this used to run INSIDE [`run_service_call`], before it returned the result to
+/// its caller -- so `call_service_local`'s `println!` of a successful reply was delayed by the
+/// full grace window even though the result had already arrived. Callers now get the result
+/// immediately and call this afterward, holding their side of the session open across it.
+pub(crate) async fn upgrade_grace() {
+    let upgrade_configured = std::env::var_os("CT_CHANNEL_RELAY_GATE").is_some()
+        || std::env::var_os("CT_CHANNEL_CIRCUIT_RELAY").is_some()
+        || std::env::var_os("CT_CHANNEL_DIRECT_UPGRADE").is_some();
+    if upgrade_configured {
+        // #248: 2s (the original fb5a799 value, tuned against local-loopback tests where a
+        // hole-punch is near-instant) turned out too short for a REAL cross-NAT relay-gate
+        // DCUtR attempt over genuine WAN paths -- live-reproduced on the bob-1<->bob-2
+        // pairing after aad49fb finally got both sides' real reflexive addresses into
+        // DCUtR's candidate pool: the swarm logged `Dialing` toward the peer's real address,
+        // then the one-shot process exited (reply already received over the relay leg,
+        // concurrently) before any `ConnectionEstablished`/`OutgoingConnectionError` for that
+        // dial appeared, even with CT_DEBUG_A2A_TIMING on. A real hole-punch involves actual
+        // network round-trips over the internet (address exchange, then a simultaneous
+        // connect attempt, possibly retried) -- meaningfully slower than anything on
+        // loopback. This is still a blind fixed sleep, not "wait for the actual upgrade
+        // outcome" -- a real fix would have the channel session signal completion
+        // (success/failure/timeout) instead of guessing a window, which remains open.
+        const UPGRADE_GRACE: std::time::Duration = std::time::Duration::from_secs(6);
+        tokio::time::sleep(UPGRADE_GRACE).await;
     }
-    result
 }
 
 /// #19: the initiator-side PERSISTENT service-call driver — the calling-side counterpart of the
@@ -814,8 +832,21 @@ pub(crate) fn call_service_local(slug: String, input: String) -> LocalDuplex {
     let (session_side, serve_side) = tokio::io::duplex(1 << 16);
     // ct-agent#180: guarded, same reasoning as `call_local`.
     let pump = TaskGuard::spawn(async move {
-        match run_service_call(serve_side, &slug, &input).await {
-            Ok(output) => println!("{output}"),
+        let (result, serve_side) = run_service_call_keeping_local(serve_side, &slug, &input).await;
+        match result {
+            // ct-agent#386: print (and flush -- stdout is line-buffered only when it's a
+            // terminal; the crew bridge reads it through a pipe) the INSTANT the reply
+            // arrives, rather than after `upgrade_grace`'s window. `serve_side` is still
+            // held open across that window below, exactly as it was while the sleep used
+            // to run before this result came back -- the #248 fix's actual guarantee (the
+            // session outlives the reply by a fair margin) is unchanged, only the caller no
+            // longer waits on it too.
+            Ok(output) => {
+                println!("{output}");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                upgrade_grace().await;
+            }
             // #211: fail closed AND exit NON-ZERO. Previously this only `eprintln!`'d and let the
             // process exit 0 with empty stdout — indistinguishable from "the role produced no output"
             // (the empty-stdout bugs #206/a3412fc). An oversized `input` is correctly rejected by
@@ -827,7 +858,7 @@ pub(crate) fn call_service_local(slug: String, input: String) -> LocalDuplex {
                 std::process::exit(1);
             }
         }
-        // Dropping serve_side (moved into run_service_call) EOFs the session → the session ends.
+        drop(serve_side); // EOFs the session → the session ends.
     });
     LocalDuplex::with_pump(session_side, pump)
 }
