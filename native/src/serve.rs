@@ -2228,7 +2228,7 @@ pub async fn run_agent(
         eprintln!(
             "ct-agent: CT_AGENT_REGISTER_TCP_ONLY set — registering over TLS-TCP exclusively (no QUIC)"
         );
-        switch_transport("tcp-fallback");
+        switch_transport(crate::status::Transport::TcpFallback);
         return run_agent_tcp_fallback_with_ctx(&fallback_ctx).await;
     }
     let (reconnect_base, reconnect_max) = reconnect_backoff_bounds();
@@ -2263,7 +2263,7 @@ pub async fn run_agent(
         .await
         {
             Ok(conn) => {
-                switch_transport("quic");
+                switch_transport(crate::status::Transport::Quic);
                 (conn, false)
             }
             Err(e) => {
@@ -2281,14 +2281,14 @@ pub async fn run_agent(
                             "ct-agent: edge dial failed ({e}); reached the edge instead through the \
                              RFC 9298 CONNECT-UDP (MASQUE) tunnel"
                         );
-                        switch_transport("masque");
+                        switch_transport(crate::status::Transport::Masque);
                         (conn, false)
                     }
                     None => {
                         eprintln!(
                             "ct-agent: edge dial failed ({e}); serving over the TLS-TCP fallback until UDP/QUIC recovers (#16)"
                         );
-                        switch_transport("tcp-fallback");
+                        switch_transport(crate::status::Transport::TcpFallback);
                         match run_agent_tcp_fallback_until_quic_recovers(
                             &fallback_ctx,
                             reprobe_policy_after(quic_flaps),
@@ -2301,7 +2301,7 @@ pub async fn run_agent(
                                 // fresh budget, no second registration.
                                 policy.after_success();
                                 crate::status::note_reconnect();
-                                switch_transport("quic");
+                                switch_transport(crate::status::Transport::Quic);
                                 (conn, true)
                             }
                             FallbackExit::AllWorkersGaveUp => {
@@ -2394,7 +2394,7 @@ pub async fn run_agent(
             crate::events::REGISTERED,
             serde_json::json!({
                 "edge": edge.to_string(),
-                "transport": crate::status::STATUS.transport(),
+                "transport": crate::status::STATUS.transport().as_str(),
                 // CADS-Tunnel#795: whether this registration also bound the public hostname.
                 "hostname_bound": config.binds_hostname(),
             }),
@@ -2433,10 +2433,13 @@ pub async fn run_agent(
 /// ct-agent#178: record the serving transport on `/status` and emit one
 /// `transport_switch {from, to}` event when it actually changed (a fallback
 /// re-entered from the fallback is not a switch).
-fn switch_transport(to: &'static str) {
+fn switch_transport(to: crate::status::Transport) {
     let from = crate::status::set_transport(to);
     if from != to {
-        crate::events::emit(crate::events::TRANSPORT_SWITCH, serde_json::json!({ "from": from, "to": to }));
+        crate::events::emit(
+            crate::events::TRANSPORT_SWITCH,
+            serde_json::json!({ "from": from.as_str(), "to": to.as_str() }),
+        );
     }
 }
 

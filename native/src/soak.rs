@@ -344,7 +344,7 @@ fn status_healthz_flips_only_on_silence_and_recovers() {
     };
 
     let status = AgentStatus::new();
-    status.set_transport("quic");
+    status.set_transport(crate::status::Transport::Quic);
     status.set_registered(Some(t0));
     let mut healthy = false;
     let mut flips = 0u32;

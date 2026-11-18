@@ -561,7 +561,7 @@ mod tests {
     #[tokio::test]
     async fn status_route_serves_the_json_snapshot_with_the_version() {
         let p = private_state();
-        p.status.set_transport("quic");
+        p.status.set_transport(crate::status::Transport::Quic);
         let (code, ct, body) = fetch(observe_router(p.state.clone()), "/status").await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(ct, "application/json");
@@ -632,7 +632,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_route_carries_the_private_status_and_event_series() {
         let p = private_state();
-        p.status.set_transport("tcp-fallback");
+        p.status.set_transport(crate::status::Transport::TcpFallback);
         p.status.set_registered(Some(1));
         p.status.note_reconnect();
         p.status.note_reconnect();
