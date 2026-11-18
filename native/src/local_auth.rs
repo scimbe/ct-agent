@@ -636,6 +636,19 @@ fn read_first_line(stdin: impl io::Read) -> Result<String, String> {
 /// dir, overwriting any generated one. The password itself is resolved by
 /// [`resolve_password`] (ct-agent#175).
 pub fn set_credential(state_dir: &Path, username: &str, password: &str) -> io::Result<()> {
+    // ct-agent#378: the stored line is `username:salt_hex:hash_hex`, parsed back by
+    // splitting on the first two colons. A username containing ':' is written
+    // successfully here but read back wrong (part of it consumed as the salt field),
+    // so `set_credential` reports success for a credential the agent can never load --
+    // the mismatch should be caught here, not discovered later as "invalid salt" at
+    // startup. Control characters (a stray newline in particular, which would split the
+    // stored line in two) are rejected for the same reason.
+    if username.is_empty() || username.contains(':') || username.chars().any(|c| c.is_control()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid local-auth username {username:?}: must be non-empty and must not contain ':' or control characters"),
+        ));
+    }
     std::fs::create_dir_all(state_dir)?;
     #[cfg(unix)]
     {
@@ -1447,6 +1460,18 @@ mod tests {
         assert!(notice.is_none(), "an operator-set credential must not trigger generation");
         assert!(gate.verify("root", b"hunter2").is_ok());
         assert!(gate.verify("root", b"wrong").is_err());
+    }
+
+    #[test]
+    fn set_credential_rejects_a_username_that_would_corrupt_the_stored_line() {
+        // ct-agent#378: a username containing ':' would otherwise be written successfully
+        // and read back wrong (part of it consumed as the salt field).
+        let dir = scratch("bad-username-colon");
+        assert!(set_credential(&dir, "a:b", "hunter2").is_err());
+        let dir = scratch("bad-username-empty");
+        assert!(set_credential(&dir, "", "hunter2").is_err());
+        let dir = scratch("bad-username-newline");
+        assert!(set_credential(&dir, "a\nb", "hunter2").is_err());
     }
 
     #[test]
