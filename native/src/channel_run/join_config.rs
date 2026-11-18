@@ -660,12 +660,8 @@ impl ChannelJoinCliConfig {
         // that mode — it's never bound or advertised (the relay-only sentinel stands in). #173: both
         // source-2 and sink independently hit the old unconditional hard-error and had to invent a
         // dummy value; a relay-only operator no longer has to.
-        let relay_only_explicit = f("CT_CHANNEL_RELAY_ONLY")
-            .map(|s| {
-                let t = s.trim();
-                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
-            })
-            .unwrap_or(false);
+        let relay_only_explicit =
+            crate::envflag::flag_named("CT_CHANNEL_RELAY_ONLY", f("CT_CHANNEL_RELAY_ONLY").as_deref(), false);
         let listen_addr = match f("CT_CHANNEL_LISTEN") {
             Some(s) if !s.trim().is_empty() => s.trim().parse().map_err(|e| format!("CT_CHANNEL_LISTEN invalid: {e}"))?,
             // Relay-only has no dialable address → an unbound placeholder is never used.
@@ -766,12 +762,8 @@ impl ChannelJoinCliConfig {
         );
         // #104 in-band relay->direct upgrade: opt-in, off by default (unset -> false,
         // identical truthy-string handling as CT_CHANNEL_RELAY_ONLY above).
-        let direct_upgrade = f("CT_CHANNEL_DIRECT_UPGRADE")
-            .map(|s| {
-                let t = s.trim();
-                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
-            })
-            .unwrap_or(false);
+        let direct_upgrade =
+            crate::envflag::flag_named("CT_CHANNEL_DIRECT_UPGRADE", f("CT_CHANNEL_DIRECT_UPGRADE").as_deref(), false);
         // ct-agent#22 (b): opt-in accept-vs-relay race, off by default (pure helper, same
         // truthy handling as CT_CHANNEL_DIRECT_UPGRADE above).
         let accept_race = accept_race_enabled_from(f("CT_CHANNEL_ACCEPT_RACE").as_deref());
@@ -786,12 +778,11 @@ impl ChannelJoinCliConfig {
         // #16: front-door-only dialing (same truthy handling as CT_CHANNEL_RELAY_ONLY).
         // Requires a usable front door — refusing at parse time beats a zero-rung ladder
         // that would fail every join with an unhelpful "no rungs to dial".
-        let front_door_only = f("CT_CHANNEL_FRONT_DOOR_ONLY")
-            .map(|s| {
-                let t = s.trim();
-                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
-            })
-            .unwrap_or(false);
+        let front_door_only = crate::envflag::flag_named(
+            "CT_CHANNEL_FRONT_DOOR_ONLY",
+            f("CT_CHANNEL_FRONT_DOOR_ONLY").as_deref(),
+            false,
+        );
         if front_door_only && (front_door.is_none() || front_door_cert.is_none()) {
             return Err(
                 "CT_CHANNEL_FRONT_DOOR_ONLY requires CT_CHANNEL_FRONT_DOOR and CT_CHANNEL_FRONT_DOOR_CERT"

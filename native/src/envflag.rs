@@ -6,12 +6,12 @@
 //! to another. Every flag keeps its own default; only the spelling is shared.
 //!
 //! Scope: the `CT_AGENT_*` config flags, the channel mode switches that go through this module
-//! (`CT_CHANNEL_SERVE`, `_PHASE_MARKER`, `_CALL_PERSISTENT`, `_CALL_RECONNECT`), the ACME, relay
-//! and manifest switches, and the SSH owner-auth opt-out. Deliberately NOT covered: a few
-//! channel switches that still parse on their own (`CT_CHANNEL_ACCEPT_RACE`, `_RELAY_ONLY`,
-//! `_DIRECT_UPGRADE`, `_FRONT_DOOR_ONLY`, `_GRANT_ANY`, `CT_INVITE_DELEGABLE`) -- not yet
-//! migrated -- and `self_update`'s `CT_AGENT_UPDATE_SKIP_VERIFY`, whose narrower reading is
-//! the safer one for a switch that disables verification and stays as it is.
+//! (`CT_CHANNEL_SERVE`, `_PHASE_MARKER`, `_CALL_PERSISTENT`, `_CALL_RECONNECT`,
+//! `_ACCEPT_RACE`, `_RELAY_ONLY`, `_DIRECT_UPGRADE`, `_FRONT_DOOR_ONLY`), `CT_INVITE_DELEGABLE`,
+//! the ACME, relay and manifest switches, and the SSH owner-auth opt-out. Deliberately NOT
+//! covered: `CT_CHANNEL_GRANT_ANY` -- not yet migrated -- and `self_update`'s
+//! `CT_AGENT_UPDATE_SKIP_VERIFY`, whose narrower reading is the safer one for a switch that
+//! disables verification and stays as it is.
 //!
 //! A set, non-empty value that is not a recognised spelling falls back to the flag's default
 //! and is reported once per key on stderr, so a typo is visible at start instead of only in

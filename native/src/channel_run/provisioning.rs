@@ -637,10 +637,7 @@ impl OperatorInviteRequest {
             }
             other => return Err(format!("CT_INVITE_RIGHTS must be read|write|readwrite, got {other:?}")),
         };
-        let delegable = match f("CT_INVITE_DELEGABLE").as_deref() {
-            None => false,
-            Some(v) => v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"),
-        };
+        let delegable = crate::envflag::flag_named("CT_INVITE_DELEGABLE", f("CT_INVITE_DELEGABLE").as_deref(), false);
         let expires_at = req_str(&f, "CT_INVITE_EXPIRES", "unix seconds")?
             .trim()
             .parse()

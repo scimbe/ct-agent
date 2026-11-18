@@ -512,10 +512,7 @@ where
 /// monitor could otherwise win a pairing as a corpse after the direct path won here. See
 /// the `TODO(#22)` at the decision point in `run_channel_join_with_admission`.
 pub(crate) fn accept_race_enabled_from(v: Option<&str>) -> bool {
-    matches!(
-        v.map(str::trim),
-        Some(s) if s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
-    )
+    crate::envflag::flag_named("CT_CHANNEL_ACCEPT_RACE", v, false)
 }
 
 /// ct-agent#22 (b): a relay leg that is **parked and admitted** -- the edge has paired this
