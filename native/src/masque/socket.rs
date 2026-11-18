@@ -199,6 +199,22 @@ impl MasqueUdpSocket {
                     Ok(framed) => framed,
                     Err(_) => continue,
                 };
+                // ct-agent#357: reserve real h2 flow-control capacity before send_data instead
+                // of letting h2 buffer it unboundedly -- h2's own doc for send_data says exactly
+                // that ("send_data can be called without reserving capacity... this buffering is
+                // unbounded"). Waiting here applies backpressure to the bounded mpsc channel
+                // above, where ct-agent#177's drop-and-count path already handles a slow peer,
+                // instead of letting the backlog pile up invisibly inside h2.
+                send_stream.reserve_capacity(framed.len());
+                loop {
+                    if send_stream.capacity() >= framed.len() {
+                        break;
+                    }
+                    match std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await {
+                        Some(Ok(_)) => continue, // capacity changed -- recheck via .capacity()
+                        Some(Err(_)) | None => return, // tunnel gone
+                    }
+                }
                 if send_stream.send_data(Bytes::from(framed), false).is_err() {
                     break; // tunnel gone -- poll_recv's own end-of-channel surfaces this to quinn
                 }
