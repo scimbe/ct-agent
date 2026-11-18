@@ -511,11 +511,13 @@ pub(crate) async fn run_service_calls_persistent<S, W>(
     slug: &str,
     lines: &mut tokio::sync::mpsc::Receiver<String>,
     out: &mut W,
+    in_flight: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     W: AsyncWrite + Unpin,
 {
+    use std::sync::atomic::Ordering;
     use tokio::io::AsyncWriteExt;
     let (mut recv, mut send) = tokio::io::split(local);
     while let Some(line) = lines.recv().await {
@@ -523,7 +525,19 @@ where
         if input.is_empty() {
             continue; // a blank line is a keep-alive/no-op, not a call
         }
-        match call_role_service(&mut send, &mut recv, slug, input).await {
+        // ct-agent#353: mark the window in which this line has been taken off `lines` but
+        // not yet answered -- the ONLY window in which dropping this future (the reconnect
+        // loop's session ended) would lose the line with no envelope at all. Idle at
+        // `lines.recv()` above, dropping this future is correct and lossless: the line
+        // simply stays queued for the next session.
+        if let Some(f) = in_flight {
+            f.store(true, Ordering::SeqCst);
+        }
+        let result = call_role_service(&mut send, &mut recv, slug, input).await;
+        if let Some(f) = in_flight {
+            f.store(false, Ordering::SeqCst);
+        }
+        match result {
             Ok(output) => {
                 let envelope = serde_json::json!({ "ok": true, "output": output });
                 out.write_all(format!("{envelope}\n").as_bytes()).await?;
@@ -571,7 +585,7 @@ pub(crate) fn call_service_persistent_local(slug: String) -> LocalDuplex {
     // `rx.recv()` -- the NEXT stdin line, however much later -- before it could notice.
     let pump = TaskGuard::spawn(async move {
         let mut stdout = tokio::io::stdout();
-        if let Err(e) = run_service_calls_persistent(serve_side, &slug, &mut rx, &mut stdout).await {
+        if let Err(e) = run_service_calls_persistent(serve_side, &slug, &mut rx, &mut stdout, None).await {
             eprintln!("ct-agent channel --call-service {slug} (persistent): {e}");
             std::process::exit(1);
         }
@@ -700,7 +714,13 @@ where
         // ct-agent#308: inside a grant-end record, so this loop learns whose grant ended it.
         let record = GrantEndRecord::default();
         let pump = with_grant_end_record(record.clone(), admit(ChannelLocal::Serve(session_side.into())));
-        let calls = run_service_calls_persistent(serve_side, &slug, rx, &mut out);
+        // ct-agent#353: set only while `calls` is between taking a line off `rx` and writing
+        // its envelope -- idle at `rx.recv()` (the common case between calls, and the whole
+        // case when a session dies before ever being handed a line) this stays false, so the
+        // behavior below is unchanged from before #353 in that case: drop `calls` at once,
+        // the line stays queued for the next attempt.
+        let in_flight = std::sync::atomic::AtomicBool::new(false);
+        let calls = run_service_calls_persistent(serve_side, &slug, rx, &mut out, Some(&in_flight));
         let own_expiry = expiry();
         tokio::pin!(pump);
         tokio::pin!(calls);
@@ -708,6 +728,15 @@ where
 
         let clean_eof = tokio::select! {
             pumped = &mut pump => {
+                // ct-agent#353: `calls` may be mid-`call_role_service` for a line already
+                // taken from `rx` when the session ends here -- give it a bounded window to
+                // notice its duplex half hit EOF and write that line's `{"ok":false}`
+                // envelope (its own documented contract), instead of dropping the request
+                // with no envelope at all and leaving the next session to answer a
+                // DIFFERENT line as if it were this one.
+                if in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, &mut calls).await;
+                }
                 // ct-agent#308: this member's own grant is over -- the session's gate recorded
                 // it (R1), or the edge refused the admission for it.
                 if let Some(reason) = record
@@ -725,6 +754,12 @@ where
                 // The session's gate holds the same expiry (R1) and ends it the regular way
                 // within the teardown budget; a session still being admitted is dropped.
                 let _ = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, &mut pump).await;
+                // ct-agent#353: same bounded grace for an in-flight call's envelope as the
+                // `pumped` branch above -- the own-expiry path ends the loop just as
+                // definitively and must not silently swallow a pending request either.
+                if in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = tokio::time::timeout(GRANT_TEARDOWN_BUDGET, &mut calls).await;
+                }
                 return Err(own_end(expired(at)));
             }
         };

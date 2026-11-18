@@ -2918,7 +2918,7 @@ async fn persistent_call_mode_multiplexes_many_calls_over_one_held_session_19() 
     tx.send("third with spaces".into()).await.unwrap();
     drop(tx); // stdin EOF -> clean end of run
 
-    run_service_calls_persistent(peer, "text_generation", &mut rx, &mut out)
+    run_service_calls_persistent(peer, "text_generation", &mut rx, &mut out, None)
         .await
         .expect("source EOF is the clean end of a run");
 
@@ -2949,7 +2949,7 @@ async fn persistent_call_mode_fails_closed_with_a_structured_error_envelope_19()
     tx.send("doomed".into()).await.unwrap();
     drop(tx);
 
-    let err = run_service_calls_persistent(peer, "text_generation", &mut rx, &mut out).await;
+    let err = run_service_calls_persistent(peer, "text_generation", &mut rx, &mut out, None).await;
     assert!(err.is_err(), "an unoffered service fails the run closed");
     let last: serde_json::Value =
         serde_json::from_str(String::from_utf8(out).unwrap().lines().last().expect("an envelope was written"))
@@ -7539,6 +7539,55 @@ async fn persistent_call_reconnect_survives_a_session_death_without_losing_a_que
     let out = String::from_utf8(out).unwrap();
     assert!(out.contains("\"ok\":true"), "the queued line got answered, not dropped: {out}");
     assert!(out.contains("echoed") && out.contains("a matrix theme"), "answered by the SECOND (real) attempt: {out}");
+}
+
+#[tokio::test]
+async fn persistent_call_reconnect_flushes_an_in_flight_calls_envelope_when_the_session_ends_353() {
+    // ct-agent#353: unlike the #47 test above -- whose first admit dies BEFORE any line is
+    // queued, so `calls` is genuinely idle at `lines.recv()` when the session ends -- this
+    // admit reads the request bytes off `local` before ending the session, which can only
+    // succeed once `calls` has taken the line off `rx` and written its `call_role_service`
+    // request: proof the line is mid-flight, not merely queued. The session then ends
+    // (dropped, no answer ever sent) without `calls` ever getting a reply. Before #353 this
+    // dropped the line with no envelope at all; the fix must flush a `{"ok":false}` envelope
+    // for it instead.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::io::AsyncReadExt;
+
+    let attempts = std::sync::Arc::new(AtomicU32::new(0));
+    let admit = {
+        let attempts = attempts.clone();
+        move |local: ChannelLocal| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let mut local = local;
+                let mut buf = [0u8; 1];
+                let _ = local.read(&mut buf).await; // blocks until `calls` has written its request
+                drop(local); // end the session without ever answering it
+                Err::<(), BoxError>("simulated session death mid-call (#353 test)".into())
+            }
+        }
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (out_write, mut out_read) = tokio::io::duplex(1 << 16);
+    tx.send("a matrix theme".to_string()).await.unwrap();
+    drop(tx); // exactly one line, then clean stdin EOF
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_persistent_call_reconnect_loop_over("text_generation".to_string(), false, None, admit, &mut rx, out_write),
+    )
+    .await
+    .expect("must not hang");
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "one session, CT_CHANNEL_CALL_RECONNECT=0 -- no redial");
+    assert!(result.is_err(), "a mid-run death still ends the run non-zero (#47's own contract)");
+
+    let mut out = Vec::new();
+    out_read.read_to_end(&mut out).await.unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("\"ok\":false"), "the in-flight line got an error envelope, not silence: {out:?}");
 }
 
 #[tokio::test]
