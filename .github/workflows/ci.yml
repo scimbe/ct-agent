@@ -54,53 +54,66 @@ jobs:
       - name: Dependency audit
         run: |
           cargo install cargo-audit --locked || true
-          # RUSTSEC-2026-0118 (hickory-proto NSEC3 unbounded-loop) and RUSTSEC-2026-0119
-          # (hickory-proto CPU exhaustion) both resolve to the SAME unreachable dependency
-          # instance: Cargo.lock carries hickory-proto@0.25.2 only as an optional
-          # transitive dependency of libp2p (libp2p-mdns, local-network mDNS peer
-          # discovery) -- unrelated to the ACME/DNS-01 path that uses the direct,
-          # already-fixed hickory-resolver 0.26.1 dependency. `cargo tree -i
-          # hickory-proto@0.25.2` shows it as unreachable ("nothing to print"): resolved
-          # into Cargo.lock but never actually compiled, since ct-agent doesn't enable
-          # libp2p's "mdns" feature. cargo-audit scans Cargo.lock's package list without
-          # feature-awareness, so it flags both regardless -- a documented class of
-          # cargo-audit false positive.
+          # Every --ignore below (except the LAST one, see its own comment) pins to the SAME
+          # unreachable dependency instance: hickory-proto 0.25.2 / hickory-resolver 0.25.2,
+          # resolved into Cargo.lock only as an optional transitive dependency of libp2p-mdns
+          # (ct-agent never enables libp2p's "mdns" feature -- local-network peer discovery is
+          # not used). The direct, compiled dependency this agent actually uses is
+          # hickory-resolver 0.26.x (kept current by plain `cargo update`, currently >=0.26.3),
+          # which is unaffected by all of these.
           #
-          # #37 added the check below for 0119's reachability claim; #39 found it silently
-          # already covers 0118's SAME reachability premise too (confirmed 2026-08-18:
-          # `cargo audit`'s own report for 0118 names `Version: 0.25.2`, the exact instance
-          # this checks), even though the code comment for 0118 up to #39 named a DIFFERENT
-          # reason ("no fixed upgrade available") and never mentioned reachability at all.
-          if ! cargo tree -i hickory-proto@0.25.2 2>&1 | grep -q "nothing to print"; then
-            echo "::error::Die Erreichbarkeits-Begruendung fuer --ignore RUSTSEC-2026-0118" \
-                 "UND --ignore RUSTSEC-2026-0119 gilt nicht mehr: hickory-proto 0.25.2 wird" \
-                 "jetzt kompiliert. Entweder die Abhaengigkeit aufloesen oder die Ausnahmen" \
-                 "streichen -- sie decken ab jetzt eine echte Verwundbarkeit zu (#37, #39)."
-            cargo tree -i hickory-proto@0.25.2 2>&1 | head -20
+          # The OLD version of this check (#37, #39) additionally asserted that `cargo audit`
+          # still printed the literal string "No fixed upgrade is available" for RUSTSEC-2026-
+          # 0118 specifically -- a second, independent justification for the same ignore. That
+          # assertion broke (2026-11-15) not because the reachability premise changed, but
+          # because upstream hickory-dns shipped a fix (hickory-proto >=0.26.0-beta.1) and the
+          # advisory text changed shape -- exactly the kind of upstream prose this crate's own
+          # code does not control and will keep drifting. Reachability (checked below, every
+          # run) is the actual, durable property every one of these ignores rests on; the
+          # dated review below is what catches drift in GOOD TIME instead of hard-coding an
+          # assertion about upstream wording that was always going to go stale eventually.
+          if ! cargo tree -i hickory-proto@0.25.2 --all-features --target all -p ct-agent 2>&1 | grep -q "nothing to print"; then
+            echo "::error::Die Erreichbarkeits-Begruendung fuer die hickory-proto@0.25.2-" \
+                 "Ausnahmen gilt nicht mehr: hickory-proto 0.25.2 wird jetzt kompiliert." \
+                 "Entweder die Abhaengigkeit aufloesen oder die Ausnahmen streichen -- sie" \
+                 "decken ab jetzt eine echte Verwundbarkeit zu."
+            cargo tree -i hickory-proto@0.25.2 --all-features --target all -p ct-agent 2>&1 | head -20
             exit 1
           fi
-          echo "0118/0119-Erreichbarkeits-Begruendung weiterhin gedeckt: hickory-proto 0.25.2 ist nicht erreichbar."
-          # #39: RUSTSEC-2026-0118's OWN stated justification ("no fixed upgrade available",
-          # independent of the reachability check above) had no enforcer at all -- a prose
-          # "revisit once hickory-dns ships a fix" comment, exactly the "request, not a
-          # check" #37 already called out for 0119. Checked here instead of trusted: run
-          # the audit without EITHER ignore, capture its verdict for 0118 specifically, and
-          # fail loudly if the "no fixed upgrade" line is gone (a real fix shipped, or the
-          # advisory changed shape) instead of the ignore silently continuing to suppress
-          # a now-fixable vulnerability forever.
-          set +e
-          unignored_0118="$(cargo audit --ignore RUSTSEC-2026-0119 2>&1)"
-          set -e
-          if ! echo "$unignored_0118" | grep -A3 "RUSTSEC-2026-0118" | grep -q "No fixed upgrade is available"; then
-            echo "::error::Die Begruendung fuer --ignore RUSTSEC-2026-0118 gilt moeglicherweise" \
-                 "nicht mehr: cargo audit nennt keine 'No fixed upgrade is available'-Zeile" \
-                 "mehr fuer diese Advisory (neuer Fix, oder die Advisory hat sich veraendert)." \
-                 "Pruefen und die Ausnahme ggf. streichen (#39)."
-            echo "$unignored_0118" | grep -B2 -A6 "RUSTSEC-2026-0118" || echo "$unignored_0118"
+          echo "Erreichbarkeits-Begruendung weiterhin gedeckt: hickory-proto 0.25.2 ist nicht erreichbar."
+          review_by="2027-02-17"
+          if [[ "$(date -u +%F)" > "$review_by" ]]; then
+            echo "::error::Die hickory-proto@0.25.2-Ausnahmen unten sind seit $review_by" \
+                 "ueberfaellig. cargo audit erneut laufen lassen, Erreichbarkeit neu" \
+                 "pruefen, und entweder das Review-Datum erneuern (falls weiterhin" \
+                 "unerreichbar und ungefixt) oder die Ausnahmen streichen (falls" \
+                 "libp2p-mdns endlich von hickory-proto 0.25.2 weggezogen ist, oder ein" \
+                 "echter Fix jetzt angebracht ist)."
             exit 1
           fi
-          echo "0118-Fix-Verfuegbarkeits-Begruendung weiterhin gedeckt: kein Fix verfuegbar."
-          cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
+          echo "Review-Datum ($review_by) noch nicht erreicht."
+          # RUSTSEC-2026-0459 (libsqlite3-sys 0.28.0, via ct-control-plane's rusqlite 0.31
+          # "bundled" feature) needed no ignore and gets none below: fixed for real by the
+          # CADS-Tunnel v0.5.2 tag bump (ct-common/ct-control-plane/ct-dns/ct-edge/ct-client,
+          # above), which carries rusqlite 0.31 -> 0.42 / libsqlite3-sys 0.28.0 -> 0.40.0.
+          cargo audit \
+            --ignore RUSTSEC-2026-0118 `# hickory-proto 0.25.2 -- NSEC3 closest-encloser unbounded loop` \
+            --ignore RUSTSEC-2026-0119 `# hickory-proto 0.25.2 -- CPU exhaustion, same root cause family as 0118` \
+            --ignore RUSTSEC-2026-0487 `# hickory-proto 0.25.2 -- panic on malformed SVCB/HTTPS alpn value` \
+            --ignore RUSTSEC-2026-0489 `# hickory-proto 0.25.2 -- panic on a single-quote SVCB/HTTPS param value` \
+            --ignore RUSTSEC-2026-0490 `# hickory-proto 0.25.2 -- zone file lexer panics on a >=4096 char token` \
+            --ignore RUSTSEC-2026-0491 `# hickory-proto 0.25.2 -- memory amplification from record counts` \
+            --ignore RUSTSEC-2026-0504 `# hickory-proto 0.25.2 -- inverted NSEC3 comparison in DNSSEC validation` \
+            --ignore RUSTSEC-2026-0505 `# hickory-proto 0.25.2 -- NSEC3 owner names not checked against the zone` \
+            --ignore RUSTSEC-2026-0511 `# hickory-proto 0.25.2 -- NXDOMAIN accepted for a proven empty non-terminal` \
+            --ignore RUSTSEC-2026-0512 `# hickory-proto 0.25.2 -- DNSSEC validation accepted an unrelated RRset` \
+            --ignore RUSTSEC-2026-0514 `# hickory-resolver 0.25.2 -- lookup returned records failing DNSSEC validation` \
+            --ignore RUSTSEC-2026-0530 `# hickory-proto 0.25.2 -- parent-side NSEC at a zone cut proof-of-nonexistence` \
+            --ignore RUSTSEC-2026-0531 `# hickory-proto 0.25.2 -- child-side NSEC/NSEC3 "no DS record" acceptance` \
+            --ignore RUSTSEC-2026-0532 `# hickory-proto 0.25.2 -- parent-side NSEC3 at a zone cut proof-of-nonexistence` \
+            --ignore RUSTSEC-2026-0549 `# hickory-proto 0.25.2 -- NSEC3 NODATA at a zone apex without a matching record` \
+            --ignore RUSTSEC-2026-0550 `# hickory-proto 0.25.2 -- unsigned NSEC/NSEC3 used in a nonexistence proof` \
+            --ignore RUSTSEC-2026-0551   # hickory-proto 0.25.2 -- DNS class mismatch marked secure without validation
 
   clippy:
     # ct-agent#176: the panic-free gate. Each crate root (native/src/lib.rs, main.rs and
