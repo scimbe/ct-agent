@@ -186,7 +186,11 @@ pub fn parse_ssh_config_args(args: &[String]) -> Result<SshConfigArgs, String> {
             "--owner-key-file" => owner_key_file = Some(PathBuf::from(take_value("--owner-key-file", &mut it)?)),
             "--owner-key" => {
                 let raw = take_value("--owner-key", &mut it)?;
-                crate::ssh_owner::OwnerKey::from_hex(raw).map_err(|e| format!("invalid --owner-key: {e}"))?;
+                // ct-agent#379: `-` means "read the key from stdin" (resolved by the caller,
+                // which has stdin) -- not a literal key, so it is not hex-validated here.
+                if raw != "-" {
+                    crate::ssh_owner::OwnerKey::from_hex(raw).map_err(|e| format!("invalid --owner-key: {e}"))?;
+                }
                 owner_key = Some(raw.trim().to_string());
             }
             "--user" => {
@@ -213,6 +217,44 @@ pub fn parse_ssh_config_args(args: &[String]) -> Result<SshConfigArgs, String> {
         return Err("--owner-key and --owner-key-file are alternatives; give one".to_string());
     }
     Ok(SshConfigArgs { hostname, user, port, ca, owner_key_file, owner_key })
+}
+
+/// ct-agent#379: whether `owner_key` (as parsed by [`parse_ssh_config_args`]) is the
+/// deprecated literal-hex-on-argv form -- visible in `ps` and shell history, same reasoning
+/// as `local_auth::password_is_from_argv` for #175. `-` (stdin) and `None` are not.
+pub fn owner_key_is_from_argv(owner_key: Option<&str>) -> bool {
+    owner_key.is_some_and(|s| s != "-")
+}
+
+/// Resolve `ssh-config`'s owner key hex, in order: an explicit `--owner-key <hex>` other than
+/// `-` (deprecated, kept for one release); `--owner-key -` reads one line from `stdin`; absent
+/// either, falls back to [`crate::ssh_owner::OWNER_KEY_ENV`]. `None` when nothing is set --
+/// callers that also accept `--owner-key-file` check that first.
+pub fn resolve_ssh_config_owner_key(
+    argv: Option<&str>,
+    env: Option<String>,
+    stdin: impl std::io::Read,
+) -> Result<Option<String>, String> {
+    let (raw, source) = match argv {
+        // Already hex-validated by parse_ssh_config_args; this call revalidates harmlessly.
+        Some(s) if s != "-" => (s.to_string(), "--owner-key"),
+        Some(_) => {
+            let mut line = String::new();
+            let n = std::io::BufRead::read_line(&mut std::io::BufReader::new(stdin), &mut line)
+                .map_err(|e| format!("ct-agent ssh-config: reading --owner-key from stdin failed: {e}"))?;
+            if n == 0 {
+                return Err("ct-agent ssh-config: no --owner-key on stdin (EOF)".to_string());
+            }
+            (line, "--owner-key on stdin")
+        }
+        None => match env {
+            Some(v) if !v.trim().is_empty() => (v, crate::ssh_owner::OWNER_KEY_ENV),
+            _ => return Ok(None),
+        },
+    };
+    let trimmed = raw.trim();
+    crate::ssh_owner::OwnerKey::from_hex(trimmed).map_err(|e| format!("invalid {source}: {e}"))?;
+    Ok(Some(trimmed.to_string()))
 }
 
 /// Where `ssh-config --owner-key` stores the key: `~/.ssh/ct-agent-<hostname>.owner`.
@@ -895,6 +937,42 @@ mod tests {
         assert!(parse_ssh_config_args(&["h.test.invalid".into(), "--owner-key".into(), "nothex".into()]).unwrap_err().contains("--owner-key"));
         let e = parse_ssh_config_args(&["h.test.invalid".into(), "--owner-key".into(), hex, "--owner-key-file".into(), "/x".into()]).unwrap_err();
         assert!(e.contains("alternatives"), "{e}");
+    }
+
+    #[test]
+    fn ssh_config_owner_key_dash_reads_the_hex_from_stdin_379() {
+        // `--owner-key -` is not hex-validated at parse time (no stdin there yet).
+        let a = parse_ssh_config_args(&["h.test.invalid".into(), "--owner-key".into(), "-".into()]).unwrap();
+        assert_eq!(a.owner_key.as_deref(), Some("-"));
+        assert!(!owner_key_is_from_argv(a.owner_key.as_deref()), "stdin form is not the deprecated argv form");
+
+        let hex = crate::ssh_owner::OwnerKey::generate().to_hex();
+        let resolved = resolve_ssh_config_owner_key(Some("-"), None, format!("{hex}\n").as_bytes()).unwrap();
+        assert_eq!(resolved, Some(hex));
+    }
+
+    #[test]
+    fn ssh_config_owner_key_falls_back_to_the_env_var_379() {
+        let hex = crate::ssh_owner::OwnerKey::generate().to_hex();
+        let resolved = resolve_ssh_config_owner_key(None, Some(hex.clone()), std::io::empty()).unwrap();
+        assert_eq!(resolved, Some(hex));
+        assert_eq!(resolve_ssh_config_owner_key(None, None, std::io::empty()).unwrap(), None, "nothing set -- pre-#214 mode");
+        assert_eq!(
+            resolve_ssh_config_owner_key(None, Some(String::new()), std::io::empty()).unwrap(),
+            None,
+            "an empty env value is treated as unset, not an invalid key"
+        );
+    }
+
+    #[test]
+    fn ssh_config_owner_key_from_argv_is_the_deprecated_form_379() {
+        let hex = crate::ssh_owner::OwnerKey::generate().to_hex();
+        assert!(owner_key_is_from_argv(Some(&hex)));
+        assert!(!owner_key_is_from_argv(Some("-")));
+        assert!(!owner_key_is_from_argv(None));
+        // The direct argv form still resolves (one release, with a warning printed by the caller).
+        let resolved = resolve_ssh_config_owner_key(Some(&hex), None, std::io::empty()).unwrap();
+        assert_eq!(resolved, Some(hex));
     }
 
     #[test]
