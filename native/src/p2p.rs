@@ -1317,6 +1317,42 @@ pub(crate) async fn dcutr_reserve_and_accept(
 /// swarm's own event loop and never grow without bound.
 const INBOUND_UPGRADE_QUEUE: usize = 8;
 
+/// ct-agent#370: how long ONE inbound candidate gets to finish its Noise handshake in
+/// [`accept_first_authenticated`]. Without a per-stream bound, a third party that opens the
+/// substream and then goes silent holds the loop until the overall deadline, starving the
+/// legitimate peer queued behind it.
+const DCUTR_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Take inbound candidate streams from `rx` one at a time until `establish` authenticates one,
+/// `rx` closes, or `deadline` elapses. A candidate that fails -- or stalls past `per_handshake` --
+/// costs only its own slot.
+async fn accept_first_authenticated<S, T, E, F, Fut>(
+    mut rx: tokio::sync::mpsc::Receiver<S>,
+    deadline: Duration,
+    per_handshake: Duration,
+    mut establish: F,
+) -> Option<T>
+where
+    F: FnMut(S) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let deadline = tokio::time::Instant::now() + deadline;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let stream = match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(stream)) => stream,
+            Ok(None) | Err(_) => return None,
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if let Ok(Ok(result)) = tokio::time::timeout(per_handshake.min(remaining), establish(stream)).await {
+            return Some(result);
+        }
+    }
+}
+
 /// How long [`dcutr_reserve_and_accept`] waits for the relay to accept the reservation and
 /// [`dcutr_dial_via_relay`] for the channel stream to open. Both used to wait forever: a
 /// refused reservation or a dial that never reaches the target surfaces in this libp2p
@@ -1719,24 +1755,10 @@ where
                 // runs out. A third party's stream fails the handshake and costs one iteration,
                 // never the whole upgrade slot.
                 move || async move {
-                    let mut inbound_rx = inbound_rx;
-                    let deadline = tokio::time::Instant::now() + DCUTR_SETUP_TIMEOUT;
-                    loop {
-                        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                        if remaining.is_zero() {
-                            return None;
-                        }
-                        let stream = match tokio::time::timeout(remaining, inbound_rx.recv()).await {
-                            Ok(Some(stream)) => stream,
-                            Ok(None) | Err(_) => return None,
-                        };
-                        if let Ok(result) =
-                            ct_common::a2a::establish_direct_over_duplex(stream, false, &direct_priv, &direct_peer)
-                                .await
-                        {
-                            return Some(result);
-                        }
-                    }
+                    accept_first_authenticated(inbound_rx, DCUTR_SETUP_TIMEOUT, DCUTR_HANDSHAKE_TIMEOUT, |stream| {
+                        ct_common::a2a::establish_direct_over_duplex(stream, false, &direct_priv, &direct_peer)
+                    })
+                    .await
                 },
             )
             .await
@@ -2901,6 +2923,34 @@ mod tests {
         })
         .await
         .expect("the DCUtR-enabled relayed Noise round-trip completes within 15s (a hang here is a deadlock)");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_inbound_stream_does_not_block_the_next_candidate() {
+        // ct-agent#370: candidate 1 never finishes its handshake (attacker), 2 is the real peer.
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(1u8).await.unwrap();
+        tx.send(2u8).await.unwrap();
+        let got = accept_first_authenticated(rx, Duration::from_secs(5), Duration::from_millis(100), |s| async move {
+            if s == 1 {
+                std::future::pending::<Result<u8, ()>>().await
+            } else {
+                Ok(s)
+            }
+        })
+        .await;
+        assert_eq!(got, Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_failing_inbound_stream_is_skipped_and_an_empty_queue_times_out() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(1u8).await.unwrap();
+        let got = accept_first_authenticated(rx, Duration::from_millis(200), Duration::from_millis(100), |s| async move {
+            Err::<u8, _>(s)
+        })
+        .await;
+        assert_eq!(got, None);
     }
 
     #[tokio::test]
