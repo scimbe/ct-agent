@@ -332,8 +332,14 @@ verify_release_asset_in() {
     1|true|yes|on) warn "CT_AGENT_UPDATE_SKIP_VERIFY is set: release signature NOT verified"; return 0 ;;
   esac
   if ! command -v openssl >/dev/null 2>&1 || ! openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
-    warn "OpenSSL >= 3 not found: the release signature was NOT verified (checksum only)"
-    return 0
+    # ct-agent#349: a checksum fetched from the same release base as the binary gives
+    # integrity against corruption, not authenticity -- a replaced asset or a hostile
+    # RELEASE_BASE mirror would pass it too. Fail closed when the signature can't be
+    # checked, same as every other failure in this function; CT_AGENT_UPDATE_SKIP_VERIFY
+    # (checked above) is the one explicit, already-documented way to accept that risk.
+    warn "OpenSSL >= 3 not found: cannot verify the release signature (checksum only isn't enough)"
+    warn "set CT_AGENT_UPDATE_SKIP_VERIFY=1 to install on checksum alone anyway"
+    return 1
   fi
   curl -fsSL "$base/release-manifest.json" -o "$tmp/manifest" \
     || { warn "the release publishes no release-manifest.json"; return 1; }
