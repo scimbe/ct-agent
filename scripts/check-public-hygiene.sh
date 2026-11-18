@@ -98,7 +98,15 @@ for l in sys.stdin:
 run_hashes() {
   [ -n "${PUBLIC_HYGIENE_EXTRA_SHA256:-}" ] || return 0
   local tok loc
-  { sed "s/^[^${us}]*${us}//" "$stream" | grep -Eo '[A-Za-z0-9][A-Za-z0-9._-]{2,40}' | tr 'A-Z' 'a-z' | sort -u || true; } > "$work/toks"
+  { sed "s/^[^${us}]*${us}//" "$stream" | grep -Eo '[A-Za-z0-9][A-Za-z0-9._-]{2,40}' | tr 'A-Z' 'a-z' || true; } > "$work/toks.raw"
+  # #351: a listed token adjacent to '.', '-' or '_' (an FQDN, a "host-01" name, a
+  # sentence period) is captured as part of one longer candidate by the grep above,
+  # whose hash never matches the listed token's own hash. Hash the sub-tokens too,
+  # split on the same three separators the character class itself accepts, alongside
+  # the untouched full candidate (so a listed FULL dotted/hyphenated string still
+  # matches too).
+  { tr '._-' '\n\n\n' < "$work/toks.raw" | grep -v '^$' || true; } >> "$work/toks.raw"
+  sort -u "$work/toks.raw" > "$work/toks"
   hash_lines < "$work/toks" > "$work/hashed"
   printf '%s\n' "$PUBLIC_HYGIENE_EXTRA_SHA256" | tr -s ' \t' '\n\n' | grep -v '^$' > "$work/wanted" || true
   awk 'NR==FNR { w[$1] = 1; next } ($1 in w) { print $2 }' "$work/wanted" "$work/hashed" > "$work/hit"
