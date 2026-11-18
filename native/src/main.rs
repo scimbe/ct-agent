@@ -1233,7 +1233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // is the "install -> enroll -> tunnel" single step — the operator supplies
     // only a control-plane URL and a single-use join token.
     let onboarding = std::env::args().nth(1).as_deref() == Some("onboard")
-        || std::env::var("CT_AGENT_JOIN_TOKEN").is_ok();
+        || ct_agent::envflag::env_value_nonempty("CT_AGENT_JOIN_TOKEN").is_some();
     let config = if onboarding {
         let env = OnboardEnv::from_env()?;
         let edge = env.config.edge;
@@ -1365,7 +1365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Obtain the Edge CA root. With CT_AGENT_EDGE_CERT_URL set, fetch it from the
     // control plane's published /pki/ca (#11 C2) — self-serve cross-host, no
     // out-of-band copy. Otherwise wait for it on the shared-volume path.
-    let edge_cert = if let Ok(url) = std::env::var("CT_AGENT_EDGE_CERT_URL") {
+    let edge_cert = if let Some(url) = ct_agent::envflag::env_value_nonempty("CT_AGENT_EDGE_CERT_URL") {
         let der = ct_control_plane::client::ControlPlaneClient::new(url.clone())
             .fetch_edge_cert()
             .await
