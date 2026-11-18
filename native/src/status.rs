@@ -303,7 +303,22 @@ pub fn render_prometheus() -> String {
 /// The URL `ct-agent status` fetches for a metrics listener at `listen`
 /// (`CT_AGENT_METRICS_LISTEN`'s value, e.g. `127.0.0.1:9100`).
 pub fn status_url(listen: &str) -> String {
-    format!("http://{}/status", listen.trim())
+    let trimmed = listen.trim();
+    // ct-agent#369: CT_AGENT_METRICS_LISTEN is commonly a wildcard bind address
+    // (0.0.0.0:9100, [::]:9100) -- the right thing to BIND, but connecting a client to the
+    // unspecified address itself fails (notably on Windows). Replace it with the matching
+    // loopback address before building the URL; anything else (a real address, or a value
+    // that doesn't parse as one) is used exactly as given.
+    match trimmed.parse::<std::net::SocketAddr>() {
+        Ok(addr) if addr.ip().is_unspecified() => {
+            let loopback = match addr {
+                std::net::SocketAddr::V4(a) => std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), a.port()),
+                std::net::SocketAddr::V6(a) => std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), a.port()),
+            };
+            format!("http://{loopback}/status")
+        }
+        _ => format!("http://{trimmed}/status"),
+    }
 }
 
 /// What `ct-agent status` prints when no metrics listener is configured: the
@@ -487,5 +502,16 @@ mod tests {
         assert!(text.contains("CT_AGENT_METRICS_LISTEN"));
         let text = offline_status_text(None, &[]);
         assert!(text.contains("no event ring"));
+    }
+
+    #[test]
+    fn status_url_replaces_a_wildcard_bind_address_with_loopback() {
+        // ct-agent#369: a client cannot connect to the unspecified address itself.
+        assert_eq!(status_url("0.0.0.0:9100"), "http://127.0.0.1:9100/status");
+        assert_eq!(status_url(" [::]:9100 "), "http://[::1]:9100/status");
+        // A real, specific address is left exactly as given.
+        assert_eq!(status_url("10.0.0.5:9100"), "http://10.0.0.5:9100/status");
+        // Anything that doesn't parse as a SocketAddr is used as-is (unchanged behavior).
+        assert_eq!(status_url("metrics.internal:9100"), "http://metrics.internal:9100/status");
     }
 }
