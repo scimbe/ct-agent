@@ -58,6 +58,18 @@ pub(crate) fn is_flapping_session(elapsed: std::time::Duration, errored: bool) -
     errored && elapsed < FLAPPING_SESSION_THRESHOLD
 }
 
+/// Shared shape behind every capped-exponential backoff in this module: `base * 2^exponent`,
+/// saturating rather than overflowing, then clamped to `cap`. `exponent` is capped at 16 by each
+/// caller before it gets here, well before `2^exponent` could overflow `u32`.
+pub(crate) fn capped_exponential(
+    base: std::time::Duration,
+    exponent: u32,
+    cap: std::time::Duration,
+) -> std::time::Duration {
+    base.saturating_mul(1u32.checked_shl(exponent).unwrap_or(u32::MAX))
+        .min(cap)
+}
+
 /// #250: exponential backoff after `consecutive_flaps` near-instant session deaths in a row,
 /// same shape as [`admission_retry_backoff`]'s refused-admission path but capped lower (see
 /// [`FLAPPING_SESSION_BACKOFF_CAP`]'s doc for why). Pure.
@@ -65,10 +77,7 @@ pub(crate) fn flapping_session_backoff(
     retry_backoff: std::time::Duration,
     consecutive_flaps: u32,
 ) -> std::time::Duration {
-    let shift = consecutive_flaps.min(16);
-    retry_backoff
-        .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
-        .min(FLAPPING_SESSION_BACKOFF_CAP)
+    capped_exponential(retry_backoff, consecutive_flaps.min(16), FLAPPING_SESSION_BACKOFF_CAP)
 }
 
 /// #231: does an admission error mean the presenting holder was **definitively** refused (not a
@@ -342,10 +351,7 @@ pub(crate) fn handshake_eof_backoff(
     retry_backoff: std::time::Duration,
     consecutive_eofs: u32,
 ) -> std::time::Duration {
-    let shift = consecutive_eofs.min(16);
-    retry_backoff
-        .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
-        .min(HANDSHAKE_EOF_BACKOFF_CAP)
+    capped_exponential(retry_backoff, consecutive_eofs.min(16), HANDSHAKE_EOF_BACKOFF_CAP)
 }
 
 /// Ceiling on the serve loop's backoff after consecutive TRANSIENT admission failures (see
@@ -365,9 +371,7 @@ pub(crate) fn transient_admission_backoff(
     consecutive: u32,
 ) -> std::time::Duration {
     let shift = consecutive.saturating_sub(1).min(16);
-    retry_backoff
-        .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
-        .min(TRANSIENT_ADMISSION_BACKOFF_CAP)
+    capped_exponential(retry_backoff, shift, TRANSIENT_ADMISSION_BACKOFF_CAP)
 }
 
 /// #21: typed marker for a park expiry -- the edge reaped this member's park because no partner
@@ -459,8 +463,6 @@ pub(crate) fn admission_retry_backoff(
     if !refused {
         return retry_backoff;
     }
-    let shift = consecutive_refusals.min(16); // avoids overflow in 2^shift well before the cap binds
-    retry_backoff
-        .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
-        .min(REFUSED_ADMISSION_BACKOFF_CAP)
+    // avoids overflow in 2^shift well before the cap binds
+    capped_exponential(retry_backoff, consecutive_refusals.min(16), REFUSED_ADMISSION_BACKOFF_CAP)
 }
