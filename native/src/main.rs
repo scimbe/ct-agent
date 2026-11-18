@@ -505,16 +505,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let args: Vec<String> = std::env::args().skip(2).collect();
         match ct_agent::ssh_access::parse_ssh_config_args(&args) {
             Ok(mut parsed) => {
-                // scimbe/ct-agent#214: `--owner-key <hex>` is stored as a 0600 file next to the
-                // user's ssh config and referenced from the stanza; the stanza never carries the key.
-                if let Some(hex) = parsed.owner_key.take() {
-                    let home = std::env::var("HOME").map_err(|_| "ct-agent ssh-config --owner-key: HOME is not set")?;
-                    let path = ct_agent::ssh_access::default_owner_key_file(std::path::Path::new(&home), &parsed.hostname);
-                    let key = ct_agent::ssh_owner::OwnerKey::from_hex(&hex).map_err(|e| format!("ct-agent ssh-config: {e}"))?;
-                    key.save(&path).map_err(|e| format!("ct-agent ssh-config: {e}"))?;
-                    eprintln!("ct-agent ssh-config: owner key stored in {} (0600)", path.display());
-                    parsed.owner_key_file = Some(path);
+                // ct-agent#379: `--owner-key <hex>` on the command line is visible in `ps` and
+                // shell history -- deprecated, kept for one release, same reasoning as #175's
+                // argv password. `--owner-key -` (stdin) and CT_AGENT_SSH_OWNER_KEY are not.
+                if ct_agent::ssh_access::owner_key_is_from_argv(parsed.owner_key.as_deref()) {
+                    eprintln!(
+                        "ct-agent: WARNING: passing --owner-key as a command-line argument is deprecated \
+                         (visible in `ps` and shell history) -- use `--owner-key -` (reads stdin) or set \
+                         {} instead; the argv form will be removed in a later release (ct-agent#379)",
+                        ct_agent::ssh_owner::OWNER_KEY_ENV
+                    );
                 }
+                // scimbe/ct-agent#214: the resolved key is stored as a 0600 file next to the
+                // user's ssh config and referenced from the stanza; the stanza never carries it.
+                if parsed.owner_key_file.is_none() {
+                    let env_key = std::env::var(ct_agent::ssh_owner::OWNER_KEY_ENV).ok();
+                    if let Some(hex) =
+                        ct_agent::ssh_access::resolve_ssh_config_owner_key(parsed.owner_key.as_deref(), env_key, std::io::stdin())
+                            .map_err(|e| format!("ct-agent ssh-config: {e}"))?
+                    {
+                        let home = std::env::var("HOME").map_err(|_| "ct-agent ssh-config --owner-key: HOME is not set")?;
+                        let path = ct_agent::ssh_access::default_owner_key_file(std::path::Path::new(&home), &parsed.hostname);
+                        let key = ct_agent::ssh_owner::OwnerKey::from_hex(&hex).map_err(|e| format!("ct-agent ssh-config: {e}"))?;
+                        key.save(&path).map_err(|e| format!("ct-agent ssh-config: {e}"))?;
+                        eprintln!("ct-agent ssh-config: owner key stored in {} (0600)", path.display());
+                        parsed.owner_key_file = Some(path);
+                    }
+                }
+                parsed.owner_key = None;
                 print!("{}", ct_agent::ssh_access::render_ssh_config(&parsed));
             }
             Err(e) => {
