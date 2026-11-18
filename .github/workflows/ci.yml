@@ -93,15 +93,9 @@ jobs:
           fi
           echo "Review-Datum ($review_by) noch nicht erreicht."
           # RUSTSEC-2026-0459 (libsqlite3-sys 0.28.0, via ct-control-plane's rusqlite 0.31
-          # "bundled" feature) is deliberately NOT ignored below: unlike every hickory-proto
-          # advisory above, `cargo tree -i libsqlite3-sys@0.28.0 -p ct-agent` is NOT empty --
-          # it is a real, compiled, reachable dependency. CADS-Tunnel's own rusqlite pin is
-          # itself locked at 0.31 for its own reasons (see crates/control-plane/Cargo.toml's
-          # #344 comment there), and no version of libsqlite3-sys satisfying rusqlite 0.31's
-          # requirement carries the fix (>=0.39.0 needs rusqlite >=0.32 -- a breaking bump
-          # this repo cannot make unilaterally against an externally pinned tag). This is
-          # left failing ON PURPOSE: a real, unresolved, reachable vulnerability needs a risk
-          # decision by whoever owns that call, not a silent exemption from this script.
+          # "bundled" feature) needed no ignore and gets none below: fixed for real by the
+          # CADS-Tunnel v0.5.2 tag bump (ct-common/ct-control-plane/ct-dns/ct-edge/ct-client,
+          # above), which carries rusqlite 0.31 -> 0.42 / libsqlite3-sys 0.28.0 -> 0.40.0.
           cargo audit \
             --ignore RUSTSEC-2026-0118 `# hickory-proto 0.25.2 -- NSEC3 closest-encloser unbounded loop` \
             --ignore RUSTSEC-2026-0119 `# hickory-proto 0.25.2 -- CPU exhaustion, same root cause family as 0118` \
