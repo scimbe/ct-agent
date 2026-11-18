@@ -218,10 +218,15 @@ impl OnboardedAgent {
         // already-deployed one elsewhere (a separate local process/user might
         // depend on reading it today) -- this only ever narrows a directory
         // this same call just created or already owns.
+        // ct-agent#344: best-effort, as ssh_owner::save's equivalent chmod already
+        // is. By this point `probe_state_dir_writable` has confirmed the directory
+        // is writable and the join token is already spent -- a chmod failure here
+        // (e.g. EPERM: writable but not owned) must not turn into a persist
+        // failure with no way to retry.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))?;
+            let _ = std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700));
         }
         let identity_path = state_dir.join(Self::IDENTITY_FILE);
         let agent_path = state_dir.join(Self::AGENT_FILE);
@@ -293,9 +298,27 @@ pub async fn onboard_or_restore(
             config,
         });
     }
+    // ct-agent#344: prove `state_dir` is actually writable BEFORE redeeming the
+    // single-use join token below. Every local failure -- a missing, read-only,
+    // full, or not-owned directory -- used to surface only inside `persist`,
+    // called AFTER `onboard()` already spent the token, with no way to retry
+    // short of a freshly issued one. A probe write+remove catches exactly the
+    // class of failure `persist`'s own writes would hit, without spending
+    // anything.
+    probe_state_dir_writable(state_dir)?;
     let onboarded = onboard(cp_url, join_token, agent_id, config).await?;
     onboarded.persist(state_dir)?;
     Ok(onboarded)
+}
+
+/// ct-agent#344: create `state_dir` (if missing) and confirm a file can actually
+/// be written and removed inside it, before anything that must not be retried
+/// (spending the single-use join token) depends on that being true.
+fn probe_state_dir_writable(state_dir: &Path) -> std::io::Result<()> {
+    crate::secret_file::create_private_dir_all(state_dir)?;
+    let probe = state_dir.join(".ct-agent-writable-probe");
+    std::fs::write(&probe, b"")?;
+    std::fs::remove_file(&probe)
 }
 
 #[cfg(test)]
