@@ -136,6 +136,10 @@ echo "cert-dir is ${CT_ACME_CERT_OUT_DIR:-none}" >> "$STUB_LOG"
 sleep 120 >/dev/null 2>&1 & echo $! > ct-agent.pid; echo $! >> "$STUB_PIDS"
 echo "done — current tier: gelb"
 STUB
+cat > "$BIN/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "docker $*" >> "$STUB_LOG"
+STUB
 chmod +x "$BIN"/*
 
 run_qs() { # workdir, then args; env comes from the caller via E=(...)
@@ -305,6 +309,18 @@ check "a foreign file in the workdir survives --clean" [ -f "$T/w7/my-notes.txt"
 check "the script's own marker is gone" [ ! -e "$T/w7/.ct-quickstart" ]
 check "a recycled pid of a foreign process is not killed" kill -0 "$spid"
 killrec
+
+# --clean removes the 'ct-agent' container when the workdir recorded a --docker tunnel (#368)
+mkdir -p "$T/w8"; : > "$T/w8/.ct-quickstart"; : > "$T/w8/.ct-docker"
+run_qs "$T/w8" --clean --yes >/dev/null 2>&1; rc=$?
+check "--clean succeeds for a docker-mode workdir" [ "$rc" -eq 0 ]
+check "--clean removed the ct-agent container" grep -q '^docker rm -f ct-agent$' "$T/stub.log"
+: > "$T/stub.log"
+# a non-docker workdir's --clean must not touch docker at all
+mkdir -p "$T/w9"; : > "$T/w9/.ct-quickstart"
+run_qs "$T/w9" --clean --yes >/dev/null 2>&1; rc=$?
+check "--clean succeeds for a non-docker workdir" [ "$rc" -eq 0 ]
+check "--clean left docker alone for a non-docker workdir" [ ! -s "$T/stub.log" ]
 
 # a bootstrap token with odd characters is refused before it is sent
 reset

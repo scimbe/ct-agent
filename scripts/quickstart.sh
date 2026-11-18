@@ -495,10 +495,16 @@ do_clean() {
   case "$WORK" in /|"$HOME"|"${HOME:-/nonexistent}/") die "refusing to remove $WORK" ;; esac
   confirm "Stop what runs from $WORK and delete the files this script created there (keys, grants, logs)?" || die "aborted"
   stop_runs
+  # ct-agent#368: a tunnel started with --docker runs as the 'ct-agent' container, not
+  # a pid stop_runs can find -- .ct-docker (written by tunnel_up) is the only record
+  # that this workdir ever started one.
+  if [ -f "$WORK/.ct-docker" ] && command -v docker >/dev/null 2>&1; then
+    docker rm -f ct-agent >/dev/null 2>&1 || true
+  fi
   local x
   for x in logs run grants accept initiate site ct-agent-cert .ct-agent-state \
            operator.env inbox.txt received.txt .env .env.bak .env.new ct-agent setup.sh ssh-owner.key ssh-owner.key.new \
-           ct-agent.pid ct-agent.log .ct-quickstart; do
+           ct-agent.pid ct-agent.log .ct-quickstart .ct-docker; do
     [ -e "$WORK/$x" ] && rm -rf "${WORK:?}/$x"
   done
   if rmdir "$WORK" 2>/dev/null; then
@@ -868,6 +874,12 @@ tunnel_up() {
     pid_alive "$(cat "$WORK/ct-agent.pid" 2>/dev/null || true)" || die "the agent is not running after setup"
     record_sig "$WORK/ct-agent.pid"
     ok "agent running, pid $(cat "$WORK/ct-agent.pid")"
+  else
+    # ct-agent#368: do_clean only ever walked pid files, so it never removed the
+    # 'ct-agent' container -- this run's own invocation of quickstart.sh is the only
+    # process that knows DOCKER=1 was passed; a later `--clean` run needs this marker
+    # to find out.
+    : > "$WORK/.ct-docker"
   fi
   case "$TIER" in
     gelb|gruen|Gelb|Grün|Gruen) ok "tier: $TIER" ;;
