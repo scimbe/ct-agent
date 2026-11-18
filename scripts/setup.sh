@@ -227,6 +227,21 @@ ensure_env() {
     case "$CT_AGENT_TOKEN" in ""|*[!A-Za-z0-9._~+/=-]*) die "the control plane returned a token with unexpected characters — nothing was written" ;; esac
     export CT_AGENT_JOIN_TOKEN CT_AGENT_TOKEN
     ok "bootstrap redeemed"
+    # ct-agent#346: CT_BOOTSTRAP is single-use. Leaving a spent one in .env made
+    # every later run (a reboot, a retry after a failed download, --green) die
+    # at the redeem step above with a misleading "expired/already used" error.
+    # Replace it with the tokens it just redeemed into, so a re-run against this
+    # same .env reads real, reusable credentials instead of re-spending nothing.
+    if [ -f .env ]; then
+      local env_tmp=.env.new
+      grep -v '^CT_BOOTSTRAP=' .env > "$env_tmp" || true
+      {
+        printf 'CT_AGENT_JOIN_TOKEN=%s\n' "$CT_AGENT_JOIN_TOKEN"
+        printf 'CT_AGENT_TOKEN=%s\n' "$CT_AGENT_TOKEN"
+      } >> "$env_tmp"
+      chmod 600 "$env_tmp"
+      mv -f "$env_tmp" .env
+    fi
   fi
 
   local missing=()
