@@ -49,8 +49,12 @@ fn same_origin_redirects() -> reqwest::redirect::Policy {
         };
         let next = attempt.url();
         let same_host = next.host_str() == origin.host_str();
+        // #375: a different port on the SAME host was still followed -- the custom
+        // `x-ct-agent-token` header and, on 307/308, the request body (a refresh token, a
+        // device code) would go to whatever else is listening there.
+        let same_port = next.port_or_known_default() == origin.port_or_known_default();
         let no_downgrade = !(origin.scheme() == "https" && next.scheme() != "https");
-        if attempt.previous().len() > 10 || !same_host || !no_downgrade {
+        if attempt.previous().len() > 10 || !same_host || !same_port || !no_downgrade {
             attempt.stop()
         } else {
             attempt.follow()
@@ -124,16 +128,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_same_host_redirect_is_still_followed() {
+    async fn a_redirect_to_another_port_on_the_same_host_is_not_followed_375() {
+        // ct-agent#375: same host name, different port -- the custom x-ct-agent-token header
+        // and a 307/308 body (a refresh token, a device code) must not go to whatever else
+        // is listening on that other port.
         let (target, target_hits) = one_shot("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n".into()).await;
         let (origin, _) = one_shot(format!(
             "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{}/x\r\ncontent-length: 0\r\n\r\n",
             target.port()
         ))
         .await;
-        let resp = shared().get(format!("http://{origin}/")).send().await.unwrap();
-        assert_eq!(resp.status(), 200);
-        assert_eq!(target_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let resp = shared()
+            .get(format!("http://{origin}/"))
+            .header("x-ct-agent-token", "secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 302, "the redirect is handed back, not followed");
+        assert_eq!(target_hits.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing reached the other port");
+    }
+
+    #[tokio::test]
+    async fn a_same_host_same_port_redirect_is_still_followed() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let (mut s, _) = l.accept().await.unwrap();
+                let n = h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let resp = if n == 0 {
+                    "HTTP/1.1 302 Found\r\nlocation: /x\r\ncontent-length: 0\r\n\r\n".to_string()
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n".to_string()
+                };
+                let _ = s.write_all(resp.as_bytes()).await;
+            }
+        });
+        let resp = shared().get(format!("http://{addr}/")).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "a redirect to another path on the SAME host:port is still followed");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
