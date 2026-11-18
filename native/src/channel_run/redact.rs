@@ -39,13 +39,14 @@ fn is_b64url(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
 }
 
-/// If one of [`KEYWORDS`] starts at `i`, the index just past it and whether it was `bearer`.
-fn keyword_at(b: &[u8], i: usize) -> Option<(usize, bool)> {
+/// If one of [`KEYWORDS`] starts at `i`, the index just past it, whether it was `bearer`,
+/// and whether it was `authorization`.
+fn keyword_at(b: &[u8], i: usize) -> Option<(usize, bool, bool)> {
     let rest = &b[i..];
     for kw in KEYWORDS {
         let k = kw.as_bytes();
         if rest.len() >= k.len() && rest[..k.len()].eq_ignore_ascii_case(k) {
-            return Some((i + k.len(), *kw == "bearer"));
+            return Some((i + k.len(), *kw == "bearer", *kw == "authorization"));
         }
     }
     None
@@ -61,10 +62,27 @@ fn value_end(b: &[u8], from: usize) -> Option<usize> {
     (q > from).then_some(q)
 }
 
+/// The index of the end of the line containing `from` (the next `\n`, or the end of `b`).
+fn line_end(b: &[u8], from: usize) -> usize {
+    b[from..].iter().position(|&c| c == b'\n').map(|o| from + o).unwrap_or(b.len())
+}
+
+/// A value's end: a quoted value (`"..."` / `'...'`) runs through its matching closing quote
+/// (or the end of the line, if unterminated) instead of stopping at the first whitespace --
+/// `"password": "correct horse battery"` must mask the whole phrase, not just its first word.
+fn value_end_quote_aware(b: &[u8], from: usize) -> Option<usize> {
+    let quote = *b.get(from)?;
+    if quote != b'"' && quote != b'\'' {
+        return value_end(b, from);
+    }
+    let close = b[from + 1..].iter().position(|&c| c == quote).map(|o| from + 1 + o + 1);
+    Some(close.unwrap_or_else(|| line_end(b, from)))
+}
+
 /// Try the key/value shape at `i`. On a match, copies the unmasked prefix and the mask into
 /// `out` and returns the index to resume scanning from.
 fn redact_keyword_value(b: &[u8], i: usize, out: &mut Vec<u8>) -> Option<usize> {
-    let (mut p, bearer) = keyword_at(b, i)?;
+    let (mut p, bearer, authorization) = keyword_at(b, i)?;
     if !bearer {
         // `secret_key`, `api_key_v2`, `password-hash` ... the suffix is part of the key.
         while p < b.len() && is_ident(b[p]) {
@@ -107,6 +125,19 @@ fn redact_keyword_value(b: &[u8], i: usize, out: &mut Vec<u8>) -> Option<usize> 
             return Some(s);
         }
     }
+    // Any OTHER `Authorization:` scheme (`Token`, `Digest`, `ApiKey`, ...) -- the credential
+    // is whatever follows the scheme word, which may itself contain whitespace (a Digest
+    // header's comma-separated params); mask through the end of the line instead of just the
+    // scheme word, rather than resuming the scan right after it and emitting the real
+    // credential verbatim.
+    if authorization {
+        out.extend_from_slice(&b[i..value_start]);
+        out.extend_from_slice(MASK);
+        return Some(line_end(b, value_start));
+    }
+    // A quoted value (`"password": "correct horse battery"`) runs through its closing quote,
+    // not just its first word.
+    let end = value_end_quote_aware(b, value_start)?;
     out.extend_from_slice(&b[i..value_start]);
     out.extend_from_slice(MASK);
     Some(end)
@@ -194,7 +225,12 @@ mod tests {
             ("API-KEY: sk-live-abc123", "API-KEY: [REDACTED]"),
             ("ApiKey = sk-live-abc123\nnext", "ApiKey = [REDACTED]\nnext"),
             ("--token=deadbeef --other=1", "--token=[REDACTED] --other=1"),
-            ("\"password\": \"hunter2\",", "\"password\": [REDACTED]"),
+            // ct-agent#364: the closing quote ends the masked value, not the first whitespace
+            // inside it -- the trailing `,` (outside the quotes) is no longer swallowed by the
+            // mask, which is the more precise redaction (it used to vanish only because this
+            // single-word case had no internal whitespace for the OLD whitespace-bounded scan
+            // to stop on first).
+            ("\"password\": \"hunter2\",", "\"password\": [REDACTED],"),
             ("SECRET_KEY=abc", "SECRET_KEY=[REDACTED]"),
             ("client_secret: s3cr3t", "client_secret: [REDACTED]"),
             ("OPENAI_API_KEY=sk-proj-xyz", "OPENAI_API_KEY=[REDACTED]"),
@@ -228,6 +264,37 @@ mod tests {
         assert_eq!(redact_secrets(&format!("jwt {jwt}!")), "jwt [REDACTED]!");
         assert_eq!(redact_secrets("eyJhbGciOiJIUzI1NiJ9.eyJzdWIifQ"), "[REDACTED]", "two-segment JWT");
         assert_eq!(redact_secrets("eyJ alone"), "eyJ alone", "no dot-separated segment -> not a JWT");
+    }
+
+    #[test]
+    fn redact_secrets_masks_non_bearer_authorization_schemes_through_end_of_line_364() {
+        // ct-agent#364: only `Bearer`/`Basic` kept the scheme word and masked what followed
+        // it -- any OTHER scheme resumed scanning right after the scheme word, emitting the
+        // real credential that followed it verbatim.
+        assert_eq!(redact_secrets("Authorization: Token x"), "Authorization: [REDACTED]");
+        assert_eq!(redact_secrets("authorization=Digest a b"), "authorization=[REDACTED]");
+        assert_eq!(
+            redact_secrets("Authorization: ApiKey sk-live-abc\r\n"),
+            "Authorization: [REDACTED]\n",
+            "the mask runs through end of line (swallowing a trailing \\r along with the \
+             credential, the accepted over-redaction bias) but the \\n terminator itself \
+             survives, so a multi-line trace does not get glued into one line"
+        );
+    }
+
+    #[test]
+    fn redact_secrets_masks_a_quoted_value_through_its_closing_quote_364() {
+        // ct-agent#364: a quoted value containing whitespace used to mask only its first word.
+        assert_eq!(
+            redact_secrets("\"password\": \"correct horse battery\""),
+            "\"password\": [REDACTED]"
+        );
+        assert_eq!(redact_secrets("secret: 'a b c' end"), "secret: [REDACTED] end");
+        assert_eq!(
+            redact_secrets("\"password\": \"unterminated"),
+            "\"password\": [REDACTED]",
+            "an unterminated quote masks through end of line rather than looping forever"
+        );
     }
 
     #[test]
