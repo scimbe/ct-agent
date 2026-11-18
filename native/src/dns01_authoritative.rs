@@ -89,30 +89,50 @@ impl AuthoritativeChecker {
         Err(format!("no zone with an NS RRset found for {name}"))
     }
 
-    /// Every authoritative nameserver address for `zone` (each NS name resolved
-    /// to all of its A/AAAA addresses -- an anycast name can front several).
-    async fn authoritative_addrs(&self, zone: &str) -> Result<Vec<(String, IpAddr)>, String> {
+    /// Every authoritative nameserver NAME for `zone`, from its own NS RRset.
+    async fn authoritative_ns_names(&self, zone: &str) -> Result<Vec<String>, String> {
         let ns = self
             .system
             .ns_lookup(format!("{zone}."))
             .await
             .map_err(|e| format!("NS lookup for {zone} failed: {e}"))?;
-        let mut out = Vec::new();
+        let mut names = Vec::new();
         for rec in ns.answers() {
             let hickory_resolver::proto::rr::RData::NS(ns_name) = &rec.data else {
                 continue;
             };
-            let host = ns_name.0.to_utf8();
-            if let Ok(lookup) = self.system.lookup_ip(host.clone()).await {
-                for ip in lookup.iter() {
-                    out.push((host.clone(), ip));
+            names.push(ns_name.0.to_utf8());
+        }
+        if names.is_empty() {
+            return Err(format!("no NS records found for {zone}"));
+        }
+        Ok(names)
+    }
+
+    /// Resolve every NS `names` to all of its A/AAAA addresses (an anycast name
+    /// can front several). ct-agent#365: a name whose address lookup fails is
+    /// returned separately as still-unresolved rather than silently dropped --
+    /// the caller must keep treating it as a pending server, the same way
+    /// [`Probe::Unreachable`] already does for a server that resolved but didn't
+    /// answer, instead of letting the NS RRset's own count quietly shrink.
+    async fn resolve_ns_addrs(&self, names: &[String]) -> (Vec<(String, IpAddr)>, Vec<String>) {
+        let mut resolved = Vec::new();
+        let mut unresolved = Vec::new();
+        for host in names {
+            match self.system.lookup_ip(host.clone()).await {
+                Ok(lookup) => {
+                    let before = resolved.len();
+                    for ip in lookup.iter() {
+                        resolved.push((host.clone(), ip));
+                    }
+                    if resolved.len() == before {
+                        unresolved.push(host.clone());
+                    }
                 }
+                Err(_) => unresolved.push(host.clone()),
             }
         }
-        if out.is_empty() {
-            return Err(format!("no authoritative nameserver addresses resolved for {zone}"));
-        }
-        Ok(out)
+        (resolved, unresolved)
     }
 }
 
@@ -238,9 +258,14 @@ impl AuthoritativeChecker {
     /// rather than looking like a generic timeout.
     pub async fn wait_for_all(&self, record_name: &str, expected_value: &str) -> Result<(), String> {
         let zone = self.zone_of(record_name).await?;
-        let servers = self.authoritative_addrs(&zone).await?;
+        let ns_names = self.authoritative_ns_names(&zone).await?;
         let deadline = Instant::now() + self.timeout;
         loop {
+            // ct-agent#365: re-resolve every round, not just once before the loop --
+            // an NS name whose address lookup fails transiently must get another
+            // chance within the same wait, the same way an unreachable-but-resolved
+            // server already does via `probe`.
+            let (servers, unresolved) = self.resolve_ns_addrs(&ns_names).await;
             // Probe every server concurrently instead of one at a time, via a JoinSet: each
             // probe already carries its own internal cap (QUERY_TIMEOUT for the TXT query,
             // plus another QUERY_TIMEOUT for the SOA liveness fallback on a miss), so a round
@@ -279,14 +304,20 @@ impl AuthoritativeChecker {
                 .zip(results)
                 .map(|((host, ip), probe)| (host.as_str(), *ip, probe.unwrap_or(Probe::Unreachable)))
                 .collect();
-            let (missing, unreachable) = pending_servers(&probes);
+            let (mut missing, unreachable) = pending_servers(&probes);
+            missing.extend(unresolved.iter().map(|host| format!("{host} (address unresolved)")));
             // Not one authoritative server is reachable from here. That is a
             // fact about this host's network, not about propagation -- most
             // often outbound UDP/53 being blocked. Refusing to issue on that
             // basis would be wrong: it blocks issuance that would otherwise
             // succeed. Hand back a distinguishable error so the caller can
             // fall back to the (weaker, but usable) public-resolver check.
-            if unreachable.len() == servers.len() {
+            // Guarded on `!servers.is_empty()`: when NOTHING resolved yet (every
+            // NS name still unresolved), that is evidence about name resolution,
+            // not about reaching an address we already have -- it must keep
+            // retrying like any other missing server, not claim the specific
+            // "outbound DNS blocked" diagnosis on the very first round.
+            if !servers.is_empty() && unreachable.len() == servers.len() {
                 return Err(format!(
                     "{UNREACHABLE_MARKER}: none of {zone}'s authoritative nameservers answered from this host ({}). \
                      This is almost always outbound DNS (UDP/53) being blocked locally, not a propagation problem.",
