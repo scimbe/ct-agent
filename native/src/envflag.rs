@@ -46,6 +46,15 @@ pub fn env_flag(key: &str, default: bool) -> bool {
     flag_named(key, std::env::var(key).ok().as_deref(), default)
 }
 
+/// `key`'s value, trimmed, with an empty value treated the same as unset. ct-agent#372: a
+/// mode selector read with a bare `std::env::var(key).is_ok()`/`.ok()` treats an EMPTY value
+/// (e.g. a compose file's `${VAR:-}` with nothing after the `:-`) as "set", switching into an
+/// exclusive mode nobody asked for. Every selector that means "is this var present and
+/// meaningful" should go through this instead.
+pub fn env_value_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
 /// `key`'s raw value from the process environment, for a caller that feeds it to a pure
 /// `*_from(Option<&str>)` helper; an unrecognised spelling is reported like [`flag_named`].
 /// `default` is only used for that report.

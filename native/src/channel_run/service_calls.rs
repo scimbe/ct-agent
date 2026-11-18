@@ -1890,7 +1890,7 @@ pub(crate) fn channel_local(peer: Option<[u8; 32]>) -> ChannelLocal {
     // Checked first because, like that branch, a construction failure (a bad spec, or the
     // loopback listener failing to bind) must fail THIS session loudly, never silently fall
     // through to a Pipe/Serve session the operator never asked for.
-    if let Ok(raw) = std::env::var(super::forward_stream::FORWARD_ENV) {
+    if let Some(raw) = crate::envflag::env_value_nonempty(super::forward_stream::FORWARD_ENV) {
         let max_streams = super::forward_stream::max_streams_from_env(
             std::env::var(super::forward_stream::FORWARD_MAX_STREAMS_ENV)
                 .ok()
@@ -1947,8 +1947,7 @@ pub(crate) fn channel_local(peer: Option<[u8; 32]>) -> ChannelLocal {
     // #173 distributed crew: one-shot `service/<slug>` client. Reads the prompt on stdin, calls the
     // peer's service, prints the BARE output — the crew-bridge `CREW_*_CMD` contract. Checked before
     // the raw CT_CHANNEL_CALL below because it's the service-specific (and jq-free) path.
-    if let Ok(slug) = std::env::var("CT_CHANNEL_CALL_SERVICE") {
-        let slug = slug.trim().to_string();
+    if let Some(slug) = crate::envflag::env_value_nonempty("CT_CHANNEL_CALL_SERVICE") {
         // ct-agent#94: CT_CHANNEL_CALL_PARAMS is a real, working env var -- just for the OTHER
         // client mode below (CT_CHANNEL_CALL=<method>). It is never read on this branch (input
         // comes from stdin instead), and silently ignoring it is exactly the "worst failure
@@ -2018,7 +2017,7 @@ pub(crate) fn channel_local(peer: Option<[u8; 32]>) -> ChannelLocal {
         // wanting both request/response services AND a streaming one runs two separate
         // `--serve` channels (two `CT_CHANNEL_ID`s), same as any two differently-shaped
         // services already would.
-        if let Ok(cmd) = std::env::var("CT_AGENT_STREAM_HANDLER_CMD") {
+        if let Some(cmd) = crate::envflag::env_value_nonempty("CT_AGENT_STREAM_HANDLER_CMD") {
             let service = std::env::var("CT_AGENT_STREAM_SERVICE").unwrap_or_default();
             eprintln!(
                 "ct-agent channel: --serve mode (streaming; unframed duplex piped to a '{service}' \
