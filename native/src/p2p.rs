@@ -335,16 +335,7 @@ struct RelayServerBehaviour {
 /// Decode a 64-hex `CT_RELAY_NODE_KEY` into a 32-byte ed25519 seed. `None` on anything but
 /// exactly 64 valid hex characters — no panics on malformed input.
 fn relay_node_key_seed(hex: &str) -> Option<[u8; 32]> {
-    let hex = hex.trim();
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut seed = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let byte_str = std::str::from_utf8(chunk).ok()?;
-        seed[i] = u8::from_str_radix(byte_str, 16).ok()?;
-    }
-    Some(seed)
+    crate::codec::hex_decode::<32>(hex.trim())
 }
 
 /// ct-agent#173: env var that lets an operator deliberately bind `ct-agent relay-node` to a
