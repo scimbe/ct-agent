@@ -216,6 +216,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversize_frames_are_rejected_or_truncated_on_write_not_sent_411() {
+        // #411: the writer enforces the reader's caps instead of emitting a frame the peer rejects.
+        let mut sink = Vec::new();
+        let open = Frame::Open { id: 1, target: "a".repeat(MAX_TARGET_WIRE_LEN + 1) };
+        assert!(open.write(&mut sink).await.is_err() && sink.is_empty());
+        let data = Frame::Data { id: 1, payload: vec![0; MAX_DATA_FRAME_LEN + 1] };
+        assert!(data.write(&mut sink).await.is_err() && sink.is_empty());
+        // An over-long Close.reason is truncated (on a char boundary) and still round-trips.
+        let reason = "é".repeat(MAX_TARGET_WIRE_LEN); // 2 bytes each -> over the cap
+        match round_trip(Frame::Close { id: 1, reason: Some(reason) }).await {
+            Frame::Close { reason: Some(r), .. } => assert!(r.len() <= MAX_TARGET_WIRE_LEN),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn open_data_close_round_trip_byte_exact() {
         assert_eq!(
             round_trip(Frame::Open {
