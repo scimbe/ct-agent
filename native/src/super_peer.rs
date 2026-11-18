@@ -101,13 +101,19 @@ const MAX_SUPER_PEER_CLIENTS: usize = 256;
 /// Returns only on a fatal bind/listen error; per-client forwarding errors are logged and
 /// that one client's mapping is torn down, never the whole relay.
 pub async fn run(listen: SocketAddr, upstream: SocketAddr) -> Result<(), BoxError> {
-    run_with_cap(listen, upstream, MAX_SUPER_PEER_CLIENTS).await
+    let front = UdpSocket::bind(listen).await?;
+    run_on(front, upstream, MAX_SUPER_PEER_CLIENTS).await
 }
 
-/// [`run`]'s actual implementation, taking the client-count ceiling as a parameter so tests
-/// can exercise it hitting a small cap without opening hundreds of real sockets.
-async fn run_with_cap(listen: SocketAddr, upstream: SocketAddr, max_clients: usize) -> Result<(), BoxError> {
-    let front = Arc::new(UdpSocket::bind(listen).await?);
+/// [`run`]'s shared body, taking an already-bound socket. Lets tests bind their own
+/// `127.0.0.1:0` listener (optionally with a small client-count cap, so they can exercise it
+/// hitting the cap without opening hundreds of real sockets) and hand it straight in, instead
+/// of binding, reading back the ephemeral port, dropping the socket and hoping `run` wins the
+/// re-bind before anything else grabs the now-free port -- the exact TOCTOU `observe.rs`'s
+/// `serve_metrics_on` was already split out to avoid.
+async fn run_on(front: UdpSocket, upstream: SocketAddr, max_clients: usize) -> Result<(), BoxError> {
+    let listen = front.local_addr()?;
+    let front = Arc::new(front);
     eprintln!("ct-agent super-peer: relaying {listen} -> {upstream}");
     let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
 
@@ -243,12 +249,9 @@ mod tests {
             }
         });
 
-        let relay_listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let relay_bind = TokioUdp::bind(relay_listen).await.unwrap();
+        let relay_bind = TokioUdp::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = relay_bind.local_addr().unwrap();
-        drop(relay_bind); // free the port for `run` to bind for real
-        tokio::spawn(run(relay_addr, edge_addr));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::spawn(run_on(relay_bind, edge_addr, MAX_SUPER_PEER_CLIENTS));
 
         // A LAN client dials the SUPER-PEER's listen address, never the real edge directly.
         let client = TokioUdp::bind("127.0.0.1:0").await.unwrap();
@@ -276,9 +279,7 @@ mod tests {
         });
         let relay_bind = TokioUdp::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = relay_bind.local_addr().unwrap();
-        drop(relay_bind);
-        tokio::spawn(run(relay_addr, edge_addr));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::spawn(run_on(relay_bind, edge_addr, MAX_SUPER_PEER_CLIENTS));
 
         let client = TokioUdp::bind("127.0.0.1:0").await.unwrap();
         client.send_to(b"v6 upstream", relay_addr).await.unwrap();
@@ -309,9 +310,7 @@ mod tests {
 
         let relay_bind = TokioUdp::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = relay_bind.local_addr().unwrap();
-        drop(relay_bind);
-        tokio::spawn(run(relay_addr, edge_addr));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::spawn(run_on(relay_bind, edge_addr, MAX_SUPER_PEER_CLIENTS));
 
         let client_a = TokioUdp::bind("127.0.0.1:0").await.unwrap();
         let client_b = TokioUdp::bind("127.0.0.1:0").await.unwrap();
@@ -353,10 +352,8 @@ mod tests {
 
         let relay_bind = TokioUdp::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = relay_bind.local_addr().unwrap();
-        drop(relay_bind);
         const CAP: usize = 2;
-        tokio::spawn(run_with_cap(relay_addr, edge_addr, CAP));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::spawn(run_on(relay_bind, edge_addr, CAP));
 
         // Two distinct "clients" fill the cap -- both must be served normally.
         let mut admitted = Vec::new();
@@ -403,9 +400,7 @@ mod tests {
 
         let relay_bind = TokioUdp::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = relay_bind.local_addr().unwrap();
-        drop(relay_bind);
-        tokio::spawn(run(relay_addr, unreachable));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::spawn(run_on(relay_bind, unreachable, MAX_SUPER_PEER_CLIENTS));
 
         let client = TokioUdp::bind("127.0.0.1:0").await.unwrap();
         // Must not panic or hang the relay -- just best-effort forward into the void.
