@@ -123,12 +123,29 @@ fn resolve_primary_identity(
     };
     if let Some(kp) = key_path {
         // Shared identity: reuse the persisted key + capability if both exist.
-        if let (Ok(key), Ok(capb)) = (std::fs::read(kp), std::fs::read(cap_path)) {
-            if key.len() == 32 {
-                let mut origin_private = [0u8; 32];
-                origin_private.copy_from_slice(&key);
-                return Ok((Capability::decode(&capb)?, origin_private));
+        // ct-agent#359: a read failure OTHER than "this file doesn't exist yet"
+        // (EACCES, EIO, a transient error) used to be read the same as first
+        // boot and fall straight through to generating -- and renaming -- a
+        // BRAND NEW identity over the existing one, destroying every capability
+        // already distributed to clients. Only a genuine absence of BOTH files
+        // is first boot; anything else is an error, exactly like
+        // `rotate_origin_key`'s own non-32-byte guard below treats a bad key.
+        let loaded = match (std::fs::read(kp), std::fs::read(cap_path)) {
+            (Ok(key), Ok(capb)) => Some((key, capb)),
+            (Err(ke), Err(ce))
+                if ke.kind() == std::io::ErrorKind::NotFound && ce.kind() == std::io::ErrorKind::NotFound =>
+            {
+                None
             }
+            (Err(e), _) | (_, Err(e)) => return Err(format!("reading the current origin identity: {e}").into()),
+        };
+        if let Some((key, capb)) = loaded {
+            if key.len() != 32 {
+                return Err(format!("current origin key at {kp} is not 32 bytes").into());
+            }
+            let mut origin_private = [0u8; 32];
+            origin_private.copy_from_slice(&key);
+            return Ok((Capability::decode(&capb)?, origin_private));
         }
         // First agent: generate the identity and persist both for peers to share.
         // Staged the same way as `rotate_origin_key` (#51), for the same reason: a
@@ -488,6 +505,52 @@ mod tests {
         let _ = std::fs::remove_file(&key);
         let _ = std::fs::remove_file(&cap);
         let _ = std::fs::remove_dir_all(&cap_tmp);
+    }
+
+    #[test]
+    fn a_corrupt_origin_key_is_an_error_not_a_silent_fresh_identity() {
+        // ct-agent#359: a short/corrupt key file alongside an existing capability
+        // must error, not silently mint-and-persist a brand new identity over it.
+        let key = tmp("corrupt-origin.key");
+        let cap = tmp("corrupt-cap.bin");
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&cap);
+        resolve_serving_identity(Some(&key), &cap, "edge:443", None).unwrap();
+        let cap_before = std::fs::read(&cap).unwrap();
+        std::fs::write(&key, b"not thirty two bytes").unwrap();
+
+        let err = match resolve_serving_identity(Some(&key), &cap, "edge:443", None) {
+            Err(e) => e,
+            Ok(_) => panic!("a corrupt current key must be an error, not a silent regeneration"),
+        };
+        assert!(err.to_string().contains("not 32 bytes"), "{err}");
+        assert_eq!(std::fs::read(&cap).unwrap(), cap_before, "capability untouched by the failed load");
+
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&cap);
+    }
+
+    #[test]
+    fn exactly_one_of_the_pair_missing_is_an_error_not_a_silent_fresh_identity() {
+        // ct-agent#359: only BOTH files absent is first boot. Exactly one present
+        // (the other deleted, e.g. by an operator mistake) must error.
+        let key = tmp("onemissing-origin.key");
+        let cap = tmp("onemissing-cap.bin");
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&cap);
+        resolve_serving_identity(Some(&key), &cap, "edge:443", None).unwrap();
+        let key_before = std::fs::read(&key).unwrap();
+        std::fs::remove_file(&cap).unwrap();
+
+        let err = match resolve_serving_identity(Some(&key), &cap, "edge:443", None) {
+            Err(e) => e,
+            Ok(_) => panic!("exactly one file of the pair present must be an error"),
+        };
+        assert!(!err.to_string().contains("not 32 bytes"), "{err}");
+        assert_eq!(std::fs::read(&key).unwrap(), key_before, "surviving key untouched");
+
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&cap);
     }
 
     #[test]
