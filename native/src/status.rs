@@ -19,12 +19,47 @@ use serde_json::{json, Value};
 /// stream from the edge for this long -- three missed 30 s reprobe/ping cadences.
 pub const HEALTHZ_MAX_SILENCE_SECS: u64 = 90;
 
-/// The serving transport names `set_transport` accepts and `/metrics` labels.
-pub const TRANSPORTS: [&str; 4] = ["quic", "masque", "tcp-fallback", "none"];
+/// The serving transport `set_transport` accepts and `/metrics` labels.
+///
+/// ct-agent#383: previously a bare `&'static str`, with the accepted spellings living
+/// separately in [`TRANSPORTS`] (which `render_prometheus` iterates). A caller passing a name
+/// not in that list -- a typo, or a new transport nobody updated the list for -- produced a
+/// `/metrics` block where every `ct_agent_transport` series read 0, with nothing to flag it. As
+/// an enum, the label set and the accepted values cannot drift apart: a new transport is a
+/// compile error in every `match`/`[Transport; N]` site until it is handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Quic,
+    Masque,
+    TcpFallback,
+    None,
+}
+
+impl Transport {
+    /// Every variant, in the order `/metrics` renders them (stable series set for a scraper).
+    pub const ALL: [Transport; 4] = [Transport::Quic, Transport::Masque, Transport::TcpFallback, Transport::None];
+
+    /// The wire/label spelling -- what `/status` JSON and `/metrics` already published before
+    /// this type existed, unchanged.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Transport::Quic => "quic",
+            Transport::Masque => "masque",
+            Transport::TcpFallback => "tcp-fallback",
+            Transport::None => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone)]
 struct StatusInner {
-    transport: &'static str,
+    transport: Transport,
     registered_since: Option<u64>,
     last_seen: Option<u64>,
     reconnects: u64,
@@ -110,7 +145,7 @@ impl AgentStatus {
     pub const fn new() -> Self {
         Self {
             inner: RwLock::new(StatusInner {
-                transport: "none",
+                transport: Transport::None,
                 registered_since: None,
                 last_seen: None,
                 reconnects: 0,
@@ -122,7 +157,7 @@ impl AgentStatus {
 
     /// Record the serving transport; returns the previous one so the caller can
     /// emit a `transport_switch` event when it actually changed.
-    pub fn set_transport(&self, transport: &'static str) -> &'static str {
+    pub fn set_transport(&self, transport: Transport) -> Transport {
         let mut s = self.inner.write_safe();
         std::mem::replace(&mut s.transport, transport)
     }
@@ -161,8 +196,8 @@ impl AgentStatus {
         self.inner.write_safe().update_state = state.into();
     }
 
-    /// The current transport name.
-    pub fn transport(&self) -> &'static str {
+    /// The current transport.
+    pub fn transport(&self) -> Transport {
         self.inner.read_safe().transport
     }
 
@@ -185,7 +220,7 @@ impl AgentStatus {
             "session": facts.session,
             "conn": facts.conn,
             "uptime_secs": facts.uptime_secs,
-            "transport": s.transport,
+            "transport": s.transport.as_str(),
             "registered": s.registered_since.is_some(),
             "registered_since": s.registered_since,
             "last_seen_secs_ago": s.last_seen.map(|t| now.saturating_sub(t)),
@@ -227,9 +262,10 @@ impl AgentStatus {
             u8::from(s.registered_since.is_some()),
             s.reconnects
         );
-        for t in TRANSPORTS {
+        for t in Transport::ALL {
             text.push_str(&format!(
-                "ct_agent_transport{{transport=\"{t}\"}} {}\n",
+                "ct_agent_transport{{transport=\"{}\"}} {}\n",
+                t.as_str(),
                 u8::from(t == s.transport)
             ));
         }
@@ -246,7 +282,7 @@ impl Default for AgentStatus {
 // ---- process-wide convenience wrappers ------------------------------------------------
 
 /// [`AgentStatus::set_transport`] on [`STATUS`].
-pub fn set_transport(transport: &'static str) -> &'static str {
+pub fn set_transport(transport: Transport) -> Transport {
     STATUS.set_transport(transport)
 }
 
@@ -435,8 +471,8 @@ mod tests {
     #[test]
     fn snapshot_reflects_the_setters() {
         let st = AgentStatus::new();
-        assert_eq!(st.set_transport("quic"), "none");
-        assert_eq!(st.set_transport("tcp-fallback"), "quic");
+        assert_eq!(st.set_transport(Transport::Quic), Transport::None);
+        assert_eq!(st.set_transport(Transport::TcpFallback), Transport::Quic);
         st.set_registered(Some(900));
         st.note_keepalive_at(980);
         st.note_reconnect();
@@ -480,7 +516,7 @@ mod tests {
     #[test]
     fn prometheus_block_renders_registered_reconnects_and_all_transport_labels() {
         let st = AgentStatus::new();
-        st.set_transport("masque");
+        st.set_transport(Transport::Masque);
         st.set_registered(Some(1));
         st.note_reconnect();
         let text = st.render_prometheus();
