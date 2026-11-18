@@ -149,6 +149,10 @@ pub(crate) struct Member {
     pub(crate) forward: bool,
     /// It runs for good -- a forward, a persistent serve member -- rather than for one transfer.
     pub(crate) persistent: bool,
+    /// The accept role (ct-agent#381): a one-shot acceptor stopped with nothing in flight has
+    /// simply seen no peer yet, which is its normal idle outcome. A one-shot INITIATOR in the
+    /// same state had something to send and never got to -- see [`exit_status`].
+    pub(crate) accept: bool,
 }
 
 /// Whether a member runs for good rather than for one transfer: a forward on either side, or a
@@ -164,12 +168,20 @@ pub(crate) fn persistent_member(forward: bool, accept: bool, serve: Option<&str>
 /// The exit status after a stop that `signal` started and that ended as `end` (see the module
 /// doc): 0, unless the drain cut a one-shot member's work -- then what the signal itself gave
 /// before there was a handler, 128 + its number, as a shell reports a process the signal ended.
-pub(crate) fn exit_status(end: DrainEnd, persistent: bool, signal: &str) -> i32 {
+///
+/// ct-agent#381: `in_flight()` (what decides `end`) does not count a still-parked admission, so
+/// a one-shot member stopped before its FIRST session ever got established also drains to
+/// `DrainEnd::Idle` (nothing "cut"). For the accept role that's a normal idle outcome -- no peer
+/// showed up, there was nothing to send either way -- but for an initiator with input waiting to
+/// go out, the transfer it existed to make never happened; `ever_established` lets that case
+/// exit non-zero too, same as a transfer the drain actually cut.
+pub(crate) fn exit_status(end: DrainEnd, persistent: bool, accept: bool, ever_established: bool, signal: &str) -> i32 {
     let cut = match end {
         DrainEnd::Idle => 0,
         DrainEnd::TimedOut(n) | DrainEnd::Interrupted(n) => n,
     };
-    if persistent || cut == 0 {
+    let initiator_never_connected = !persistent && !accept && !ever_established;
+    if persistent || (cut == 0 && !initiator_never_connected) {
         0
     } else if signal == "SIGTERM" {
         128 + 15
@@ -245,7 +257,7 @@ where
         health.in_flight(member.forward)
     ));
     let end = drain_in_flight(|| health.in_flight(member.forward), drain, again).await;
-    let status = exit_status(end, member.persistent, name);
+    let status = exit_status(end, member.persistent, member.accept, health.ever_established(), name);
     match end {
         DrainEnd::Idle => say(format_args!("ct-agent channel: nothing in flight -- exiting with status {status}")),
         DrainEnd::TimedOut(n) => say(format_args!(
@@ -343,6 +355,7 @@ pub async fn start_channel_lifecycle() -> Result<(), String> {
             env("CT_CHANNEL_SERVE").as_deref(),
             env("CT_CHANNEL_BROKER").as_deref(),
         ),
+        accept,
     };
     if forward && window != super::forward_stream::SESSION_WINDOW {
         eprintln!(
@@ -394,8 +407,11 @@ mod tests {
         Box::leak(Box::new(ChannelHealth::new()))
     }
 
-    /// A pipe or a call: one transfer, its sessions are the work in flight.
-    const ONE_SHOT: Member = Member { forward: false, persistent: false };
+    /// A pipe or a call: one transfer, its sessions are the work in flight. `accept: true` so
+    /// every existing use of this const below (several of which never establish a session)
+    /// keeps representing the acceptor case -- see `an_initiator_with_nothing_sent_exits_non_zero`
+    /// for the initiator-specific gap ct-agent#381 fixes.
+    const ONE_SHOT: Member = Member { forward: false, persistent: false, accept: true };
 
     /// Stop signals at these gaps, each after the one before (the first gap counts from the first
     /// signal, which the caller already took), then none.
@@ -509,6 +525,18 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_one_shot_initiator_stopped_with_nothing_sent_yet_exits_non_zero() {
+        // ct-agent#381: same "nothing in flight at the first look" shape as the acceptor case
+        // right above, but for the INITIATE role -- it had a transfer to make and the stop
+        // arrived before it ever got going, so unlike the acceptor this is not a clean no-op.
+        let h = private();
+        let stop = CancellationToken::new();
+        let initiator = Member { forward: false, persistent: false, accept: false };
+        let end = drain_after_signal("SIGTERM", &stop, h, initiator, Duration::from_secs(5), std::future::pending()).await;
+        assert_eq!(end, (DrainEnd::Idle, 128 + 15));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn the_drain_time_bounds_the_wait() {
         let h = private();
         let stop = CancellationToken::new();
@@ -570,14 +598,33 @@ mod tests {
     fn the_status_is_0_unless_the_stop_cut_a_one_shot_members_work() {
         for end in [DrainEnd::Idle, DrainEnd::TimedOut(3), DrainEnd::Interrupted(1), DrainEnd::Interrupted(0)] {
             for signal in ["SIGTERM", "SIGINT", "Ctrl-C"] {
-                assert_eq!(exit_status(end, true, signal), 0, "a member that runs for good: {end:?} {signal}");
+                assert_eq!(exit_status(end, true, false, false, signal), 0, "a member that runs for good: {end:?} {signal}");
             }
         }
-        assert_eq!(exit_status(DrainEnd::Idle, false, "SIGTERM"), 0, "nothing cut");
-        assert_eq!(exit_status(DrainEnd::Interrupted(0), false, "SIGINT"), 0, "nothing cut");
-        assert_eq!(exit_status(DrainEnd::TimedOut(1), false, "SIGTERM"), 143);
-        assert_eq!(exit_status(DrainEnd::Interrupted(2), false, "SIGINT"), 130);
-        assert_eq!(exit_status(DrainEnd::TimedOut(1), false, "Ctrl-C"), 130);
+        // The acceptor case: nothing cut, and (for the first two) nothing ever established
+        // either -- no peer showed up, which is this side's normal idle outcome (ct-agent#381).
+        assert_eq!(exit_status(DrainEnd::Idle, false, true, false, "SIGTERM"), 0, "nothing cut");
+        assert_eq!(exit_status(DrainEnd::Interrupted(0), false, true, false, "SIGINT"), 0, "nothing cut");
+        assert_eq!(exit_status(DrainEnd::TimedOut(1), false, true, true, "SIGTERM"), 143);
+        assert_eq!(exit_status(DrainEnd::Interrupted(2), false, true, true, "SIGINT"), 130);
+        assert_eq!(exit_status(DrainEnd::TimedOut(1), false, true, true, "Ctrl-C"), 130);
+    }
+
+    #[test]
+    fn an_initiator_stopped_before_its_first_session_exits_non_zero() {
+        // ct-agent#381: in_flight() doesn't count a still-parked admission, so an initiator
+        // stopped before ever establishing a session also drains to DrainEnd::Idle (nothing
+        // "cut") -- but it had a transfer to make and never got to, unlike the acceptor case
+        // right above, which stays 0 in the exact same DrainEnd.
+        assert_eq!(exit_status(DrainEnd::Idle, false, false, false, "SIGTERM"), 128 + 15);
+        assert_eq!(exit_status(DrainEnd::Idle, false, false, false, "SIGINT"), 128 + 2);
+        assert_eq!(exit_status(DrainEnd::Idle, false, false, false, "Ctrl-C"), 128 + 2);
+        // Once a session WAS established at least once, this initiator is back to the normal
+        // rule: idle (nothing currently cut) is status 0, same as the acceptor case.
+        assert_eq!(exit_status(DrainEnd::Idle, false, false, true, "SIGTERM"), 0, "connected at least once");
+        // A persistent initiator (e.g. a forward) is exempt regardless -- it is meant to run
+        // for good, so "never connected yet" is not a failure to report.
+        assert_eq!(exit_status(DrainEnd::Idle, true, false, false, "SIGTERM"), 0, "persistent: exempt");
     }
 
     #[test]
@@ -601,7 +648,7 @@ mod tests {
         let _idle_session = h.session_established();
         let stream = tokio::spawn(h.forward_stream(tokio::time::sleep(Duration::from_secs(1))));
         let started = tokio::time::Instant::now();
-        let forward = Member { forward: true, persistent: true };
+        let forward = Member { forward: true, persistent: true, accept: false };
         let end = drain_after_signal("SIGTERM", &stop, h, forward, Duration::from_secs(5), std::future::pending()).await;
         assert_eq!(end, (DrainEnd::Idle, 0), "the idle session is not waited for");
         let took = started.elapsed();
@@ -614,7 +661,7 @@ mod tests {
         let h = private();
         let stop = CancellationToken::new();
         let _stream = h.forward_stream(std::future::pending::<()>());
-        let forward = Member { forward: true, persistent: true };
+        let forward = Member { forward: true, persistent: true, accept: false };
         let end = drain_after_signal("SIGTERM", &stop, h, forward, Duration::from_secs(2), std::future::pending()).await;
         assert_eq!(end, (DrainEnd::TimedOut(1), 0), "stopped on request");
     }

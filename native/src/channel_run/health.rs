@@ -72,6 +72,10 @@ pub(crate) struct ChannelHealth {
     park_ended_at: AtomicU64,
     /// A shutdown started: not ready any more.
     stopping: AtomicBool,
+    /// ct-agent#381: set once, the first time a session is established, and never cleared.
+    /// Unlike `established` (which counts back down to 0 the moment a one-shot session
+    /// ends), this is what tells `exit_status` whether a transfer EVER happened at all.
+    ever_established: AtomicBool,
 }
 
 /// The process-wide health every production call site counts in.
@@ -130,13 +134,21 @@ impl ChannelHealth {
             session_ended_at: AtomicU64::new(0),
             park_ended_at: AtomicU64::new(0),
             stopping: AtomicBool::new(false),
+            ever_established: AtomicBool::new(false),
         }
     }
 
     /// A session completed its Noise handshake: counted until the ticket drops, and its end is
     /// time-stamped for the readiness grace.
     pub(crate) fn session_established(&'static self) -> Ticket {
+        self.ever_established.store(true, Ordering::SeqCst);
         Ticket::new(&self.established, Some(&self.session_ended_at))
+    }
+
+    /// Whether a session has EVER been established, for the lifetime of this health instance
+    /// (ct-agent#381) -- unlike `in_flight`, never goes back to "nothing happened" once true.
+    pub(crate) fn ever_established(&self) -> bool {
+        self.ever_established.load(Ordering::SeqCst)
     }
 
     /// Run `present` -- an admission on a leg that is already connected -- counted as parked. An
