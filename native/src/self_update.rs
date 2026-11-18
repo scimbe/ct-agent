@@ -835,8 +835,19 @@ pub(crate) async fn perform_update_into(
         let _ = std::fs::remove_file(&old_path); // best-effort cleanup of a PRIOR update's leftover
         std::fs::rename(current_exe, &old_path)
             .map_err(|e| format!("renaming the running exe aside ({current_exe:?} -> {old_path:?}): {e}"))?;
-        std::fs::rename(&tmp_path, current_exe)
-            .map_err(|e| format!("installing the new exe at {current_exe:?}: {e}"))?;
+        // ct-agent#362: if this second rename fails (antivirus lock, sharing violation),
+        // `current_exe` is now empty -- the process stays running, but the next restart
+        // finds no binary. Best-effort roll the first rename back before reporting the
+        // error, and say in the message whether that rollback actually succeeded.
+        if let Err(e) = std::fs::rename(&tmp_path, current_exe) {
+            return Err(match std::fs::rename(&old_path, current_exe) {
+                Ok(()) => format!("installing the new exe at {current_exe:?}: {e} (rolled back: the old exe is back in place)"),
+                Err(rollback_err) => format!(
+                    "installing the new exe at {current_exe:?}: {e} (rollback ALSO failed: {rollback_err} -- \
+                     the old exe is still at {old_path:?}, nothing is at {current_exe:?}; move it back manually)"
+                ),
+            });
+        }
     }
 
     Ok((current_exe.to_path_buf(), outcome))
