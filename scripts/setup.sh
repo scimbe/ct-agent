@@ -361,6 +361,22 @@ verify_release_asset_in() {
 }
 
 install_direct() {
+  # ct-agent#341: a re-run that doesn't stop an already-running agent starts a
+  # second process under the same identity, overwriting $PID_FILE and
+  # truncating ct-agent.log out from under the first one -- which then keeps
+  # running, orphaned, holding the tunnel credentials, with nothing left able
+  # to find and stop it via $PID_FILE.
+  if [ -f "$PID_FILE" ]; then
+    old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+      log "stopping the previous ct-agent (pid $old_pid) before starting a new one"
+      kill "$old_pid" 2>/dev/null || true
+      sleep 1
+      kill -0 "$old_pid" 2>/dev/null && kill -9 "$old_pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+  fi
+
   download_binary
 
   local fresh=1

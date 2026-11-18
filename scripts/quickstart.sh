@@ -858,6 +858,10 @@ tunnel_up() {
   fi
   stage "start the agent" "see $WORK/ct-agent.log and $WORK/logs/setup.log"
   demo_origin "$ORIGIN"
+  # ct-agent#341: a re-run (the advertised "run it again after a failure" path)
+  # must not leave a prior agent running under the same identity -- the ssh
+  # switch phase below already does this before its own run_setup.
+  stop_pidfile "$WORK/ct-agent.pid"; sleep 1
   local args=(--yes); [ "$DOCKER" -eq 0 ] || args=(--docker)
   run_setup ${args[@]+"${args[@]}"} || die "setup.sh failed"
   if [ "$DOCKER" -eq 0 ]; then
