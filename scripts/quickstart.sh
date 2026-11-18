@@ -979,9 +979,17 @@ cmd_ssh_tunnel() {
     local cdir="$WORK/ct-agent-cert" i=0 cwait="${CT_QS_CERT_WAIT:-180}"
     cert_done() { [ -s "$cdir/fullchain.pem" ] && [ -s "$cdir/privkey.pem" ]; }
     if cert_done; then ok "certificate pair already in $cdir"; else
-      mkdir -p "$cdir"
-      (cd "$WORK" && CT_AGENT_CP_URL="$CP" CT_AGENT_TOKEN="$AGENT_TOKEN" CT_AGENT_HOSTNAME="$HOSTNAME_" CT_ACME_CERT_OUT_DIR="$cdir" \
-        nohup "$CTA" certificate >"$WORK/logs/certificate.log" 2>&1 & echo $! > "$WORK/run/certificate.pid")
+      if ours "$WORK/run/certificate.pid"; then
+        ok "ct-agent certificate already running, pid $(cat "$WORK/run/certificate.pid") -- waiting for the pair"
+      else
+        # ct-agent#345: stop a non-"ours" leftover (e.g. its .sig got cleaned up but the
+        # process didn't) before starting a fresh one.
+        stop_pidfile "$WORK/run/certificate.pid"
+        mkdir -p "$cdir"
+        (cd "$WORK" && CT_AGENT_CP_URL="$CP" CT_AGENT_TOKEN="$AGENT_TOKEN" CT_AGENT_HOSTNAME="$HOSTNAME_" CT_ACME_CERT_OUT_DIR="$cdir" \
+          nohup "$CTA" certificate >"$WORK/logs/certificate.log" 2>&1 & echo $! > "$WORK/run/certificate.pid")
+        record_sig "$WORK/run/certificate.pid"
+      fi
       while ! cert_done; do
         pid_alive "$(cat "$WORK/run/certificate.pid")" || { tail_log "$WORK/logs/certificate.log"; die "ct-agent certificate stopped before it wrote the pair"; }
         [ "$i" -lt "$cwait" ] || { tail_log "$WORK/logs/certificate.log"; die "no certificate after ${cwait}s"; }
