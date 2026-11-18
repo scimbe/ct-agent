@@ -228,7 +228,12 @@ async fn poll_for_token_with_backoff(
         }
         tokio::time::sleep(interval).await;
 
-        let resp = http
+        // ct-agent#376: a transport error here (one timeout, one blip) used to end the whole
+        // device flow -- the user has to restart it and re-enter a new code. The user is
+        // spending minutes authorizing in a browser; one bad poll in that window shouldn't
+        // cost the whole login. Retryable within the `expires_in` budget, same as the
+        // RFC 8628 §3.5 "slow_down" case below.
+        let resp = match http
             .post(token_url)
             .timeout(HTTP_TIMEOUT)
             .form(&[
@@ -238,23 +243,44 @@ async fn poll_for_token_with_backoff(
             ])
             .send()
             .await
-            .map_err(|e| LoginError::Http(e.to_string()))?;
+        {
+            Ok(resp) => resp,
+            Err(_) => {
+                interval += slow_down_backoff;
+                continue;
+            }
+        };
 
         if resp.status().is_success() {
             return resp.json().await.map_err(|e| LoginError::Http(e.to_string()));
         }
 
-        let body: TokenErrorResponse = resp.json().await.unwrap_or_default();
-        match body.error.as_str() {
-            "authorization_pending" => continue,
-            // RFC 8628 §3.5: back off by (at least) the configured amount and keep polling.
-            "slow_down" => {
+        // A 5xx is the server's own transient-failure signal; a body that doesn't parse as
+        // the documented OAuth error JSON at all gives no definitive answer either way. Both
+        // get the same retry as a transport error, rather than being folded into a fabricated
+        // "unknown_error" that ends the loop.
+        let server_error = resp.status().is_server_error();
+        match resp.json::<TokenErrorResponse>().await {
+            Err(_) if server_error => {
                 interval += slow_down_backoff;
                 continue;
             }
-            "expired_token" => return Err(LoginError::ExpiredToken),
-            "access_denied" => return Err(LoginError::AccessDenied),
-            other => return Err(LoginError::Other(body.error_description.unwrap_or_else(|| other.to_string()))),
+            Err(e) => return Err(LoginError::Http(e.to_string())),
+            Ok(body) => match body.error.as_str() {
+                "authorization_pending" => continue,
+                // RFC 8628 §3.5: back off by (at least) the configured amount and keep polling.
+                "slow_down" => {
+                    interval += slow_down_backoff;
+                    continue;
+                }
+                "expired_token" => return Err(LoginError::ExpiredToken),
+                "access_denied" => return Err(LoginError::AccessDenied),
+                _ if server_error => {
+                    interval += slow_down_backoff;
+                    continue;
+                }
+                other => return Err(LoginError::Other(body.error_description.unwrap_or_else(|| other.to_string()))),
+            },
         }
     }
 }
@@ -978,6 +1004,33 @@ mod tests {
         let backed_off = base_interval + backoff;
         assert!(gap(1, 2) >= backed_off && gap(1, 2) < backed_off + slack, "post-slow_down gap ~{backed_off:?}: got {:?}", gap(1, 2));
         assert!(gap(2, 3) >= backed_off && gap(2, 3) < backed_off + slack, "the new interval sticks for later polls too: got {:?}", gap(2, 3));
+    }
+
+    #[tokio::test]
+    async fn poll_retries_a_transient_server_error_instead_of_ending_the_flow() {
+        // ct-agent#376: one 503-with-a-non-OAuth-body blip (a restarting proxy in front of
+        // the IdP, the exact ServerError scenario #181 already treats as transient
+        // elsewhere) used to end the whole device flow instead of being retried.
+        let (base, state) = spawn_mock_idp(vec![
+            MockTokenReply::Pending,
+            MockTokenReply::ServerError,
+            MockTokenReply::Success { access_token: "at-3", refresh_token: None, expires_in: 300 },
+        ])
+        .await;
+        let http = reqwest::Client::new();
+        let tok = poll_for_token_with_backoff(
+            &http,
+            &format!("{base}/protocol/openid-connect/token"),
+            "ct-agent-cli",
+            "dc-1",
+            Duration::from_millis(30),
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("retries through the transient error and eventually succeeds");
+        assert_eq!(tok.access_token, "at-3");
+        assert_eq!(state.call_times.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]
