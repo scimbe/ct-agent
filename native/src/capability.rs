@@ -148,15 +148,11 @@ fn resolve_primary_identity(
             return Ok((Capability::decode(&capb)?, origin_private));
         }
         // First agent: generate the identity and persist both for peers to share.
-        // Staged the same way as `rotate_origin_key` (#51), for the same reason: a
-        // crash between the two writes would leave `kp` holding a key with no
-        // matching `cap_path` -- self-healing IS possible here (the load branch
-        // above falls through to regenerate when either file is missing, since
-        // nothing external has trusted the partial state yet on a genuine first
-        // boot), but a peer sharing these paths (#8 R4) that starts up in that
-        // exact window would ALSO see "cap_path missing" and race to generate its
-        // OWN fresh identity, silently discarding the first agent's key instead of
-        // sharing it. Staging removes the window instead of relying on retry luck.
+        // Staged the same way as `rotate_origin_key` (#51): a crash between the two
+        // renames below can leave `kp` without `cap_path`; since #359 that half-written
+        // state is an error on the next start (an operator removes the stray key), not a
+        // silent regeneration. Staging keeps the window to the two renames and stops a
+        // peer sharing these paths (#8 R4) from racing to generate its OWN fresh identity.
         let origin_key = OriginKey::generate();
         let cap = mint(origin_key.origin_identity());
         let key_tmp = format!("{kp}.new");
